@@ -69,7 +69,7 @@ Guarantees:
 
 Storage and transport:
 
-1. No log compaction. The relay and each device keep every change. Storage use grows over time, and a new device downloads the full log on first sync. A snapshot record type can come later under the versioning rules (C43).
+1. No compaction of security records. Grants, epoch records and recovery records stay in full for the life of the space.
 2. No real-time push. Devices poll for changes. A change on one device reaches another device only at its next poll. On iOS, the system decides when a background app runs, so a phone in the background can get a change hours late. The app syncs when it opens. A push hint can come later as an additive route.
 3. No automatic repair of a fork. The devices stop sync and report the fork, and the user repairs it by hand from one device (see Fork repair). A rollback without a fork has an automatic repair (S6).
 4. No sync of a part of an app's data. Each device gets all data for each app that it joins.
@@ -97,11 +97,11 @@ S3. Offline edits. On a flight, Sam completes three tasks on the phone. On the l
 
 S4. Stolen phone. Someone steals Sam's phone. Sam signs in to the user page and selects "Block this machine" on the phone. The relay refuses requests at once from every device with the machine label of the phone, in every app. Next, the laptop shows the devices that stay, and Sam confirms the list. The laptop signs the removal, makes a new app key, and seals it only to the devices on the list. The phone keeps the old data that it already holds, but it cannot read new changes.
 
-S5. All devices lost. A fire destroys the laptop and the phone. Sam buys a new laptop, installs the app, signs in with the synced passkey, and enters the paper recovery key. If Sam has no passkey left, the relay operator sends Sam a new invite link. The new laptop gets access to the app, removes the old devices, and makes a new app key. It downloads the full encrypted log and decrypts it with the recovered keys. Edits that never reached the relay are lost.
+S5. All devices lost. A fire destroys the laptop and the phone. Sam buys a new laptop, installs the app, signs in with the synced passkey, and enters the paper recovery key. If Sam has no passkey left, the relay operator sends Sam a new invite link. The new laptop gets access to the app, removes the old devices, and makes a new app key. It downloads the latest snapshot, the security records and the later changes, and decrypts them with the recovered keys. Edits that never reached the relay are lost.
 
 S6. Relay returns old data. A storage fault rolls the relay back by one day. On the next sync, the laptop sees that the relay log ends before the position that the laptop verified. The laptop uploads the lost records again, with the same bytes at the same positions. The other devices then sync as normal, and the app tells Sam about the repair.
 
-S7. Full quota. Sam reaches the app's storage quota. The relay refuses new changes but continues to serve the stored changes. The sync engine keeps the queued edits in its outbox, and the app shows "Sync paused: storage full". The user page shows usage against the limit, and Sam asks the relay operator for a larger quota.
+S7. Full quota. Sam reaches the app's storage quota. The relay refuses new changes but continues to serve the stored changes. The sync engine keeps the queued edits in its outbox, and the app shows "Sync paused: storage full". The user page shows usage against the limit. The next snapshot replaces older changes with stubs, so usage drops. If that is not enough, Sam asks the relay operator for a larger quota.
 
 ## User roles
 
@@ -167,7 +167,7 @@ while (req := sync.next_request()) is not None:    # method, URL, headers, body 
     resp = httpx.request(req.method, req.url, headers=req.headers, content=req.body, follow_redirects=False)
     sync.handle_response(resp.status_code, resp.headers, resp.content)
 
-# Pull. The engine keeps the full log, so the app asks for the changes after its own applied position.
+# Pull. The engine keeps the log, so the app asks for the changes after its own applied position.
 for change in engine.changes_after(app_db.applied_position()):  # decrypted and verified, in log order
     with app_db.transaction():
         if change.position <= app_db.applied_position().position:
@@ -180,7 +180,7 @@ for change in engine.changes_after(app_db.applied_position()):  # decrypted and 
 print(engine.status())                             # for example ok, degraded, paused: quota, stopped: fork
 ```
 
-- The engine keeps its state in its own SQLite file in `data_dir`: the outbox of encrypted envelopes and the full verified log.
+- The engine keeps its state in its own SQLite file in `data_dir`: the outbox of encrypted envelopes and the verified log.
 - The app keeps two records in its own database: the app outbox, and the applied position (log position and log digest).
 - `key_store` is an interface that the host app implements. It holds the device private keys and the app keys. The Swift binding uses the Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so a backup or a migration does not copy the keys to another machine. The Python demo client uses a file.
 - The Swift binding excludes `data_dir` from backups, so an engine state file never arrives on a machine without its keys.
@@ -193,11 +193,11 @@ Delivery rules. No transaction covers both the app database and the engine state
 - `enqueue` encrypts and signs the change, and stores the envelope, the `change_id` and a hash of the change bytes in one durable transaction.
 - `enqueue` has no effect if the engine outbox or the verified log already holds the `change_id` with the same bytes. A known `change_id` with different bytes is an error. A change larger than the relay limit is an error, so the app can split it.
 - The engine sends the stored envelope again on a retry. It encrypts a change again only after the relay refuses it for an old epoch. The relay checks for a known `change_id` before it checks the epoch, so this refusal means that the relay did not store the change.
-- The engine keeps each own envelope in its outbox until a fetch shows it in the verified log. It keeps the full verified log and deletes nothing from it.
+- The engine keeps each own envelope in its outbox until a fetch shows it in the verified log. It keeps every record of the verified log, and it replaces a change record with a stub only after a snapshot covers it (see Log compaction).
 - If the relay refuses an envelope for a permanent reason, for example a lower size limit, the engine marks it rejected, keeps it, and reports `degraded`. Later envelopes do not wait for it.
 - `changes_after` returns every change after the applied position, own changes included, with its position, log digest and `change_id`.
 - An app outbox row stays until its change comes back from `changes_after`. If the row exists, the app applied the edit at edit time, so it deletes the row and does not apply the change again. If the row does not exist, for example after an app database restore, the app applies the change.
-- If the verified log holds a different digest at the applied position, `changes_after` raises `ResetRequired`. The app then deletes its synced data, applies each outbox row again, and pulls from position 0.
+- If the verified log holds a different digest at the applied position, or holds only stubs after it, `changes_after` raises `ResetRequired`. The app then deletes its synced data, imports the latest snapshot, applies each outbox row again, and pulls (see Log compaction).
 - If a validly signed change fails decryption or strict parsing, the engine skips it and reports `degraded` with the author device. The change keeps its position, so the app position moves past it. Every engine reaches the same verdict, because the verdict depends only on the record bytes and the keys.
 - If the app finds an app payload version that it cannot read, it stops at that change and tells the user. It does not skip the change, because a skip makes the device diverge.
 
@@ -205,7 +205,8 @@ Merge contract. The engine delivers changes in log order, but the app must not d
 
 - Each device applies each change once: its own edits at edit time, and the changes of other devices through `changes_after`.
 - The app merge rules must give the same state for the same set of changes in any order. Examples are per-field last-writer-wins with a hybrid logical clock and a device ID tie-break, tombstones for deletes, and a separate counter for each device.
-- Each app change carries an app format version. The app must keep a reader for each version in the log, because the log is permanent.
+- Each app change and each snapshot carries an app format version. The app must keep a reader for each change format that can appear after the latest snapshot, and for each snapshot format.
+- A snapshot must hold the merge metadata, so that later changes merge in the same way as on a device that applied every change.
 - When the user turns on sync, the app writes an outbox row for each record that exists, in the same transaction that turns on sync.
 
 ### Space log
@@ -213,7 +214,7 @@ Merge contract. The engine delivers changes in log order, but the app must not d
 Each space has one log. The log holds every signed record of the space: security records and changes. The space ID is the app ID, for example `com.example.tasks`.
 
 - Positions are dense integers from 1. Position 1 holds the genesis record.
-- The log digest at position n is the SHA-256 hash of a fixed label, the digest at n-1, n and the record bytes. The digest at position 0 comes from the tenant ID and the space ID.
+- The log digest at position n is the SHA-256 hash of a fixed label, the digest at n-1, n and the SHA-256 hash of the record bytes. The digest at position 0 comes from the tenant ID and the space ID.
 - Each record payload holds a `base`: the position and digest of the last log entry that the author verified. The base of the genesis record is position 0. The base of every other record is an entry at position 1 or later, before the record.
 - A security record must use the entry just before it as its base. The relay refuses a security record with an older base, so two devices cannot append two security records on the same base. After a refusal, the engine fetches, checks the space state again, and signs the record again on the new base. The user confirms again only if a grant or a removal arrived in the meantime.
 - The engine judges each record against the space state after the entry before it: the active devices, the current epoch and the write level.
@@ -230,8 +231,45 @@ Each space has one log. The log holds every signed record of the space: security
 | `snailfish.device.v1` | The device | A new highest protocol level after an engine update |
 | `snailfish.level.v1` | Trusted device | A new space write level |
 | `snailfish.change.v1` | Active device | Epoch, `change_id` and ciphertext |
+| `snailfish.snapshot.v1` | Active device with an empty outbox | Epoch and the encrypted app state at the base position. It is not a security record. |
 
 A checkpoint is a signed statement of one log position and its digest. It is not a log record. The trusted device signs a checkpoint during enrollment.
+
+### Log compaction
+
+A snapshot record holds the full app state at one log position, encrypted with the current app key. After a snapshot, the relay and the devices replace the older change records with stubs. Security records always stay in full.
+
+```python
+# After each sync. The engine asks for a snapshot after 1,000 changes, or 1 MiB of changes, since the last one.
+if engine.snapshot_due():
+    with app_db.read_transaction():
+        if app_db.outbox_empty():                  # then the state equals the state at the applied position
+            engine.write_snapshot(app_db.applied_position(), app.export_state())
+
+# After ResetRequired.
+snap = engine.latest_snapshot()                    # None if the log holds no snapshot
+with app_db.transaction():
+    app.delete_synced_data()
+    if snap is not None:
+        app.import_state(snap.state_bytes)
+        app_db.set_applied_position(snap.position, snap.digest)
+    else:
+        app_db.set_applied_position(0, engine.genesis_base())
+    for change_id, change_bytes in app_db.outbox():
+        app.apply(change_bytes)                    # own edits that the log does not hold yet
+```
+
+Rules:
+
+- A stub holds only the position and the hash of the record bytes. The log digest uses the record hash, so a log with stubs still verifies.
+- `export_state` returns the full app state with its merge metadata, for example hybrid logical clocks and tombstones. `import_state` replaces the synced app data with that state.
+- The snapshot base is the applied position of the export. The relay publishes a snapshot size limit in `GET /v1/info`. If the state is larger than the limit, the engine writes no snapshot and reports `degraded`.
+- The relay replaces a change record with a stub when a snapshot covers its position and every active device reports an applied position at or after the snapshot base. A device that does not fetch for 30 days does not delay the stubs. The relay operator can change the 30 days.
+- The relay uses only snapshots by devices that are active. If a removal makes the author of the latest snapshot inactive, the device that removes it writes a new snapshot.
+- Each engine replaces its own copies of covered change records with stubs after the app applies past the snapshot base.
+- A stub is valid only if a later snapshot covers its position. If the log head holds a stub that no snapshot covers, the engine stops with `stopped: missing records`.
+- A new device imports the latest snapshot and then applies the changes after its base. A device whose applied position is before a stub gets `ResetRequired`.
+- To upload a lost record again at a stub position, a device sends the stub. The relay accepts a stub only if its log, or the same upload, holds a later snapshot that covers it.
 
 ### Enrollment
 
@@ -294,7 +332,7 @@ Sample fetch response:
 
 ```json
 {
-  "entries": [ { "position": 1041, "envelope": { "...": "..." } } ],
+  "entries": [ { "position": 12, "stub": "<base64 record hash>" }, { "position": 1041, "envelope": { "...": "..." } } ],
   "has_more": false
 }
 ```
@@ -319,7 +357,7 @@ Signed records:
 
 - The payload type carries the record version, for example `snailfish.change.v1`. A released record type never changes. A change to its fields or algorithms makes a new type, for example `snailfish.change.v2`.
 - The record version fixes the algorithms. No field in a record selects an algorithm, so there is no negotiation that an attacker can downgrade.
-- The engine must verify every record version that it ever wrote, for as long as the log exists.
+- The engine must verify every record version that it ever wrote, for as long as the log holds a record of that version in full.
 - If the engine finds an unknown record type, it stops sync with the status `stopped: update required`. It never skips a security record, because a skipped grant or removal changes the security state.
 
 Protocol levels:
@@ -389,6 +427,8 @@ flowchart LR
 | Block | A relay refusal of all requests from a device. A user can undo a block. |
 | Removal | An epoch record that removes a device for ever. |
 | Protocol level | A set of record versions that one engine release can write. |
+| Snapshot | A signed record that holds the full app state at one log position. |
+| Stub | The position and record hash that replace a change record after a snapshot covers it. |
 | Sync engine | The Rust library, with Swift and Python bindings, that does all client crypto, verification and sync logic. The host app uses it through a binding. |
 | Host app | The app that embeds the sync engine. It owns its data, its merge rules and its HTTP client. |
 | Envelope | The DSSE v1 JSON wrapper for one signed record: payload type, exact payload bytes and signatures. |
@@ -408,7 +448,7 @@ Decided concepts:
 | Device enrollment | A trusted device approves a new device through numeric comparison with commit before reveal. The user confirms the code on both devices. The new device gets a signed checkpoint. See Enrollment. | User sign-in alone must not add a reader. A copied QR code alone must not work. A relay gets one guess at the code for each session. The checkpoint gives the new device a root of trust. | Medium. Only the enrollment flow changes. |
 | Recovery | A random recovery key that the user stores offline. Each space has its own recovery key. Each epoch record seals the new key to it, and it signs the genesis record of its space. A recovery record replaces it, signed by the old and the new key. | Recovery works without key escrow on the relay. A separate key for each space keeps apps isolated from each other. | High. Stored key sets depend on it. |
 | Device removal | The user blocks the device on the user page, and the relay refuses its requests at once. A trusted device then appends an epoch record after the user confirms the devices that stay. | A block alone leaves the old key valid. The relay cannot rotate a key that it does not hold. A session alone must not remove a device for ever. A thief can enroll a second device before the block, so the user confirms the list. | Medium. |
-| Log integrity | One hash-linked log per space, with dense positions and a signed base in each record. Each device keeps the full verified log. | Devices detect rollback, gaps and reorders. A device detects a fork when it sees a record whose base is not in its own log. A device repairs a rollback from its own copy. | Very high. It is part of the stored format. |
+| Log integrity | One hash-linked log per space, with dense positions and a signed base in each record. Each device keeps the verified log: every security record, the latest snapshot and every change after it. | Devices detect rollback, gaps and reorders. A device detects a fork when it sees a record whose base is not in its own log. A device repairs a rollback from its own copy. | Very high. It is part of the stored format. |
 | Transport | HTTPS request and response with polls. No persistent connections. | Phones sync at intervals. Polls keep no idle connection state. | Low. Push can come later as a hint. |
 | User page | The relay serves it behind passkey sign-in. | One deployable unit is easier to self-host. | Low. |
 | Metrics and alerts | Metrics in Prometheus or OpenMetrics format, on a separate listen address. Alert rules ship as a Prometheus rules file. User alerts go to a webhook URL that each user sets. See Monitoring and alerting. | Self-hosters use their own stack. The relay holds no mail credentials and no alert rules. | Low. Both are standard interfaces. |
@@ -420,8 +460,8 @@ Decided concepts:
 | User sign-in | Passkeys that the relay serves, with one-time invite links from the relay operator. | No external identity provider to run or register with. The relay assigns the user ID, so the identity is exact and stable. Invite links match the manual approval of each user. | Medium. OIDC can come later and link to the same user ID. |
 | Wire encoding | UTF-8 JSON over HTTPS. Each signed record is a DSSE v1 envelope that carries the exact payload bytes. | JSON is easy to read and debug, and every target language supports it. DSSE is a published envelope format, and a signature over exact bytes needs no canonical form. | High. Stored records use the envelope. |
 | Versioning | Protocol versions are separate from release versions. Released record types never change, and the record version fixes the algorithms. A signed space write level controls when devices write a new level. Databases migrate forward only. See Versioning. | No algorithm negotiation to downgrade. A device never skips a security record that it cannot verify. One updated device cannot stop the other devices. | High after the first public release. Released formats stay readable for the life of the log. |
-| Delivery | A transactional outbox in the app database for push. Pull by applied position from the full engine log, own changes included. See Delivery rules. | No transaction covers two SQLite files. The app records only what makes a retry safe, so app merges need not be idempotent. The engine keeps the full log, so an app database restore or a new engine state file loses no stored change. | Medium. It changes the integration API. |
-| Sync engine | One Rust crate, on top of `protocol`, holds all client crypto, log verification, space state logic and sync logic. It is a synchronous state machine with no network I/O: it builds each request and reads each response, and the host app sends the bytes. It keeps its sync state and the full verified log in its own SQLite file. The host app holds the device private keys and the app keys through a key store interface. | One implementation of the security-critical code and the sync logic for every platform. No network I/O means no async across the binding layer. Local SQLite access is synchronous. | High. Every binding depends on it. |
+| Delivery | A transactional outbox in the app database for push. Pull by applied position from the engine log, own changes included. See Delivery rules. | No transaction covers two SQLite files. The app records only what makes a retry safe, so app merges need not be idempotent. The engine keeps the log after the latest snapshot, so an app database restore or a new engine state file loses no stored change. | Medium. It changes the integration API. |
+| Sync engine | One Rust crate, on top of `protocol`, holds all client crypto, log verification, space state logic and sync logic. It is a synchronous state machine with no network I/O: it builds each request and reads each response, and the host app sends the bytes. It keeps its sync state and the verified log in its own SQLite file. The host app holds the device private keys and the app keys through a key store interface. | One implementation of the security-critical code and the sync logic for every platform. No network I/O means no async across the binding layer. Local SQLite access is synchronous. | High. Every binding depends on it. |
 | Engine bindings | UniFFI generates the Swift and Python bindings from the sync engine. Swift for macOS and iOS is the first app platform. The Python binding drives the demo client and the end-to-end tests. | UniFFI supports Swift and Python directly, and Mozilla uses it in production. One tool covers both targets. Python tests run in Linux CI without a simulator. | Medium. A switch to PyO3 for Python changes only the Python binding. |
 
 Crypto boundary. The sync engine does all security-critical crypto. The relay only verifies and hashes.
@@ -482,14 +522,14 @@ Scale:
 - 1 to 5 users per instance. 1 to 10 apps per user. 2 to 10 devices per app.
 - The relay sets fixed upper limits for change size, request size and stored bytes per tenant. Each self-hoster selects the values. `GET /v1/info` publishes them.
 - Load: one device polls once a minute in the foreground, so it makes about 60 fetches in each active hour. A design load of 5 users with 3 active device hours each per day gives about 1,000 fetches per day. The relay must handle 100,000 requests per day on one small machine, which allows for 100 times the design load.
-- Growth: a task app that writes 50 changes a day reaches 10,000 changes in about 7 months, and about 90,000 changes in 5 years.
+- Growth: a task app that writes 50 changes a day writes about 90,000 changes in 5 years. With a snapshot after each 1,000 changes, a log holds one snapshot, the security records and at most about 1,000 changes in full.
 
 Service:
 
 - Availability: 99% per month (about 7 hours of outage a month). An outage delays sync and loses no data, because devices keep queued edits and their own envelopes until the verified log holds them.
 - Append latency: p95 under 1 second.
 - Propagation: a change reaches another device in the foreground within one poll interval (default 1 minute). A device in the background syncs when its operating system runs it.
-- First sync of a new device: 10,000 changes of 1 KiB in under 2 minutes. M2 measures it. Without compaction, the time grows with the log. If the M2 figure fails the target, snapshots get a design (C43).
+- First sync of a new device: one snapshot and 10,000 changes of 1 KiB in under 2 minutes. M2 measures the changes, and M8 measures the snapshot.
 - Durability: the relay targets no data-loss SLO. Devices that survive repair a relay rollback from their own logs.
 
 These numbers justify one small process and an embedded database per tenant, with no queue, cache or cluster.
@@ -562,7 +602,7 @@ T6. An attacker photographs or copies a QR enrollment code, or a malicious relay
 
 T7. A malicious or faulty relay rolls back, forks, reorders or drops records.
 
-- Each device keeps the full verified log. It stops sync if the relay changes a verified entry.
+- Each device keeps the verified log. It stops sync if the relay changes a verified entry. A stub keeps the record hash, so the relay cannot change a pruned entry either.
 - Each record holds the signed base of its author. A device that receives a record whose base is not in its own log stops with `stopped: fork`.
 - If the relay log ends before a verified position, the device uploads its copies of the lost records again (S6).
 - Clients verify the security records themselves, so the relay cannot add a device.
@@ -573,6 +613,7 @@ T8. A device is lost or stolen.
 
 - The user blocks the machine on the user page. The relay refuses requests at once from every device with that machine label.
 - A trusted device shows the devices that stay. The user confirms the list, so a device that the thief enrolled before the block does not stay.
+- If the stolen device wrote the latest snapshot, the device that removes it writes a new snapshot, and the relay stops using the old one.
 - The epoch record removes the device and seals the new key only to the devices on the list.
 - The relay and each engine refuse every record from the removed device after the epoch record.
 - Limit: the removed device keeps the data and keys that it already holds. There is no forward secrecy for old changes.
@@ -605,6 +646,12 @@ T14. A backup or a migration copies a device to a second machine.
 - The Swift binding keeps device keys in the Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. A backup restore or a migration does not move the keys, so the copy cannot act as the old device. The copy must enroll as a new device.
 - The engine identifies own changes by the app outbox, and not by the signing key. An app reinstall that keeps the keys rebuilds the engine state from the log and continues as the same device.
 
+T15. A device writes a wrong snapshot, by a bug or by intent.
+
+- New devices and reset devices import the wrong state. Devices that apply changes do not use the snapshot, so they keep the correct state.
+- Only an active device can write a snapshot, and only snapshots by active devices count. A removal therefore stops the use of a snapshot by the removed device.
+- Limit: no device can check that a snapshot matches the changes that it covers. An app bug in `export_state` spreads to each new device.
+
 ## Privacy
 
 | Data | Devices | Relay and relay operator | Hosting provider |
@@ -619,12 +666,14 @@ The relay stores the minimum plaintext that routing, the device list, expiry and
 
 ## Data retention
 
-- The relay and each device keep every record for the life of the space. There is no automatic deletion.
+- The relay and each device keep every security record for the life of the space.
+- They keep each change in full until a snapshot covers it (see Log compaction). Then they keep only a stub. Deleted app data therefore leaves the relay after the next snapshot.
+- Relay backups made before a snapshot can still hold the older changes.
 - The user can delete one space or the whole tenant. Deletion removes the relay copy only. Devices keep their local data.
 - A removed device stays in the log as a removed entry, because devices must still verify the log.
 - The relay backup command `snailfish-relay backup` copies each tenant file with `VACUUM INTO`. A plain file copy of a live WAL database can be corrupt. A backup holds only ciphertext and public metadata.
 - A relay restore from an old backup is a rollback. The devices repair it from their own logs (S6).
-- Each device and the user page can export the space log as one file. The export holds only envelopes, so it is safe to store anywhere. A new relay can import it, and the recovery key then opens it. A home relay must not be the only copy, because one fire can destroy both the relay and the devices.
+- Each device and the user page can export the space log as one file. The export holds only envelopes and stubs, so it is safe to store anywhere. A new relay can import it, and the recovery key then opens it. A home relay must not be the only copy, because one fire can destroy both the relay and the devices.
 
 ## Logging
 
@@ -664,9 +713,10 @@ The demo client is a Python CLI on the Python binding. It uses the integration l
 6. M6: Swift sample app. The scope is a SwiftUI version of the demo app on macOS and iOS, with real QR scans in both directions, the Keychain key store, the first-device flow with sign-in, and a measurement of background sync delay on iOS. Demo: an iPhone joins through a QR scan from a Mac, and edits sync both ways.
 7. M7: removal and recovery. The scope is block, removal with key rotation, recovery key replacement, full recovery onto a new device, protocol levels, and the reserved capacity for security records (T10). Demo: scenarios S4 and S5.
 
-After M7:
+After M7, and before the first public release:
 
-8. M8: operations and packages. The scope is the space export and import, the fork repair procedure, the Prometheus rules file, the sample proxy configuration, self-host docs and a published Python package. Demo: an alert from a full quota, a space moved to a new relay through an export, a fork repair, and a fresh install from the published docs.
+8. M8: log compaction. The scope is the snapshot record, `export_state` and `import_state` in the demo app, stubs on the relay and on each device, and the 30-day rule. Demo: device A writes 10,000 changes and a snapshot, and the relay storage for the space drops. A new device syncs from the snapshot. A device that is offline while the relay replaces records with stubs imports the snapshot and keeps its outbox edits.
+9. M9: operations and packages. The scope is the space export and import, the fork repair procedure, the Prometheus rules file, the sample proxy configuration, self-host docs and a published Python package. Demo: an alert from a full quota, a space moved to a new relay through an export, a fork repair, and a fresh install from the published docs.
 
 ## Open issues
 
@@ -709,7 +759,7 @@ Protocol:
 
 - C20. Wire encoding? UTF-8 JSON over HTTPS, with signed records in DSSE v1 envelopes of exact payload bytes. CBOR and Protocol Buffers save little at this scale and make traffic harder to read. A signature over a re-encoded structure needs a canonical form, which is a common source of bugs.
 - C21. Does the host app build protocol messages itself, or does a separate transport library do it? Neither. The sync engine builds every request and reads every response, and the host app only sends bytes. Almost every message needs signatures or verification, and sync logic errors cause silent divergence (goal 8).
-- C22. Where does the engine keep its sync state? In its own SQLite file in a directory that the host app gives it, with the full verified log. If every app saves engine state itself, every app must get crash safety right.
+- C22. Where does the engine keep its sync state? In its own SQLite file in a directory that the host app gives it, with the verified log. If every app saves engine state itself, every app must get crash safety right.
 - C23. Versioning policy? Frozen record types, algorithms fixed by the record version, fail closed on an unknown security record type, a signed space write level (C30), relay first, forward-only migrations. The rules start at the first public release.
 - C24. How do the app database and the engine state stay consistent after a crash? A transactional outbox for push, and pull by applied position from the full engine log (C31). The engine cannot write the app database without a tie to its storage engine. A rule that every merge is idempotent fails for changes such as counter increments.
 - C25. Crypto primitives? Ed25519, SHA-256, XChaCha20-Poly1305, HKDF-SHA256 and HPKE with X25519. All except XChaCha20-Poly1305 have an RFC. All have Rust crates with an audit of an older version, and a random nonce is safe for many devices that share one key.
@@ -721,19 +771,19 @@ Protocol:
 Log, keys and delivery:
 
 - C30. Can a device write a new record version as soon as its engine supports it? No. One updated device then stops every older device. A signed space write level controls each change of level, and the relay refuses new records below it.
-- C31. Can the engine delete changes after the app applies them? No. An app database restore then loses every change between the restored position and the newest position. The engine keeps the full log, and the app pulls by its own applied position.
-- C32. Can the engine delete an envelope after the relay returns a position? No. A relay rollback or a power loss then loses the change. The engine keeps the envelope until the verified log holds it, and each device keeps the full log for repair.
+- C31. Can the engine delete changes after the app applies them? No. An app database restore then loses every change between the restored position and the newest position. The engine keeps the log after the latest snapshot, and the app pulls by its own applied position.
+- C32. Can the engine delete an envelope after the relay returns a position? No. A relay rollback or a power loss then loses the change. The engine keeps the envelope until the verified log holds it, and each device keeps the log for repair.
 - C33. Can a sealed key set travel without a signature? No. HPKE base mode does not authenticate the sender, so the relay can seal its own key to a device. Each key set is part of a signed security record, with a key commitment.
 - C34. Can security records and changes use separate logs? No. The relay can then place a change from a removed device before or after the removal. One log for each space gives one order for all records.
 - C35. Can a user session alone remove a device? No. A stolen session then removes every device for ever. A session blocks a device, and a trusted device or the recovery key signs the removal.
-- C36. Can a device restore the relay through a snapshot of app state? No. A snapshot needs an export and import API in every app, and it can apply changes twice. Each device keeps the full log, so it uploads lost records again at their positions.
+- C36. Can a device restore the relay from its app state? No. A restore from app state loses the changes of other devices and can apply changes twice. Each device keeps the log, so it uploads lost records again at their positions.
 - C37. Can the engine stop for ever at a change that does not decrypt? No. A stolen device can then stop a space with one bad change. Every engine skips such a change and reports it. Security records still fail closed.
 - C38. Is the change order from the relay enough for app merges? No. Each device applies its own edits before the relay orders them. Apps must use merge rules that do not depend on order.
 - C39. Can the engine identify own changes by the signing key? No. A reinstall or a cloned key store then hides own changes from the app. The app outbox identifies own changes, and device keys stay on one machine.
 - C40. Use a custom envelope and signature input? No. DSSE v1 defines the same design with a published pre-authentication encoding, and RFC 9421 defines HTTP request signatures.
 - C41. One recovery key for each tenant, or for each space? For each space. With one key for each tenant, every app that creates a space can keep the key and read every other space. A key for each space also removes the tenant key check on the relay and the replacement across all spaces. The cost is one paper key for each app.
 - C42. User sign-in? Passkeys that the relay serves, with operator invite links. OIDC needs an OAuth client or an identity provider for each self-hoster, and identity from several providers enables the T3 attack. An identity header from a proxy is unsafe if a client can reach the relay directly. Sign-in gives no data access, so a simple account recovery through a new invite link is acceptable.
-- C43. Log compaction in v1? No. A snapshot needs an app export and import API, and it weakens the repair of a rollback from the full log. At 50 changes a day, a space reaches about 90 MB in 5 years, which a small VPS and a phone can hold. A snapshot record type can come later under the versioning rules. Revisit if the M2 first-sync figure fails the SLO.
+- C43. Log compaction? Signed snapshots and stubs, before the first public release (M8). Without compaction, every app must keep a reader for every change format for ever, deleted data stays on the relay for ever, and first sync grows without limit. The log digest uses a hash of each record, so stubs keep the chain valid. The cost is `export_state` and `import_state` in each app, and the 30-day rule for devices that do not fetch.
 - C44. Push wake-ups for iOS in v1? No. APNs keys belong to the app developer, so a relay operator cannot send a push for a third-party app. A push gateway for each developer works against self-hosting. Local-first apps hold their data, so a delay costs freshness and not correctness. Revisit after the M6 background sync measurement.
 - C45. Fork repair? Manual, from the export of one device (see Fork repair). A fork means the relay is not trustworthy, so an automatic repair on the same relay is not useful. Automatic repair needs a new security record type and rules for security records on the losing branch.
 
