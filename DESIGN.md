@@ -389,11 +389,34 @@ HTTP API and storage:
 
 - The relay API has a path prefix, for example `/v1/`. A path version accepts only additive changes, for example a new route or a new optional response field.
 - The engine parses unsigned response JSON loosely and ignores unknown fields.
-- The engine state file and each relay tenant file keep a schema version in SQLite `PRAGMA user_version`. Each file migrates forward when it opens.
+- The engine state file and each relay database file keep a schema version in SQLite `PRAGMA user_version`. Each file migrates forward when it opens.
 - A file with a schema version newer than the software knows does not open. A downgrade then fails with a clear error and does not corrupt the file.
 - The engine crate, the bindings and the relay each use their own semver release versions.
 
 The app owns the format of its own data inside the ciphertext. The engine never reads it. The merge contract gives the rules for app formats.
+
+### Relay storage
+
+The relay data directory has this layout:
+
+```text
+data/
+  directory.db                      users, passkeys, invite links, user ID to tenant ID
+  tenants/<tenant ID>/
+    tenant.db                       space index, machine labels, blocks, device status, webhooks, nonces
+    spaces/<random name>.db         one space log
+```
+
+Rules:
+
+- Each file uses WAL mode with `synchronous=FULL`, `secure_delete=ON` and `auto_vacuum=INCREMENTAL`.
+- A space file name is 128 random bits in base32. The tenant file maps each log ID to its file name, app ID, status, quota and restore hold. The relay never builds a path from a log ID, an app ID or any other value from a caller.
+- The tenant file keeps a deletion marker for each deleted log ID after the space file is gone.
+- Each space file holds its own log ID and app ID. `snailfish-relay restore` rebuilds the space index from the space files, because a backup does not copy the files at one instant.
+- An append runs in one transaction in the space file: the signature and permission checks, the space quota check and the append.
+- The relay checks a block in the tenant file before it opens the space file. The two files have no shared transaction. A request that starts before a block can still finish, and a block affects availability only.
+- After the relay replaces records with stubs, it runs `PRAGMA incremental_vacuum` on that space file. Only that space waits for it.
+- The relay limits the spaces per tenant and the stored bytes per space. The product of the two limits bounds the storage of one tenant. The relay reserves capacity in each space for security records and one snapshot.
 
 ## Diagram
 
@@ -409,8 +432,9 @@ flowchart LR
   subgraph Relay
     S[Sync and enrollment surfaces]
     O[User and setup surfaces]
-    Dir[(User directory<br/>identity to tenant)]
-    T[(Tenant store<br/>one log for each space)]
+    Dir[(User directory<br/>users, passkeys, invites)]
+    TF[(Tenant file<br/>space index, blocks,<br/>device status)]
+    T[(Space files<br/>one log each)]
   end
   A -- signed, encrypted changes --> S
   B -- signed, encrypted changes --> S
@@ -418,7 +442,9 @@ flowchart LR
   Browser --> O
   Op -. invite link .-> Browser
   O --> Dir
+  S --> TF
   S --> T
+  O --> TF
   O --> T
   RK -. entered only for setup, recovery or key replacement .-> A
 ```
@@ -429,7 +455,9 @@ flowchart LR
 | --- | --- |
 | Relay operator | The person who runs a relay instance and approves users. |
 | User | The person whose devices sync. One user has one tenant. |
-| Tenant | The separate store for one user's data on the relay. |
+| Tenant | The separate storage for one user on the relay: one tenant file, and one space file for each space. |
+| Tenant file | The SQLite file for the state of one tenant that spans spaces: the space index, machine labels, blocks, device status, webhooks and nonces. |
+| Space file | The SQLite file that holds the log of one space. It has a random file name. |
 | Space | The isolated area for one app inside a tenant. Each app gets one space. A tenant can have many spaces. Each space has its own log, devices and app keys. |
 | Space log | The one ordered, hash-linked list of signed records in a space: security records and changes. |
 | Security record | A space log record that changes the space state: genesis, grant, epoch, recovery, device and level records. |
@@ -464,7 +492,7 @@ Decided concepts:
 | Where encryption occurs | Clients encrypt and sign every change. The relay never holds a key. | The relay and its storage must be unreadable (goal 3). | Very high. A change breaks the whole trust model. |
 | Relay role | One ordered, append-only log of signed records for each space. The relay checks signatures, permissions and quotas only. | A relay that cannot read data cannot merge it. A log keeps the relay small. | High. Stored logs depend on the log shape. |
 | Conflict resolution | Clients merge with app-defined rules that meet the merge contract. | Only clients see plaintext. Each app knows its own merge semantics. A device applies its own edits before the relay orders them, so only order-independent rules converge. | Low for the relay. High for an app that ships an order-dependent merge. |
-| Tenant isolation | Each user's data lives in a separate store, with no shared tables for app data. | An authorisation bug in one tenant cannot expose or change another tenant's records. The stored records are ciphertext, so the main gain is integrity and availability, and simple deletion of one tenant. | Medium. A move to shared storage needs a data migration. |
+| Tenant isolation | Each user's data lives in separate files, with no shared tables for app data. | An authorisation bug in one tenant cannot expose or change another tenant's records. The stored records are ciphertext, so the main gain is integrity and availability, and simple deletion of one tenant. | Medium. A move to shared storage needs a data migration. |
 | Device authority | Each device has its own signing key. Signed security records in the space log record which devices can act. The genesis record is the root, and the recovery key signs it. Clients verify the log themselves. | The relay can lie about membership, so clients must not trust its word. | Very high. Every device depends on the log format. |
 | Device enrollment | A trusted device approves a new device through numeric comparison with commit before reveal. The user confirms the code on both devices. The new device gets a signed checkpoint. See Enrollment. | User sign-in alone must not add a reader. A copied QR code alone must not work. A relay gets one guess at the code for each session. The checkpoint gives the new device a root of trust. | Medium. Only the enrollment flow changes. |
 | Recovery | A random recovery key that the user stores offline. Each space has its own recovery key. Each epoch record seals the new key to it, and it signs the genesis record of its space. A recovery record replaces it, signed by the old and the new key. | Recovery works without key escrow on the relay. A separate key for each space keeps apps isolated from each other. | High. Stored key sets depend on it. |
@@ -476,8 +504,8 @@ Decided concepts:
 | Relay deployment | One static Rust binary, shipped as a container image. It runs on a small VPS or a home server. One process serves all tenants of an instance. The data directory must be on a local disk. | Anyone can run it on any host for a few pounds a month (goal 6). The SLOs need no edge distribution or cluster. SQLite is not safe on a network file system. | Medium. A managed platform needs a new storage layer. |
 | Relay language | Rust, with axum and tokio for HTTP and rusqlite for storage. It builds as a static musl binary. | The relay and the sync engine use the same `protocol` crate. A second implementation of the verification rules can drift and make the relay accept records that clients refuse. | High. A new language means a rewrite of the relay. |
 | Code layout | One Cargo workspace with four crates. `protocol`: record types, envelopes, signature input, verification, log digests and space state, with no I/O. `engine`: `protocol` plus the sync state machine and its SQLite state. `bindings`: the UniFFI Swift and Python bindings. `relay`: `protocol` plus HTTP and tenant storage. The published names have a `snailfish-` prefix, for example `snailfish-engine`. The Python package is `snailfish` and the Swift module is `Snailfish`. | The relay and the engine apply the same rules from the same code. `protocol` does no I/O, so both a synchronous engine and an async relay can use it. | Medium. |
-| Relay storage | One SQLite database file per tenant, in WAL mode with `synchronous=FULL` and `secure_delete=ON`. `snailfish-relay backup` copies each file with `VACUUM INTO`. | One SQLite transaction covers the permission check, the quota check and the append. A separate file per tenant gives tenant isolation. One process with one write transaction per file gives one writer at a time. A file copy of a live WAL database can be corrupt. | Medium. A new engine needs a data migration. |
-| User directory | A separate SQLite database file. It holds only users, their tenants, passkey credentials, invite links and status. | The directory stays apart from app data, keys and grants. | Low. |
+| Relay storage | SQLite, with one space file for each space, one tenant file for each tenant, and one user directory file. See Relay storage. | One SQLite transaction in the space file covers the permission check, the quota check and the append. A compaction or a failed migration in one space does not affect other spaces. A space deletion is a file deletion. | Medium. A new engine needs a data migration. |
+| User directory | A separate SQLite file. It holds only users, their tenant IDs, passkey credentials, invite links and status. | The directory stays apart from app data, keys and grants. | Low. |
 | User sign-in | Passkeys that the relay serves, with one-time invite links from the relay operator. | No external identity provider to run or register with. The relay assigns the user ID, so the identity is exact and stable. Invite links match the manual approval of each user. | Medium. OIDC can come later and link to the same user ID. |
 | Wire encoding | UTF-8 JSON over HTTPS. Each signed record is a DSSE v1 envelope that carries the exact payload bytes. | JSON is easy to read and debug, and every target language supports it. DSSE is a published envelope format, and a signature over exact bytes needs no canonical form. | High. Stored records use the envelope. |
 | Versioning | Protocol versions are separate from release versions. Released record types never change, and the record version fixes the algorithms. A signed space write level controls when devices write a new level. Databases migrate forward only. See Versioning. | No algorithm negotiation to downgrade. A device never skips a security record that it cannot verify. One updated device cannot stop the other devices. | High after the first public release. Released formats stay readable for the life of the log. |
@@ -541,7 +569,7 @@ Apps work offline, so relay downtime only delays sync.
 Scale:
 
 - 1 to 5 users per instance. 1 to 10 apps per user. 2 to 10 devices per app.
-- The relay sets fixed upper limits for change size, request size and stored bytes per tenant. Each self-hoster selects the values. `GET /v1/info` publishes them.
+- The relay sets fixed upper limits for change size, request size, stored bytes per space and spaces per tenant. Each self-hoster selects the values. `GET /v1/info` publishes them.
 - Load: one device polls once a minute in the foreground, so it makes about 60 fetches in each active hour. A design load of 5 users with 3 active device hours each per day gives about 1,000 fetches per day. The relay must handle 100,000 requests per day on one small machine, which allows for 100 times the design load.
 - Growth: a task app that writes 50 changes a day writes about 90,000 changes in 5 years. With a snapshot after each 1,000 changes, a log holds the security records, the latest snapshot and about 1,000 changes in full, while every device applies past each snapshot.
 
@@ -553,7 +581,7 @@ Service:
 - First sync of a new device in under 2 minutes: 10,000 changes of 1 KiB without a snapshot (M2), and one 10 MiB snapshot with 1,000 changes (M8).
 - Durability: the relay targets no data-loss SLO. Devices that survive repair a relay rollback from their own logs.
 
-These numbers justify one small process and an embedded database per tenant, with no queue, cache or cluster.
+These numbers justify one small process and embedded SQLite files, with no queue, cache or cluster. At the design scale, a relay holds 5 tenant files and up to 50 space files.
 
 ## Monitoring and alerting
 
@@ -563,9 +591,9 @@ Relay operator signals:
 
 1. An external liveness check runs every 5 minutes against an unauthenticated health route. It alerts after 3 failures in a row.
 2. The relay counts requests, 4xx and 5xx responses, signature failures, authentication denials and quota denials per hour.
-3. The relay exports storage per tenant against its limit.
+3. The relay exports storage per tenant, and the number of spaces above 80% and 95% of their quota.
 4. The relay counts storage-layer errors and failed schema migrations.
-5. The project ships a Prometheus rules file: 5xx responses above 5% for 15 minutes, storage at 80% and 95%, and any storage error or failed migration. Alertmanager routes the alerts.
+5. The project ships a Prometheus rules file: 5xx responses above 5% for 15 minutes, a space above 95% of its quota, free disk below 10%, and any storage error or failed migration. Alertmanager routes the alerts.
 
 User signals:
 
@@ -647,7 +675,7 @@ T9. An attacker steals the recovery key.
 
 T10. A device or attacker uploads malformed or oversized records, or a flood of records.
 
-- The relay checks size limits and signatures before storage, and quotas inside the same transaction as the append.
+- The relay checks size limits and signatures before storage, and the space quota inside the same transaction as the append.
 - A refused record modifies no stored state.
 - The relay reserves separate capacity for security records, so a full quota cannot block a device removal or recovery.
 - A validly signed change that does not decrypt does not stop the space. Each engine skips it and reports `degraded` with the author device.
@@ -655,6 +683,7 @@ T10. A device or attacker uploads malformed or oversized records, or a flood of 
 T11. An attacker guesses or forges a tenant identifier to reach the storage of another tenant.
 
 - The relay routes requests only through a server-signed tenant handle or the user directory, and never through a raw tenant ID from the caller.
+- Space file names are random and come only from the space index in the tenant file. No value from a caller becomes part of a file path.
 
 T12. Server-side injection into app data does not apply. The relay never parses or queries app content.
 
@@ -692,9 +721,9 @@ The relay stores the minimum plaintext that routing, the device list, expiry and
 - The relay and each device keep every security record for the life of the space.
 - They keep each change in full until a snapshot covers it (see Log compaction). Then they keep only a stub. The relay sets `PRAGMA secure_delete=ON` and checkpoints the WAL, so deleted app data leaves the relay disk after the next snapshot.
 - Relay backups made before a snapshot can still hold the older changes.
-- The user can delete one space or the whole tenant. Deletion removes the relay copy only. Devices keep their local data.
+- The user can delete one space or the whole tenant. The relay deletes the space file, or the tenant directory, with the WAL files. Deletion removes the relay copy only. Devices keep their local data.
 - A removed device stays in the log as a removed entry, because devices must still verify the log.
-- The relay backup command `snailfish-relay backup` copies each tenant file with `VACUUM INTO`. A plain file copy of a live WAL database can be corrupt. A backup holds only ciphertext and public metadata.
+- The relay backup command `snailfish-relay backup` copies each database file with `VACUUM INTO`. A plain file copy of a live WAL database can be corrupt. A backup holds only ciphertext and public metadata.
 - A relay restore from an old backup is a rollback. `snailfish-relay restore` puts each space on hold, and the devices repair it from their own logs (S6).
 - Each device and the user page can export the space log as one file. The export holds only envelopes and stubs, so it is safe to store anywhere. The setup surface imports it into an empty space on any relay, and the recovery key then opens it. A home relay must not be the only copy, because one fire can destroy both the relay and the devices.
 
@@ -773,7 +802,7 @@ Platform:
 - C13. Where does the relay run? As one static binary in a container, on a small VPS or a home server. Any self-hoster can run it on any host, and the SLOs need no more.
 - C14. Support a managed edge platform (for example Cloudflare Durable Objects) in v1? No. It ties every self-hoster to one vendor and needs a second storage layer.
 - C15. Relay language? Rust. The relay shares the `protocol` crate with the sync engine, so envelope parsing, request signatures, log digests, space state and signature strictness have one implementation. Go has a simpler server model, but a second implementation of these rules can drift from the engine.
-- C16. Relay storage? One SQLite file per tenant, and a separate SQLite file for the user directory. One transaction covers checks and the append, and separate files isolate tenants.
+- C16. Relay storage? SQLite, with one space file for each space, one tenant file for each tenant and one user directory file (C49). One transaction in the space file covers the checks and the append.
 - C17. Client library strategy? One Rust sync engine with UniFFI bindings for Swift and Python. Swift for macOS and iOS is the first app platform, and Python drives the demo client and tests. One implementation of the client crypto removes a class of cross-platform bugs.
 - C18. Use napi-rs or wasm-bindgen for Node and browsers in v1? No. No v1 app needs them. UniFFI has no mature Node support, so they need a second binding tool. They stay in Missing features.
 - C19. First demo client? A Python CLI, not a phone app. An agent or CI can run two devices on one machine with no simulator or camera.
@@ -812,6 +841,7 @@ Log, keys and delivery:
 - C46. Can signed records hold the tenant ID? No. The relay assigns the tenant ID, so a log with the tenant ID cannot move to another tenant or relay. Signed records hold a random log ID that the first device chooses.
 - C47. Does a snapshot stop being valid when its author is removed? No. The stubs that it covers then have no valid snapshot, and a recovery device cannot read the log. A snapshot is valid if its author is active at its position. After a removal for theft, the device that removes the thief writes a new snapshot.
 - C48. Must a security record use the entry just before it as its base? No. A stream of changes then makes removal fail again and again. The base must be at or after the last security record.
+- C49. One relay database file for each tenant, or for each space? For each space, with a tenant file for the state that spans spaces. Each space has its own log, keys and recovery key, so no transaction spans spaces. A file for each space lets compaction, migration and deletion touch one app only. A tenant-wide quota cannot be atomic across files, so quotas are per space with a limit on spaces per tenant.
 
 ## Alternatives considered
 
