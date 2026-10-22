@@ -69,9 +69,9 @@ Guarantees:
 
 Storage and transport:
 
-1. No log compaction. The relay and each device keep every change. Storage use grows over time, and a new device downloads the full log on first sync (Open issue 2).
-2. No real-time push. Devices poll for changes. A change on one device reaches another device only at its next poll. On iOS, the system decides when a background app runs, so a change from a background device can wait for hours (Open issue 4).
-3. No automatic repair of a fork. The devices stop sync and report the fork (Open issue 5). A rollback without a fork has an automatic repair (S6).
+1. No log compaction. The relay and each device keep every change. Storage use grows over time, and a new device downloads the full log on first sync. A snapshot record type can come later under the versioning rules (C43).
+2. No real-time push. Devices poll for changes. A change on one device reaches another device only at its next poll. On iOS, the system decides when a background app runs, so a phone in the background can get a change hours late. The app syncs when it opens. A push hint can come later as an additive route.
+3. No automatic repair of a fork. The devices stop sync and report the fork, and the user repairs it by hand from one device (see Fork repair). A rollback without a fork has an automatic repair (S6).
 4. No sync of a part of an app's data. Each device gets all data for each app that it joins.
 
 Security and operations:
@@ -87,9 +87,9 @@ Client platforms:
 
 ## Scenarios
 
-Sam uses a task app on a laptop and a phone. Sam's friend hosts the relay and approved Sam as a user.
+Sam uses a task app on a laptop and a phone. Sam's friend hosts the relay, created a user for Sam, and sent Sam an invite link. Sam opened the link and registered a passkey.
 
-S1. First device. Sam installs the task app on the laptop. The app works at once with no account, and Sam adds tasks offline. Later Sam turns on sync. The app opens a browser sign-in to the relay. The app shows a recovery key once. Sam writes it on paper and types it back, and the app checks the copy. The app then uploads the tasks in encrypted form.
+S1. First device. Sam installs the task app on the laptop. The app works at once with no account, and Sam adds tasks offline. Later Sam turns on sync. The app opens a browser sign-in to the relay, and Sam signs in with the passkey. The app shows a recovery key for the task app once. Sam writes it on paper and types it back, and the app checks the copy. The app then uploads the tasks in encrypted form.
 
 S2. Second device. Sam installs the app on the phone and selects "Add to my account". The laptop shows a QR code, and Sam scans it with the phone. A device without a camera can show the QR code, or the user can type a session code. Both devices show the same 6-digit code, and Sam confirms the match on both devices. The laptop appends a grant with the app keys sealed to the phone, and sends the phone a signed checkpoint. The phone checks the log up to the checkpoint, and then it downloads and decrypts the tasks.
 
@@ -97,7 +97,7 @@ S3. Offline edits. On a flight, Sam completes three tasks on the phone. On the l
 
 S4. Stolen phone. Someone steals Sam's phone. Sam signs in to the user page and selects "Block this machine" on the phone. The relay refuses requests at once from every device with the machine label of the phone, in every app. Next, the laptop shows the devices that stay, and Sam confirms the list. The laptop signs the removal, makes a new app key, and seals it only to the devices on the list. The phone keeps the old data that it already holds, but it cannot read new changes.
 
-S5. All devices lost. A fire destroys the laptop and the phone. Sam buys a new laptop, installs the app, signs in, and enters the paper recovery key. The new laptop gets access to the app, removes the old devices, and makes a new app key. It downloads the full encrypted log and decrypts it with the recovered keys. Edits that never reached the relay are lost.
+S5. All devices lost. A fire destroys the laptop and the phone. Sam buys a new laptop, installs the app, signs in with the synced passkey, and enters the paper recovery key. If Sam has no passkey left, the relay operator sends Sam a new invite link. The new laptop gets access to the app, removes the old devices, and makes a new app key. It downloads the full encrypted log and decrypts it with the recovered keys. Edits that never reached the relay are lost.
 
 S6. Relay returns old data. A storage fault rolls the relay back by one day. On the next sync, the laptop sees that the relay log ends before the position that the laptop verified. The laptop uploads the lost records again, with the same bytes at the same positions. The other devices then sync as normal, and the app tells Sam about the repair.
 
@@ -107,14 +107,14 @@ S7. Full quota. Sam reaches the app's storage quota. The relay refuses new chang
 
 | Action | Relay operator | User (browser sign-in) | Trusted device | Recovery key | Relay |
 | --- | --- | --- | --- | --- | --- |
-| Approve a new user identity | Yes | No | No | No | No |
+| Create a user and send an invite link | Yes | No | No | No | No |
 | Read app data | No | No | Yes | Yes, after it opens the key sets | No |
 | Write app data | No | No | Yes | No | No |
 | Add the first device to a new app | No | Sign-in required | No | Yes, signs the genesis record, which holds the first grant | No |
 | Add a later device to an app | No | No | Yes, after the code match on both devices | Yes, in a full recovery | No |
 | Block or unblock a device | No | Yes | No | No | Enforces |
 | Remove a device and rotate the app key | No | No | Yes, after the user confirms the devices that stay | Yes, if no trusted device survives | Enforces |
-| Replace the recovery key | No | Sign-in required | Yes, appends the record to each space | Yes, the current and the new key both sign | No |
+| Replace the recovery key | No | Sign-in required | Yes, appends the record | Yes, the current and the new key both sign | No |
 | See device list and usage | No | Yes | Yes | No | Stores |
 | Set quotas | Yes | No | No | No | Enforces |
 | Order records and enforce quotas | No | No | No | No | Yes |
@@ -123,7 +123,7 @@ S7. Full quota. Sam reaches the app's storage quota. The relay refuses new chang
 - User sign-in alone never gives read access, because a stolen session must not expose data.
 - A block is reversible and affects availability only. A removal is a signed log record, and it is final. The relay refuses every request from a removed device, and an unblock does not change that.
 - The recovery key stays offline. The user enters it only for a first device in a new app, a full recovery, or a key replacement.
-- One recovery key serves all spaces of a tenant, so every app in a tenant must trust every other app in it (T13, Open issue 3). A replacement appends a recovery record to each space. The user page shows each space that still uses the old key.
+- Each space has its own recovery key, so an app never receives the recovery key of another app (T13).
 
 ## Interfaces
 
@@ -131,14 +131,20 @@ The relay has four surfaces. This section lists operations only. Cryptography li
 
 | Surface | Authentication | Operations |
 | --- | --- | --- |
-| User | User sign-in in a browser | View spaces and devices, block or unblock a device, block all devices with one machine label, view usage, quotas and device status |
-| Setup | A setup token from user sign-in, plus a device signature, from a native app | Create a space, recover a space, get a tenant handle, get the tenant recovery public key |
+| User | Passkey sign-in in a browser | View spaces and devices, block or unblock a device, block all devices with one machine label, view usage, quotas and device status |
+| Setup | A setup token from passkey sign-in, plus a device signature, from a native app | Create a space, recover a space, get a tenant handle |
 | Sync | Device signature only | Append records, fetch records from a position, upload lost records again, bind an enrollment session, report and fetch device status |
 | Enrollment | None. The relay limits the rate for each IP address. | Open an enrollment session, exchange enrollment messages |
 
-The native app gets a setup token through the system browser (`ASWebAuthenticationSession` on Apple platforms). The flow uses an authorization code with PKCE, as RFC 8252 requires for native apps. The relay binds the setup token to the device public keys, and the token expires after 10 minutes.
+User sign-in uses passkeys (WebAuthn) that the relay serves, with the `webauthn-rs` crate.
 
-The relay stores the current recovery public key of the tenant, from the first genesis record or the newest recovery record. The setup surface refuses a genesis record with a different recovery key. If the user enters a different key for a new space, the app says so and asks for the key on paper.
+- The relay operator creates each user with a command, for example `snailfish-relay user add sam`. The command prints a one-time invite link that expires after 7 days.
+- The user opens the link and registers a passkey. The user can register more passkeys later on the user page.
+- The relay assigns each user a random user ID. The user directory maps the user ID to the tenant and to the passkey credentials.
+- If the user loses every passkey, the relay operator makes a new invite link. The new link removes the old passkeys of that user.
+- The WebAuthn relying party ID is the relay domain. The relay needs a stable HTTPS domain, for example a Tailscale `ts.net` name, because a passkey works only on its domain.
+
+The native app gets a setup token through the system browser (`ASWebAuthenticationSession` on Apple platforms). The flow uses an authorization code with PKCE, as RFC 8252 requires for native apps. The relay binds the setup token to the device public keys, and the token expires after 10 minutes.
 
 ### App integration
 
@@ -243,6 +249,20 @@ Enrollment adds a device to a space that has a trusted device. It uses numeric c
 
 Each session works once and expires after 10 minutes. A relay that substitutes keys gets one guess at the code for each session. A grant needs a device level at or above the space write level.
 
+### Fork repair
+
+A fork means that the relay showed two devices two different logs. The repair is manual, because a relay that forks the log is not trustworthy.
+
+1. The engine stops with `stopped: fork`, and the app shows the device that saw the fork.
+2. The user selects one device as the source.
+3. The source device exports its space log.
+4. The relay operator deletes the space, or the user moves to a relay that they trust.
+5. The source device imports the log into the empty space.
+6. Each other device enrolls again from the source device.
+7. Each device sends again, with new change IDs, its own changes that are not in the new log.
+
+The merge contract makes the result independent of the order in which the changes arrive.
+
 ### Wire format
 
 Requests and responses are UTF-8 JSON over HTTPS. Binary fields use base64. Each signed record travels in a DSSE v1 envelope.
@@ -330,7 +350,7 @@ flowchart LR
     B[Device B<br/>app DB + sync engine]
   end
   Browser[User browser]
-  IdP[Sign-in provider]
+  Op[Relay operator<br/>invite links]
   RK[(Recovery key<br/>offline)]
   subgraph Relay
     S[Sync and enrollment surfaces]
@@ -342,7 +362,7 @@ flowchart LR
   B -- signed, encrypted changes --> S
   A <-. enrollment code match .-> B
   Browser --> O
-  O -- sign-in --> IdP
+  Op -. invite link .-> Browser
   O --> Dir
   S --> T
   O --> T
@@ -365,7 +385,7 @@ flowchart LR
 | Epoch | One version of the app key. Each removal or recovery starts a new epoch. |
 | Key commitment | A hash of an app key in a signed record. Each device checks that the key it opens matches it. |
 | Checkpoint | A signed statement of one log position and its digest. A trusted device gives one to a new device. |
-| Recovery key | A random 128-bit secret that the user keeps offline. Keys derived from it sign the genesis record and open the key sets for the recovery key. |
+| Recovery key | A random 128-bit secret for one space that the user keeps offline. Keys derived from it sign the genesis record and open the key sets for the recovery key. |
 | Block | A relay refusal of all requests from a device. A user can undo a block. |
 | Removal | An epoch record that removes a device for ever. |
 | Protocol level | A set of record versions that one engine release can write. |
@@ -386,17 +406,18 @@ Decided concepts:
 | Tenant isolation | Each user's data lives in a separate store, with no shared tables for app data. | An authorisation bug in one tenant cannot expose or change another tenant's records. The stored records are ciphertext, so the main gain is integrity and availability, and simple deletion of one tenant. | Medium. A move to shared storage needs a data migration. |
 | Device authority | Each device has its own signing key. Signed security records in the space log record which devices can act. The genesis record is the root, and the recovery key signs it. Clients verify the log themselves. | The relay can lie about membership, so clients must not trust its word. | Very high. Every device depends on the log format. |
 | Device enrollment | A trusted device approves a new device through numeric comparison with commit before reveal. The user confirms the code on both devices. The new device gets a signed checkpoint. See Enrollment. | User sign-in alone must not add a reader. A copied QR code alone must not work. A relay gets one guess at the code for each session. The checkpoint gives the new device a root of trust. | Medium. Only the enrollment flow changes. |
-| Recovery | A random recovery key that the user stores offline. Each epoch record seals the new key to it. The recovery key signs the genesis record of each space. A recovery record replaces it, signed by the old and the new key. | Recovery works without key escrow on the relay. | High. Stored key sets depend on it. |
+| Recovery | A random recovery key that the user stores offline. Each space has its own recovery key. Each epoch record seals the new key to it, and it signs the genesis record of its space. A recovery record replaces it, signed by the old and the new key. | Recovery works without key escrow on the relay. A separate key for each space keeps apps isolated from each other. | High. Stored key sets depend on it. |
 | Device removal | The user blocks the device on the user page, and the relay refuses its requests at once. A trusted device then appends an epoch record after the user confirms the devices that stay. | A block alone leaves the old key valid. The relay cannot rotate a key that it does not hold. A session alone must not remove a device for ever. A thief can enroll a second device before the block, so the user confirms the list. | Medium. |
 | Log integrity | One hash-linked log per space, with dense positions and a signed base in each record. Each device keeps the full verified log. | Devices detect rollback, gaps and reorders. A device detects a fork when it sees a record whose base is not in its own log. A device repairs a rollback from its own copy. | Very high. It is part of the stored format. |
 | Transport | HTTPS request and response with polls. No persistent connections. | Phones sync at intervals. Polls keep no idle connection state. | Low. Push can come later as a hint. |
-| User page | The relay serves it behind user sign-in. | One deployable unit is easier to self-host. | Low. |
+| User page | The relay serves it behind passkey sign-in. | One deployable unit is easier to self-host. | Low. |
 | Metrics and alerts | Metrics in Prometheus or OpenMetrics format, on a separate listen address. Alert rules ship as a Prometheus rules file. User alerts go to a webhook URL that each user sets. See Monitoring and alerting. | Self-hosters use their own stack. The relay holds no mail credentials and no alert rules. | Low. Both are standard interfaces. |
 | Relay deployment | One static Rust binary, shipped as a container image. It runs on a small VPS or a home server. One process serves all tenants of an instance. The data directory must be on a local disk. | Anyone can run it on any host for a few pounds a month (goal 6). The SLOs need no edge distribution or cluster. SQLite is not safe on a network file system. | Medium. A managed platform needs a new storage layer. |
 | Relay language | Rust, with axum and tokio for HTTP and rusqlite for storage. It builds as a static musl binary. | The relay and the sync engine use the same `protocol` crate. A second implementation of the verification rules can drift and make the relay accept records that clients refuse. | High. A new language means a rewrite of the relay. |
 | Code layout | One Cargo workspace with four crates. `protocol`: record types, envelopes, signature input, verification, log digests and space state, with no I/O. `engine`: `protocol` plus the sync state machine and its SQLite state. `bindings`: the UniFFI Swift and Python bindings. `relay`: `protocol` plus HTTP and tenant storage. The published names have a `snailfish-` prefix, for example `snailfish-engine`. The Python package is `snailfish` and the Swift module is `Snailfish`. | The relay and the engine apply the same rules from the same code. `protocol` does no I/O, so both a synchronous engine and an async relay can use it. | Medium. |
 | Relay storage | One SQLite database file per tenant, in WAL mode with `synchronous=FULL`. `snailfish-relay backup` copies each file with `VACUUM INTO`. | One SQLite transaction covers the permission check, the quota check and the append. A separate file per tenant gives tenant isolation. One process with one write transaction per file gives one writer at a time. A file copy of a live WAL database can be corrupt. | Medium. A new engine needs a data migration. |
-| User directory | A separate SQLite database file. It holds only the approved identity-to-tenant mapping and status. | The directory stays apart from app data, keys and grants. | Low. |
+| User directory | A separate SQLite database file. It holds only users, their tenants, passkey credentials, invite links and status. | The directory stays apart from app data, keys and grants. | Low. |
+| User sign-in | Passkeys that the relay serves, with one-time invite links from the relay operator. | No external identity provider to run or register with. The relay assigns the user ID, so the identity is exact and stable. Invite links match the manual approval of each user. | Medium. OIDC can come later and link to the same user ID. |
 | Wire encoding | UTF-8 JSON over HTTPS. Each signed record is a DSSE v1 envelope that carries the exact payload bytes. | JSON is easy to read and debug, and every target language supports it. DSSE is a published envelope format, and a signature over exact bytes needs no canonical form. | High. Stored records use the envelope. |
 | Versioning | Protocol versions are separate from release versions. Released record types never change, and the record version fixes the algorithms. A signed space write level controls when devices write a new level. Databases migrate forward only. See Versioning. | No algorithm negotiation to downgrade. A device never skips a security record that it cannot verify. One updated device cannot stop the other devices. | High after the first public release. Released formats stay readable for the life of the log. |
 | Delivery | A transactional outbox in the app database for push. Pull by applied position from the full engine log, own changes included. See Delivery rules. | No transaction covers two SQLite files. The app records only what makes a retry safe, so app merges need not be idempotent. The engine keeps the full log, so an app database restore or a new engine state file loses no stored change. | Medium. It changes the integration API. |
@@ -452,12 +473,6 @@ Audit status. The audits covered older major versions than the versions in use.
 
 The shared test vectors also include all 914 Ed25519 vectors from the C2SP CCTV set, so the verification behaviour is recorded.
 
-Open choices. Each row states a constraint that any choice must meet. Open issues track the decisions.
-
-| Concern | Status | Constraint on the choice |
-| --- | --- | --- |
-| User sign-in | Open | Must give a stable, exact user identity for a relay operator allowlist. Email never selects a tenant. The relay does not store passwords. |
-
 ## SLOs
 
 Apps work offline, so relay downtime only delays sync.
@@ -474,7 +489,7 @@ Service:
 - Availability: 99% per month (about 7 hours of outage a month). An outage delays sync and loses no data, because devices keep queued edits and their own envelopes until the verified log holds them.
 - Append latency: p95 under 1 second.
 - Propagation: a change reaches another device in the foreground within one poll interval (default 1 minute). A device in the background syncs when its operating system runs it.
-- First sync of a new device: 10,000 changes of 1 KiB in under 2 minutes. M2 measures it. Without compaction, the time grows with the log (Open issue 2).
+- First sync of a new device: 10,000 changes of 1 KiB in under 2 minutes. M2 measures it. Without compaction, the time grows with the log. If the M2 figure fails the target, snapshots get a design (C43).
 - Durability: the relay targets no data-loss SLO. Devices that survive repair a relay rollback from their own logs.
 
 These numbers justify one small process and an embedded database per tenant, with no queue, cache or cluster.
@@ -496,7 +511,7 @@ User signals:
 6. Each device reports a status after each sync: the time of the last fetch, the outbox size, the age of the oldest outbox entry, the last applied position and the current state (for example ok, degraded or stopped). The status holds no content.
 7. The user page shows each device with its status. It marks a device as stalled after 7 days without a fetch, or after 1 day with an outbox entry that is older than 1 day.
 8. The user page shows usage against quota for each space, with a warning at 80%.
-9. The user page shows open security actions (from M7), for example a block that waits for a trusted device to remove the device, a device that blocks a level raise, or a space that still uses an old recovery key.
+9. The user page shows open security actions (from M7), for example a block that waits for a trusted device to remove the device, or a device that blocks a level raise.
 10. Each user can set a webhook URL. The relay sends a JSON message for a stalled device, a quota warning and an open security action. The message has a `text` field, so Slack incoming webhooks and ntfy accept it.
 
 Client-detected failures:
@@ -520,10 +535,12 @@ T2. An attacker steals the user's sign-in session or sign-in account.
 - Sign-in alone cannot add a device to a space that has devices, remove a device for ever, or decrypt data.
 - Sign-in alone cannot replace the recovery key, because the current recovery key must sign the recovery record.
 
-T3. An attacker gets an approved identity at a different identity provider, or an email address that matches the user's address.
+T3. An attacker tries to get a user account, or to take over the account of a user.
 
-- The relay selects a tenant only from the exact identity on the relay operator allowlist. Email never selects a tenant.
-- There is no public signup route.
+- There is no public signup route. Only an invite link from the relay operator registers a passkey.
+- Each invite link works once and expires after 7 days. The relay stores only a hash of the link token.
+- The relay selects a tenant only from the user ID of the passkey. Email never selects a tenant.
+- Limit: a party that intercepts an invite link before the user opens it can register its own passkey. The relay operator sends links through a private channel, and the user page shows each passkey.
 
 T4. Cross-site request forgery against the user page.
 
@@ -562,8 +579,8 @@ T8. A device is lost or stolen.
 
 T9. An attacker steals the recovery key.
 
-- The attacker can open every key set sealed to it.
-- The user appends a recovery record to each space, signed with the old and the new key, and then an epoch record. A space without the new records stays exposed, and the user page shows it. Old ciphertext copies stay readable to the attacker.
+- The attacker can open every key set of that space that is sealed to it. Other spaces use other recovery keys.
+- The user appends a recovery record, signed with the old and the new key, and then an epoch record. Old ciphertext copies stay readable to the attacker.
 
 T10. A device or attacker uploads malformed or oversized records, or a flood of records.
 
@@ -578,10 +595,10 @@ T11. An attacker guesses or forges a tenant identifier to reach the storage of a
 
 T12. Server-side injection into app data does not apply. The relay never parses or queries app content.
 
-T13. A malicious app or a buggy app in the same tenant reads the recovery key.
+T13. A malicious app or a buggy app keeps a recovery key.
 
-- The user types the recovery key into each app that creates a space. That app can keep the key and open the key sets of every space in the tenant.
-- Limit: every app in a tenant must trust every other app in the tenant. A user who installs apps from different developers can use one tenant for each developer (Open issue 3).
+- Each space has its own recovery key, and the user types it only into the app of that space. An app that keeps its key can open only its own space.
+- An app cannot recover another space with the user sign-in alone, because recovery needs the recovery key of that space.
 
 T14. A backup or a migration copies a device to a second machine.
 
@@ -643,23 +660,17 @@ The demo client is a Python CLI on the Python binding. It uses the integration l
 2. M2: two devices sync, with one hard-coded user. The scope is one user, one space, and a genesis record made by hand, with encrypted append and fetch, the space log, and exact retries. The relay uses the final storage design. The relay ships as a container image with a health route. Demo: a script edits a task on device A, syncs both devices, and device B shows the edit. The relay storage holds only ciphertext. A crash test stops the demo client at each step of push and pull, and a power-loss test resets a virtual machine. No change is lost or applied twice. A test with two orders of the same changes gives the same app state.
 3. M3: log integrity. The scope is the client checks on the space log, fork detection through the record base, repair of a rollback from a device, and the relay backup command. Demo: the relay operator restores an old relay backup, and a device uploads the lost records again. A test relay that forks the log causes `stopped: fork`.
 4. M4: device authority. The scope is grants, the recovery key, and enrollment in both directions with the signed checkpoint (see Enrollment). In the demo client, the QR payload is a text string, and the code match is a prompt with a non-interactive flag for tests. Demo: device B joins through the text payload and a code match, and the relay refuses an unknown key. A test relay that substitutes keys causes a code mismatch.
-5. M5: user sign-in and the user page. The scope is a decision on Open issue 1, the native sign-in handoff, a user allowlist, tenant isolation, the device list with device status, usage, quotas and user webhooks. Security actions on the user page come in M7. Demo: a second user on the same instance cannot reach the first user's tenant.
-6. M6: Swift sample app. The scope is a SwiftUI version of the demo app on macOS and iOS, with real QR scans in both directions, the Keychain key store and the first-device flow with sign-in. Demo: an iPhone joins through a QR scan from a Mac, and edits sync both ways.
+5. M5: user sign-in and the user page. The scope is passkey sign-in, invite links, the native sign-in handoff, tenant isolation, the device list with device status, usage, quotas and user webhooks. Security actions on the user page come in M7. Demo: a second user on the same instance cannot reach the first user's tenant.
+6. M6: Swift sample app. The scope is a SwiftUI version of the demo app on macOS and iOS, with real QR scans in both directions, the Keychain key store, the first-device flow with sign-in, and a measurement of background sync delay on iOS. Demo: an iPhone joins through a QR scan from a Mac, and edits sync both ways.
 7. M7: removal and recovery. The scope is block, removal with key rotation, recovery key replacement, full recovery onto a new device, protocol levels, and the reserved capacity for security records (T10). Demo: scenarios S4 and S5.
 
 After M7:
 
-8. M8: operations and packages. The scope is the space export and import, the Prometheus rules file, the sample proxy configuration, self-host docs and a published Python package. Demo: an alert from a full quota, a space moved to a new relay through an export, and a fresh install from the published docs.
+8. M8: operations and packages. The scope is the space export and import, the fork repair procedure, the Prometheus rules file, the sample proxy configuration, self-host docs and a published Python package. Demo: an alert from a full quota, a space moved to a new relay through an export, a fork repair, and a fresh install from the published docs.
 
 ## Open issues
 
-Protocol:
-
-1. User sign-in mechanism. Options: OIDC with any provider, passkeys that the relay serves, or an identity layer in a reverse proxy in front of the relay. The choice must also give a recovery path if the user loses every device, because passkeys on lost devices then fail. Next step: compare the effort for a self-hoster and the stability of the identity value.
-2. Log growth. There is no compaction in v1. A new device downloads the full log, and each device keeps it. Option: a signed snapshot record that a trusted device writes, with a policy for devices that are offline for a long time. The snapshot record is a format decision. Next step: measure growth after M2, and decide before the first public release.
-3. One recovery key for each tenant. One key serves all spaces, so every app in a tenant must trust every other app (T13). Options: keep one key for each tenant, use one key for each space, or use one tenant for each app developer. Next step: decide before M1, because `PROTOCOL.md` fixes the genesis record, and the genesis record holds the recovery public keys.
-4. Push wake-up for iOS. Polls in the background depend on the operating system. Option: a silent push through APNs as a hint. It needs an Apple developer account for each relay operator. Next step: measure background sync delay in M6.
-5. Fork recovery. A device that detects a fork stops sync. The design has no automatic merge of two forks. Option: a trusted device chooses one branch, and each device uploads its own changes from the other branch again as new changes. Next step: design after M3.
+None.
 
 ## Closed issues
 
@@ -720,6 +731,11 @@ Log, keys and delivery:
 - C38. Is the change order from the relay enough for app merges? No. Each device applies its own edits before the relay orders them. Apps must use merge rules that do not depend on order.
 - C39. Can the engine identify own changes by the signing key? No. A reinstall or a cloned key store then hides own changes from the app. The app outbox identifies own changes, and device keys stay on one machine.
 - C40. Use a custom envelope and signature input? No. DSSE v1 defines the same design with a published pre-authentication encoding, and RFC 9421 defines HTTP request signatures.
+- C41. One recovery key for each tenant, or for each space? For each space. With one key for each tenant, every app that creates a space can keep the key and read every other space. A key for each space also removes the tenant key check on the relay and the replacement across all spaces. The cost is one paper key for each app.
+- C42. User sign-in? Passkeys that the relay serves, with operator invite links. OIDC needs an OAuth client or an identity provider for each self-hoster, and identity from several providers enables the T3 attack. An identity header from a proxy is unsafe if a client can reach the relay directly. Sign-in gives no data access, so a simple account recovery through a new invite link is acceptable.
+- C43. Log compaction in v1? No. A snapshot needs an app export and import API, and it weakens the repair of a rollback from the full log. At 50 changes a day, a space reaches about 90 MB in 5 years, which a small VPS and a phone can hold. A snapshot record type can come later under the versioning rules. Revisit if the M2 first-sync figure fails the SLO.
+- C44. Push wake-ups for iOS in v1? No. APNs keys belong to the app developer, so a relay operator cannot send a push for a third-party app. A push gateway for each developer works against self-hosting. Local-first apps hold their data, so a delay costs freshness and not correctness. Revisit after the M6 background sync measurement.
+- C45. Fork repair? Manual, from the export of one device (see Fork repair). A fork means the relay is not trustworthy, so an automatic repair on the same relay is not useful. Automatic repair needs a new security record type and rules for security records on the losing branch.
 
 ## Alternatives considered
 
