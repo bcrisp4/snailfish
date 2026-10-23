@@ -28,7 +28,7 @@ module delivery {
     | EvEdit | EvPushStored | EvPushKnown | EvPushRefused | EvPushBadBase
     | EvFetch | EvPull | EvPullOwn | EvAppRestore | EvRelayRestore | EvRelayFault
     | EvRepair | EvHoldReleased | EvEarlyRelease | EvForkDetected | EvReverted
-    | EvSplit | EvEngineLoss | EvResetRequired | EvLimitLowered | EvResetAhead
+    | EvSplit | EvEngineLoss | EvResetRequired | EvLimitLowered | EvResetAhead | EvWarnedRelease
 
   // The durable part of the app DB that a backup copies.
   type AppImage = { applied: Set[Id], outbox: Set[Id], appliedLog: List[Id] }
@@ -47,7 +47,8 @@ module delivery {
     refused: Set[Id],      // envelopes that the relay refused for ever (degraded)
     log: List[Id],         // verified log
     stop: Stop,
-    fresh: bool,           // a new state file after a loss. The status report carries it (F3).
+    fresh: bool,           // a new state file since the last hold ended. The status
+                           // report carries it until a hold ends (F3).
   }
 
   type Relay = {
@@ -66,6 +67,8 @@ module delivery {
     stored: Set[Id],       // changes that enqueue stored in an engine outbox
     exposed: Set[Id],      // changes of which an engine state loss destroyed a copy
     reverted: Set[Id],     // changes that an app reverted after a refusal
+    lostAtRelease: Set[Id],// changes that only app DBs held when a hold ended
+    silentLoss: bool,      // a hold ended with no warning and lost a change
     faults: int,
     events: Set[Event],
   }
@@ -102,6 +105,7 @@ module delivery {
     "enqueueChecksSize",    // enqueue_many refuses a change over the size limit locally (F4)
     "noAheadReset",         // no ResetRequired if the applied position is past the log end (F2)
     "releaseIgnoresFresh",  // the user page does not mark a new engine state file (F3)
+    "freshClearsOnFetch",   // the "not repaired" mark ends at the first fetch, not at the hold end (F3)
   )
 
   // ---------------------------------------------------------------- pure logic
@@ -172,9 +176,9 @@ module delivery {
     a.outbox.contains(id) and not(knows(e, id))
 
   // An own envelope leaves the outbox only when the verified log holds it.
-  pure def applyFetch(e: Engine, newLog: List[Id]): Engine =
+  pure def applyFetch(e: Engine, newLog: List[Id], bug: str): Engine =
     { ...e, log: newLog, outbox: without(e.outbox, ids(newLog)),
-      fresh: e.fresh and newLog.length() == 0 }
+      fresh: e.fresh and not(bug == "freshClearsOnFetch" and newLog.length() > 0) }
 
   // ---- relay
 
@@ -222,7 +226,7 @@ module delivery {
     engines' = DEVS.mapBy(_ => freshEngine),
     relay' = { log: List(), hold: false, reported: Set(), limitLow: false },
     env' = { nextId: 0, changes: Map(), stored: Set(), exposed: Set(), reverted: Set(),
-             faults: 0, events: Set() },
+             lostAtRelease: Set(), silentLoss: false, faults: 0, events: Set() },
   }
 
   // The user edits on device d. The app works offline, and also when sync stops.
@@ -283,7 +287,7 @@ module delivery {
     running(d),
     isPrefix(eng(d).log, relay.log),
     eng(d).log.length() < n, n <= relay.log.length(),
-    engines' = engines.set(d, applyFetch(eng(d), relay.log.slice(0, n))),
+    engines' = engines.set(d, applyFetch(eng(d), relay.log.slice(0, n), BUG)),
     apps' = apps,
     relay' = relay,
     env' = ev(EvFetch),
@@ -299,7 +303,7 @@ module delivery {
     all {
       running(d),
       forked or (shorter and BUG == "noRepair"),
-      engines' = engines.set(d, if (adopt) applyFetch(e, relay.log) else { ...e, stop: Forked }),
+      engines' = engines.set(d, if (adopt) applyFetch(e, relay.log, BUG) else { ...e, stop: Forked }),
       apps' = apps,
       relay' = relay,
       env' = ev(if (adopt) EvFetch else EvForkDetected),
@@ -333,19 +337,29 @@ module delivery {
     env' = env,
   }
 
+  // The end of a hold. Each device stops the "new engine state file" report. The
+  // ghost state records the changes that only app DBs hold at this point: the
+  // release loses them. A release with no warning that loses a change is silent.
+  action endHold(e: Event, warned: bool): bool = {
+    val newLoss = unheldApplied.exclude(env.lostAtRelease)
+    all {
+      relay' = { ...relay, hold: false },
+      engines' = engines.keys().mapBy(d => { ...eng(d), fresh: false }),
+      apps' = apps,
+      env' = { ...ev(e), lostAtRelease: env.lostAtRelease.union(newLoss),
+               silentLoss: env.silentLoss or (not(warned) and newLoss != Set()) },
+    }
+  }
+
   // Only the user (user page) or the relay operator (snailfish-relay
   // release-hold) ends a hold. This action is a release after the user page shows
-  // a report from every device. The relay does not end a hold by itself.
+  // a report from every device and marks no device as "not repaired". The relay
+  // does not end a hold by itself.
   action releaseHold: bool = all {
     relay.hold,
     relay.reported == DEVS,
-    // The user page marks a device with a new engine state file as "not repaired".
-    // Only releaseHoldWarned releases then.
     BUG == "releaseIgnoresFresh" or DEVS.forall(d => not(eng(d).fresh)),
-    relay' = { ...relay, hold: false },
-    engines' = engines,
-    apps' = apps,
-    env' = ev(EvHoldReleased),
+    endHold(EvHoldReleased, false),
   }
 
   action pull(d: Dev, crash: bool): bool = all {
@@ -446,25 +460,22 @@ module delivery {
     env' = fault(EvRelayFault),
   }
 
-  // The user confirms the warning and releases, with a new engine state file on a
-  // device that reported. The changes that only the old engine file held are lost.
+  // The user page marks a device as "not repaired". The user confirms the warning
+  // and releases. The changes that only the lost engine state file held are lost.
   action releaseHoldWarned: bool = all {
     FAULTS.contains("warnedRelease"),
     relay.hold,
     relay.reported == DEVS,
-    relay' = { ...relay, hold: false },
-    engines' = engines.keys().mapBy(d => { ...eng(d), fresh: false }),
-    apps' = apps,
-    env' = ev(EvHoldReleased),
+    DEVS.exists(d => eng(d).fresh),
+    endHold(EvWarnedRelease, true),
   }
 
+  // The user page shows that a device did not report. The user releases anyway.
   action releaseHoldEarly: bool = all {
     FAULTS.contains("earlyRelease"),
     relay.hold,
-    relay' = { ...relay, hold: false },
-    engines' = engines,
-    apps' = apps,
-    env' = ev(EvEarlyRelease),
+    relay.reported != DEVS,
+    endHold(EvEarlyRelease, true),
   }
 
   action lowerLimit: bool = all {
@@ -512,6 +523,9 @@ module delivery {
     DEVS.fold(ids(relay.log), (s, d) =>
       s.union(app(d).outbox).union(eng(d).outbox.keys()).union(eng(d).refused).union(ids(eng(d).log)))
 
+  // Changes in an app state that sync can no longer deliver.
+  val unheldApplied: Set[Id] = DEVS.fold(Set(), (s, d) => s.union(app(d).applied)).exclude(held)
+
   // I1. Each device applies each change once (merge contract).
   val noDoubleApply: bool = DEVS.forall(d => app(d).dups == 0)
 
@@ -539,7 +553,9 @@ module delivery {
 
   // I5. A change that an app reverted after a permanent refusal is in no log. If
   // it is, a device holds it and the other devices apply it, so the devices
-  // diverge without notice (goal 8). The restore hold prevents it after a restore. A silent rollback can still cause it (F1 limit).
+  // diverge without notice (goal 8).
+  // Limit F1: a silent rollback, or a hold release before every device reports,
+  // can break it.
   val logged: Set[Id] = DEVS.fold(ids(relay.log), (s, d) => s.union(ids(eng(d).log)))
   val refusedNotStored: bool = env.reverted.intersect(logged) == Set()
 
@@ -549,6 +565,12 @@ module delivery {
   val noStuckDevice: bool = DEVS.forall(d =>
     (running(d) and eng(d).log == relay.log and not(relay.hold) and app(d).appliedLog != eng(d).log)
       implies (canPull(app(d), eng(d)) or resetRequired(app(d), eng(d), relay, BUG)))
+
+  // I8. No hold ends without a warning while it loses a change (F3). An engine
+  // state loss and a relay restore can leave a change that only an app DB holds.
+  // The user page then marks a device as "not repaired", so the user sees the
+  // loss before the release.
+  val noSilentLoss: bool = not(env.silentLoss)
 
   // I6. Running devices never hold conflicting verified logs. A silent rollback
   // or an early hold release can break it (T7 limit), and the devices then stop
@@ -576,6 +598,9 @@ module delivery {
   val wRelayFault: bool = happened(EvRelayFault)
   val wRepair: bool = happened(EvRepair)
   val wHoldReleased: bool = happened(EvHoldReleased)
+  val wWarnedRelease: bool = happened(EvWarnedRelease)
+  // A warned release lost a change: the case that the "not repaired" mark is for.
+  val wWarnedLoss: bool = happened(EvWarnedRelease) and env.lostAtRelease != Set()
   val wEarlyRelease: bool = happened(EvEarlyRelease)
   val wForkDetected: bool = happened(EvForkDetected)
   val wResetRequired: bool = happened(EvResetRequired)
@@ -588,7 +613,7 @@ module delivery {
     DEVS.forall(d => caughtUp(d) and app(d).outbox == Set() and eng(d).outbox == Map()) and
     DEVS.forall(d => ids(relay.log).exists(id => env.changes.get(id).author == d))
   // A repair after a restore, and then the hold ends.
-  val wRepairThenRelease: bool = happened(EvRepair) and happened(EvHoldReleased)
+  val wRepairThenRelease: bool = happened(EvRepair) and (happened(EvHoldReleased) or happened(EvWarnedRelease))
   // Two faults lost a change that enqueue stored (expected: see noLostChangeWeak).
   val wDoubleFaultLoss: bool = not(env.stored.exclude(env.reverted).subseteq(held))
 }

@@ -136,6 +136,26 @@ module deliveryTest {
       .expect(not(resetRequired(app(1), eng(1), relay, BUG)))
       .then(releaseHoldWarned)
       .expect(resetRequired(app(1), eng(1), relay, BUG))
+      // The reset deletes change 0, the last copy (two faults, limit 2).
+      .then(handleReset(1))
+      .expect(app(1).applied == Set() and not(held.contains(0)))
+
+  // F3: an engine state loss during a restore hold leaves change 1 only in the
+  // app state of device 1. Device 1 fetches during the hold. The user page still
+  // marks it "not repaired", so only a release with the warning is possible.
+  run notRepairedMarkTest =
+    init
+      .then(edit(2, false, false)).then(enqueue(2, 0)).then(push(2, 0, false))
+      .then(edit(1, false, false)).then(enqueue(1, 1)).then(push(1, 1, false))
+      .then(fetchExtend(1, 2)).then(pull(1, false)).then(pull(1, false))
+      .then(restoreRelay(1))
+      .then(loseEngine(1))
+      .expect(eng(1).fresh and unheldApplied == Set(1))
+      .then(fetchExtend(1, 1))
+      .expect(eng(1).fresh)
+      .then(reportStatus(1)).then(reportStatus(2))
+      .then(releaseHoldWarned)
+      .expect(not(relay.hold) and noSilentLoss and env.lostAtRelease == Set(1))
 
   // The relay lowers the limit after enqueue. The relay refuses the envelope for ever.
   run refusedAtPushTest =

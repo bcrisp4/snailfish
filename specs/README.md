@@ -51,6 +51,7 @@ These Quint models check parts of `DESIGN.md`. Each model is executable. A check
 | `caughtUpState` | A caught-up device holds the relay changes and its own pending edits, and nothing else. |
 | `refusedNotStored` | No log holds a change that an app reverted after a refusal. |
 | `noStuckDevice` | A device that fetched to the relay head, with no hold, can pull or reset. |
+| `noSilentLoss` | No hold ends without a warning while the release loses a change. |
 | `noFork` | Running devices never hold conflicting verified logs. |
 
 ### Results
@@ -67,11 +68,13 @@ The checks also confirm three known limits. Each one fails on purpose:
 
 | ID | Fix | Check |
 | --- | --- | --- |
-| F1 | No design change. The restore hold already prevents it after a restore. The text of T7 now names the case. A silent rollback or an early release remains a limit. | `refusedNotStored`, configs `faultyRelay`, `earlyReleaseOnly`, `silentOnly` |
-| F2 | `changes_after` raises `ResetRequired` if the applied position is after the end of a log that the engine fetched to the relay head, with no hold. | `resetRequired`, `noStuckDevice`, mutant `noAheadReset` |
-| F3 | A device with a new engine state file reports it. The user page marks it "not repaired" and warns before a release. | `fresh`, `releaseHold`, `releaseHoldWarned`, mutant `releaseIgnoresFresh` |
+| F1 | No design change. The restore hold prevents it after a restore, if the release comes after every device reports. The text of T7 names the case. A silent rollback or an earlier release remains a limit. | `refusedNotStored`, configs `faultyRelay`, `earlyReleaseOnly`, `silentOnly` |
+| F2 | `changes_after` raises `ResetRequired` if the applied position is after the end of a log that the engine fetched to the relay head, with no hold. After two faults, the reset deletes the changes that only the app DB holds. DESIGN.md states this. | `resetRequired`, `noStuckDevice`, mutant `noAheadReset`, test `aheadOfLogResetTest` |
+| F3 | A device with a new engine state file reports it until the hold ends, also after a fetch. The user page marks it "not repaired" and warns before a release. The warning does not prevent the loss. It makes the loss visible. | `noSilentLoss`, mutants `releaseIgnoresFresh` and `freshClearsOnFetch`, test `notRepairedMarkTest` |
 | F4 | `enqueue_many` does not check the size limit. The relay checks the known `change_id` first. | `enqueue`, `refusedNotStored`, mutant `enqueueChecksSize` |
 | F5 | The Delivery row says "if no second fault occurs". | `noLostChange` limit 2 |
+
+Mutant `freshClearsOnFetch` needs a restore, an engine state loss and a fetch, in that order, during one hold. Random sampling seldom finds this path. `check.sh` therefore also runs the scenario tests with the `BUG` of each mutant, and `notRepairedMarkTest` catches this one.
 
 ### Not covered
 

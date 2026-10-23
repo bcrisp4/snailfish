@@ -4,7 +4,8 @@
 //
 // base_restore: an honest relay that the relay operator can restore.
 // base_fork: a silent rollback, so that forks can occur.
-// base_engine: engine state loss and a relay restore, so that ResetRequired occurs.
+// base_engine: engine state loss and a relay restore, so that ResetRequired occurs
+// and a hold release can lose a change (F3).
 
 
 module base_restore {
@@ -72,7 +73,6 @@ module m_resetDropsOutbox {
                   BUG = "resetDropsOutbox").* from "./delivery"
 }
 
-
 module m_enqueueChecksSize {
   import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss"),
                   BUG = "enqueueChecksSize").* from "./delivery"
@@ -86,4 +86,9 @@ module m_noAheadReset {
 module m_releaseIgnoresFresh {
   import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "relayRestore", "warnedRelease"),
                   BUG = "releaseIgnoresFresh").* from "./delivery"
+}
+
+module m_freshClearsOnFetch {
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "relayRestore", "warnedRelease"),
+                  BUG = "freshClearsOnFetch").* from "./delivery"
 }
