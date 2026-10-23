@@ -13,6 +13,16 @@ These Quint models check parts of `DESIGN.md`. Each model is executable. The fas
 | `<model>/_gen/` | Generated config modules and traces. Not committed. |
 | `tools/verify.py` | Runs the checks of each tier for each model. |
 | `tools/trace.py` | Finds and prints a counterexample with only the changed fields. |
+| `tools/rules.py` | Checks the rule IDs of `DESIGN.md` against the model citations and `coverage.toml`. Finds rule changes with no change in `specs/`. |
+| `coverage.toml` | The rules that no model encodes yet, each with a reason. |
+
+## Rule IDs
+
+Each normative rule in `DESIGN.md` ends with an ID tag, for example `[DLV-3]`. A model cites the rules that it encodes in a comment, for example `// [DLV-3]`. A rule with no citation is listed in `coverage.toml` under `not_modelled`.
+
+1. Run `mise exec -- uv run --script specs/tools/rules.py list` to see the rules.
+2. Run `make verify-fast`. It runs `rules.py check`.
+3. Run `make verify-drift` before you commit a design change. It fails if a rule changed and nothing in `specs/` changed since `main`.
 
 ## Models
 

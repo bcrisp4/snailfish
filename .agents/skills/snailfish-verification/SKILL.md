@@ -15,7 +15,7 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 ## Workflow for a protocol change
 
 1. Read `specs/<model>/README.md` for the coverage map and the known limits.
-2. Change `model.qnt` first. Then change `DESIGN.md`. The model is the source of truth.
+2. Change `model.qnt` first. Then change `DESIGN.md`. The model is the source of truth. Keep the `[ID]` tag at the end of each rule line. Cite the rule in a `// [ID]` comment in the model, or list it in `specs/coverage.toml` with a reason.
 3. If you add a rule, add a BUG value that breaks it, and a mutant in `checks.toml`.
 4. Run `make verify-fast` after each edit. It takes seconds.
 5. Run `make verify` before you commit. Run `make verify-deep` if a deep invariant changed.
@@ -53,8 +53,11 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 
 | Command | Purpose |
 | --- | --- |
-| `make verify-fast` | Typecheck, tests, short sampling of `fast_config`. |
+| `make verify-fast` | Rule ID check, typecheck, tests, short sampling of `fast_config`. |
 | `make verify` | Every config, limit, mutant and witness. Also the runner tests. |
 | `make verify-deep` | `quint verify` on `[deep]` invariants. |
 | `specs/tools/trace.py repro` | Find and print a counterexample. |
 | `specs/tools/trace.py show` | Print an ITF trace file. |
+| `make verify-drift` | Fail if a tagged `DESIGN.md` rule changed since `main` and no file in `specs/` changed. |
+| `specs/tools/rules.py list` | Print each rule ID with its first 80 characters. |
+| `specs/tools/rules.py check` | Fail on a duplicate, uncited or unknown rule ID. |

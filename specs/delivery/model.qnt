@@ -130,10 +130,12 @@ module delivery {
   // ---- app
 
   // Edit: apply the edit and write the outbox row in one transaction.
+  // Rules: [DLV-2]
   pure def applyEdit(a: App, id: Id, crash: bool, bug: str): App =
     if (bug == "editSplitTxn" and crash) { ...a, applied: a.applied.union(Set(id)) }
     else { ...a, applied: a.applied.union(Set(id)), outbox: a.outbox.union(Set(id)) }
 
+  // Rules: [DLV-10]
   pure def canPull(a: App, e: Engine): bool =
     isPrefix(a.appliedLog, e.log) and e.log.length() > a.appliedLog.length()
 
@@ -141,6 +143,7 @@ module delivery {
 
   // Handle the next change in one transaction. If the outbox row exists, the app
   // applied the edit at edit time: it deletes the row and does not apply again.
+  // Rules: [DLV-11]
   pure def applyPull(a: App, e: Engine, crash: bool, bug: str): App = {
     val id = nextEntry(a, e)
     val moved = e.log.slice(0, a.appliedLog.length() + 1)
@@ -157,12 +160,15 @@ module delivery {
   // changes_after raises ResetRequired: the verified log holds a different digest
   // at the applied position, or the applied position is past the end of a log that
   // the engine fetched to the relay head with no hold (F2).
+  // Rules: [DLV-12]
+  // Partial: stubs are not modelled, so the stub case is not encoded.
   pure def resetRequired(a: App, e: Engine, r: Relay, bug: str): bool =
     (e.log.length() >= a.appliedLog.length() and not(isPrefix(a.appliedLog, e.log)))
     or (bug != "noAheadReset" and e.log.length() < a.appliedLog.length()
         and e.log == r.log and not(r.hold))
 
   // Delete the synced data, import no snapshot, apply each outbox row again.
+  // Rules: [DLV-12]
   pure def applyReset(a: App, bug: str): App =
     { ...a, applied: if (bug == "resetDropsOutbox") Set() else a.outbox, appliedLog: List() }
 
@@ -172,10 +178,13 @@ module delivery {
     e.outbox.keys().contains(id) or e.refused.contains(id) or ids(e.log).contains(id)
 
   // Enqueue has no effect if the engine already knows the change_id.
+  // Rules: [DLV-5]
   pure def canEnqueue(a: App, e: Engine, id: Id): bool =
     a.outbox.contains(id) and not(knows(e, id))
 
   // An own envelope leaves the outbox only when the verified log holds it.
+  // Rules: [DLV-8]
+  // Partial: stubs are not modelled, so the replacement of a covered record is not encoded.
   pure def applyFetch(e: Engine, newLog: List[Id], bug: str): Engine =
     { ...e, log: newLog, outbox: without(e.outbox, ids(newLog)),
       fresh: e.fresh and not(bug == "freshClearsOnFetch" and newLog.length() > 0) }
@@ -186,6 +195,8 @@ module delivery {
   // not an entry of the relay log, after a rollback or on another branch.
   type Verdict = Stored | Known | Refused | BadBase
 
+  // Rules: [DLV-5] [DLV-7] [DLV-9] [LOG-6] [WIR-6]
+  // Partial: change bytes and record hashes are not modelled, so DLV-5 (different bytes) and WIR-6 (conflict) are not encoded. Epochs are not modelled, so DLV-7 (new epoch) is not encoded.
   pure def verdict(r: Relay, id: Id, base: List[Id], big: bool, bug: str): Verdict = {
     val known = ids(r.log).contains(id)
     val tooBig = big and r.limitLow
@@ -246,6 +257,7 @@ module delivery {
   // of these actions with no other action between them, so the model includes it.
   // The engine does not check the size limit. Only the relay refuses a change for
   // size, and it checks the known change_id first (F4).
+  // Rules: [DLV-2] [DLV-5]
   action enqueue(d: Dev, id: Id): bool = {
     val tooBig = BUG == "enqueueChecksSize" and env.changes.get(id).big and relay.limitLow
     all {
@@ -263,6 +275,7 @@ module delivery {
 
   // The engine sends one stored envelope. If the response is lost, the engine
   // learns nothing and sends the same envelope again later.
+  // Rules: [DLV-7] [DLV-9] [LOG-14]
   action push(d: Dev, id: Id, lost: bool): bool = {
     val v = verdict(relay, id, eng(d).outbox.get(id), env.changes.get(id).big, BUG)
     all {
@@ -295,6 +308,7 @@ module delivery {
 
   // Fetch when the relay log conflicts with a verified entry: stop with fork.
   // adoptFork adopts the conflicting log. noRepair adopts a shorter log.
+  // Rules: [FRK-1]
   action fetchConflict(d: Dev): bool = {
     val e = eng(d)
     val shorter = isPrefix(relay.log, e.log) and relay.log.length() < e.log.length()
@@ -313,6 +327,8 @@ module delivery {
   // Repair session: the relay log ends before a verified position, so the device
   // uploads the lost entries at the same positions. The relay commits the staged
   // entries in one transaction. It accepts a repair during a restore hold.
+  // Rules: [LOG-10] [LOG-14]
+  // Partial: chunks, the staging table and the 24 hour expiry are not modelled.
   action repair(d: Dev): bool = all {
     BUG != "noRepair",
     running(d),
@@ -326,6 +342,7 @@ module delivery {
 
   // Status report during a restore hold. The user page shows each device that
   // reported a verified tip at or below the log head since the restore.
+  // Rules: [LOG-14]
   action reportStatus(d: Dev): bool = all {
     relay.hold,
     running(d),
@@ -340,6 +357,7 @@ module delivery {
   // The end of a hold. Each device stops the "new engine state file" report. The
   // ghost state records the changes that only app DBs hold at this point: the
   // release loses them. A release with no warning that loses a change is silent.
+  // Rules: [LOG-14] [LOG-15]
   action endHold(e: Event, warned: bool): bool = {
     val newLoss = unheldApplied.exclude(env.lostAtRelease)
     all {
@@ -355,6 +373,7 @@ module delivery {
   // release-hold) ends a hold. This action is a release after the user page shows
   // a report from every device and marks no device as "not repaired". The relay
   // does not end a hold by itself.
+  // Rules: [LOG-15]
   action releaseHold: bool = all {
     relay.hold,
     relay.reported == DEVS,
@@ -362,6 +381,7 @@ module delivery {
     endHold(EvHoldReleased, false),
   }
 
+  // Rules: [DLV-10] [DLV-11]
   action pull(d: Dev, crash: bool): bool = all {
     canPull(app(d), eng(d)),
     apps' = apps.set(d, applyPull(app(d), eng(d), crash, BUG)),
@@ -370,6 +390,7 @@ module delivery {
     env' = ev(if (app(d).outbox.contains(nextEntry(app(d), eng(d)))) EvPullOwn else EvPull),
   }
 
+  // Rules: [DLV-12]
   action handleReset(d: Dev): bool = all {
     resetRequired(app(d), eng(d), relay, BUG),
     apps' = apps.set(d, applyReset(app(d), BUG)),
@@ -380,6 +401,7 @@ module delivery {
 
   // The app reads the degraded status and removes the outbox row of a refused
   // change: it reverts the edit, or it splits it into a new, smaller change.
+  // Rules: [DLV-9]
   action resolveRefused(d: Dev, id: Id, split: bool): bool = {
     val a = app(d)
     val newId = env.nextId
@@ -441,6 +463,7 @@ module delivery {
   }
 
   // snailfish-relay restore from an older backup. A backup is a log prefix.
+  // Rules: [LOG-14]
   action restoreRelay(k: int): bool = all {
     canFault("relayRestore"),
     0 <= k, k < relay.log.length(),
@@ -527,6 +550,7 @@ module delivery {
   val unheldApplied: Set[Id] = DEVS.fold(Set(), (s, d) => s.union(app(d).applied)).exclude(held)
 
   // I1. Each device applies each change once (merge contract).
+  // Rules: [MRG-1]
   val noDoubleApply: bool = DEVS.forall(d => app(d).dups == 0)
 
   // I2. A change that enqueue stored, and that no app reverted, is never lost.
