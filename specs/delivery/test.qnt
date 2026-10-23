@@ -1,8 +1,9 @@
-// Scenario tests for delivery.qnt. Run: quint test delivery_test.qnt --main deliveryTest
+// Scenario tests for model.qnt. specs/tools/verify.py runs them, also with the
+// BUG of each mutant that sampling does not catch.
 module deliveryTest {
   import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 3,
                   FAULTS = Set("appRestore", "engineLoss", "relayRestore", "silentRollback", "earlyRelease", "warnedRelease"),
-                  BUG = "none").* from "./delivery"
+                  BUG = "none").* from "./model"
 
   // Device d edits change id, enqueues it and the relay stores it.
   action editAndPush(d: Dev, id: Id): bool =

@@ -1,6 +1,6 @@
 // Model of the Snailfish delivery rules: DESIGN.md "App integration" (Delivery
 // rules), "Space log" (repair sessions, restore hold) and threat T7.
-// specs/README.md has the coverage map, the findings and the run commands.
+// specs/delivery/README.md has the coverage map and the findings.
 //
 // Abstractions:
 //  - A change is an opaque int id. In the design it is 128 random bits, so ids
@@ -15,8 +15,8 @@
 //    handled. Prefix equality stands for digest equality.
 //
 // The const BUG selects one deliberate violation of the design. "none" is the
-// design. delivery_mutants.qnt binds each other value, and specs/check.sh
-// requires an invariant to fail for each one. A mutant that survives shows a
+// design. specs/delivery/checks.toml binds the consts for each config and each
+// mutant, and specs/tools/verify.py runs them. A mutant that survives shows a
 // vacuous invariant or a rule that the model does not need.
 module delivery {
   type Dev = int
@@ -616,44 +616,4 @@ module delivery {
   val wRepairThenRelease: bool = happened(EvRepair) and (happened(EvHoldReleased) or happened(EvWarnedRelease))
   // Two faults lost a change that enqueue stored (expected: see noLostChangeWeak).
   val wDoubleFaultLoss: bool = not(env.stored.exclude(env.reverted).subseteq(held))
-}
-
-// ------------------------------------------------------------------ configs
-// Each config binds every const. specs/check.sh runs each one with the
-// invariants that must hold for it.
-
-// One fault class at a time, with crashes and lost responses everywhere.
-module crashOnly {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 0, FAULTS = Set(), BUG = "none").*
-}
-module appRestore {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("appRestore"), BUG = "none").*
-}
-module engineLoss {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "warnedRelease"), BUG = "none").*
-}
-// snailfish-relay restore with a hold, together with app DB restores. Three devices.
-module relayRestore {
-  import delivery(DEVS = Set(1, 2, 3), MAX_IDS = 4, MAX_FAULTS = 2,
-                  FAULTS = Set("relayRestore", "appRestore"), BUG = "none").*
-}
-// Silent rollback and early hold release: forks can occur (T7 limit).
-module faultyRelay {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2,
-                  FAULTS = Set("relayRestore", "silentRollback", "earlyRelease", "appRestore"), BUG = "none").*
-}
-// Every fault class together.
-module allFaults {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 3,
-                  FAULTS = Set("appRestore", "engineLoss", "relayRestore", "silentRollback", "earlyRelease", "warnedRelease"),
-                  BUG = "none").*
-}
-// F1 split by cause.
-module earlyReleaseOnly {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2,
-                  FAULTS = Set("relayRestore", "earlyRelease"), BUG = "none").*
-}
-module silentOnly {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2,
-                  FAULTS = Set("silentRollback"), BUG = "none").*
 }

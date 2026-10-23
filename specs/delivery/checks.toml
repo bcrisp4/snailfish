@@ -1,0 +1,177 @@
+# Checks for the delivery model. specs/tools/verify.py reads this file.
+# Each [config] binds every const of model.qnt. verify.py generates one module
+# file for each config and each mutant in specs/delivery/_gen/.
+
+model = "model.qnt"
+module = "delivery"
+tests = "test.qnt"
+test_module = "deliveryTest"
+
+# Invariants that hold in every config unless a config lists it under `limits`.
+invariants = [
+  "noDoubleApply", "noLostChange", "noLostChangeWeak", "appliedHeld",
+  "caughtUpState", "refusedNotStored", "noStuckDevice", "noSilentLoss", "noFork",
+]
+
+# Configs that verify.py uses to count witnesses. Each witness (val w*) must be
+# reached in at least one of them.
+witness_configs = ["allFaults", "restoreEngine"]
+witness_steps = 60
+
+# The config that the fast tier samples.
+fast_config = "restoreEngine"
+
+# Invariants for `tier = "deep"` (quint verify with Apalache).
+[deep]
+config = "crashOnly"
+invariants = ["noDoubleApply", "noLostChange", "appliedHeld", "caughtUpState"]
+max_steps = 8
+
+[defaults]
+DEVS = "Set(1, 2)"
+MAX_IDS = "4"
+MAX_FAULTS = "2"
+BUG = '"none"'
+
+# ---------------------------------------------------------------- configs
+# `skip` lists invariants that the config does not check, because a fault class
+# in the config breaks them on purpose. `why` must explain each skip. A config
+# also skips each invariant that a [[limits]] entry names for it.
+
+[configs.crashOnly]
+MAX_FAULTS = "0"
+FAULTS = "Set()"
+
+[configs.appRestore]
+FAULTS = 'Set("appRestore")'
+
+[configs.engineLoss]
+FAULTS = 'Set("engineLoss", "warnedRelease")'
+
+[configs.relayRestore]
+DEVS = "Set(1, 2, 3)"
+FAULTS = 'Set("relayRestore", "appRestore")'
+
+[configs.faultyRelay]
+FAULTS = 'Set("relayRestore", "silentRollback", "earlyRelease", "appRestore")'
+
+[configs.allFaults]
+MAX_FAULTS = "3"
+FAULTS = 'Set("appRestore", "engineLoss", "relayRestore", "silentRollback", "earlyRelease", "warnedRelease")'
+skip = ["refusedNotStored", "noFork"]
+why = "Limit 1 and F1 break these (checked in faultyRelay)."
+
+[configs.earlyReleaseOnly]
+FAULTS = 'Set("relayRestore", "earlyRelease")'
+skip = ["noFork"]
+why = "An early release can fork the log (limit 1, checked in faultyRelay)."
+
+[configs.silentOnly]
+FAULTS = 'Set("silentRollback")'
+skip = ["noFork"]
+why = "A silent rollback can fork the log (limit 1, checked in faultyRelay)."
+
+# Baselines for the mutants. A mutant must fail an invariant that its baseline passes.
+[configs.restoreBase]
+FAULTS = 'Set("appRestore", "relayRestore")'
+
+[configs.forkBase]
+FAULTS = 'Set("silentRollback", "appRestore")'
+skip = ["noFork", "refusedNotStored"]
+why = "A silent rollback breaks noFork and refusedNotStored (limit 1 and F1, checked in faultyRelay)."
+
+[configs.restoreEngine]
+FAULTS = 'Set("engineLoss", "relayRestore", "warnedRelease")'
+skip = ["noLostChange"]
+why = "Limit 2: an engine state loss and a relay restore lose a change (checked in allFaults)."
+
+[configs.engineOnly]
+FAULTS = 'Set("engineLoss")'
+
+# ---------------------------------------------------------------- known limits
+# Each limit must be violated. If one holds, the model changed or the limit is gone.
+
+[[limits]]
+config = "faultyRelay"
+invariant = "noFork"
+why = "Limit 1: a silent rollback or an early release forks the log (T7)."
+
+[[limits]]
+config = "faultyRelay"
+invariant = "refusedNotStored"
+why = "F1: a late repair stores a reverted change."
+
+[[limits]]
+config = "earlyReleaseOnly"
+invariant = "refusedNotStored"
+why = "F1: an early release, then a late repair."
+
+[[limits]]
+config = "silentOnly"
+invariant = "refusedNotStored"
+why = "F1: a silent rollback has no hold."
+
+[[limits]]
+config = "allFaults"
+invariant = "noLostChange"
+why = "Limit 2: an engine state loss and a second fault lose a change."
+
+# ---------------------------------------------------------------- mutants
+# `caught_by` is the invariant that must fail. "tests" means a scenario test
+# must fail, because sampling seldom reaches the path.
+
+[mutants.editSplitTxn]
+base = "restoreBase"
+caught_by = "appliedHeld"
+
+[mutants.appDropsRowOnEnqueue]
+base = "restoreBase"
+caught_by = "noDoubleApply"
+
+[mutants.engineDropsOnAccept]
+base = "restoreBase"
+caught_by = "noLostChangeWeak"
+
+[mutants.relayNoDedupe]
+base = "restoreBase"
+caught_by = "noDoubleApply"
+
+[mutants.sizeBeforeDedupe]
+base = "restoreBase"
+caught_by = "refusedNotStored"
+
+[mutants.pullSplitTxn]
+base = "restoreBase"
+caught_by = "noDoubleApply"
+
+[mutants.noRepair]
+base = "restoreBase"
+caught_by = "noLostChangeWeak"
+
+[mutants.noHold]
+base = "restoreBase"
+caught_by = "refusedNotStored"
+
+[mutants.adoptFork]
+base = "forkBase"
+caught_by = "noLostChangeWeak"
+
+[mutants.resetDropsOutbox]
+base = "restoreEngine"
+caught_by = "caughtUpState"
+
+[mutants.enqueueChecksSize]
+base = "engineOnly"
+caught_by = "refusedNotStored"
+
+[mutants.noAheadReset]
+base = "restoreEngine"
+caught_by = "noStuckDevice"
+
+[mutants.releaseIgnoresFresh]
+base = "restoreEngine"
+caught_by = "noSilentLoss"
+
+[mutants.freshClearsOnFetch]
+base = "restoreEngine"
+caught_by = "tests"
