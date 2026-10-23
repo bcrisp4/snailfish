@@ -26,11 +26,19 @@ ok() { printf '  ok    %s\n' "$*"; }
 bad() { printf '  FAIL  %s\n' "$*"; fail=1; }
 
 SAFE="noDoubleApply noLostChange noLostChangeWeak appliedHeld caughtUpState refusedNotStored noFork"
-# The invariants that the mutant configs check. base_restore is an honest relay
-# that the operator can restore. base_fork adds a silent rollback, so noFork and
-# refusedNotStored are known limits there (see "known limits").
+# The invariants for each mutant baseline. noFork and refusedNotStored are
+# known violations with a silent rollback (limit 1, F1) or an engine state loss
+# (F4), so base_fork and base_engine do not check them.
 MUT_RESTORE="noDoubleApply noLostChangeWeak appliedHeld caughtUpState refusedNotStored noFork"
 MUT_FORK="noDoubleApply noLostChangeWeak appliedHeld caughtUpState"
+MUT_ENGINE="noDoubleApply noLostChangeWeak appliedHeld caughtUpState noFork"
+invs_for() { # module -> invariant list
+  case "$1" in
+    m_adoptFork|base_fork) echo "$MUT_FORK" ;;
+    m_resetDropsOutbox|base_engine) echo "$MUT_ENGINE" ;;
+    *) echo "$MUT_RESTORE" ;;
+  esac
+}
 
 echo "== typecheck"
 for f in delivery.qnt delivery_test.qnt delivery_mutants.qnt; do
@@ -49,7 +57,7 @@ check_hold() { # module invariants...
 }
 check_hold crashOnly    $SAFE
 check_hold appRestore   $SAFE
-check_hold engineLoss   $SAFE
+check_hold engineLoss   noDoubleApply noLostChange noLostChangeWeak appliedHeld caughtUpState noFork
 check_hold relayRestore $SAFE
 check_hold faultyRelay  noDoubleApply noLostChange noLostChangeWeak appliedHeld caughtUpState
 check_hold allFaults    noDoubleApply noLostChangeWeak appliedHeld caughtUpState
@@ -62,20 +70,19 @@ check_limit() { # module invariant reason
 check_limit faultyRelay noFork           "silent rollback forks the log (T7 limit)"
 check_limit faultyRelay refusedNotStored "refusal after a rollback, then a repair stores the change"
 check_limit allFaults   noLostChange     "engine state loss plus a second fault loses a change"
+check_limit engineLoss  refusedNotStored "F4: a new engine refuses a stored change over the size limit"
 
 echo "== mutants: at least one invariant must fail"
 for m in $(grep -oE '^module m_[A-Za-z]+' delivery_mutants.qnt | cut -d' ' -f2); do
-  invs="$MUT_RESTORE"
-  [[ "$m" == "m_adoptFork" ]] && invs="$MUT_FORK"
+  invs=$(invs_for "$m")
   caught=""
   for i in $invs; do
     if ! run delivery_mutants.qnt "$m" "$i"; then caught="$i"; break; fi
   done
   if [[ -n "$caught" ]]; then ok "$m caught by $caught"; else bad "$m survived"; fi
 done
-for b in base_restore base_fork; do
-  invs="$MUT_RESTORE"; [[ "$b" == "base_fork" ]] && invs="$MUT_FORK"
-  for i in $invs; do
+for b in base_restore base_fork base_engine; do
+  for i in $(invs_for "$b"); do
     if run delivery_mutants.qnt "$b" "$i"; then ok "$b $i (baseline)"
     else bad "$b $i (violated: the mutant baseline must pass)"; fi
   done

@@ -64,8 +64,8 @@ module deliveryTest {
       .then(pull(2, false))
       .expect(app(2).applied == Set(0, 1) and app(2).dups == 0)
 
-  // S6: snailfish-relay restore. The hold refuses appends, a device repairs the
-  // log, and the hold ends when every device reports.
+  // S6: snailfish-relay restore. The hold refuses changes, a device repairs the
+  // log, and the hold stays on after every device reports until a release.
   run relayRestoreRepairTest =
     init
       .then(editAndPush(1, 0))
@@ -79,7 +79,8 @@ module deliveryTest {
       .then(repair(1))
       .expect(relay.log == [0, 1])
       .then(reportStatus(1)).then(reportStatus(2))
-      .expect(not(relay.hold))
+      .expect(relay.hold and relay.reported == DEVS)
+      .then(releaseHold)
       .then(push(1, 2, false))
       .expect(relay.log == [0, 1, 2])
 
@@ -98,18 +99,26 @@ module deliveryTest {
       .then(enqueue(1, 2))
       .then(push(1, 2, false).fail())
 
-  // A permanent refusal: the app splits the change into a new change.
+  // enqueue_many refuses a change larger than the relay limit. The app splits it.
   run refusedSplitTest =
     init
       .then(lowerLimit)
       .then(edit(1, true, false))
       .then(enqueue(1, 0))
-      .then(push(1, 0, false))
-      .expect(relay.log == [] and eng(1).refused == Set(0))
+      .expect(eng(1).outbox == Map() and eng(1).refused == Set(0))
       .then(resolveRefused(1, 0, true))
       .expect(app(1).applied == Set(1) and app(1).outbox == Set(1))
       .then(enqueue(1, 1)).then(push(1, 1, false))
       .expect(relay.log == [1])
+
+  // The relay lowers the limit after enqueue. The relay refuses the envelope for ever.
+  run refusedAtPushTest =
+    init
+      .then(edit(1, true, false))
+      .then(enqueue(1, 0))
+      .then(lowerLimit)
+      .then(push(1, 0, false))
+      .expect(relay.log == [] and eng(1).refused == Set(0) and happened(EvPushRefused))
 
   // The relay checks the known change_id before the size limit. A retry of a
   // stored change after a lower limit is Known, not Refused.
@@ -131,7 +140,7 @@ module deliveryTest {
       .then(fetchExtend(2, 1)).then(pull(2, false))
       .then(loseEngine(1)).then(loseEngine(2))
       .then(restoreRelay(0))
-      .then(reportStatus(1)).then(reportStatus(2))
+      .then(reportStatus(1)).then(reportStatus(2)).then(releaseHold)
       .then(editAndPush(2, 1))
       .then(enqueue(1, 0)).then(push(1, 0, false))
       .expect(relay.log == [1, 0])

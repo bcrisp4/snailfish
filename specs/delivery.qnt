@@ -28,7 +28,7 @@ module delivery {
     | EvEdit | EvPushStored | EvPushKnown | EvPushRefused | EvPushBadBase
     | EvFetch | EvPull | EvPullOwn | EvAppRestore | EvRelayRestore | EvRelayFault
     | EvRepair | EvHoldReleased | EvEarlyRelease | EvForkDetected | EvReverted
-    | EvSplit | EvEngineLoss | EvResetRequired | EvLimitLowered
+    | EvSplit | EvEngineLoss | EvResetRequired | EvLimitLowered | EvEnqueueRefused
 
   // The durable part of the app DB that a backup copies.
   type AppImage = { applied: Set[Id], outbox: Set[Id], appliedLog: List[Id] }
@@ -228,15 +228,23 @@ module delivery {
     }
   }
 
-  // The app calls enqueue for an outbox row, after each commit and at startup.
-  action enqueue(d: Dev, id: Id): bool = all {
-    canEnqueue(app(d), eng(d), id),
-    engines' = engines.set(d, { ...eng(d), outbox: eng(d).outbox.put(id, eng(d).log) }),
-    apps' = if (BUG == "appDropsRowOnEnqueue")
-              apps.set(d, { ...app(d), outbox: app(d).outbox.exclude(Set(id)) })
-            else apps,
-    relay' = relay,
-    env' = { ...env, stored: env.stored.union(Set(id)) },
+  // The app calls enqueue_many with its outbox rows, after each commit and at
+  // startup. One action is one row. A batch of rows in one transaction is a run
+  // of these actions with no other action between them, so the model includes it.
+  // A change larger than the relay limit goes to the refused list of the result.
+  action enqueue(d: Dev, id: Id): bool = {
+    val tooBig = env.changes.get(id).big and relay.limitLow
+    all {
+      canEnqueue(app(d), eng(d), id),
+      engines' = engines.set(d,
+        if (tooBig) { ...eng(d), refused: eng(d).refused.union(Set(id)) }
+        else { ...eng(d), outbox: eng(d).outbox.put(id, eng(d).log) }),
+      apps' = if (BUG == "appDropsRowOnEnqueue")
+                apps.set(d, { ...app(d), outbox: app(d).outbox.exclude(Set(id)) })
+              else apps,
+      relay' = relay,
+      env' = if (tooBig) ev(EvEnqueueRefused) else { ...env, stored: env.stored.union(Set(id)) },
+    }
   }
 
   // The engine sends one stored envelope. If the response is lost, the engine
@@ -302,22 +310,29 @@ module delivery {
     env' = ev(EvRepair),
   }
 
-  // Status report during a restore hold. The hold ends when every device reports
-  // a verified tip at or below the log head. (Every device in DEVS counts as
-  // seen in the 30 days before the restore.)
-  action reportStatus(d: Dev): bool = {
-    val reported = relay.reported.union(Set(d))
-    val release = reported == DEVS
-    all {
-      relay.hold,
-      running(d),
-      not(relay.reported.contains(d)),
-      isPrefix(eng(d).log, relay.log),
-      relay' = { ...relay, reported: reported, hold: not(release) },
-      engines' = engines,
-      apps' = apps,
-      env' = if (release) ev(EvHoldReleased) else env,
-    }
+  // Status report during a restore hold. The user page shows each device that
+  // reported a verified tip at or below the log head since the restore.
+  action reportStatus(d: Dev): bool = all {
+    relay.hold,
+    running(d),
+    not(relay.reported.contains(d)),
+    isPrefix(eng(d).log, relay.log),
+    relay' = { ...relay, reported: relay.reported.union(Set(d)) },
+    engines' = engines,
+    apps' = apps,
+    env' = env,
+  }
+
+  // Only the user (user page) or the relay operator (snailfish-relay
+  // release-hold) ends a hold. This action is a release after the user page shows
+  // a report from every device. The relay does not end a hold by itself.
+  action releaseHold: bool = all {
+    relay.hold,
+    relay.reported == DEVS,
+    relay' = { ...relay, hold: false },
+    engines' = engines,
+    apps' = apps,
+    env' = ev(EvHoldReleased),
   }
 
   action pull(d: Dev, crash: bool): bool = all {
@@ -456,6 +471,7 @@ module delivery {
       loseEngine(d),
       restoreRelay(k),
       rollBackRelay(k),
+      releaseHold,
       releaseHoldEarly,
       lowerLimit,
     }
@@ -515,6 +531,7 @@ module delivery {
   val wPushKnown: bool = happened(EvPushKnown)
   val wPushRefused: bool = happened(EvPushRefused)
   val wPushBadBase: bool = happened(EvPushBadBase)
+  val wEnqueueRefused: bool = happened(EvEnqueueRefused)
   val wPullOther: bool = happened(EvPull)
   val wPullOwn: bool = happened(EvPullOwn)
   val wReverted: bool = happened(EvReverted)
