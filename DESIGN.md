@@ -79,11 +79,10 @@ Security and operations:
 5. No group key agreement with post-compromise security (for example MLS). Key rotation occurs only on device removal or recovery.
 6. No request traces or detailed request logs. Diagnosis uses aggregate metrics and client-side reports only.
 7. No quota edits in the user page. The relay operator sets quotas in configuration. The user can only see usage.
-8. No post-quantum key sealing yet (Open issue 1).
 
 Client platforms:
 
-9. No sync engine binding for Node, TypeScript, browsers or Android. v1 targets Swift (macOS and iOS) and Python only.
+8. No sync engine binding for Node, TypeScript, browsers or Android. v1 targets Swift (macOS and iOS) and Python only.
 
 ## Scenarios
 
@@ -101,7 +100,7 @@ S5. All devices lost. A fire destroys the laptop and the phone. Sam buys a new l
 
 S6. Relay returns old data. A storage fault rolls the relay back by one day. On the next sync, the laptop sees that the relay log ends before the position that the laptop verified. The laptop uploads the lost records and stubs again at the same positions, in a repair session. The other devices then sync as normal, and the app tells Sam about the repair.
 
-S7. Full quota. Sam reaches the app's storage quota. The relay refuses new changes but continues to serve the stored changes. The sync engine keeps the queued edits in its outbox, and the app shows "Sync paused: storage full". The user page shows usage against the limit. After every active device accepts the next snapshot and applies past it, the relay replaces older changes with stubs, and usage drops. Stubs still use space, so a very old space can reach its quota with stubs alone. If that is not enough, Sam asks the relay operator for a larger quota. If every device holds an unsent edit, no device can write a snapshot, so only a larger quota helps.
+S7. Full quota. Sam reaches the app's storage quota. The relay refuses new changes but continues to serve the stored changes. The sync engine keeps the queued edits in its outbox, and the app shows "Sync paused: storage full". The user page shows usage against the limit. After every active device accepts the next snapshot and applies past it, the relay replaces older changes with stubs, and usage drops. Stubs do not count against the quota. If that is not enough, Sam asks the relay operator for a larger quota. If every device holds an unsent edit, no device can write a snapshot, so only a larger quota helps.
 
 ## User roles
 
@@ -310,7 +309,7 @@ Rules:
 - A new device imports the usable snapshot and then applies the changes after its state position. If a stub follows the applied position of a device, `changes_after` raises `ResetRequired`.
 - A repair session can hold stubs only if the staged range also holds a usable snapshot that covers them (see Space log).
 - The relay reserves capacity in each space for two snapshots and their accept records, so a full quota does not block a new snapshot before the relay replaces the old one with a stub.
-- Stubs count against the space quota. A stub is about 160 bytes, and no rule removes a stub (Open issue 3). A repair session that moves stubs into the log can take the space over its quota. The relay then refuses new changes, as in S7.
+- A stub is about 160 bytes, and no rule removes a stub. Stubs do not count against the space quota, because the user cannot remove them. The relay exports the number and size of stubs for each space as an operator metric.
 - Security records and accept records never become stubs. Each new grant and recovery record seals only the keys of the epochs that full records in the log still use.
 - Fork repair after compaction cannot restore own edits that a stub covers. Those edits are already in the usable snapshot of the old log (see Fork repair).
 
@@ -458,7 +457,8 @@ Rules:
 - An append runs in one transaction in the space file: the signature and permission checks, the space quota check and the append.
 - The relay checks a block in the tenant file before it opens the space file. The two files have no shared transaction. A request that starts before a block can still finish, and a block affects availability only.
 - After the relay replaces records with stubs, it runs `PRAGMA incremental_vacuum` on that space file. Only that space waits for it.
-- The relay limits the spaces per tenant and the stored bytes per space. The product of the two limits bounds the storage of one tenant. The relay reserves capacity in each space for security records and two snapshots. The security record reserve is 1 MiB by default, which holds thousands of grants. The user page warns at 80% of the reserve.
+- The relay limits the spaces per tenant and the stored bytes per space. The product of the two limits bounds the storage of one tenant. The relay reserves capacity in each space for security records and two snapshots.
+- The security record reserve is 16 MiB by default, outside the space quota. One person writes about 150 KB of security records in 10 years: about 20 grants of 4 KB, 10 epoch records and 50 device records. The relay refuses more than 10 security records from one device in one day, so a stolen device cannot fill the reserve before the block. The relay operator can raise the reserve.
 
 ## Diagram
 
@@ -581,17 +581,19 @@ Cryptography. The `protocol` and `engine` crates use these primitives. The recor
 | Log digests, body digests, device IDs and key commitments | SHA-256 | `sha2` |
 | Change encryption | XChaCha20-Poly1305, with a random 24-byte nonce for each change | `chacha20poly1305` |
 | Key derivation | HKDF-SHA256 | `hkdf` |
-| Key sealing to devices and to the recovery key | HPKE (RFC 9180) base mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and ChaCha20Poly1305, inside a signed security record | `hpke` |
+| Key sealing to devices and to the recovery key | HPKE base mode with the MLKEM768-X25519 KEM (X-Wing, KEM ID 0x647A), HKDF-SHA256 and ChaCha20Poly1305, inside a signed security record | `hpke` with its `mlkem` feature, which uses `ml-kem` and `x-wing` |
 | Request signatures | RFC 9421 HTTP Message Signatures with Ed25519 | `protocol` crate |
 | Randomness | The operating system CSPRNG | `getrandom` |
 
 Rules:
 
-- Each device has a separate Ed25519 signing key and X25519 sealing key. The grant holds both public keys. The design never converts an Ed25519 key to an X25519 key.
+- Each device has a separate Ed25519 signing key and an X-Wing sealing key. The grant holds both public keys. The design never derives one key from the other.
+- X-Wing combines ML-KEM-768 and X25519. A sealed key set stays secret if either of the two stays secure, so the hybrid is never weaker than X25519 alone.
+- An X-Wing public key is 1,216 bytes, and each sealed key set adds about 1,120 bytes for the encapsulation. A grant for 10 epochs is about 13 KB.
 - The device ID is the SHA-256 hash of the two device public keys, so an ID cannot name a different key.
 - `verify_strict` refuses small-order public keys, small-order R values and non-canonical R values. It accepts non-canonical public key encodings. The `protocol` crate therefore refuses a public key whose bytes differ from the canonical encoding of the decoded point.
 - HPKE base mode does not authenticate the sender. Each sealed key set is therefore part of a signed security record, and the HPKE `info` value holds the log ID, epoch and recipient device ID. The record also holds a key commitment, and each device checks the opened key against it.
-- The recovery key is 128 random bits. The user sees it as Crockford base32 with a checksum. HKDF derives an X25519 sealing key and an Ed25519 signing key from it.
+- The recovery key is 128 random bits. The user sees it as Crockford base32 with a checksum. HKDF derives a 32-byte X-Wing seed and an Ed25519 signing key from it. X-Wing derives its key pair from that seed.
 - Many devices encrypt with one app key and share no counter. Each change therefore uses a random 192-bit nonce. XChaCha20-Poly1305 has no RFC. The project accepts it because libsodium and other common libraries use the same construction.
 - Each signature input, HKDF `info` value, HPKE `info` value and AEAD associated data starts with a versioned type string, for example `snailfish.change.v1`.
 - The AEAD associated data of a change holds the log ID, epoch, `change_id` and author device ID. A relay cannot present a ciphertext with other routing fields.
@@ -603,7 +605,8 @@ Audit status. The audits covered older major versions than the versions in use.
 - Quarkslab audited `curve25519-dalek` 1.2.1 in 2019. It reviewed `ed25519-dalek` 1.0.0-pre.1 and `x25519-dalek` 0.5.2 at a high level only. Current releases are `curve25519-dalek` 5 and `ed25519-dalek` 3. RUSTSEC-2024-0344, a timing leak, came after the audit and was fixed in `curve25519-dalek` 4.1.3.
 - NCC Group reviewed the `chacha20poly1305` crate in 2020 and found no vulnerability. The report does not cover XChaCha20.
 - `hpke` has no paid audit. Its documentation states that Cloudflare reviewed version 0.8. Version 0.14 uses newer major versions of its dependencies.
-- CI checks `hpke` against the RFC 9180 test vectors. A separate harness opens key sets from `hpke` with the Go standard library `crypto/hpke`, and the reverse. The Go API takes no fixed ephemeral key, so the harness cannot reproduce the RFC vectors in Go.
+- `ml-kem` and `x-wing` from RustCrypto have no independent audit. The `ml-kem` README states this. The test vectors check correctness, but not timing side channels.
+- CI checks `hpke` against the RFC 9180 test vectors and the MLKEM768-X25519 vectors in `draft-ietf-hpke-pq`. A separate harness opens key sets from `hpke` with the Go standard library `crypto/hpke`, and the reverse. The Go API takes no fixed ephemeral key, so the harness cannot reproduce the RFC vectors in Go.
 
 The shared test vectors also include all 914 Ed25519 vectors from the C2SP CCTV set, so the verification behaviour is recorded.
 
@@ -616,7 +619,7 @@ Scale:
 - 1 to 5 users per instance. 1 to 10 apps per user. 2 to 10 devices per app.
 - The relay sets fixed upper limits for change size, request size, stored bytes per space and spaces per tenant. Each self-hoster selects the values. `GET /v1/info` publishes them.
 - Load: one device polls once a minute in the foreground, so it makes about 60 fetches in each active hour. A design load of 5 users with 3 active device hours each per day gives about 1,000 fetches per day. The relay must handle 100,000 requests per day on one small machine, which allows for 100 times the design load.
-- Growth: a task app that writes 50 changes a day writes about 90,000 changes in 5 years. With a snapshot after each 1,000 changes, a log holds the security records, the accept records, the usable snapshot, about 1,000 changes in full, and about 90,000 stubs (about 15 MB). A new device downloads and checks each stub (Open issue 3).
+- Growth: a task app that writes 50 changes a day writes about 90,000 changes in 5 years. With a snapshot after each 1,000 changes, a log holds the security records, the accept records, the usable snapshot, about 1,000 changes in full, and about 90,000 stubs (about 15 MB). A new device downloads and checks each stub (C66).
 
 Service:
 
@@ -637,8 +640,8 @@ Relay operator signals:
 1. An external liveness check runs every 5 minutes against an unauthenticated health route. It alerts after 3 failures in a row.
 2. The relay counts requests, 4xx and 5xx responses, signature failures, authentication denials and quota denials per hour.
 3. The relay exports storage per tenant, and the number of spaces above 80% and 95% of their quota.
-4. The relay counts storage-layer errors and failed schema migrations.
-5. The project ships a Prometheus rules file: 5xx responses above 5% for 15 minutes, a space above 95% of its quota, free disk below 10%, and any storage error or failed migration. Alertmanager routes the alerts.
+4. The relay counts storage-layer errors, failed schema migrations, refused security records, the number of spaces above 50% of their security record reserve, and the stub count and stub bytes for each space.
+5. The project ships a Prometheus rules file: 5xx responses above 5% for 15 minutes, a space above 95% of its quota, a space above 50% of its security record reserve, a space with more than 1 million stubs, free disk below 10%, and any storage error or failed migration. Alertmanager routes the alerts.
 
 User signals:
 
@@ -662,7 +665,8 @@ T1. The relay operator, the hosting provider, or a thief copies the relay storag
 
 - The storage holds only ciphertext, public keys, signed records and sealed key sets.
 - No key that decrypts app data exists on the relay.
-- Limit: key sets use classical X25519 sealing. A party that keeps a copy now can open them later with a large quantum computer (Open issue 1).
+- Key sets use X-Wing, so a party that keeps a copy now cannot open them later with a large quantum computer, if ML-KEM-768 stays secure.
+- Limit: Ed25519 signatures are not post-quantum. A quantum attacker can forge records only while devices still verify them, and a new record version can change the signature scheme.
 
 T2. An attacker steals the user's sign-in session or sign-in account.
 
@@ -727,7 +731,7 @@ T10. A device or attacker uploads malformed or oversized records, or a flood of 
 - The relay checks size limits and signatures before storage, and the space quota inside the same transaction as the append.
 - A refused record modifies no stored state.
 - The relay reserves separate capacity for security records, so a full quota cannot block a device removal or recovery.
-- Limit: a device can fill the security record reserve with grants or level records before its removal. The user page warns at 80% of the reserve, and the relay operator can raise it (Open issue 2).
+- The rate limit and the 16 MiB reserve stop a device from filling the reserve before its removal. The relay operator gets an alert at 50% of the reserve. The user sees no warning, because the user can take no action.
 - A validly signed change that does not decrypt does not stop the space. Each engine skips it and reports `degraded` with the author device.
 
 T11. An attacker guesses or forges a tenant identifier to reach the storage of another tenant.
@@ -825,9 +829,7 @@ After M7, and before the first public release:
 
 ## Open issues
 
-1. Post-quantum key sealing. Key sets sealed with X25519 stay on the relay for the life of the space, so a future quantum computer can open them. The `hpke` crate 0.14 and Go 1.26 `crypto/hpke` ship MLKEM768-X25519 (X-Wing) from `draft-ietf-hpke-pq`. That draft is a working group document, and the IESG has not started to process it. The IANA HPKE registry already lists 0x647A for X-Wing, and the concrete hybrid KEM draft states that MLKEM768-X25519 is identical to X-Wing. Options: classical X25519 in v1 and a hybrid key set type after an RFC, which has no date, or MLKEM768-X25519 in v1 and a new record version if the final KEM differs. The record version fixes the KEM (see Versioning). Next step: decide before M1, because device keys and key sets are part of `PROTOCOL.md`.
-2. Security record growth. Security records never become stubs, so a space with many grants, removals or level records grows without a bound. A device can also fill the 1 MiB reserve before its removal. Option: a signed security snapshot that a trusted device writes, which summarises the active devices, the current epoch, the write level and the recovery keys, so older security records can become stubs. Next step: measure the record sizes in M7, and decide before the first public release.
-3. Stub growth. Each compacted change stays as a stub of about 160 bytes, because positions are dense and the log digest needs every entry. At 50 changes a day, a space holds about 15 MB of stubs after 5 years, and a new device downloads all of them. At 5,000 changes a day, the stubs grow to about 1.5 GB. Stubs also count against the space quota, so a very old space can fill its quota with stubs. Options: a range stub that replaces a run of stubs, or a new device that starts from a signed checkpoint and the security records. Both change the entry hash or the digest chain. Next step: decide before M1, with open issue 2, because both change the log format.
+None.
 
 ## Closed issues
 
@@ -869,9 +871,9 @@ Protocol:
 - C22. Where does the engine keep its sync state? In its own SQLite file in a directory that the host app gives it, with the verified log. If every app saves engine state itself, every app must get crash safety right.
 - C23. Versioning policy? Frozen record types, algorithms fixed by the record version, fail closed on an unknown security record type, a signed space write level (C30), relay first, forward-only migrations. The rules start at the first public release.
 - C24. How do the app database and the engine state stay consistent after a crash? A transactional outbox for push, and pull by applied position from the full engine log (C31). The engine cannot write the app database without a tie to its storage engine. A rule that every merge is idempotent fails for changes such as counter increments.
-- C25. Crypto primitives? Ed25519, SHA-256, XChaCha20-Poly1305, HKDF-SHA256 and HPKE with X25519. All except XChaCha20-Poly1305 have an RFC. All have Rust crates with an audit of an older version, and a random nonce is safe for many devices that share one key.
+- C25. Crypto primitives? Ed25519, SHA-256, XChaCha20-Poly1305, HKDF-SHA256 and HPKE with X-Wing (C27). All except XChaCha20-Poly1305 have an RFC. All have Rust crates with an audit of an older version, and a random nonce is safe for many devices that share one key.
 - C26. Use the `hpke` crate without a paid audit? Yes. It uses common RustCrypto and dalek primitive crates, and CI checks it against the RFC 9180 vectors and Go `crypto/hpke`. Cryspen published vulnerabilities in `hpke-rs` before 0.6.0 in 2026, including nonce reuse (RUSTSEC-2026-0071).
-- C27. Post-quantum key sealing in v1? Open again (Open issue 1). The `hpke` crate 0.14 ships X-Wing in its default features, and Go 1.26 `crypto/hpke` ships MLKEM768-X25519, both from `draft-ietf-hpke-pq`.
+- C27. Post-quantum key sealing in v1? Yes, with X-Wing (MLKEM768-X25519). Key sets stay on the relay, in backups and in exports for the life of a space, so a party can copy them now and open X25519 key sets later. X-Wing is a hybrid, so it is never weaker than X25519. The `hpke` crate 0.14 and Go 1.26 `crypto/hpke` ship it, and IANA lists KEM ID 0x647A. The IETF draft has no RFC date. If the final RFC differs, a new record version changes the KEM. The cost is about 1.2 KB for each public key and each sealed key set, and crates with no independent audit.
 - C28. Is a short code alone enough for enrollment? No. A relay can try many keys until a 6-digit code matches. A commit before reveal step leaves one guess for each session, and the user confirms the code on both devices.
 - C29. Project name? Snailfish. The bare name is free on PyPI and crates.io, and the only clash found is Advent of Code puzzle solutions. Olm, the blind cave salamander, is the Matrix encryption library, so it causes confusion.
 
@@ -918,6 +920,8 @@ Review D, 2026-10-23:
 - C62. Can the macOS binding use the default keychain? No. `SecItem` uses the file-based keychain by default, which ignores `ThisDeviceOnly`, and Setup Assistant copies it. The binding uses the data protection keychain and fails closed without the entitlement.
 - C63. Can the relay read the request authority from `Host`? No. nginx sends the upstream name by default, so every signature fails behind it. The relay operator sets the public authority.
 - C64. Does a server key sign tenant handles? No. A restore on a new host then loses the key, and each device needs a user action. A random handle in `directory.db` survives a restore.
+- C65. Can security records become stubs? No. A recovery device checks each grant and removal from the genesis record, which the recovery key signs, so the full chain stops a relay that hides a removal. A security snapshot needs a recovery key signature for each snapshot, or a recovery device that trusts the relay. One person writes about 150 KB of security records in 10 years, so a 16 MiB reserve and a rate limit of 10 security records for each device each day are enough. The reserve is an operator concern, so the user page shows no warning. Revisit if a space reaches 50% of its reserve.
+- C66. Can the log drop stubs before a snapshot? No, not in v1. A stub keeps the hash chain checkable from the genesis record, lets a device find old change IDs, and lets a device repair a rollback. At 50 changes a day, a space holds about 16 MB of stubs in 5 years, and a new device checks them in seconds. Stubs do not count against the space quota, and the relay operator sees them in metrics. A separate security chain with a signed anchor in each snapshot can replace stubs before the first public release. Revisit if the M8 first-sync figure fails the SLO, or if a space passes 1 million stubs.
 
 ## Alternatives considered
 
