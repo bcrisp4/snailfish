@@ -1,7 +1,7 @@
 // Scenario tests for delivery.qnt. Run: quint test delivery_test.qnt --main deliveryTest
 module deliveryTest {
   import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 3,
-                  FAULTS = Set("appRestore", "engineLoss", "relayRestore", "silentRollback", "earlyRelease"),
+                  FAULTS = Set("appRestore", "engineLoss", "relayRestore", "silentRollback", "earlyRelease", "warnedRelease"),
                   BUG = "none").* from "./delivery"
 
   // Device d edits change id, enqueues it and the relay stores it.
@@ -99,17 +99,43 @@ module deliveryTest {
       .then(enqueue(1, 2))
       .then(push(1, 2, false).fail())
 
-  // enqueue_many refuses a change larger than the relay limit. The app splits it.
+  // The relay refuses a change over the limit at push. The app splits it only
+  // after the engine fetched to the relay head.
   run refusedSplitTest =
     init
       .then(lowerLimit)
       .then(edit(1, true, false))
       .then(enqueue(1, 0))
-      .expect(eng(1).outbox == Map() and eng(1).refused == Set(0))
+      .expect(eng(1).outbox.keys() == Set(0) and eng(1).refused == Set())
+      .then(push(1, 0, false))
+      .expect(eng(1).refused == Set(0))
       .then(resolveRefused(1, 0, true))
       .expect(app(1).applied == Set(1) and app(1).outbox == Set(1))
       .then(enqueue(1, 1)).then(push(1, 1, false))
       .expect(relay.log == [1])
+
+  // F4: after an engine state loss, enqueue_many stores a change that the relay
+  // holds. The relay answers Known, so the change is not refused.
+  run enqueueAfterLossTest =
+    init
+      .then(edit(1, true, false))
+      .then(enqueue(1, 0)).then(push(1, 0, false))
+      .then(lowerLimit)
+      .then(loseEngine(1))
+      .then(enqueue(1, 0)).then(push(1, 0, false))
+      .expect(eng(1).refused == Set() and relay.log == [0])
+
+  // F2: the applied position is past the end of the log. changes_after raises
+  // ResetRequired once the engine fetched to the relay head with no hold.
+  run aheadOfLogResetTest =
+    init
+      .then(editAndPush(1, 0))
+      .then(fetchExtend(1, 1)).then(pull(1, false))
+      .then(loseEngine(1)).then(restoreRelay(0))
+      .then(reportStatus(1)).then(reportStatus(2))
+      .expect(not(resetRequired(app(1), eng(1), relay, BUG)))
+      .then(releaseHoldWarned)
+      .expect(resetRequired(app(1), eng(1), relay, BUG))
 
   // The relay lowers the limit after enqueue. The relay refuses the envelope for ever.
   run refusedAtPushTest =
@@ -140,12 +166,12 @@ module deliveryTest {
       .then(fetchExtend(2, 1)).then(pull(2, false))
       .then(loseEngine(1)).then(loseEngine(2))
       .then(restoreRelay(0))
-      .then(reportStatus(1)).then(reportStatus(2)).then(releaseHold)
+      .then(reportStatus(1)).then(reportStatus(2)).then(releaseHoldWarned)
       .then(editAndPush(2, 1))
       .then(enqueue(1, 0)).then(push(1, 0, false))
       .expect(relay.log == [1, 0])
       .then(fetchExtend(2, 2))
-      .expect(resetRequired(app(2), eng(2)) and not(canPull(app(2), eng(2))))
+      .expect(resetRequired(app(2), eng(2), relay, BUG) and not(canPull(app(2), eng(2))))
       .then(handleReset(2))
       .expect(app(2).applied == Set(1) and app(2).appliedLog == [])
       .then(pull(2, false)).then(pull(2, false))

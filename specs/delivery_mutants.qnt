@@ -18,7 +18,7 @@ module base_fork {
 }
 
 module base_engine {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "relayRestore"),
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "relayRestore", "warnedRelease"),
                   BUG = "none").* from "./delivery"
 }
 
@@ -68,6 +68,22 @@ module m_adoptFork {
 }
 
 module m_resetDropsOutbox {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "relayRestore"),
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "relayRestore", "warnedRelease"),
                   BUG = "resetDropsOutbox").* from "./delivery"
+}
+
+
+module m_enqueueChecksSize {
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss"),
+                  BUG = "enqueueChecksSize").* from "./delivery"
+}
+
+module m_noAheadReset {
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "relayRestore", "warnedRelease"),
+                  BUG = "noAheadReset").* from "./delivery"
+}
+
+module m_releaseIgnoresFresh {
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "relayRestore", "warnedRelease"),
+                  BUG = "releaseIgnoresFresh").* from "./delivery"
 }

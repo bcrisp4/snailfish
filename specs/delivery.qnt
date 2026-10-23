@@ -28,7 +28,7 @@ module delivery {
     | EvEdit | EvPushStored | EvPushKnown | EvPushRefused | EvPushBadBase
     | EvFetch | EvPull | EvPullOwn | EvAppRestore | EvRelayRestore | EvRelayFault
     | EvRepair | EvHoldReleased | EvEarlyRelease | EvForkDetected | EvReverted
-    | EvSplit | EvEngineLoss | EvResetRequired | EvLimitLowered | EvEnqueueRefused
+    | EvSplit | EvEngineLoss | EvResetRequired | EvLimitLowered | EvResetAhead
 
   // The durable part of the app DB that a backup copies.
   type AppImage = { applied: Set[Id], outbox: Set[Id], appliedLog: List[Id] }
@@ -47,6 +47,7 @@ module delivery {
     refused: Set[Id],      // envelopes that the relay refused for ever (degraded)
     log: List[Id],         // verified log
     stop: Stop,
+    fresh: bool,           // a new state file after a loss. The status report carries it (F3).
   }
 
   type Relay = {
@@ -83,6 +84,7 @@ module delivery {
     "relayRestore",    // snailfish-relay restore from an older backup, with a restore hold
     "silentRollback",  // a storage fault rolls the relay back; no hold (T7 limit)
     "earlyRelease",    // the user releases a restore hold before every device reports
+    "warnedRelease",   // the user releases after the warning about a new engine state file (F3)
   )
 
   pure val BUGS: Set[str] = Set(
@@ -97,6 +99,9 @@ module delivery {
     "noHold",               // snailfish-relay restore sets no restore hold
     "adoptFork",            // engine adopts a conflicting relay log and does not stop
     "resetDropsOutbox",     // ResetRequired handling does not apply the outbox rows again
+    "enqueueChecksSize",    // enqueue_many refuses a change over the size limit locally (F4)
+    "noAheadReset",         // no ResetRequired if the applied position is past the log end (F2)
+    "releaseIgnoresFresh",  // the user page does not mark a new engine state file (F3)
   )
 
   // ---------------------------------------------------------------- pure logic
@@ -116,7 +121,7 @@ module delivery {
 
   pure val emptyImage: AppImage = { applied: Set(), outbox: Set(), appliedLog: List() }
   pure val freshApp: App = { applied: Set(), outbox: Set(), appliedLog: List(), dups: 0, backup: emptyImage }
-  pure val freshEngine: Engine = { outbox: Map(), refused: Set(), log: List(), stop: Running }
+  pure val freshEngine: Engine = { outbox: Map(), refused: Set(), log: List(), stop: Running, fresh: false }
 
   // ---- app
 
@@ -146,9 +151,12 @@ module delivery {
   }
 
   // changes_after raises ResetRequired: the verified log holds a different digest
-  // at the applied position.
-  pure def resetRequired(a: App, e: Engine): bool =
-    e.log.length() >= a.appliedLog.length() and not(isPrefix(a.appliedLog, e.log))
+  // at the applied position, or the applied position is past the end of a log that
+  // the engine fetched to the relay head with no hold (F2).
+  pure def resetRequired(a: App, e: Engine, r: Relay, bug: str): bool =
+    (e.log.length() >= a.appliedLog.length() and not(isPrefix(a.appliedLog, e.log)))
+    or (bug != "noAheadReset" and e.log.length() < a.appliedLog.length()
+        and e.log == r.log and not(r.hold))
 
   // Delete the synced data, import no snapshot, apply each outbox row again.
   pure def applyReset(a: App, bug: str): App =
@@ -165,7 +173,8 @@ module delivery {
 
   // An own envelope leaves the outbox only when the verified log holds it.
   pure def applyFetch(e: Engine, newLog: List[Id]): Engine =
-    { ...e, log: newLog, outbox: without(e.outbox, ids(newLog)) }
+    { ...e, log: newLog, outbox: without(e.outbox, ids(newLog)),
+      fresh: e.fresh and newLog.length() == 0 }
 
   // ---- relay
 
@@ -231,9 +240,10 @@ module delivery {
   // The app calls enqueue_many with its outbox rows, after each commit and at
   // startup. One action is one row. A batch of rows in one transaction is a run
   // of these actions with no other action between them, so the model includes it.
-  // A change larger than the relay limit goes to the refused list of the result.
+  // The engine does not check the size limit. Only the relay refuses a change for
+  // size, and it checks the known change_id first (F4).
   action enqueue(d: Dev, id: Id): bool = {
-    val tooBig = env.changes.get(id).big and relay.limitLow
+    val tooBig = BUG == "enqueueChecksSize" and env.changes.get(id).big and relay.limitLow
     all {
       canEnqueue(app(d), eng(d), id),
       engines' = engines.set(d,
@@ -243,7 +253,7 @@ module delivery {
                 apps.set(d, { ...app(d), outbox: app(d).outbox.exclude(Set(id)) })
               else apps,
       relay' = relay,
-      env' = if (tooBig) ev(EvEnqueueRefused) else { ...env, stored: env.stored.union(Set(id)) },
+      env' = if (tooBig) env else { ...env, stored: env.stored.union(Set(id)) },
     }
   }
 
@@ -329,6 +339,9 @@ module delivery {
   action releaseHold: bool = all {
     relay.hold,
     relay.reported == DEVS,
+    // The user page marks a device with a new engine state file as "not repaired".
+    // Only releaseHoldWarned releases then.
+    BUG == "releaseIgnoresFresh" or DEVS.forall(d => not(eng(d).fresh)),
     relay' = { ...relay, hold: false },
     engines' = engines,
     apps' = apps,
@@ -344,11 +357,11 @@ module delivery {
   }
 
   action handleReset(d: Dev): bool = all {
-    resetRequired(app(d), eng(d)),
+    resetRequired(app(d), eng(d), relay, BUG),
     apps' = apps.set(d, applyReset(app(d), BUG)),
     engines' = engines,
     relay' = relay,
-    env' = ev(EvResetRequired),
+    env' = ev(if (eng(d).log.length() < app(d).appliedLog.length()) EvResetAhead else EvResetRequired),
   }
 
   // The app reads the degraded status and removes the outbox row of a refused
@@ -404,8 +417,8 @@ module delivery {
     val e = eng(d)
     all {
       canFault("engineLoss"),
-      e != freshEngine,
-      engines' = engines.set(d, freshEngine),
+      e != { ...freshEngine, fresh: e.fresh },
+      engines' = engines.set(d, { ...freshEngine, fresh: true }),
       apps' = apps,
       relay' = relay,
       env' = { ...fault(EvEngineLoss),
@@ -431,6 +444,18 @@ module delivery {
     engines' = engines,
     apps' = apps,
     env' = fault(EvRelayFault),
+  }
+
+  // The user confirms the warning and releases, with a new engine state file on a
+  // device that reported. The changes that only the old engine file held are lost.
+  action releaseHoldWarned: bool = all {
+    FAULTS.contains("warnedRelease"),
+    relay.hold,
+    relay.reported == DEVS,
+    relay' = { ...relay, hold: false },
+    engines' = engines.keys().mapBy(d => { ...eng(d), fresh: false }),
+    apps' = apps,
+    env' = ev(EvHoldReleased),
   }
 
   action releaseHoldEarly: bool = all {
@@ -473,6 +498,7 @@ module delivery {
       rollBackRelay(k),
       releaseHold,
       releaseHoldEarly,
+      releaseHoldWarned,
       lowerLimit,
     }
   }
@@ -511,10 +537,18 @@ module delivery {
   val caughtUpState: bool = DEVS.forall(d =>
     caughtUp(d) implies app(d).applied == ids(relay.log).union(app(d).outbox))
 
-  // I5. A permanent refusal means that no device can get the change. If one can,
-  // the author reverts or splits an edit that other devices apply.
+  // I5. A change that an app reverted after a permanent refusal is in no log. If
+  // it is, a device holds it and the other devices apply it, so the devices
+  // diverge without notice (goal 8). The restore hold prevents it after a restore. A silent rollback can still cause it (F1 limit).
   val logged: Set[Id] = DEVS.fold(ids(relay.log), (s, d) => s.union(ids(eng(d).log)))
-  val refusedNotStored: bool = DEVS.forall(d => eng(d).refused.intersect(logged) == Set())
+  val refusedNotStored: bool = env.reverted.intersect(logged) == Set()
+
+  // I7. No running device is stuck. A device that fetched to the relay head, with
+  // no hold, either holds the same position as the relay or can pull or reset.
+  // Without the reset for an applied position past the log end (F2), it is stuck.
+  val noStuckDevice: bool = DEVS.forall(d =>
+    (running(d) and eng(d).log == relay.log and not(relay.hold) and app(d).appliedLog != eng(d).log)
+      implies (canPull(app(d), eng(d)) or resetRequired(app(d), eng(d), relay, BUG)))
 
   // I6. Running devices never hold conflicting verified logs. A silent rollback
   // or an early hold release can break it (T7 limit), and the devices then stop
@@ -531,7 +565,7 @@ module delivery {
   val wPushKnown: bool = happened(EvPushKnown)
   val wPushRefused: bool = happened(EvPushRefused)
   val wPushBadBase: bool = happened(EvPushBadBase)
-  val wEnqueueRefused: bool = happened(EvEnqueueRefused)
+  val wResetAhead: bool = happened(EvResetAhead)
   val wPullOther: bool = happened(EvPull)
   val wPullOwn: bool = happened(EvPullOwn)
   val wReverted: bool = happened(EvReverted)
@@ -555,12 +589,6 @@ module delivery {
     DEVS.forall(d => ids(relay.log).exists(id => env.changes.get(id).author == d))
   // A repair after a restore, and then the hold ends.
   val wRepairThenRelease: bool = happened(EvRepair) and happened(EvHoldReleased)
-  // The applied position is past the end of a fully fetched verified log. Neither
-  // pull nor ResetRequired is enabled until the log grows. DESIGN.md does not
-  // define this case. It needs an engine state loss and a relay rollback.
-  val wAheadOfLog: bool = DEVS.exists(d =>
-    running(d) and eng(d).log == relay.log and not(relay.hold)
-    and app(d).appliedLog.length() > eng(d).log.length())
   // Two faults lost a change that enqueue stored (expected: see noLostChangeWeak).
   val wDoubleFaultLoss: bool = not(env.stored.exclude(env.reverted).subseteq(held))
 }
@@ -577,7 +605,7 @@ module appRestore {
   import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("appRestore"), BUG = "none").*
 }
 module engineLoss {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss"), BUG = "none").*
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2, FAULTS = Set("engineLoss", "warnedRelease"), BUG = "none").*
 }
 // snailfish-relay restore with a hold, together with app DB restores. Three devices.
 module relayRestore {
@@ -592,6 +620,15 @@ module faultyRelay {
 // Every fault class together.
 module allFaults {
   import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 3,
-                  FAULTS = Set("appRestore", "engineLoss", "relayRestore", "silentRollback", "earlyRelease"),
+                  FAULTS = Set("appRestore", "engineLoss", "relayRestore", "silentRollback", "earlyRelease", "warnedRelease"),
                   BUG = "none").*
+}
+// F1 split by cause.
+module earlyReleaseOnly {
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2,
+                  FAULTS = Set("relayRestore", "earlyRelease"), BUG = "none").*
+}
+module silentOnly {
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 2,
+                  FAULTS = Set("silentRollback"), BUG = "none").*
 }

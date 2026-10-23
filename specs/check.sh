@@ -25,17 +25,18 @@ run() { # file module invariant -> exit status of quint run
 ok() { printf '  ok    %s\n' "$*"; }
 bad() { printf '  FAIL  %s\n' "$*"; fail=1; }
 
-SAFE="noDoubleApply noLostChange noLostChangeWeak appliedHeld caughtUpState refusedNotStored noFork"
-# The invariants for each mutant baseline. noFork and refusedNotStored are
-# known violations with a silent rollback (limit 1, F1) or an engine state loss
-# (F4), so base_fork and base_engine do not check them.
-MUT_RESTORE="noDoubleApply noLostChangeWeak appliedHeld caughtUpState refusedNotStored noFork"
+SAFE="noDoubleApply noLostChange noLostChangeWeak appliedHeld caughtUpState refusedNotStored noStuckDevice noFork"
+# The invariants for each mutant baseline. base_fork has a silent rollback, so it
+# does not check noFork or refusedNotStored (limit 1, F1).
+MUT_RESTORE="noDoubleApply noLostChangeWeak appliedHeld caughtUpState refusedNotStored noStuckDevice noFork"
 MUT_FORK="noDoubleApply noLostChangeWeak appliedHeld caughtUpState"
-MUT_ENGINE="noDoubleApply noLostChangeWeak appliedHeld caughtUpState noFork"
+MUT_ENGINE="noDoubleApply noLostChangeWeak appliedHeld caughtUpState refusedNotStored noStuckDevice noFork"
+MUT_LOSS="noLostChange $MUT_ENGINE"
 invs_for() { # module -> invariant list
   case "$1" in
     m_adoptFork|base_fork) echo "$MUT_FORK" ;;
-    m_resetDropsOutbox|base_engine) echo "$MUT_ENGINE" ;;
+    m_resetDropsOutbox|m_enqueueChecksSize|m_noAheadReset|base_engine) echo "$MUT_ENGINE" ;;
+    m_releaseIgnoresFresh) echo "$MUT_LOSS" ;;
     *) echo "$MUT_RESTORE" ;;
   esac
 }
@@ -57,10 +58,10 @@ check_hold() { # module invariants...
 }
 check_hold crashOnly    $SAFE
 check_hold appRestore   $SAFE
-check_hold engineLoss   noDoubleApply noLostChange noLostChangeWeak appliedHeld caughtUpState noFork
+check_hold engineLoss   noDoubleApply noLostChange noLostChangeWeak appliedHeld caughtUpState refusedNotStored noStuckDevice noFork
 check_hold relayRestore $SAFE
 check_hold faultyRelay  noDoubleApply noLostChange noLostChangeWeak appliedHeld caughtUpState
-check_hold allFaults    noDoubleApply noLostChangeWeak appliedHeld caughtUpState
+check_hold allFaults    noDoubleApply noLostChangeWeak appliedHeld caughtUpState noStuckDevice
 
 echo "== known limits: these must be violated"
 check_limit() { # module invariant reason
@@ -68,9 +69,10 @@ check_limit() { # module invariant reason
   else ok "$1 $2 violated: $3"; fi
 }
 check_limit faultyRelay noFork           "silent rollback forks the log (T7 limit)"
-check_limit faultyRelay refusedNotStored "refusal after a rollback, then a repair stores the change"
+check_limit faultyRelay refusedNotStored "F1: a late repair stores a reverted change after a silent rollback or an early release"
+check_limit earlyReleaseOnly refusedNotStored "F1: an early release, then a late repair"
+check_limit silentOnly refusedNotStored "F1: a silent rollback has no hold"
 check_limit allFaults   noLostChange     "engine state loss plus a second fault loses a change"
-check_limit engineLoss  refusedNotStored "F4: a new engine refuses a stored change over the size limit"
 
 echo "== mutants: at least one invariant must fail"
 for m in $(grep -oE '^module m_[A-Za-z]+' delivery_mutants.qnt | cut -d' ' -f2); do

@@ -25,7 +25,7 @@ These Quint models check parts of `DESIGN.md`. Each model is executable. A check
 | DESIGN.md rule | Model |
 | --- | --- |
 | Edit and outbox row in one transaction | `edit`, mutant `editSplitTxn` |
-| `enqueue_many` after each commit and at startup, no effect if known, a change over the limit in `refused` | `enqueue`, mutant `appDropsRowOnEnqueue` |
+| `enqueue_many` after each commit and at startup, no effect if known, a known `change_id` with other bytes in `refused` | `enqueue`, mutant `appDropsRowOnEnqueue` |
 | Batches in `enqueue_many` and `changes_after` | One action for each row. A batch in one transaction allows fewer interleavings, so a safe result for single rows also holds for batches. |
 | Retry sends the stored envelope. The relay returns the original position. | `push` with a lost response, mutant `relayNoDedupe` |
 | Engine keeps an own envelope until the verified log holds it | `applyFetch`, mutant `engineDropsOnAccept` |
@@ -49,29 +49,29 @@ These Quint models check parts of `DESIGN.md`. Each model is executable. A check
 | `noLostChangeWeak` | `noLostChange` for changes that no engine state loss touched. |
 | `appliedHeld` | A change in an app state is never only in that app state. |
 | `caughtUpState` | A caught-up device holds the relay changes and its own pending edits, and nothing else. |
-| `refusedNotStored` | No device can get a change that the relay refused for ever. |
+| `refusedNotStored` | No log holds a change that an app reverted after a refusal. |
+| `noStuckDevice` | A device that fetched to the relay head, with no hold, can pull or reset. |
 | `noFork` | Running devices never hold conflicting verified logs. |
 
 ### Results
 
 `check.sh` passes. The sampled checks found no violation of the invariants that must hold, in any config. Each mutant fails at least one invariant. Each witness is reached in at least one trace.
 
-The checks also confirm four known limits. Each one fails on purpose:
+The checks also confirm three known limits. Each one fails on purpose:
 
 1. A silent relay rollback, or an early hold release, can fork the log. The devices then stop with `fork` (T7 limit).
 2. An engine state loss and a second fault can lose a change. Each fault destroys one copy.
-3. A silent rollback, or an early hold release, can make the relay refuse a change for ever that another device still holds (finding F1).
-4. After an engine state loss, `enqueue_many` can refuse a change for ever that the relay already stores (finding F4).
+3. A silent rollback, or an early hold release, can let a repair session return a change that an app already reverted after a refusal (F1). Configs: `faultyRelay`, `earlyReleaseOnly`, `silentOnly`.
 
-### Findings for DESIGN.md
+### Findings fixed in DESIGN.md
 
-F1. Permanent refusal after a silent rollback. The relay stores change C. Then the operator lowers the size limit. A storage fault rolls the relay back, so the relay no longer knows C. The author sends C again, and the relay refuses it for ever. The author reverts C. Another device holds C in its verified log and repairs the log, so the other devices apply C. The devices diverge without notice. A restore hold prevents this case, if the release comes after every device reports. A release before that allows it. Trace: `quint run specs/delivery.qnt --main faultyRelay --invariant refusedNotStored`.
-
-F2. Applied position after the end of the log. An engine state loss and a relay restore leave the app applied position after the end of a fully fetched log. No rule applies: `changes_after` has no change to return, and `ResetRequired` needs a different digest at the applied position. The app state holds a lost change until the log grows. Witness: `wAheadOfLog`.
-
-F3. Restore hold after an engine state loss. A device with a new engine state file reports a verified tip of 0. The user page then shows that device as reported. Its app DB can hold changes that only the lost engine file and the old relay held. If the user releases the hold, those changes are lost. The user page does not mark this case. This is the two-fault case of limit 2.
-
-F4. `enqueue_many` refuses a stored change after an engine state loss. The relay stores change C, and then the operator lowers the size limit. The engine state file of the author is lost. The app calls `enqueue_many` for its outbox row C again. The new engine does not know C, so it puts C in the `refused` list. The app then reverts or splits C, but the other devices apply C. The cause is the review D rule that `enqueue_many` checks the size limit locally. The relay checks the known `change_id` first, but the engine does not ask the relay. Trace: `quint run specs/delivery.qnt --main engineLoss --invariant refusedNotStored`.
+| ID | Fix | Check |
+| --- | --- | --- |
+| F1 | No design change. The restore hold already prevents it after a restore. The text of T7 now names the case. A silent rollback or an early release remains a limit. | `refusedNotStored`, configs `faultyRelay`, `earlyReleaseOnly`, `silentOnly` |
+| F2 | `changes_after` raises `ResetRequired` if the applied position is after the end of a log that the engine fetched to the relay head, with no hold. | `resetRequired`, `noStuckDevice`, mutant `noAheadReset` |
+| F3 | A device with a new engine state file reports it. The user page marks it "not repaired" and warns before a release. | `fresh`, `releaseHold`, `releaseHoldWarned`, mutant `releaseIgnoresFresh` |
+| F4 | `enqueue_many` does not check the size limit. The relay checks the known `change_id` first. | `enqueue`, `refusedNotStored`, mutant `enqueueChecksSize` |
+| F5 | The Delivery row says "if no second fault occurs". | `noLostChange` limit 2 |
 
 ### Not covered
 
