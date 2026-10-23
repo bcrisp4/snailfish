@@ -9,7 +9,7 @@ Local-first apps keep data on each device, so the copies on a laptop and a phone
 ## Approach
 
 - Each device encrypts and signs its changes before upload. The relay stores only ciphertext and never holds a key.
-- A small Rust relay runs on a cheap VPS or a home server, with one SQLite file for each user.
+- A small Rust relay runs on a cheap VPS or a home server. It keeps one SQLite file for each app of each user, and `snailfish-relay backup` copies all of them.
 - Apps integrate through the Rust sync engine, with Swift and Python bindings.
 
 ## Name
