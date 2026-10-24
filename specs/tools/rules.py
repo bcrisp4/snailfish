@@ -7,7 +7,8 @@
 
 DESIGN.md tags each normative rule bullet with an ID at the end of the line,
 for example `[DLV-3]`. A model cites the rules that it encodes in a comment,
-for example `// [DLV-3]`. A rule that no model encodes is listed in
+for example `// [DLV-3]`. A ProVerif file (`*.pv`, `*.pvl`) cites rules in a
+`(* ... *)` comment. A rule that no model encodes is listed in
 specs/coverage.toml under `not_modelled`, with a reason.
 
 Subcommands:
@@ -92,6 +93,36 @@ def parse_rules(design: str) -> tuple[list[Rule], list[str]]:
     return rules, errors
 
 
+def _proverif_comment(line: str, in_block: bool) -> tuple[str, bool]:
+    """Return the comment text of one ProVerif line.
+
+    ProVerif comments nest as `(* ... *)`. A comment can span lines.
+
+    Args:
+        line: One source line.
+        in_block: True if the previous line ended inside a comment.
+
+    Returns:
+        The comment text of the line and the in_block state at the end of the line.
+    """
+    text: list[str] = []
+    depth = 1 if in_block else 0
+    i = 0
+    while i < len(line):
+        pair = line[i : i + 2]
+        if pair == "(*":
+            depth += 1
+            i += 2
+        elif pair == "*)" and depth > 0:
+            depth -= 1
+            i += 2
+        else:
+            if depth > 0:
+                text.append(line[i])
+            i += 1
+    return "".join(text), depth > 0
+
+
 def cited_ids(root: Path) -> dict[str, list[str]]:
     """Find the rule IDs that model and test files cite in comments.
 
@@ -102,12 +133,18 @@ def cited_ids(root: Path) -> dict[str, list[str]]:
         A map from ID to the "file:line" places that cite it.
     """
     found: dict[str, list[str]] = {}
-    files = sorted((root / "specs").glob("*/model.qnt")) + sorted((root / "specs").glob("*/test.qnt"))
-    for path in files:
+    specs = root / "specs"
+    files = sorted(specs.glob("*/model.qnt")) + sorted(specs.glob("*/test.qnt"))
+    proverif_files = sorted(specs.glob("*/*.pv")) + sorted(specs.glob("*/*.pvl"))
+    for path in files + proverif_files:
+        in_block = False
         for number, line in enumerate(path.read_text().splitlines(), start=1):
-            if "//" not in line:
+            if path.suffix in (".pv", ".pvl"):
+                comment, in_block = _proverif_comment(line, in_block)
+            elif "//" in line:
+                comment = line.split("//", 1)[1]
+            else:
                 continue
-            comment = line.split("//", 1)[1]
             for rule_id in CITE.findall(comment):
                 found.setdefault(rule_id, []).append(f"{path.relative_to(root)}:{number}")
     return found

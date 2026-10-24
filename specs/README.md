@@ -13,7 +13,8 @@ These Quint models check parts of `DESIGN.md`. Each model is executable. The fas
 | `<model>/_gen/` | Generated config modules and traces. Not committed. |
 | `tools/verify.py` | Runs the checks of each tier for each model. |
 | `tools/trace.py` | Finds and prints a counterexample with only the changed fields. |
-| `tools/rules.py` | Checks the rule IDs of `DESIGN.md` against the model citations and `coverage.toml`. Finds rule changes with no change in `specs/`. |
+| `tools/proverif.py` | Runs the ProVerif files of `enrollment/` and compares each query with `enrollment/expect.toml`. |
+| `tools/rules.py` | Checks the rule IDs of `DESIGN.md` against the model citations (`.qnt`, `.pv` and `.pvl` files) and `coverage.toml`. Finds rule changes with no change in `specs/`. |
 | `coverage.toml` | The rules that no model encodes yet, each with a reason. |
 
 ## Rule IDs
@@ -30,6 +31,7 @@ Each normative rule in `DESIGN.md` ends with an ID tag, for example `[DLV-3]`. A
 | --- | --- |
 | [delivery](delivery/README.md) | Outbox, enqueue, push, pull, app DB restore, engine state loss, relay rollback, repair, restore hold. |
 | [spacelog](spacelog/README.md) | Genesis, grants, removal with key rotation, the base rule, a malicious relay (fork, forge, reorder). |
+| [enrollment](enrollment/README.md) | ProVerif (symbolic, Dolev-Yao): numeric comparison, commit before reveal, signed confirmation, grant and checkpoint, app key sealing. Run with `make verify-crypto`. |
 
 ## Run the checks
 

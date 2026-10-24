@@ -1,0 +1,2 @@
+(* Variant vCpUnsigned. Run: proverif -lib lib.pvl cp_unsigned.pv *)
+process System(vCpUnsigned)

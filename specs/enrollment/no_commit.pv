@@ -1,0 +1,2 @@
+(* Variant vNoCommit. Run: proverif -lib lib.pvl no_commit.pv *)
+process System(vNoCommit)

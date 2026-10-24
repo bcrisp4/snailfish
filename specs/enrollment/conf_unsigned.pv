@@ -1,0 +1,2 @@
+(* Variant vConfUnsigned. Run: proverif -lib lib.pvl conf_unsigned.pv *)
+process System(vConfUnsigned)

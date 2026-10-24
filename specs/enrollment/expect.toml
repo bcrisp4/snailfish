@@ -1,0 +1,75 @@
+# Expected ProVerif results. One table for each .pv file in this directory.
+# Each key is a stable substring of one query as ProVerif prints it in a RESULT line.
+# Values: "true" (query holds), "false" (attack found), "reachable" (a `not event(X)`
+# query that ProVerif reports as false, so the event can happen).
+# specs/tools/proverif.py checks that each RESULT line matches exactly one key.
+
+["enrollment.pv"]
+"==> inj-event(NConfirms" = "true"
+"==> inj-event(TAppends" = "true"
+"==> event(TSignsCp" = "true"
+"not attacker(appk" = "true"
+"not event(TAppends" = "reachable"
+"not event(NConfirms" = "reachable"
+"not event(NAccepts" = "reachable"
+"not event(UserConfirms" = "reachable"
+
+["no_commit.pv"]
+"==> inj-event(NConfirms" = "false"
+"==> inj-event(TAppends" = "false"
+"==> event(TSignsCp" = "false"
+"not attacker(appk" = "false"
+"not event(TAppends" = "reachable"
+"not event(NConfirms" = "reachable"
+"not event(NAccepts" = "reachable"
+"not event(UserConfirms" = "reachable"
+
+["no_key_binding.pv"]
+"==> inj-event(NConfirms" = "false"
+"==> inj-event(TAppends" = "false"
+"==> event(TSignsCp" = "false"
+"not attacker(appk" = "false"
+"not event(TAppends" = "reachable"
+"not event(NConfirms" = "reachable"
+"not event(NAccepts" = "reachable"
+"not event(UserConfirms" = "reachable"
+
+["cp_unsigned.pv"]
+"==> inj-event(NConfirms" = "true"
+"==> inj-event(TAppends" = "true"
+"==> event(TSignsCp" = "false"
+"not attacker(appk" = "true"
+"not event(TAppends" = "reachable"
+"not event(NConfirms" = "reachable"
+"not event(NAccepts" = "reachable"
+"not event(UserConfirms" = "reachable"
+
+["conf_unsigned.pv"]
+"==> inj-event(NConfirms" = "false"
+"==> inj-event(TAppends" = "false"
+"==> event(TSignsCp" = "true"
+"not attacker(appk" = "true"
+"not event(TAppends" = "reachable"
+"not event(NConfirms" = "reachable"
+"not event(NAccepts" = "reachable"
+"not event(UserConfirms" = "reachable"
+
+["conf_no_meta.pv"]
+"==> inj-event(NConfirms" = "false"
+"==> inj-event(TAppends" = "true"
+"==> event(TSignsCp" = "true"
+"not attacker(appk" = "true"
+"not event(TAppends" = "reachable"
+"not event(NConfirms" = "reachable"
+"not event(NAccepts" = "reachable"
+"not event(UserConfirms" = "reachable"
+
+["user_blind.pv"]
+"==> inj-event(NConfirms" = "false"
+"==> inj-event(TAppends" = "false"
+"==> event(TSignsCp" = "false"
+"not attacker(appk" = "false"
+"not event(TAppends" = "reachable"
+"not event(NConfirms" = "reachable"
+"not event(NAccepts" = "reachable"
+"not event(UserConfirms" = "reachable"

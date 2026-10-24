@@ -12,7 +12,7 @@ FUZZ_SECONDS ?= 300
 
 .PHONY: check verify-fast verify verify-deep verify-tools verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-deny \
-        rust-nightly-check
+        rust-nightly-check verify-crypto
 
 ## The gate for each commit: Rust lint and tests, then the fast Quint tier.
 check: rust verify-fast
@@ -25,7 +25,7 @@ verify-fast:
 	$(VERIFY) fast
 
 ## Every config, known limit, mutant and witness. About 6 minutes.
-verify: verify-tools
+verify: verify-tools verify-crypto
 	$(RULES) check
 	$(VERIFY) full
 
@@ -98,3 +98,9 @@ rust-mutants:
 ## Licences, advisories and sources of every dependency.
 rust-deny:
 	$(CARGO) deny check
+
+## ---------------------------------------------------------------- ProVerif
+
+## ProVerif models of enrollment. Needs `opam install proverif`. About 30 seconds.
+verify-crypto:
+	eval $$(opam env 2>/dev/null); mise exec -- uv run --script specs/tools/proverif.py

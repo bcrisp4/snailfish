@@ -76,3 +76,4 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | `make rust-fuzz` | Each fuzz target for `FUZZ_SECONDS` (default 300). |
 | `make rust-mutants` | cargo-mutants on the protocol crate. Fails on a missed mutant. |
 | `make rust-deny` | Licences, advisories and sources of every dependency. |
+| `make verify-crypto` | Run the ProVerif models of `specs/enrollment` and compare each query with `expect.toml`. Needs ProVerif 2.05 (`opam install proverif`). |

@@ -107,6 +107,26 @@ def test_tags_inside_code_fences_are_ignored(tmp_path: Path) -> None:
     assert rules.check(make_repo(tmp_path, design=design)) == []
 
 
+def test_proverif_comment_citation_counts(tmp_path: Path) -> None:
+    root = make_repo(tmp_path, model="// [DLV-1]\n")
+    (root / "specs" / "m" / "lib.pvl").write_text("(* Rules: [DLV-2] *)\nlet P = 0.\n")
+    assert rules.check(root) == []
+
+
+def test_proverif_multiline_comment_citation_counts(tmp_path: Path) -> None:
+    root = make_repo(tmp_path, model="// [DLV-1]\n")
+    (root / "specs" / "m" / "a.pv").write_text("(* Model.\n   Rules: [DLV-2]\n*)\nprocess 0\n")
+    assert rules.check(root) == []
+
+
+def test_proverif_citation_outside_a_comment_does_not_count(tmp_path: Path) -> None:
+    root = make_repo(tmp_path, model="// [DLV-1]\n")
+    (root / "specs" / "m" / "a.pv").write_text('free x: bitstring. (* open *)\nconst l: bitstring. (* [DLV-2] *) (* x *)\n')
+    assert rules.check(root) == []
+    (root / "specs" / "m" / "a.pv").write_text('free x: bitstring. (* open *) process 0 [DLV-2]\n')
+    assert any("[DLV-2]" in e and "not cited" in e for e in rules.check(root))
+
+
 def test_list_prints_text_without_tag(tmp_path: Path) -> None:
     parsed, errors = rules.parse_rules(DESIGN)
     assert errors == []
