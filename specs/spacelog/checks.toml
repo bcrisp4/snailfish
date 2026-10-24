@@ -1,0 +1,132 @@
+# Checks for the space log model. specs/tools/verify.py reads this file.
+# Each [config] binds every const of model.qnt. verify.py generates one module
+# file for each config and each mutant in specs/spacelog/_gen/.
+
+model = "model.qnt"
+module = "spacelog"
+tests = "test.qnt"
+test_module = "spacelogTest"
+
+# Invariants that hold in every config unless a config lists it under `skip`
+# or a [[limits]] entry names it.
+invariants = [
+  "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
+  "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
+  "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
+  "noStaleChangeStored",
+]
+
+witness_configs = ["honest", "recovery", "forkRelay", "forgeRelay", "reorderRelay", "thief"]
+witness_steps = 40
+
+fast_config = "honest"
+
+[deep]
+config = "honest"
+invariants = ["authorActive", "noKeyToRemoved", "baseRule", "activeSetDeterministic"]
+max_steps = 8
+
+[defaults]
+DEVS = "Set(1, 2)"
+BAD = "Set()"
+MAX_REC = "6"
+MAX_ATTACKS = "0"
+FAULTS = "Set()"
+BUG = '"none"'
+
+# ---------------------------------------------------------------- configs
+
+[configs.honest]
+
+[configs.recovery]
+FAULTS = 'Set("recovery")'
+
+[configs.forkRelay]
+MAX_ATTACKS = "3"
+FAULTS = 'Set("fork")'
+skip = ["noFork", "noStaleChangeStored"]
+why = "A fork can split honest devices on two valid branches (limit T7). A withheld epoch record can store a stale change (limit T8). Both are checked in the limit entries."
+
+[configs.forgeRelay]
+MAX_ATTACKS = "2"
+FAULTS = 'Set("forge")'
+
+[configs.reorderRelay]
+MAX_ATTACKS = "3"
+FAULTS = 'Set("reorder")'
+
+[configs.thief]
+DEVS = "Set(1, 2, 3)"
+BAD = "Set(3)"
+MAX_REC = "7"
+FAULTS = 'Set("recovery")'
+
+[configs.allFaults]
+DEVS = "Set(1, 2, 3)"
+BAD = "Set(3)"
+MAX_REC = "7"
+MAX_ATTACKS = "3"
+FAULTS = 'Set("fork", "reorder", "forge", "recovery")'
+skip = ["noFork", "noStaleChangeStored"]
+why = "Limits T7 and T8, checked in forkRelay."
+
+# ---------------------------------------------------------------- known limits
+
+[[limits]]
+config = "forkRelay"
+invariant = "noFork"
+why = "T7: a malicious relay serves two valid branches to two devices. Neither device sees a conflict until it compares logs."
+
+# ---------------------------------------------------------------- mutants
+
+[mutants.noBaseRule]
+base = "honest"
+caught_by = "baseRule"
+
+[mutants.relayNoBaseRule]
+base = "honest"
+caught_by = "relayLogValid"
+
+[mutants.relaySkipsCheck]
+base = "honest"
+caught_by = "relayLogValid"
+
+[mutants.verifierIgnoresRemovals]
+base = "honest"
+caught_by = "activeSetDeterministic"
+
+[mutants.epochSealsToAll]
+base = "honest"
+caught_by = "noKeyToRemoved"
+
+[mutants.trustsRelayVerdict]
+base = "forgeRelay"
+caught_by = "grantAuthorized"
+
+[mutants.noSigCheck]
+base = "forgeRelay"
+caught_by = "grantAuthorized"
+
+[mutants.baseUnchecked]
+base = "forkRelay"
+caught_by = "baseInOwnLog"
+
+[mutants.grantFromRemoved]
+base = "honest"
+caught_by = "authorActive"
+
+[mutants.regrantRemoved]
+base = "honest"
+caught_by = "noKeyToRemoved"
+
+[mutants.epochUnchecked]
+base = "honest"
+caught_by = "logChangeEpoch"
+
+[mutants.staleWriteEpoch]
+base = "honest"
+caught_by = "writeEpochCurrent"
+
+[mutants.resignReusesKey]
+base = "honest"
+caught_by = "removedKeyIsolation"
