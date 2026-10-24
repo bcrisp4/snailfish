@@ -7,6 +7,7 @@ tag could hide a rule, and a citation of a deleted rule would pass.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -117,7 +118,17 @@ def test_list_prints_text_without_tag(tmp_path: Path) -> None:
 
 
 def git(root: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True)
+    """Run git in a throwaway fixture repo.
+
+    The fixture must not read the user's global or system git config. A
+    global `commit.gpgsign` would make each fixture commit call the user's
+    signing agent, so the tests would hang or fail on a developer machine.
+    """
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        check=True, capture_output=True, env=env,
+    )
 
 
 @pytest.fixture

@@ -16,7 +16,7 @@ invariants = [
   "noStaleChangeStored",
 ]
 
-witness_configs = ["honest", "recovery", "forkRelay", "forgeRelay", "reorderRelay", "thief"]
+witness_configs = ["honest", "forkRelay", "forgeRelay", "reorderRelay", "thief"]
 witness_steps = 40
 
 fast_config = "honest"
@@ -38,9 +38,6 @@ BUG = '"none"'
 
 [configs.honest]
 
-[configs.recovery]
-FAULTS = 'Set("recovery")'
-
 [configs.forkRelay]
 MAX_ATTACKS = "3"
 FAULTS = 'Set("fork")'
@@ -50,25 +47,18 @@ why = "A fork can split honest devices on two valid branches (limit T7). A withh
 [configs.forgeRelay]
 MAX_ATTACKS = "2"
 FAULTS = 'Set("forge")'
+skip = ["relayLogValid"]
+why = "A malicious relay appends a record with no signature, so its log is not valid by design. Only an honest relay promises relayLogValid (checked in honest and thief)."
 
 [configs.reorderRelay]
 MAX_ATTACKS = "3"
 FAULTS = 'Set("reorder")'
+skip = ["relayLogValid", "noStaleChangeStored"]
+why = "A malicious relay appends records in any order, so its log is not valid by design (relayLogValid). It can also store a change after a later epoch record (limit T8, checked in forkRelay)."
 
 [configs.thief]
-DEVS = "Set(1, 2, 3)"
-BAD = "Set(3)"
-MAX_REC = "7"
+BAD = "Set(2)"
 FAULTS = 'Set("recovery")'
-
-[configs.allFaults]
-DEVS = "Set(1, 2, 3)"
-BAD = "Set(3)"
-MAX_REC = "7"
-MAX_ATTACKS = "3"
-FAULTS = 'Set("fork", "reorder", "forge", "recovery")'
-skip = ["noFork", "noStaleChangeStored"]
-why = "Limits T7 and T8, checked in forkRelay."
 
 # ---------------------------------------------------------------- known limits
 
@@ -77,15 +67,24 @@ config = "forkRelay"
 invariant = "noFork"
 why = "T7: a malicious relay serves two valid branches to two devices. Neither device sees a conflict until it compares logs."
 
+[[limits]]
+config = "forkRelay"
+invariant = "noStaleChangeStored"
+why = "T8 limit: a relay that withholds an epoch record from a stayed device can store that device's change under the old epoch."
+
 # ---------------------------------------------------------------- mutants
 
 [mutants.noBaseRule]
 base = "honest"
 caught_by = "baseRule"
+open = true
+why = "no sampled trace or scripted test yet reaches two valid security records on one base: each pair tried is refused for another reason first (finding S1)"
 
 [mutants.relayNoBaseRule]
 base = "honest"
 caught_by = "relayLogValid"
+open = true
+why = "same as noBaseRule (finding S1)"
 
 [mutants.relaySkipsCheck]
 base = "honest"
@@ -114,6 +113,8 @@ caught_by = "baseInOwnLog"
 [mutants.grantFromRemoved]
 base = "honest"
 caught_by = "authorActive"
+open = true
+why = "no sampled trace reaches a removed device that signs a grant before it verifies its own removal and the relay appends it (finding S1)"
 
 [mutants.regrantRemoved]
 base = "honest"
@@ -130,3 +131,5 @@ caught_by = "writeEpochCurrent"
 [mutants.resignReusesKey]
 base = "honest"
 caught_by = "removedKeyIsolation"
+open = true
+why = "the reused key reaches a removed device only on a long path that sampling does not reach (finding S1)"

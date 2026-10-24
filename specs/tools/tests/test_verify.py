@@ -93,3 +93,19 @@ def test_limit_invariant_is_not_checked_as_must_hold() -> None:
     data = manifest(limits=[{"config": "faulty", "invariant": "other", "why": "limit"}])
     m = verify.validate(Path("x"), data, MODEL)
     assert verify.skipped(m, "faulty") == {"safe", "other"}
+
+
+def test_open_mutant_without_reason_is_refused() -> None:
+    data = manifest(mutants={"dropRow": {"base": "base", "caught_by": "safe", "open": True}})
+    with pytest.raises(verify.ManifestError, match="no `why`"):
+        verify.validate(Path("x"), data, MODEL)
+
+
+def test_open_mutant_check_expects_the_invariant_to_hold() -> None:
+    mutants = {"dropRow": {"base": "base", "caught_by": "safe", "open": True, "why": "gap"}}
+    data = manifest(mutants=mutants, tests="t.qnt", test_module="t")
+    m = verify.validate(Path("x"), data, MODEL)
+    checks = [c for c in verify.plan(m, "full", None) if "dropRow" in c.label]
+    assert len(checks) == 1
+    assert checks[0].expect_pass is True
+    assert checks[0].label.startswith("OPEN")

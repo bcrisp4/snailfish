@@ -158,6 +158,8 @@ def validate(path: Path, data: dict[str, Any], source: str) -> Manifest:
             errors.append(f"mutant {name!r} has unknown base {base!r}")
             continue
         caught = mut.get("caught_by")
+        if mut.get("open") and not mut.get("why"):
+            errors.append(f"open mutant {name!r} has no `why`")
         if caught == "tests":
             continue
         if caught not in invariants:
@@ -296,9 +298,16 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
     for name, mut in d.get("mutants", {}).items():
         if mut["caught_by"] == "tests":
             continue
+        # An open mutant is a known gap: no check catches it yet. Its check
+        # expects the invariant to hold. If the invariant starts to fail, the
+        # check fails, so the manifest must move the mutant out of `open`.
+        is_open = bool(mut.get("open"))
+        label = (
+            f"OPEN mutant {name} not caught by {mut['caught_by']} ({mut['why']})"
+            if is_open else f"mutant {name} caught by {mut['caught_by']}"
+        )
         checks.append(Check(
-            f"mutant {name} caught by {mut['caught_by']}",
-            run_argv(f"m_{name}", mut["caught_by"], samples, steps, seed), cwd, False,
+            label, run_argv(f"m_{name}", mut["caught_by"], samples, steps, seed), cwd, is_open,
         ))
     return checks
 

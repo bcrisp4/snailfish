@@ -135,6 +135,7 @@ module spacelog {
 
   pure def max2(a: int, b: int): int = if (a > b) a else b
 
+  // Rules: [LOG-5]
   pure def dig(l: List[LogRec]): int = l.foldl(0, (h, r) => h * 100 + r.id)
 
   pure def isSec(r: LogRec): bool = r.kind != Change
@@ -162,6 +163,7 @@ module spacelog {
   }
 
   // The space state after one entry.
+  // Rules: [LOG-8]
   pure def applyRec(sp: Space, r: LogRec, pos: int, bug: str): Space = match r.kind {
     | Genesis => { active: Set(r.subject), removed: Set(), epoch: 1, keys: Set(r.key), lastSec: pos }
     | Grant => { ...sp, active: sp.active.union(Set(r.subject)), lastSec: pos }
@@ -183,6 +185,7 @@ module spacelog {
     recs.foldl(emptyLog, (l, r) => appendRec(l, r, bug))
 
   // Who can sign a record, judged against the state before it.
+  // Rules: [LOG-2] [LOG-8]
   pure def authorOk(sp: Space, r: LogRec, bug: str): bool = match r.kind {
     | Genesis => r.author == RK
     | Grant => sp.active.contains(r.author) or r.author == RK
@@ -192,6 +195,7 @@ module spacelog {
   }
 
   // What each record must hold, judged against the state before it.
+  // Rules: [LOG-8]
   pure def stateOk(sp: Space, r: LogRec, bug: str): bool = match r.kind {
     | Genesis => true
     | Grant => not(sp.active.contains(r.subject))
@@ -204,6 +208,7 @@ module spacelog {
   }
 
   // The base is a position before the record, and its digest is in the log.
+  // Rules: [LOG-6]
   pure def baseOk(l: Log, r: LogRec, bug: str): bool = {
     val pos = l.recs.length() + 1
     r.bpos >= 1 and r.bpos < pos
@@ -211,6 +216,7 @@ module spacelog {
   }
 
   // The shared `protocol` crate: the relay and each device call this function.
+  // Rules: [LOG-1] [LOG-2] [LOG-7] [LOG-8] [LOG-9]
   // `l` holds the log before the record. The order of the checks fixes which
   // verdict a record gets. A device stops with fork on BadBase.
   pure def check(l: Log, r: LogRec, signed: Set[LogRec], bug: str): Verdict = {
@@ -401,6 +407,7 @@ module spacelog {
 
   // ---- the honest relay: one branch, the shared check
 
+  // Rules: [LOG-9]
   def relayVerdict(r: LogRec): Verdict = check(branches.get(0), r, env.signed, relayBug(BUG))
 
   def storedEnv(r: LogRec): Env = {
@@ -494,6 +501,7 @@ module spacelog {
 
   // ---- devices
 
+  // Rules: [LOG-9]
   // A device fetches the record after its tip. The relay chooses the branch.
   // A device verifies the record before it applies it. A record whose base is
   // not in the log, or a log that differs from the checkpoint, stops the device

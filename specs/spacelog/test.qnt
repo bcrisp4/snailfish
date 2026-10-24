@@ -111,4 +111,5 @@ module spacelogTest {
       .then(fetchOne(1, 1))
       .expect(dev(1).status == Forked and happened(EvForkDetected) and forkStops)
       .then(fetchOne(1, 0)).fail()
+
 }

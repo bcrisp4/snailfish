@@ -29,6 +29,7 @@ Each normative rule in `DESIGN.md` ends with an ID tag, for example `[DLV-3]`. A
 | Model | Scope |
 | --- | --- |
 | [delivery](delivery/README.md) | Outbox, enqueue, push, pull, app DB restore, engine state loss, relay rollback, repair, restore hold. |
+| [spacelog](spacelog/README.md) | Genesis, grants, removal with key rotation, the base rule, a malicious relay (fork, forge, reorder). |
 
 ## Run the checks
 
