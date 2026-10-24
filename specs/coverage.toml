@@ -62,7 +62,7 @@
 "WIR-4" = "wire format is checked by protocol crate tests, not by a Quint model"
 "WIR-5" = "wire format is checked by protocol crate tests, not by a Quint model"
 "WIR-7" = "wire format is checked by protocol crate tests, not by a Quint model"
-"WIR-8" = "wire format is checked by protocol crate tests, not by a Quint model"
+"WIR-8" = "an HTTP route of the relay, checked by relay tests (M2), not by a Quint model"
 "WIR-9" = "wire format is checked by protocol crate tests, not by a Quint model"
 "VER-1" = "versioning is not modelled"
 "VER-2" = "versioning is not modelled"

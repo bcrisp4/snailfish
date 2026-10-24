@@ -1,0 +1,16 @@
+# cargo-mutants config. Run `cargo mutants -p <crate>`.
+# A surviving mutant needs a new test, or an entry in exclude_re with a reason.
+test_tool = "nextest"
+timeout_multiplier = 3.0
+# Kani proofs and fuzz targets are not unit tests. Do not mutate them.
+exclude_globs = ["**/fuzz/**"]
+exclude_re = [
+  # The `proofs` modules are `cfg(kani)`. cargo-mutants still mutates them,
+  # and no unit test can run them, so each mutant there shows as MISSED.
+  # `make rust-kani` checks them instead.
+  "proofs::",
+]
+
+# A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`
+# changed to `n %= 10` in pae::write_decimal. cargo-mutants counts a timeout as
+# a detected mutant. Only MISSED fails `make rust-mutants`.

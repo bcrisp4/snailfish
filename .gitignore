@@ -3,3 +3,10 @@ specs/*/_gen/
 _apalache-out/
 __pycache__/
 .pytest_cache/
+mutants.out*/
+# Rust
+target/
+crates/*/fuzz/corpus/
+crates/*/fuzz/artifacts/
+crates/*/fuzz/target/
+crates/*/fuzz/coverage/

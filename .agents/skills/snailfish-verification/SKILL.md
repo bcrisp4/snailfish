@@ -49,6 +49,16 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | `Map.set(k, v)` on a missing key is undefined. | Use `put`, or pre-populate the map in `init`. |
 | Ghost state (`env`) that a fault destroys must not count as "held". | Keep ghost sets for "stored", "exposed" and "reverted", and define invariants on them. |
 
+## Rust verification pitfalls
+
+| Pitfall | Fix |
+| --- | --- |
+| Kani: "CBMC appears to have run out of memory" with no failed check. | It is not a counterexample. Use concrete lengths, `assert!` instead of `assert_eq!`, and no `to_string()`. A symbolic `&str` that goes through `from_utf8` is very expensive. |
+| `cargo mutants` exits 3 (timeout) even when some mutants are missed. | Read `mutants.out/missed.txt`. `make rust-mutants` does this. |
+| `cargo fuzz` needs nightly. | Use `+nightly-2026-08-21`, the nightly that Kani installs. `make rust-fuzz` does this. |
+| A fuzz target with no seeds finds little. | Put seed inputs in `crates/<crate>/fuzz/seeds/<target>/`. The PAE seeds raise coverage from 26 to 104 edges. |
+| clippy `arithmetic_side_effects` on `d - b'0'`. | Use `char::to_digit` or checked arithmetic. Do not allow the lint. |
+
 ## Tools
 
 | Command | Purpose |
@@ -61,3 +71,8 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | `make verify-drift` | Fail if a tagged `DESIGN.md` rule changed since `main` and no file in `specs/` changed. |
 | `specs/tools/rules.py list` | Print each rule ID with its first 80 characters. |
 | `specs/tools/rules.py check` | Fail on a duplicate, uncited or unknown rule ID. |
+| `make check` | The gate for each commit: Rust lint, tests and licences, then the fast Quint tier. |
+| `make rust-kani` | Kani proofs of the Rust crates (bounded). |
+| `make rust-fuzz` | Each fuzz target for `FUZZ_SECONDS` (default 300). |
+| `make rust-mutants` | cargo-mutants on the protocol crate. Fails on a missed mutant. |
+| `make rust-deny` | Licences, advisories and sources of every dependency. |

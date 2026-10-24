@@ -1,5 +1,23 @@
-# Tool versions for the verification toolchain. Run `mise install`.
+# Dev tool versions. Run `mise install` once in the repo root.
+# Rust itself is pinned in rust-toolchain.toml. rustup installs it.
+
 [tools]
-java = "temurin-21.0.12+8.0.LTS"   # Apalache (quint verify) needs a JVM
+# Quint models and Apalache (quint verify needs a JVM).
+java = "temurin-21.0.12+8.0.LTS"
 "npm:@informalsystems/quint" = "0.33.0"
 python = "3.13"
+uv = "0.10.0"
+
+# Rust verification tools (AGENTS.md "Verification").
+# cargo-binstall lets the cargo backend download prebuilt binaries.
+cargo-binstall = "1.26.0"
+"cargo:cargo-nextest" = "0.9.149"
+"cargo:cargo-fuzz" = "0.13.2"
+"cargo:cargo-mutants" = "27.1.0"
+"cargo:cargo-deny" = "0.20.2"
+"cargo:kani-verifier" = { version = "0.68.0", postinstall = "cargo kani setup" }
+taplo = "0.10.0"
+
+[settings]
+# The cargo backend downloads a prebuilt binary if one exists.
+cargo.binstall = true

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/protocol",
+  "crates/engine",
+  "crates/bindings",
+  "crates/relay",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+repository = "https://github.com/bcrisp4/snailfish"
+# DESIGN.md "Licensing": every crate uses MIT OR Apache-2.0.
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+snailfish-protocol = { path = "crates/protocol" }
+snailfish-engine = { path = "crates/engine" }
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+# Kani and cargo-fuzz set these cfgs.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(fuzzing)"] }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+module_name_repetitions = "allow"
+
+[profile.release]
+overflow-checks = true

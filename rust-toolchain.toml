@@ -1,0 +1,6 @@
+# The stable toolchain for the workspace. cargo-fuzz uses nightly through
+# `cargo +nightly fuzz`, and Kani installs its own pinned nightly under ~/.kani.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

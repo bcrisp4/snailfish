@@ -1,0 +1,24 @@
+[package]
+name = "snailfish-protocol-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+snailfish-protocol = { path = ".." }
+
+# cargo-fuzz builds this crate on its own, outside the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "pae_decode"
+path = "fuzz_targets/pae_decode.rs"
+test = false
+doc = false
+bench = false

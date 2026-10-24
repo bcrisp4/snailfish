@@ -1,0 +1,59 @@
+# Verification in CI. The tiers match the Makefile and AGENTS.md.
+# Unverified: this workflow has not run on GitHub yet.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # The gate for each commit: Rust lint, tests, licences and the fast Quint tier.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # rust-toolchain.toml pins the stable toolchain. Install it explicitly.
+      - run: rustup toolchain install --profile minimal
+      - uses: jdx/mise-action@v2
+      # cargo kani setup installs the nightly that fuzz and the fuzz lint need.
+      # A restored mise cache skips the postinstall hook, so run it here.
+      - run: mise exec -- cargo kani setup
+      - run: make check
+      # A pull request checkout has no local main branch.
+      - run: git fetch origin main:main || true
+      - run: make verify-drift
+
+  full:
+    # Every Quint config, limit, mutant and witness, and the Rust mutants.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install --profile minimal
+      - uses: jdx/mise-action@v2
+      - run: mise exec -- cargo kani setup
+      - run: make verify-fast verify-tools
+      - run: mise exec -- uv run --script specs/tools/verify.py full
+      - run: make rust-mutants
+
+  deep:
+    # Slow, bounded exhaustive checks. Nightly only.
+    # ProVerif (make verify-crypto) needs opam. It runs on developer machines only.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install --profile minimal
+      - uses: jdx/mise-action@v2
+      - run: mise exec -- cargo kani setup
+      - run: make verify-deep
+      - run: make rust-kani
+      - run: make rust-fuzz FUZZ_SECONDS=600
