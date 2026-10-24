@@ -1,0 +1,20 @@
+# Project words that clippy::doc_markdown must not treat as code.
+doc-valid-idents = [
+  "UniFFI",
+  "SQLite",
+  "DSSE",
+  "HPKE",
+  "PAE",
+  "Kani",
+  "Quint",
+  "..",
+  "X-Wing",
+  "Ed25519",
+  "ProVerif",
+]
+
+# Tests may unwrap and index: a panic there is a test failure, not a bug.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true

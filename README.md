@@ -1,6 +1,6 @@
 # Snailfish
 
-Snailfish is a self-hosted sync system for local-first apps. It keeps one person's devices in sync, and the server cannot read the data. The project is at the design stage, and no code exists yet.
+Snailfish is a self-hosted sync system for local-first apps. It keeps one person's devices in sync, and the server cannot read the data. The project is at milestone M1: the protocol crate and the verification toolchain.
 
 ## Problem
 
@@ -18,4 +18,15 @@ Snailfish live deeper than any other fish on record, more than 8,000 m down in o
 
 ## Status
 
-See [DESIGN.md](DESIGN.md) for the current draft design.
+See [DESIGN.md](DESIGN.md) for the design and [PROTOCOL.md](PROTOCOL.md) for the exact bytes.
+
+## Develop
+
+1. Install [mise](https://mise.jdx.dev) and [rustup](https://rustup.rs).
+2. Run `mise install` in the repo root. It installs every dev tool at its pinned version.
+3. Run `make check` before each commit.
+4. Read [AGENTS.md](AGENTS.md) for the full verification workflow.
+
+## Licence
+
+MIT OR Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).

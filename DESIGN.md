@@ -394,7 +394,7 @@ Rules:
 - The relay sees the envelope, the payload routing fields and opaque ciphertext only. [WIR-5]
 - A retry with the same `change_id` and the same record hash returns the original position. The same `change_id` with another record hash returns a conflict with the original position. [WIR-6]
 - Each response carries the relay time. The engine uses it to correct the `created` and `expires` values of request signatures. [WIR-7]
-- `GET /v1/info` returns the supported protocol levels, the size limits and the source link (see Licensing). [WIR-8]
+- `GET /v1/info` returns the supported protocol levels and the size limits. [WIR-8]
 - `PROTOCOL.md` (M1) gives the exact bytes of each record type, the log digest, the signature inputs, the HKDF labels and the recovery key encoding. It is the normative reference. In v1, the sync engine is the only supported client. [WIR-9]
 
 ### Versioning
@@ -793,14 +793,10 @@ The relay stores the minimum plaintext that routing, the device list, expiry and
 
 ## Licensing
 
-The project uses two licences:
+Every crate uses MIT OR Apache-2.0. A user can take the code under either licence (C67).
 
-- The `relay` crate uses AGPL-3.0. If a party modifies the relay and runs it as a network service, it must prominently offer every remote user the Corresponding Source of the version that runs (AGPL-3.0 section 13). This rule stops closed hosted forks of a privacy tool. Some companies avoid AGPL code, and the project accepts that cost.
-- The `protocol`, `engine` and `bindings` crates use MIT OR Apache-2.0. Apps embed the sync engine, and an AGPL engine puts AGPL terms on every app (goal 7).
-
-The relay can depend on the permissive crates. The permissive crates must never depend on the `relay` crate.
-
-The relay shows a source link on the user page and in `GET /v1/info`. The relay operator sets the link in configuration, and a modified relay must point it at its own source.
+- Apps embed the sync engine, so its licence must not put terms on the app (goal 7).
+- Apache-2.0 gives an explicit patent grant. MIT works with GPLv2-only projects.
 
 Integrator notes:
 
@@ -851,7 +847,7 @@ Keys and devices:
 Operations:
 
 - C10. Persistent connections for live updates? No. Polls suit intermittent phone use and keep no idle connection state.
-- C11. Licence? AGPL-3.0 for the relay, so a hosted fork of a privacy tool must offer its source to its users. MIT OR Apache-2.0 for `protocol`, `engine` and `bindings`, so apps can embed the sync engine under any licence.
+- C11. Licence? Superseded by C67. AGPL-3.0 for the relay, so a hosted fork of a privacy tool must offer its source to its users. MIT OR Apache-2.0 for `protocol`, `engine` and `bindings`, so apps can embed the sync engine under any licence.
 - C12. Alert delivery? Prometheus metrics with a shipped rules file for the relay operator, and a webhook for each user. Built-in SMTP adds credentials to the relay. A user page alone lets a stalled device or a full quota go unnoticed. One operator webhook does not reach users who are not the operator.
 
 Platform:
@@ -922,6 +918,10 @@ Review D, 2026-10-23:
 - C64. Does a server key sign tenant handles? No. A restore on a new host then loses the key, and each device needs a user action. A random handle in `directory.db` survives a restore.
 - C65. Can security records become stubs? No. A recovery device checks each grant and removal from the genesis record, which the recovery key signs, so the full chain stops a relay that hides a removal. A security snapshot needs a recovery key signature for each snapshot, or a recovery device that trusts the relay. One person writes about 150 KB of security records in 10 years, so a 16 MiB reserve and a rate limit of 10 security records for each device each day are enough. The reserve is an operator concern, so the user page shows no warning. Revisit if a space reaches 50% of its reserve.
 - C66. Can the log drop stubs before a snapshot? No, not in v1. A stub keeps the hash chain checkable from the genesis record, lets a device find old change IDs, and lets a device repair a rollback. At 50 changes a day, a space holds about 16 MB of stubs in 5 years, and a new device checks them in seconds. Stubs do not count against the space quota, and the relay operator sees them in metrics. A separate security chain with a signed anchor in each snapshot can replace stubs before the first public release. Revisit if the M8 first-sync figure fails the SLO, or if a space passes 1 million stubs.
+
+Licence, 2026-10-24:
+
+- C67. One licence for the whole project? Yes: MIT OR Apache-2.0 for every crate. It supersedes C11. A closed hosted fork of a relay for one to five users is an unlikely threat. The AGPL relay cost two licences, a licence-graph check, a source-link rule and some users who refuse AGPL code. The cost is that a party can run a modified relay as a closed service.
 
 ## Alternatives considered
 

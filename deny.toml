@@ -1,0 +1,38 @@
+# cargo-deny: licences, advisories, bans and sources. Run `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+# A RUSTSEC advisory on any dependency fails the check.
+yanked = "deny"
+
+[licenses]
+# DESIGN.md "Licensing": every crate is MIT OR Apache-2.0, so each dependency
+# must have a licence that is compatible with both.
+# UniFFI runtime code is MPL-2.0 (an integrator note in DESIGN.md).
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+]
+confidence-threshold = 0.9
+# The allow list covers licences that M1 dependencies will bring.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies inside this workspace are not wildcards from a registry.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

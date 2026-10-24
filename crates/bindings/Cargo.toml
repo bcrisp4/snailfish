@@ -1,0 +1,15 @@
+[package]
+name = "snailfish-bindings"
+description = "UniFFI Swift and Python bindings for the Snailfish sync engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+snailfish-engine.workspace = true
+
+[lints]
+workspace = true
