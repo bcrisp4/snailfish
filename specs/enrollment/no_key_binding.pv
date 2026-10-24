@@ -1,0 +1,2 @@
+(* Variant vNoKeyBinding. Run: proverif -lib lib.pvl no_key_binding.pv *)
+process System(vNoKeyBinding)

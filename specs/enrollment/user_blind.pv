@@ -1,0 +1,2 @@
+(* Variant vUserBlind. Run: proverif -lib lib.pvl user_blind.pv *)
+process System(vUserBlind)

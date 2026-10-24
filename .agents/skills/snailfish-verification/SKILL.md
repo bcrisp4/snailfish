@@ -61,3 +61,4 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | `make verify-drift` | Fail if a tagged `DESIGN.md` rule changed since `main` and no file in `specs/` changed. |
 | `specs/tools/rules.py list` | Print each rule ID with its first 80 characters. |
 | `specs/tools/rules.py check` | Fail on a duplicate, uncited or unknown rule ID. |
+| `make verify-crypto` | Run the ProVerif models of `specs/enrollment` and compare each query with `expect.toml`. Needs ProVerif 2.05 (`opam install proverif`). |

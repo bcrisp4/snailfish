@@ -1,0 +1,2 @@
+(* Variant vConfNoMeta. Run: proverif -lib lib.pvl conf_no_meta.pv *)
+process System(vConfNoMeta)

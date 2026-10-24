@@ -11,6 +11,7 @@ Quint models in `specs/` are the source of truth for protocol behaviour. Tests c
 | A protocol rule in `DESIGN.md` | Change the Quint model | `make verify` |
 | A rule in `DESIGN.md` | Keep its `[ID]` tag. Cite it in the model, or list it in `specs/coverage.toml` | `make verify-drift` |
 | A Quint model or `checks.toml` | Read `specs/<model>/README.md` | `make verify-fast` while you work, `make verify` before you commit |
+| Enrollment, removal or key sealing in `DESIGN.md` | Change `specs/enrollment/*.pv` and `expect.toml` | `make verify-crypto` |
 | A deep invariant (`[deep]` in `checks.toml`) | Run `make verify` | `make verify-deep` |
 | Rust code | Write `proptest` tests and Kani harnesses | `cargo test`, `cargo kani` |
 | A Rust parser or decoder | Add a `cargo-fuzz` target | `cargo fuzz run <target>` for at least 5 minutes |
