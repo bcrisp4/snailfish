@@ -44,4 +44,17 @@ Models, each with a `README.md` of its scope and limits:
 - If Kani runs out of memory, shrink the harness and record the bound in a comment. Do not delete it.
 - A surviving `cargo-mutants` mutant needs a test, or an entry in `.cargo/mutants.toml` with a reason.
 - Tests check behaviour. Do not write a test that copies the implementation.
+
+### Good and bad tests
+
+A test must fail when the code has a real bug. A green pipeline makes a reviewer trust the change, so a bad test is dangerous.
+
+- Good: test observable behaviour, real inputs, boundaries and failure modes.
+- Good: mock only true external boundaries (network, clock, disk). Prefer a few real-path tests over many shallow ones.
+- Good: test the same scenario as the model's `test.qnt` when you change engine or relay logic.
+- Bad: tautological tests. They pass by construction. The expected value copies the implementation, or the test only asserts mock wiring.
+- Bad: change-detector tests. They fail on a harmless refactor and catch no real bug.
+- Bad: reflexive regression tests. They exist only because you fixed a bug, and they restate the fix.
+
+Before you add a test, a lint check or an alert, complete the sentence "without this, production would ...". If the sentence does not end in a concrete failure, do not add it.
 - Report each result with its scope: "sampled", "bounded to N steps", "every reachable state of config X (TLC)", or "for unbounded sessions (ProVerif)". Never "proven".
