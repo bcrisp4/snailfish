@@ -119,3 +119,38 @@ func TestOpenRustAcceptsGoSealed(t *testing.T) {
 		t.Fatal("wrong epochs (wrong info) opened")
 	}
 }
+
+func TestLenientEnvelopeParse(t *testing.T) {
+	const sig = `"signatures":[{"sig":"AA"}]`
+	for _, extra := range []string{`"x":1.5e3`, `"x":-0`, `"x":9007199254740993`, `"x":1.0`, `"x":{"a":[1e-2,{"b":null}]}`} {
+		if _, err := parseLenient([]byte(`{` + sig + `,` + extra + `}`)); err != nil {
+			t.Errorf("lenient parser refused %s: %v", extra, err)
+		}
+		if _, err := parseStrict([]byte(`{` + sig + `,` + extra + `}`)); err == nil && !strings.Contains(extra, "{") {
+			t.Errorf("strict parser accepted %s", extra)
+		}
+	}
+	for _, bad := range []string{`{"a":1,"a":2}`, `{"x":{"a":1.5,"a":2}}`, `{"x":[{"k":1,"\u006b":2}]}`, `{"x":"\ud800"}`, `{"x":01}`, `{"x":1.}`, `{"x":1e}`, `{"x":.5}`, `{"x":-}`, `{"x":1e999}`, `{"x":-1e999}`} {
+		if _, err := parseLenient([]byte(bad)); err == nil {
+			t.Errorf("lenient parser accepted %s", bad)
+		}
+	}
+	if _, err := parseLenient([]byte("{\"x\":\"\xff\"}")); err == nil {
+		t.Error("lenient parser accepted invalid UTF-8")
+	}
+}
+
+func TestSignKeyCheck(t *testing.T) {
+	for name, k := range map[string][]byte{"non-canonical identity": nonCanonicalKey, "small-order identity": identityKey} {
+		if checkSignKey(k) == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	if hex.EncodeToString(nonCanonicalKey) != "0100000000000000000000000000000000000000000000000000000000000080" {
+		t.Errorf("unexpected non-canonical test value %x", nonCanonicalKey)
+	}
+	k := ed25519.NewKeyFromSeed(testSeed("k", "sign")).Public().(ed25519.PublicKey)
+	if err := checkSignKey(k); err != nil {
+		t.Errorf("valid key refused: %v", err)
+	}
+}

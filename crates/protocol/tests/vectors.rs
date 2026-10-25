@@ -62,7 +62,7 @@ fn parties(p: &Value) -> Parties {
         let sign_pk = sig::SecretKey::from_seed(&sign_seed).public();
         let seal_pk = seal_public(&seal_seed);
         assert_eq!(sign_pk.to_vec(), hex(&d["sign_pk"]), "device {}", d["name"]);
-        assert_eq!(seal_pk, hex(&d["seal_pk"]), "device {}", d["name"]);
+        assert_eq!(seal_pk.to_vec(), hex(&d["seal_pk"]), "device {}", d["name"]);
         let id = device_id(&sign_pk, &seal_pk);
         assert_eq!(encode_id("d_", &id), s(&d["id"]));
         out.sign_seed.insert(s(&d["name"]).to_owned(), sign_seed);
@@ -78,7 +78,7 @@ fn parties(p: &Value) -> Parties {
         let sign_pk = sig::SecretKey::from_seed(&sign_seed).public();
         let seal_pk = seal_public(&seal_seed);
         assert_eq!(sign_pk.to_vec(), hex(&r["sign_pk"]));
-        assert_eq!(seal_pk, hex(&r["seal_pk"]));
+        assert_eq!(seal_pk.to_vec(), hex(&r["seal_pk"]));
         let id = recovery_id(&sign_pk, &seal_pk);
         assert_eq!(encode_id("r_", &id), s(&r["id"]));
         out.sign_seed.insert(s(&r["name"]).to_owned(), sign_seed);
@@ -198,7 +198,7 @@ fn log_entries() {
         b"snailfish.recovery-proof.v1",
         &log_id,
         &recovery.sign,
-        &recovery.seal,
+        &recovery.seal[..],
     ]);
     assert_eq!(pk.verify_raw(&msg, proof), Ok(()));
 }
@@ -309,10 +309,15 @@ fn key_sets_from_rust_seal_for_go() {
             "plaintext": s(&k["plaintext"]),
         }));
     }
-    let dir = root().join("target/vectors");
-    std::fs::create_dir_all(&dir).unwrap();
+    // `make vectors-check` sets RUST_SEALED and gives the file to Go.
+    let Some(path) = std::env::var_os("RUST_SEALED").map(PathBuf::from) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap();
+    }
     let text = serde_json::to_string_pretty(&serde_json::json!({ "key_sets": out })).unwrap();
-    std::fs::write(dir.join("rust-sealed.json"), text).unwrap();
+    std::fs::write(path, text).unwrap();
 }
 
 #[test]

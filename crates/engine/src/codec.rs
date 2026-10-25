@@ -8,7 +8,7 @@ use snailfish_protocol::encoding::{self, Hash32, decode_id, encode_id};
 use snailfish_protocol::envelope;
 use snailfish_protocol::hash;
 use snailfish_protocol::keys;
-use snailfish_protocol::records::{self, Author, Body, Record, TypeClass};
+use snailfish_protocol::records::{self, Author, Body, Record};
 use snailfish_protocol::recovery;
 use snailfish_protocol::sig;
 
@@ -41,9 +41,7 @@ fn author_text(a: &Author) -> String {
 }
 
 fn author_id(text: &str) -> Result<Hash32, CodecError> {
-    decode_id::<32>(text, "d_")
-        .or_else(|_| decode_id::<32>(text, "r_"))
-        .map_err(err)
+    records::parse_author(text).map(|a| *a.id()).map_err(err)
 }
 
 fn log_id(text: &str) -> Result<[u8; 16], CodecError> {
@@ -76,6 +74,9 @@ pub struct PayloadInfo {
     pub change_id: Option<Vec<u8>>,
     /// True for a security record ([VER-5]).
     pub is_security: bool,
+    /// The key sets of a genesis, grant, epoch or recovery record, in
+    /// payload order. Empty for each other type.
+    pub key_sets: Vec<KeySetInfo>,
 }
 
 /// One key set of a security record.
@@ -90,17 +91,7 @@ pub struct KeySetInfo {
 }
 
 /// The class of a payload type (`PROTOCOL.md` 6.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PayloadClass {
-    /// A known log record type.
-    Record,
-    /// A known statement type.
-    Statement,
-    /// Skip the record and report `degraded`.
-    UnknownContent,
-    /// Stop with `stopped: update required`.
-    UpdateRequired,
-}
+pub use snailfish_protocol::records::TypeClass as PayloadClass;
 
 /// The frame of `PROTOCOL.md` 2.1.
 #[must_use]
@@ -125,18 +116,19 @@ pub fn sign_public_key(seed: &[u8]) -> Result<Vec<u8>, CodecError> {
 ///
 /// Refuses a seed that is not 32 bytes.
 pub fn seal_public_key(seed: &[u8]) -> Result<Vec<u8>, CodecError> {
-    Ok(keys::seal_public(&arr(seed, "seed")?))
+    Ok(keys::seal_public(&arr(seed, "seed")?).to_vec())
 }
 
 /// The device ID text of two public keys.
 ///
 /// # Errors
 ///
-/// Refuses a signing key that is not 32 bytes.
+/// Refuses a signing key that is not 32 bytes and a sealing key that is not
+/// 1,216 bytes. An ID of a key with the wrong size names no device.
 pub fn device_id(sign_pk: &[u8], seal_pk: &[u8]) -> Result<String, CodecError> {
     Ok(encode_id(
         "d_",
-        &keys::device_id(&arr(sign_pk, "sign_pk")?, seal_pk),
+        &keys::device_id(&arr(sign_pk, "sign_pk")?, &arr(seal_pk, "seal_pk")?),
     ))
 }
 
@@ -144,11 +136,12 @@ pub fn device_id(sign_pk: &[u8], seal_pk: &[u8]) -> Result<String, CodecError> {
 ///
 /// # Errors
 ///
-/// Refuses a signing key that is not 32 bytes.
+/// Refuses a signing key that is not 32 bytes and a sealing key that is not
+/// 1,216 bytes.
 pub fn recovery_id(sign_pk: &[u8], seal_pk: &[u8]) -> Result<String, CodecError> {
     Ok(encode_id(
         "r_",
-        &keys::recovery_id(&arr(sign_pk, "sign_pk")?, seal_pk),
+        &keys::recovery_id(&arr(sign_pk, "sign_pk")?, &arr(seal_pk, "seal_pk")?),
     ))
 }
 
@@ -172,12 +165,12 @@ pub fn parse_envelope(text: &[u8]) -> Result<Envelope, CodecError> {
 ///
 /// Refuses a signature that is not 64 bytes.
 pub fn envelope_to_json(env: &Envelope, keyid: &str) -> Result<String, CodecError> {
-    let e = envelope::Envelope {
-        payload_type: env.payload_type.clone(),
-        payload: env.payload.clone(),
-        sig: arr(&env.sig, "sig")?,
-    };
-    Ok(e.to_json(keyid))
+    Ok(envelope::write_json(
+        &env.payload_type,
+        &env.payload,
+        &arr(&env.sig, "sig")?,
+        keyid,
+    ))
 }
 
 /// The record hash ([LOG-3]).
@@ -250,46 +243,51 @@ pub fn verify_record(
     )
 }
 
-/// Sign `PAE(payload_type, payload)` with a 32-byte seed.
-///
-/// # Errors
-///
-/// Refuses a seed that is not 32 bytes.
-pub fn sign_record(seed: &[u8], payload_type: &str, payload: &[u8]) -> Result<Vec<u8>, CodecError> {
-    Ok(sig::SecretKey::from_seed(&arr(seed, "seed")?)
-        .sign_record(payload_type, payload)
-        .to_vec())
-}
-
 /// Classify a payload type.
 #[must_use]
 pub fn classify(payload_type: &str) -> PayloadClass {
-    match records::classify(payload_type) {
-        TypeClass::Record => PayloadClass::Record,
-        TypeClass::Statement => PayloadClass::Statement,
-        TypeClass::UnknownContent => PayloadClass::UnknownContent,
-        TypeClass::UpdateRequired => PayloadClass::UpdateRequired,
-    }
+    records::classify(payload_type)
 }
 
 fn parse(payload_type: &str, payload: &[u8]) -> Result<Record, CodecError> {
     records::parse_payload(payload_type, payload).map_err(err)
 }
 
-/// Parse a log record payload and return its routing fields.
+/// Parse a log record payload and return its routing fields and key sets,
+/// in one parse.
+///
+/// The result does not show that the record is valid in the log: the caller
+/// must also verify the signature ([WIR-2]) and the space state ([LOG-8]).
 ///
 /// # Errors
 ///
 /// Refuses a payload that breaks `PROTOCOL.md` section 3 or 6.
 pub fn check_payload(payload_type: &str, payload: &[u8]) -> Result<PayloadInfo, CodecError> {
     let r = parse(payload_type, payload)?;
+    let change_id = r.change_id().map(|c| c.to_vec());
+    let is_security = r.is_security();
+    let sets = match r.body {
+        Body::Genesis { keys, .. }
+        | Body::Grant { keys, .. }
+        | Body::Epoch { keys, .. }
+        | Body::Recovery { keys, .. } => keys,
+        _ => Vec::new(),
+    };
     Ok(PayloadInfo {
         log: encode_id("l_", &r.log),
         author: author_text(&r.author),
         base_position: r.base.position,
         base_digest: r.base.digest.to_vec(),
-        change_id: r.change_id().map(|c| c.to_vec()),
-        is_security: r.is_security(),
+        change_id,
+        is_security,
+        key_sets: sets
+            .into_iter()
+            .map(|k| KeySetInfo {
+                to: author_text(&k.to),
+                epochs: k.epochs,
+                sealed: k.sealed,
+            })
+            .collect(),
     })
 }
 
@@ -302,30 +300,6 @@ pub fn check_statement(payload_type: &str, payload: &[u8]) -> Result<(), CodecEr
     records::parse_statement(payload_type, payload)
         .map(|_| ())
         .map_err(err)
-}
-
-/// The key sets of a security record payload, in payload order.
-///
-/// # Errors
-///
-/// Refuses an invalid payload.
-pub fn key_sets(payload_type: &str, payload: &[u8]) -> Result<Vec<KeySetInfo>, CodecError> {
-    let r = parse(payload_type, payload)?;
-    let sets = match r.body {
-        Body::Genesis { keys, .. }
-        | Body::Grant { keys, .. }
-        | Body::Epoch { keys, .. }
-        | Body::Recovery { keys, .. } => keys,
-        _ => Vec::new(),
-    };
-    Ok(sets
-        .into_iter()
-        .map(|k| KeySetInfo {
-            to: author_text(&k.to),
-            epochs: k.epochs,
-            sealed: k.sealed,
-        })
-        .collect())
 }
 
 /// The key commitment of the app key of one epoch.

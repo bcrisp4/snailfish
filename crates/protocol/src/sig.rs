@@ -15,6 +15,9 @@ pub enum SigError {
     BadKey,
     /// The bytes are a non-canonical encoding of the decoded point.
     NonCanonicalKey,
+    /// The point has small order. `verify_strict` refuses each signature
+    /// with it, so a record must not introduce it.
+    WeakKey,
     /// `verify_strict` refuses the signature.
     BadSignature,
 }
@@ -24,6 +27,7 @@ impl std::fmt::Display for SigError {
         f.write_str(match self {
             Self::BadKey => "public key is not a curve point",
             Self::NonCanonicalKey => "public key encoding is not canonical",
+            Self::WeakKey => "public key has small order",
             Self::BadSignature => "signature does not verify",
         })
     }
@@ -36,15 +40,20 @@ impl PublicKey {
     ///
     /// `verify_strict` accepts non-canonical public key encodings, so this
     /// function refuses bytes that differ from the canonical encoding of
-    /// the decoded point (DESIGN.md "Cryptography").
+    /// the decoded point (DESIGN.md "Cryptography"). It also refuses a key of
+    /// small order (`PROTOCOL.md` 7.1).
     ///
     /// # Errors
     ///
-    /// [`SigError::BadKey`] or [`SigError::NonCanonicalKey`].
+    /// [`SigError::BadKey`], [`SigError::NonCanonicalKey`] or
+    /// [`SigError::WeakKey`].
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, SigError> {
         let key = VerifyingKey::from_bytes(bytes).map_err(|_| SigError::BadKey)?;
         if key.to_edwards().compress().as_bytes() != bytes {
             return Err(SigError::NonCanonicalKey);
+        }
+        if key.is_weak() {
+            return Err(SigError::WeakKey);
         }
         Ok(Self(key))
     }
@@ -110,9 +119,83 @@ impl SecretKey {
     }
 }
 
+// No Kani harness: every function here runs Ed25519 or SHA-256 arithmetic,
+// and CBMC cannot finish it. The property tests below and the C2SP CCTV
+// vectors cover them. The PAE bytes that feed the signature are proved in
+// `pae.rs`.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sig_errors_name_the_cause() {
+        assert_eq!(SigError::WeakKey.to_string(), "public key has small order");
+    }
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Each key from a seed passes the key check, and sign then verify
+        /// succeeds. A bit flip in the message, the signature or the payload
+        /// type is refused ([WIR-1]).
+        #[test]
+        fn sign_verify_round_trip_and_refusal(
+            seed in any::<[u8; 32]>(),
+            msg in proptest::collection::vec(any::<u8>(), 0..64),
+            sig_bit in 0usize..512,
+            msg_bit in any::<usize>(),
+        ) {
+            let sk = SecretKey::from_seed(&seed);
+            let pk = PublicKey::from_bytes(&sk.public()).unwrap();
+            prop_assert_eq!(pk.to_bytes(), sk.public());
+            let sig = sk.sign_raw(&msg);
+            prop_assert_eq!(pk.verify_raw(&msg, &sig), Ok(()));
+
+            let mut bad_sig = sig;
+            bad_sig[sig_bit / 8] ^= 1 << (sig_bit % 8);
+            prop_assert_eq!(pk.verify_raw(&msg, &bad_sig), Err(SigError::BadSignature));
+
+            if !msg.is_empty() {
+                let mut bad_msg = msg.clone();
+                crate::testutil::flip_bit(&mut bad_msg, msg_bit);
+                prop_assert_eq!(pk.verify_raw(&bad_msg, &sig), Err(SigError::BadSignature));
+            }
+
+            let rsig = sk.sign_record("snailfish.change.v1", &msg);
+            prop_assert_eq!(pk.verify_record("snailfish.change.v1", &msg, &rsig), Ok(()));
+            prop_assert_eq!(
+                pk.verify_record("snailfish.change.v2", &msg, &rsig),
+                Err(SigError::BadSignature)
+            );
+            // Another key must not verify the signature.
+            let mut other = seed;
+            other[0] ^= 1;
+            let pk2 = PublicKey::from_bytes(&SecretKey::from_seed(&other).public()).unwrap();
+            prop_assert_eq!(pk2.verify_raw(&msg, &sig), Err(SigError::BadSignature));
+        }
+
+        /// `from_bytes` never panics on any 32 bytes. It accepts a key only
+        /// if the key re-encodes to the same bytes (`PROTOCOL.md` 7.1).
+        #[test]
+        fn from_bytes_accepts_only_canonical_keys(bytes in any::<[u8; 32]>()) {
+            if let Ok(pk) = PublicKey::from_bytes(&bytes) {
+                prop_assert_eq!(pk.to_bytes(), bytes);
+            }
+        }
+
+        /// Setting the high bit of the last byte of a valid key gives a
+        /// different point or a refusal, and `from_bytes` returns a key only
+        /// when the bytes are canonical.
+        #[test]
+        fn sign_bit_flip_never_gives_the_same_key(seed in any::<[u8; 32]>()) {
+            let good = SecretKey::from_seed(&seed).public();
+            let mut flipped = good;
+            flipped[31] ^= 0x80;
+            if let Ok(pk) = PublicKey::from_bytes(&flipped) {
+                prop_assert_eq!(pk.to_bytes(), flipped);
+                prop_assert_ne!(flipped, good);
+            }
+        }
+    }
 
     /// A signature for one payload type must not verify for another
     /// ([WIR-1]).
@@ -135,12 +218,14 @@ mod tests {
     /// The identity point has the canonical form 01 00 .. 00 and the
     /// alternative form 01 00 .. 80 (x = -0).
     #[test]
-    fn refuses_non_canonical_key_encoding() {
+    fn refuses_non_canonical_and_small_order_keys() {
         let mut canonical = [0u8; 32];
         canonical[0] = 1;
-        assert!(PublicKey::from_bytes(&canonical).is_ok());
+        assert_eq!(PublicKey::from_bytes(&canonical), Err(SigError::WeakKey));
         let mut alt = canonical;
         alt[31] = 0x80;
         assert_eq!(PublicKey::from_bytes(&alt), Err(SigError::NonCanonicalKey));
+        let good = SecretKey::from_seed(&[3; 32]).public();
+        assert!(PublicKey::from_bytes(&good).is_ok());
     }
 }

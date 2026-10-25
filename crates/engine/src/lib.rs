@@ -78,8 +78,21 @@ impl From<std::io::Error> for EngineError {
 pub enum Status {
     /// Sync works.
     Ok,
+    /// `paused: relay unavailable`. The relay did not answer with a readable
+    /// `GET /v1/info`, for example an HTTP error or a body from a proxy. The
+    /// engine tries again at the next sync, and no user action is needed.
+    RelayUnavailable,
     /// The relay is older than this engine needs ([VER-11]).
     RelayTooOld,
+}
+
+/// One HTTP header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Header {
+    /// The header name.
+    pub name: String,
+    /// The header value.
+    pub value: String,
 }
 
 /// One HTTP request for the host app to send. The app must not follow
@@ -91,7 +104,7 @@ pub struct Request {
     /// The full URL.
     pub url: String,
     /// The headers, in order.
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<Header>,
     /// The body bytes.
     pub body: Vec<u8>,
 }
@@ -132,6 +145,9 @@ impl Engine {
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
         let db = Connection::open(data_dir.join(STATE_FILE))?;
+        // [VER-15]: refuse a file from a newer engine before the first write.
+        // The journal mode change below writes the file header.
+        refuse_newer(&db)?;
         // [DLV-1]: WAL with synchronous=FULL, and fullfsync on Apple
         // platforms, so that a commit survives a power loss.
         db.pragma_update(None, "journal_mode", "WAL")?;
@@ -174,11 +190,16 @@ impl Engine {
 
 /// Create or migrate the schema. Refuse a file from a newer engine before
 /// any write ([VER-15]).
-fn migrate(db: &Connection) -> Result<(), EngineError> {
+fn refuse_newer(db: &Connection) -> Result<i64, EngineError> {
     let found: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if found > SCHEMA_VERSION {
         return Err(EngineError::SchemaTooNew { found });
     }
+    Ok(found)
+}
+
+fn migrate(db: &Connection) -> Result<(), EngineError> {
+    let found = refuse_newer(db)?;
     if found < 1 {
         db.execute_batch(
             "BEGIN IMMEDIATE;
@@ -213,7 +234,10 @@ impl Sync {
                 Some(Request {
                     method: "GET".into(),
                     url: format!("{}/v1/info", engine.relay_url),
-                    headers: vec![("accept".into(), "application/json".into())],
+                    headers: vec![Header {
+                        name: "accept".into(),
+                        value: "application/json".into(),
+                    }],
                     body: Vec::new(),
                 })
             }
@@ -234,30 +258,35 @@ impl Sync {
         &mut self,
         engine: &mut Engine,
         status: u16,
-        _headers: &[(String, String)],
+        _headers: &[Header],
         body: &[u8],
     ) -> Result<(), EngineError> {
         if !matches!(self.step, Step::AwaitInfo) {
             return Err(EngineError::UnexpectedResponse);
         }
         self.step = Step::Done;
+        // Only a readable answer with a `levels` list can show that the relay
+        // is too old. Every other answer is a fault that can pass, so it must
+        // not stop sync.
         let levels = (status == 200)
             .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
             .flatten()
-            .and_then(|v| v.get("levels").cloned());
-        let supported = levels
-            .as_ref()
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|l| l.iter().any(|x| x.as_u64() == Some(MAX_LEVEL)));
-        if status == 200 && supported {
-            engine.db.execute(
-                "INSERT INTO relay_info (id, body) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET body = excluded.body",
-                [body],
-            )?;
-            engine.status = Status::Ok;
-        } else if status == 200 {
-            engine.status = Status::RelayTooOld;
-        }
+            .and_then(|v| {
+                v.get("levels")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+            });
+        engine.status = match levels {
+            None => Status::RelayUnavailable,
+            Some(l) if l.iter().any(|x| x.as_u64() == Some(MAX_LEVEL)) => {
+                engine.db.execute(
+                    "INSERT INTO relay_info (id, body) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET body = excluded.body",
+                    [body],
+                )?;
+                Status::Ok
+            }
+            Some(_) => Status::RelayTooOld,
+        };
         Ok(())
     }
 }
@@ -345,6 +374,58 @@ mod tests {
         s.handle_response(&mut e, 200, &[], br#"{"levels":[0]}"#)
             .unwrap();
         assert_eq!(e.status(), Status::RelayTooOld);
+    }
+
+    /// An HTTP error or a proxy page is a fault that passes. It must not
+    /// show `stopped: relay too old`, and it must replace an old status.
+    #[test]
+    fn unreadable_info_reports_relay_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), "https://r.example", "a").unwrap();
+        let mut s = e.start_sync();
+        s.next_request(&e);
+        s.handle_response(&mut e, 200, &[], br#"{"levels":[0]}"#)
+            .unwrap();
+        assert_eq!(e.status(), Status::RelayTooOld);
+        for (status, body) in [
+            (503, &br#"{"levels":[1]}"#[..]),
+            (200, b"<html>portal</html>"),
+            (200, br#"{"version":"x"}"#),
+            (200, br#"{"levels":"1"}"#),
+        ] {
+            let mut s = e.start_sync();
+            s.next_request(&e);
+            s.handle_response(&mut e, status, &[], body).unwrap();
+            assert_eq!(e.status(), Status::RelayUnavailable, "{status}");
+        }
+        let mut s = e.start_sync();
+        s.next_request(&e);
+        s.handle_response(&mut e, 200, &[], br#"{"levels":[1]}"#)
+            .unwrap();
+        assert_eq!(e.status(), Status::Ok);
+    }
+
+    /// [VER-15]: a file from a newer engine in rollback journal mode keeps
+    /// its journal mode, so the open writes nothing before it refuses.
+    #[test]
+    fn newer_schema_in_rollback_mode_is_not_switched_to_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Connection::open(dir.path().join(STATE_FILE)).unwrap();
+            db.execute_batch("CREATE TABLE t (x); PRAGMA user_version = 9;")
+                .unwrap();
+        }
+        let before = std::fs::read(dir.path().join(STATE_FILE)).unwrap();
+        let err = Engine::open(dir.path(), "https://r.example", "a")
+            .err()
+            .unwrap();
+        assert_eq!(err, EngineError::SchemaTooNew { found: 9 });
+        assert_eq!(std::fs::read(dir.path().join(STATE_FILE)).unwrap(), before);
+        let db = Connection::open(dir.path().join(STATE_FILE)).unwrap();
+        let mode: String = db
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
     }
 
     #[test]

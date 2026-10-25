@@ -99,7 +99,7 @@ final class VectorTests: XCTestCase {
             XCTAssertEqual(toHex(eh), try str(e["entry_hash"]))
             digest = try digestNext(prev: digest, n: UInt64(position), entryHash: eh)
             XCTAssertEqual(toHex(digest), try str(e["digest"]), "entry \(position)")
-            for ks in try keySets(payloadType: env.payloadType, payload: env.payload) {
+            for ks in info.keySets {
                 let seed = try XCTUnwrap(sealSeeds[ks.to])
                 let keys = try openKeySet(sealSeed: seed, logId: logId, to: ks.to, epochs: ks.epochs, sealed: ks.sealed)
                 for (epoch, key) in zip(ks.epochs, keys) {
@@ -185,5 +185,10 @@ final class VectorTests: XCTestCase {
         XCTAssertEqual(req.url, "https://r.example/v1/info")
         try sync.handleResponse(status: 200, headers: [], body: Data(#"{"levels":[0]}"#.utf8))
         XCTAssertEqual(try engine.status(), .relayTooOld)
+        let again = try engine.startSync()
+        _ = try again.nextRequest()
+        try again.handleResponse(status: 503, headers: [Header(name: "retry-after", value: "5")], body: Data())
+        XCTAssertEqual(try engine.status(), .relayUnavailable)
+        XCTAssertThrowsError(try deviceId(signPk: Data(count: 32), sealPk: Data(count: 1215)))
     }
 }

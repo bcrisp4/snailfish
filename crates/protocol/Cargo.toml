@@ -26,7 +26,14 @@ serde = "1"
 serde_json = "1"
 sha2 = "0.11"
 
+[features]
+# Deterministic encryption and sealing for the shared test vectors. A repeated
+# nonce or encapsulation breaks the crypto, so production builds leave it off.
+test-vectors = []
+
 [dev-dependencies]
+# The integration tests in tests/ need the test-vectors API.
+snailfish-protocol = { path = ".", features = ["test-vectors"] }
 hex = "0.4"
 hpke = { version = "0.14", default-features = false, features = [
   "alloc",

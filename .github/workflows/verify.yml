@@ -57,10 +57,15 @@ jobs:
       - run: rustup toolchain install --profile minimal
       - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
       - uses: jdx/mise-action@v2
-      # The runner image chooses the simulator models. Use the first available iPhone.
+      # The runner image chooses the simulator models. Use an iPhone on the
+      # newest iOS runtime, because Package.swift needs iOS 17 or later.
       - id: sim
         run: |
-          id=$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | startswith("iPhone"))][0].udid')
+          id=$(xcrun simctl list devices available -j | jq -r '
+            .devices | to_entries
+            | map(select(.key | test("SimRuntime\\.iOS-(1[7-9]|[2-9][0-9])-")))
+            | sort_by(.key | capture("iOS-(?<maj>[0-9]+)-(?<min>[0-9]+)") | [(.maj|tonumber), (.min|tonumber)])
+            | last | .value | map(select(.name | startswith("iPhone"))) | .[0].udid // empty')
           test -n "$id" && test "$id" != null
           echo "id=$id" >> "$GITHUB_OUTPUT"
       - run: make test-swift DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=${{ steps.sim.outputs.id }}"

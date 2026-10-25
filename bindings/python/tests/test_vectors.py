@@ -62,7 +62,7 @@ def test_log_chain_signatures_key_sets_and_ciphertexts(protocol: Any) -> None:
         assert eh.hex() == e["entry_hash"]
         digest = sf.digest_next(digest, e["position"], eh)
         assert digest.hex() == e["digest"]
-        for ks in sf.key_sets(env.payload_type, env.payload):
+        for ks in info.key_sets:
             keys = sf.open_key_set(
                 seal[ks.to], log["log_id"], ks.to, ks.epochs, ks.sealed
             )

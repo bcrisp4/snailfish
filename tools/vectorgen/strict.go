@@ -7,8 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"filippo.io/edwards25519"
 )
 
 // This file is an independent oracle for PROTOCOL.md sections 3 and 6. The
@@ -19,16 +22,28 @@ const maxInt = 1<<53 - 1
 type parser struct {
 	b []byte
 	i int
+	// lenient accepts any RFC 8259 number (PROTOCOL.md section 4). Duplicate
+	// key, UTF-8 and surrogate checks stay on.
+	lenient bool
 }
 
-func parseStrict(b []byte) (any, error) {
+// rawNumber is a number that the lenient parser accepted. It is not a string,
+// so a field read with .(string) refuses it.
+type rawNumber string
+
+func parseStrict(b []byte) (any, error) { return parseJSON(b, false) }
+
+// parseLenient is the envelope reader of PROTOCOL.md section 4.
+func parseLenient(b []byte) (any, error) { return parseJSON(b, true) }
+
+func parseJSON(b []byte, lenient bool) (any, error) {
 	if bytes.HasPrefix(b, []byte{0xef, 0xbb, 0xbf}) {
 		return nil, errors.New("rule 1: byte order mark")
 	}
 	if !utf8.Valid(b) {
 		return nil, errors.New("rule 1: invalid UTF-8")
 	}
-	p := &parser{b: b}
+	p := &parser{b: b, lenient: lenient}
 	p.ws()
 	v, err := p.value()
 	if err != nil {
@@ -233,7 +248,52 @@ func (p *parser) str() (string, error) {
 	return "", errors.New("unterminated string")
 }
 
+func (p *parser) lenientNumber() (any, error) {
+	start := p.i
+	digits := func() int {
+		n := 0
+		for p.i < len(p.b) && p.b[p.i] >= '0' && p.b[p.i] <= '9' {
+			p.i++
+			n++
+		}
+		return n
+	}
+	if p.b[p.i] == '-' {
+		p.i++
+	}
+	if p.i < len(p.b) && p.b[p.i] == '0' {
+		p.i++
+	} else if p.i >= len(p.b) || p.b[p.i] < '1' || p.b[p.i] > '9' {
+		return nil, errors.New("bad number")
+	} else {
+		digits()
+	}
+	if p.i < len(p.b) && p.b[p.i] == '.' {
+		p.i++
+		if digits() == 0 {
+			return nil, errors.New("bad number")
+		}
+	}
+	if p.i < len(p.b) && (p.b[p.i] == 'e' || p.b[p.i] == 'E') {
+		p.i++
+		if p.i < len(p.b) && (p.b[p.i] == '+' || p.b[p.i] == '-') {
+			p.i++
+		}
+		if digits() == 0 {
+			return nil, errors.New("bad number")
+		}
+	}
+	// PROTOCOL.md section 4: refuse a number outside the binary64 range.
+	if _, err := strconv.ParseFloat(string(p.b[start:p.i]), 64); err != nil {
+		return nil, errors.New("number outside the binary64 range")
+	}
+	return rawNumber(p.b[start:p.i]), nil
+}
+
 func (p *parser) number() (any, error) {
+	if p.lenient {
+		return p.lenientNumber()
+	}
 	start := p.i
 	neg := false
 	if p.b[p.i] == '-' {
@@ -395,6 +455,36 @@ func (r *reader) sub(k string, names ...string) *reader {
 	return x
 }
 
+// checkSignKey applies PROTOCOL.md 6.1 and 7.1: a sign key must be a canonical
+// Ed25519 public key that is not of small order.
+func checkSignKey(b []byte) error {
+	if len(b) != 32 {
+		return fmt.Errorf("sign key has %d bytes", len(b))
+	}
+	p, err := new(edwards25519.Point).SetBytes(b)
+	if err != nil {
+		return fmt.Errorf("sign key is not a curve point: %w", err)
+	}
+	if !bytes.Equal(p.Bytes(), b) {
+		return errors.New("sign key is not canonical")
+	}
+	if new(edwards25519.Point).MultByCofactor(p).Equal(edwards25519.NewIdentityPoint()) == 1 {
+		return errors.New("sign key has small order")
+	}
+	return nil
+}
+
+// signKey reads a 32-byte sign key field and applies checkSignKey.
+func (r *reader) signKey(k string) []byte {
+	b := r.bin(k, 32, 0)
+	if r.err == nil {
+		if err := checkSignKey(b); err != nil {
+			r.fail("rule 6.2: %q: %v", k, err)
+		}
+	}
+	return b
+}
+
 type position struct {
 	n int64
 	d []byte
@@ -434,6 +524,7 @@ func idsOf(r *reader, k string) [][]byte {
 
 type keySetInfo struct {
 	to     []byte
+	toRec  bool
 	epochs []int64
 }
 
@@ -443,7 +534,9 @@ func keySets(r *reader, k string) []keySetInfo {
 		x := newReader(v, "to", "epochs", "sealed")
 		var ks keySetInfo
 		if x.err == nil {
-			_, ks.to = x.id("to", "d_|r_", 32)
+			var toText string
+			toText, ks.to = x.id("to", "d_|r_", 32)
+			ks.toRec = strings.HasPrefix(toText, "r_")
 			for _, e := range x.list("epochs") {
 				n, ok := e.(int64)
 				if !ok || n < 1 {
@@ -477,7 +570,7 @@ func keySets(r *reader, k string) []keySetInfo {
 func deviceObj(r *reader, k string) []byte {
 	x := r.sub(k, "id", "sign", "seal", "name", "level")
 	_, id := x.id("id", "d_", 32)
-	sign := x.bin("sign", 32, 0)
+	sign := x.signKey("sign")
 	seal := x.bin("seal", 1216, 0)
 	if n := len(x.str("name")); n < 1 || n > 128 {
 		x.fail("rule 6.2: name length %d", n)
@@ -494,7 +587,7 @@ func deviceObj(r *reader, k string) []byte {
 
 func keysObj(r *reader, k string) (sign, seal, rid []byte) {
 	x := r.sub(k, "sign", "seal")
-	sign, seal = x.bin("sign", 32, 0), x.bin("seal", 1216, 0)
+	sign, seal = x.signKey("sign"), x.bin("seal", 1216, 0)
 	if x.err != nil {
 		r.fail("%q: %v", k, x.err)
 		return
@@ -606,21 +699,43 @@ func validatePayload(ptype string, raw []byte) error {
 		}
 	case "snailfish.epoch.v1":
 		e := r.num("epoch", 2, maxInt)
-		idsOf(r, "removed")
+		removed := idsOf(r, "removed")
 		stay := idsOf(r, "stay")
+		for _, x := range removed {
+			for _, y := range stay {
+				if bytes.Equal(x, y) {
+					r.fail("rule 6.2: device in both removed and stay")
+				}
+			}
+		}
 		if r.err == nil && len(stay) == 0 {
 			r.fail("rule 6.2: stay is empty")
 		}
 		r.bin("commitment", 32, 0)
 		ks := keySets(r, "keys")
 		if r.err == nil {
-			if len(ks) != len(stay)+1 {
-				r.fail("rule 6.2: key set count")
-			}
+			recs := 0
 			for _, k := range ks {
 				if !eqEpochs(k, e) {
 					r.fail("rule 6.2: key set epochs must be [epoch]")
 				}
+				if k.toRec {
+					recs++
+					continue
+				}
+				in := false
+				for _, y := range stay {
+					in = in || bytes.Equal(k.to, y)
+				}
+				if !in {
+					r.fail("rule 6.2: key set to a device that is not in stay")
+				}
+			}
+			if recs != 1 {
+				r.fail("rule 6.2: epoch needs exactly one key set to a recovery id, got %d", recs)
+			}
+			if len(ks) != len(stay)+1 {
+				r.fail("rule 6.2: key set count")
 			}
 		}
 	case "snailfish.recovery.v1":

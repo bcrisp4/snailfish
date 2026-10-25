@@ -1,12 +1,14 @@
-//! The shared test vectors through `snailfish_engine::codec`, the API that
-//! the bindings forward to (DESIGN.md M1). The Python and Swift tests run the
-//! same checks through their bindings.
+//! The shared test vectors through the exported functions of the binding
+//! crate (DESIGN.md M1). Each export forwards to `snailfish_engine::codec`, so
+//! these tests cover both layers. The Python and Swift tests run the same
+//! checks across the FFI.
 #![cfg(test)]
 
 use std::path::PathBuf;
 
 use serde_json::Value;
-use snailfish_engine::codec::{self, Envelope, PayloadClass};
+use snailfish as codec;
+use snailfish::{Envelope, PayloadClass};
 
 fn load(name: &str) -> Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -30,6 +32,12 @@ fn log_chain_signatures_and_key_sets() {
     let mut seal = std::collections::BTreeMap::new();
     for d in p["devices"].as_array().unwrap() {
         let pk = codec::sign_public_key(&hex(&d["sign_seed"])).unwrap();
+        // A seal key of the wrong size names no device. The error text
+        // reaches the app, so it must name the field.
+        let err = codec::device_id(&pk, &[0; 1215]).unwrap_err();
+        assert_eq!(err.to_string(), "seal_pk must be 1216 bytes");
+        let engine_err = snailfish_engine::codec::device_id(&pk, &[0; 1215]).unwrap_err();
+        assert_eq!(engine_err.to_string(), "seal_pk must be 1216 bytes");
         let spk = codec::seal_public_key(&hex(&d["seal_seed"])).unwrap();
         assert_eq!(codec::device_id(&pk, &spk).unwrap(), s(&d["id"]));
         seeds.insert(s(&d["name"]).to_owned(), pk);
@@ -55,11 +63,20 @@ fn log_chain_signatures_and_key_sets() {
             &env.payload,
             &env.sig
         ));
+        // [WIR-1]: the signature of another record does not verify.
+        let mut bad_sig = env.sig.clone();
+        bad_sig[0] ^= 1;
+        assert!(!codec::verify_record(
+            &seeds[s(&e["signer"])],
+            &env.payload_type,
+            &env.payload,
+            &bad_sig
+        ));
         let info = codec::check_payload(&env.payload_type, &env.payload).unwrap();
         assert_eq!(info.log, s(&log["log_id"]));
         let rh = codec::record_hash(&env.payload_type, &env.payload, &env.sig).unwrap();
         assert_eq!(rh, hex(&e["record_hash"]));
-        let eh = codec::entry_hash(&env.payload_type, info.change_id.as_deref(), &rh).unwrap();
+        let eh = codec::entry_hash(&env.payload_type, &info.change_id, &rh).unwrap();
         assert_eq!(eh, hex(&e["entry_hash"]));
         digest = codec::digest_next(&digest, e["position"].as_u64().unwrap(), &eh).unwrap();
         assert_eq!(digest, hex(&e["digest"]));
@@ -67,7 +84,7 @@ fn log_chain_signatures_and_key_sets() {
             codec::envelope_to_json(&env, &info.author).unwrap(),
             s(&e["envelope"])
         );
-        for ks in codec::key_sets(&env.payload_type, &env.payload).unwrap() {
+        for ks in &info.key_sets {
             let keys = codec::open_key_set(
                 &seal[&ks.to],
                 s(&log["log_id"]),
@@ -76,6 +93,7 @@ fn log_chain_signatures_and_key_sets() {
                 &ks.sealed,
             )
             .unwrap();
+            assert_eq!(keys.len(), ks.epochs.len());
             for (epoch, key) in ks.epochs.iter().zip(keys) {
                 assert_eq!(key, hex(&log["app_keys"][epoch.to_string()]));
                 let c = codec::key_commitment(s(&log["log_id"]), *epoch, &key).unwrap();
@@ -171,4 +189,63 @@ fn cctv_ed25519() {
         let ok = codec::ed25519_verify(&hex(&t["key"]), s(&t["msg"]).as_bytes(), &hex(&t["sig"]));
         assert_eq!(ok, expected, "vector {}", t["number"]);
     }
+}
+
+#[test]
+fn frames_statements_and_recovery_display() {
+    let p = load("protocol.json");
+    for f in p["frames"].as_array().unwrap() {
+        let parts: Vec<Vec<u8>> = f["parts"].as_array().unwrap().iter().map(hex).collect();
+        assert_eq!(codec::frame(&parts), hex(&f["frame"]));
+    }
+    for st in p["statements"].as_array().unwrap() {
+        let env = codec::parse_envelope(s(&st["envelope"]).as_bytes()).unwrap();
+        codec::check_statement(&env.payload_type, &env.payload).unwrap();
+        assert!(codec::check_statement(&env.payload_type, b"{}").is_err());
+    }
+    for r in p["recovery"].as_array().unwrap() {
+        assert_eq!(
+            codec::recovery_display(&hex(&r["secret"])).unwrap(),
+            s(&r["display"])
+        );
+    }
+}
+
+/// The engine object through the binding: the directory lock, change IDs and
+/// the `GET /v1/info` exchange.
+#[test]
+fn engine_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let engine =
+        std::sync::Arc::new(snailfish::Engine::open(path, "https://r.example/", "a").unwrap());
+    let locked = snailfish::Engine::open(path, "https://r.example", "a")
+        .err()
+        .unwrap();
+    assert!(matches!(locked, snailfish::SnailfishError::Locked));
+    assert_eq!(
+        locked.to_string(),
+        "another engine uses this data directory"
+    );
+    let a = engine.new_change_id().unwrap();
+    assert_eq!(a.len(), 16);
+    assert_ne!(a, engine.new_change_id().unwrap());
+    let sync = engine.clone().start_sync().unwrap();
+    let req = sync.next_request().unwrap().unwrap();
+    assert_eq!(
+        (req.method.as_str(), req.url.as_str()),
+        ("GET", "https://r.example/v1/info")
+    );
+    assert_eq!(req.headers[0].name, "accept");
+    assert!(sync.next_request().unwrap().is_none());
+    sync.handle_response(200, &[], br#"{"levels":[0]}"#)
+        .unwrap();
+    assert_eq!(engine.status().unwrap(), snailfish::Status::RelayTooOld);
+    let sync = engine.clone().start_sync().unwrap();
+    sync.next_request().unwrap();
+    sync.handle_response(503, &[], b"").unwrap();
+    assert_eq!(
+        engine.status().unwrap(),
+        snailfish::Status::RelayUnavailable
+    );
 }

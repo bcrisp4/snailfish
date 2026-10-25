@@ -1,6 +1,11 @@
 # cargo-mutants config. Run `cargo mutants -p <crate>`.
 # A surviving mutant needs a new test, or an entry in exclude_re with a reason.
 test_tool = "nextest"
+# A package with no tests makes nextest exit 4 ("no tests to run"), and
+# cargo-mutants counts that as a caught mutant. A mutant in crates/bindings
+# must fail a real test, so every mutant runs the tests of the whole
+# workspace, also crates/bindings/tests.
+test_workspace = true
 timeout_multiplier = 3.0
 # Kani proofs and fuzz targets are not unit tests. Do not mutate them.
 exclude_globs = ["**/fuzz/**"]
@@ -9,6 +14,15 @@ exclude_re = [
   # and no unit test can run them, so each mutant there shows as MISSED.
   # `make rust-kani` checks them instead.
   "proofs::",
+  # Equivalent mutants: the two operands have no set bit in common (a high
+  # nibble shifted left by 4 and a low nibble, or a value shifted left by 5
+  # or 8 and the next symbol or byte), so `|` and `^` give the same result.
+  "replace \\| with \\^ in decode_id",
+  "replace \\| with \\^ in display",
+  "replace \\| with \\^ in parse",
+  # serde calls `expecting` only for a value type that the visitor does not
+  # handle. The visitor handles every JSON type, so serde_json never calls it.
+  "Visitor<'de> for Visit>::expecting",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`

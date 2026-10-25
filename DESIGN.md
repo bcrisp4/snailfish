@@ -187,7 +187,7 @@ Sync status. The engine reports one of these values, and the app shows it to the
 
 - `ok`.
 - `degraded`, with the cause: a skipped change, a rejected envelope, a snapshot over the size limit or a snapshot that this engine cannot read.
-- `paused`, with the cause: `quota`, `blocked`, `restore hold` or `relay authority`. The engine tries again by itself. A block or a restore hold ends on the user page. `relay authority` means that the signed authority differs from the relay configuration, and a fix of that configuration starts sync again.
+- `paused`, with the cause: `quota`, `blocked`, `restore hold`, `relay authority` or `relay unavailable`. The engine tries again by itself. A block or a restore hold ends on the user page. `relay authority` means that the signed authority differs from the relay configuration, and a fix of that configuration starts sync again. `relay unavailable` means that the relay gave an HTTP error or an answer that the engine cannot read, for example a page from a proxy. Only a readable answer from the relay can give `relay too old`.
 - `stopped`, with the cause: `fork`, `missing records`, `update required`, `relay too old`, `clock skew`, `removed` or `deleted`. Sync needs a user action.
 
 - The engine keeps its state in its own SQLite file in `data_dir`: the outbox of encrypted envelopes and the verified log.

@@ -114,7 +114,8 @@ Rules:
 - `payloadType` is the payload type string. `payload` is the base64 of the exact payload bytes. `signatures` is a list with exactly one entry ([LOG-2]).
 - `sig` is the base64 of a 64-byte Ed25519 signature over `PAE(payloadType, payload bytes)` ([WIR-1]).
 - `keyid` is optional and can hold any string. A verifier ignores it and uses the `author` field of the payload ([LOG-2]). A writer sets it to the author ID.
-- The envelope is unsigned. A reader accepts the standard and the URL-safe base64 alphabets, with or without padding, as DSSE allows. It ignores unknown envelope fields ([VER-13]). It refuses a duplicate key.
+- The envelope is unsigned. A reader accepts the standard and the URL-safe base64 alphabets, with or without padding, as DSSE allows. It refuses a duplicate key at any depth.
+- A reader ignores each unknown envelope field and each unknown field of the `signatures` entry, with any JSON value ([VER-13]). The integer rule of section 3 does not apply to the envelope, so a number such as `1.5e3` in an unknown field is valid. A reader refuses a number outside the IEEE 754 binary64 range, for example `1e999`, because common JSON libraries refuse it.
 - A writer emits the three fields in the order above, with standard base64 with padding and no whitespace.
 - The record hash covers the decoded bytes, so a change of the envelope layout does not change it ([WIR-3]).
 
@@ -156,8 +157,9 @@ Shared objects:
 
 - In a device object, `id` must equal the device ID of `sign` and `seal`.
 - In a key set, `epochs` is not empty and strictly increases.
-- A list of key sets is sorted by the bytes of `to`, with no duplicate.
-- A list of device IDs is sorted by its bytes, with no duplicate.
+- A list of key sets is sorted by the 32 decoded ID bytes of `to`, with no duplicate. The `d_` or `r_` prefix does not take part in the order.
+- A list of device IDs is sorted by its 32 decoded ID bytes, with no duplicate.
+- Each `sign` key is a canonical Ed25519 public key that is not of small order (section 7.1). A parser refuses a record with another `sign` value.
 - The base of a genesis record is position 0 with `digest(0)`. The base of each other record has a position from 1 ([LOG-6]).
 
 ### 6.2 Record types
@@ -177,7 +179,8 @@ The fields of each type follow the common fields, in this order.
 | `snailfish.accept.v1` | device ID | `snapshot` (snapshot reference), `applied` (position) |
 
 - In a genesis record, `author` must equal the recovery ID of `recovery`. A verifier can therefore find the author key in the record itself ([WIR-2]).
-- `proof` is an Ed25519 signature by the new recovery signing key over `frame("snailfish.recovery-proof.v1", log_id, new_sign_pk, new_seal_pk)`.
+- `proof` is an Ed25519 signature by the new recovery signing key over `frame("snailfish.recovery-proof.v1", log_id, new_sign_pk, new_seal_pk)`. A parser refuses a recovery record whose proof does not verify, because the record holds every input of the check.
+- In an epoch record, no device ID is in both `removed` and `stay`. The record has exactly one key set to a recovery ID. A parser cannot know the current recovery ID, so the space state check confirms it ([LOG-8]).
 - `commitment` is `SHA-256(frame("snailfish.key-commitment.v1", log_id, u64be(epoch), key))` for the 32-byte app key of the epoch.
 - Level 1 is the set of the `v1` types of this file.
 
@@ -204,7 +207,7 @@ These statements use the same envelope and signature input. They have no `base` 
 ### 7.1 Ed25519
 
 - Each signature is Ed25519 (RFC 8032) with `verify_strict` of `ed25519-dalek`. It refuses small-order public keys, small-order R values and non-canonical R values.
-- A verifier also refuses a public key whose bytes differ from the canonical encoding of the decoded point.
+- A verifier also refuses a public key whose bytes differ from the canonical encoding of the decoded point, and a public key of small order.
 - A device signing key is 32 random bytes from the operating system CSPRNG.
 - `vectors/third_party/cctv-ed25519.json` holds the 914 C2SP CCTV vectors. A vector verifies only if its flags are a subset of `low_order_component_A` and `low_order_component_R`.
 

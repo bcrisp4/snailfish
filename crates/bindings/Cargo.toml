@@ -16,7 +16,12 @@ name = "snailfish"
 
 [dependencies]
 snailfish-engine.workspace = true
-uniffi = "=0.32.2"
+uniffi.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+hex = "0.4"
+serde_json = "1"
+tempfile = "3"

@@ -15,3 +15,15 @@ pub mod records;
 pub mod recovery;
 pub mod sig;
 pub mod strict;
+
+#[cfg(test)]
+mod testutil {
+    /// Flip bit `n` of `bytes`, with `n` taken modulo the bit length. Do
+    /// nothing for an empty slice.
+    pub fn flip_bit(bytes: &mut [u8], n: usize) {
+        let Some(n) = n.checked_rem(bytes.len().wrapping_mul(8)) else {
+            return;
+        };
+        bytes[n / 8] ^= 1 << (n % 8);
+    }
+}

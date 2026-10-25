@@ -13,9 +13,11 @@ name = "uniffi-bindgen"
 path = "src/main.rs"
 
 [dependencies]
-# The version must equal the uniffi version of snailfish-bindings, because the
-# generated code checks the scaffolding contract version.
-uniffi = { version = "=0.32.2", features = ["cli"] }
+uniffi = { workspace = true, features = ["cli"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

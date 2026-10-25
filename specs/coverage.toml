@@ -50,7 +50,7 @@
 "FRK-7" = "fork repair model not written yet"
 "FRK-8" = "fork repair model not written yet"
 "WIR-1" = "byte-level, not modelled. Rust: sig::tests, vectors.rs log_entries and cctv_ed25519"
-"WIR-2" = "partly byte-level. Rust: records::parse_payload has no state. The signature-before-state rule needs the M2/M3 verifier"
+"WIR-2" = "not enforced yet: no verifier exists in M1. records::parse_payload has no state, and codec::check_payload documents that a caller must verify the signature first. The M3 verifier must enforce the order"
 "WIR-3" = "byte-level, not modelled. Rust: vectors.rs envelopes, fuzz target envelope"
 "WIR-4" = "byte-level, not modelled. Rust: vectors.rs strict_json, strict::tests, Kani in_range_is_exact, fuzz target payload"
 "WIR-5" = "wire format is checked by protocol crate tests, not by a Quint model"

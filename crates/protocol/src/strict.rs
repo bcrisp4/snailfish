@@ -1,14 +1,16 @@
-//! Strict payload JSON (`PROTOCOL.md` section 3, [WIR-4]).
+//! Strict payload JSON (`PROTOCOL.md` section 3, [WIR-4]) and the envelope
+//! JSON reader (`PROTOCOL.md` section 4).
 //!
 //! `serde_json` does the tokenising. It refuses invalid UTF-8, a byte order
-//! mark, lone surrogates and trailing data. The visitor in this module adds
-//! the rules that `serde_json` does not apply: no duplicate key, and integers
-//! only, in the range from -(2^53 - 1) to 2^53 - 1.
+//! mark, lone surrogates, numbers outside the binary64 range and trailing
+//! data. The visitor in this module adds the rules that `serde_json` does not
+//! apply: no duplicate key, and, for payloads only, integers only in the range
+//! from -(2^53 - 1) to 2^53 - 1.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
 /// The largest integer that a payload can hold: 2^53 - 1.
 pub const MAX_INT: i64 = (1 << 53) - 1;
@@ -26,6 +28,9 @@ pub enum Value {
     Bool(bool),
     /// An integer from -(2^53 - 1) to 2^53 - 1.
     Int(i64),
+    /// Any other number. Only the envelope reader produces it, for an
+    /// unknown field ([VER-13]). A payload never holds it.
+    OtherNumber,
     /// A string.
     Str(String),
     /// An array.
@@ -53,7 +58,27 @@ impl std::error::Error for StrictError {}
 ///
 /// Refuses bytes that break rules 1, 3, 4, 5 or 8 of `PROTOCOL.md` section 3.
 pub fn parse(bytes: &[u8]) -> Result<Value, StrictError> {
-    serde_json::from_slice::<Value>(bytes).map_err(|e| StrictError(e.to_string()))
+    parse_with(bytes, Numbers::PayloadIntegers)
+}
+
+/// Parse the JSON of an envelope. It applies rules 1, 3, 5 and 8, but accepts
+/// any number in the binary64 range, because an unknown envelope field can
+/// hold any JSON value (`PROTOCOL.md` section 4).
+///
+/// # Errors
+///
+/// Refuses bad UTF-8, a duplicate key, a lone surrogate and trailing data.
+pub fn parse_envelope_json(bytes: &[u8]) -> Result<Value, StrictError> {
+    parse_with(bytes, Numbers::Any)
+}
+
+fn parse_with(bytes: &[u8], numbers: Numbers) -> Result<Value, StrictError> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let v = Visit(numbers)
+        .deserialize(&mut de)
+        .map_err(|e| StrictError(e.to_string()))?;
+    de.end().map_err(|e| StrictError(e.to_string()))?;
+    Ok(v)
 }
 
 /// Parse a payload. The top-level value must be an object (rule 2).
@@ -70,13 +95,26 @@ pub fn parse_object(bytes: &[u8]) -> Result<BTreeMap<String, Value>, StrictError
     }
 }
 
-impl<'de> Deserialize<'de> for Value {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(StrictVisitor)
-    }
+/// Which numbers the reader accepts.
+#[derive(Clone, Copy)]
+enum Numbers {
+    /// Integers in +-(2^53 - 1) only: payloads, rule 4.
+    PayloadIntegers,
+    /// Each number in the binary64 range: envelopes.
+    Any,
 }
 
-struct StrictVisitor;
+/// A seed that parses one value with one number rule, also for nested values.
+#[derive(Clone, Copy)]
+struct Visit(Numbers);
+
+impl<'de> DeserializeSeed<'de> for Visit {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
 
 /// The integer if it is in the payload range ([WIR-4]).
 fn in_range(n: i128) -> Option<i64> {
@@ -94,7 +132,7 @@ fn int_in_range<E: de::Error>(n: i128) -> Result<Value, E> {
         .ok_or_else(|| E::custom("rule 4: integer outside +-(2^53 - 1)"))
 }
 
-impl<'de> Visitor<'de> for StrictVisitor {
+impl<'de> Visitor<'de> for Visit {
     type Value = Value;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -110,17 +148,19 @@ impl<'de> Visitor<'de> for StrictVisitor {
     }
 
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
-        int_in_range(i128::from(v))
+        self.number(int_in_range(i128::from(v)))
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
-        int_in_range(i128::from(v))
+        self.number(int_in_range(i128::from(v)))
     }
 
     // serde_json gives f64 for each number with a fraction or an exponent,
     // for "-0", and for an integer that does not fit in 64 bits.
     fn visit_f64<E: de::Error>(self, _v: f64) -> Result<Value, E> {
-        Err(E::custom("rule 4: a number is not an integer in range"))
+        self.number(Err(E::custom(
+            "rule 4: a number is not an integer in range",
+        )))
     }
 
     fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
@@ -133,7 +173,7 @@ impl<'de> Visitor<'de> for StrictVisitor {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
         let mut out = Vec::new();
-        while let Some(v) = seq.next_element::<Value>()? {
+        while let Some(v) = seq.next_element_seed(self)? {
             out.push(v);
         }
         Ok(Value::Arr(out))
@@ -144,12 +184,24 @@ impl<'de> Visitor<'de> for StrictVisitor {
         // serde_json decodes the escapes of each key before this point, so
         // "a" and "\u0061" are the same key here.
         while let Some(key) = map.next_key::<String>()? {
-            let value = map.next_value::<Value>()?;
+            let value = map.next_value_seed(self)?;
             if out.insert(key, value).is_some() {
                 return Err(de::Error::custom("rule 3: duplicate key"));
             }
         }
         Ok(Value::Obj(out))
+    }
+}
+
+impl Visit {
+    /// Apply the number rule: a payload refuses each number outside the
+    /// integer range, and an envelope keeps it as [`Value::OtherNumber`].
+    fn number<E: de::Error>(self, payload: Result<Value, E>) -> Result<Value, E> {
+        match (self.0, payload) {
+            (_, Ok(v)) => Ok(v),
+            (Numbers::PayloadIntegers, Err(e)) => Err(e),
+            (Numbers::Any, Err(_)) => Ok(Value::OtherNumber),
+        }
     }
 }
 
@@ -259,6 +311,12 @@ fn err(what: &str, name: &str, rule: &str) -> StrictError {
 mod tests {
     use super::*;
 
+    /// The error text reaches the app log unchanged.
+    #[test]
+    fn error_shows_its_cause() {
+        assert_eq!(StrictError("x".into()).to_string(), "x");
+    }
+
     fn ok(s: &str) -> bool {
         parse(s.as_bytes()).is_ok()
     }
@@ -326,6 +384,29 @@ mod tests {
         }
     }
 
+    /// PROTOCOL.md section 4: an unknown envelope field can hold any number.
+    /// Without this, a relay that adds `"ts":1.5e3` stops every engine.
+    #[test]
+    fn envelope_json_accepts_any_number_and_refuses_duplicates() {
+        for ok in [
+            r#"{"x":1.5e3}"#,
+            r#"{"x":-0}"#,
+            r#"{"x":9007199254740993}"#,
+            r#"{"x":[{"y":1.0}]}"#,
+        ] {
+            assert!(parse_envelope_json(ok.as_bytes()).is_ok(), "{ok}");
+            assert!(parse(ok.as_bytes()).is_err(), "{ok}");
+        }
+        for bad in [
+            r#"{"x":1e999}"#,
+            r#"{"x":{"a":1.5,"a":2}}"#,
+            r#"{"x":"\ud800"}"#,
+            "{} x",
+        ] {
+            assert!(parse_envelope_json(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn fields_exact_refuses_missing_unknown_and_null() {
         let map = parse_object(br#"{"a":1,"b":null}"#).unwrap();
@@ -335,7 +416,15 @@ mod tests {
         assert!(Fields::exact(&map, "t", &["a", "c"]).is_err());
         let f = Fields::exact(&map, "t", &["a"]).unwrap();
         assert_eq!(f.int("a", 1, 1), Ok(1));
-        assert!(f.int("a", 2, 3).is_err());
+        // The error names the rule, so the app log shows why a record failed.
+        assert_eq!(
+            f.int("a", 2, 3).unwrap_err().0,
+            "t.a: rule 7: integer out of range"
+        );
+        assert_eq!(
+            f.str("a").unwrap_err().to_string(),
+            "t.a: rule 7: not a string"
+        );
         assert!(f.str("a").is_err());
     }
 }

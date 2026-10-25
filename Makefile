@@ -134,6 +134,9 @@ rust-deny:
 ## ---------------------------------------------------------------- Vectors and bindings
 
 GO := mise exec -- go
+# The key sets that Rust seals for Go to open. An absolute path, because the
+# Rust test and the Go command run in different directories.
+RUST_SEALED := $(CURDIR)/target/vectors/rust-sealed.json
 # The iOS simulator for `make test-swift`. Override with an ID from `xcrun simctl list devices`.
 IOS_SIM ?= platform=iOS Simulator,name=iPhone 18 Pro
 DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
@@ -147,8 +150,11 @@ vectors:
 vectors-check:
 	cd tools/vectorgen && $(GO) vet ./... && test -z "$$(gofmt -l .)" && $(GO) test ./...
 	$(GO) run -C tools/vectorgen . -check ../../vectors
-	$(CARGO) nextest run -p snailfish-protocol -E 'test(key_sets_from_rust_seal_for_go)'
-	$(GO) run -C tools/vectorgen . -open-rust ../../target/vectors/rust-sealed.json
+	@# Remove the old file first, so a test that does not run cannot leave a
+	@# stale file for Go to accept.
+	rm -f $(RUST_SEALED)
+	RUST_SEALED=$(RUST_SEALED) $(CARGO) nextest run -p snailfish-protocol -E 'test(key_sets_from_rust_seal_for_go)'
+	$(GO) run -C tools/vectorgen . -open-rust $(RUST_SEALED)
 
 bindings-python:
 	bindings/scripts/build.sh python

@@ -364,6 +364,9 @@ func buildProtocol(w *world, seal sealer) (*protocolJ, *logBuilder, error) {
 		return fmt.Sprintf(`[{"keyid":"%s","sig":"%s"}]`, keyid, sg)
 	}
 	kid := w.A.idText
+	env3 := func(extra, sigs string) string {
+		return fmt.Sprintf(`{"payloadType":%q,"payload":"%s","signatures":%s%s}`, ptype, std(pl), sigs, extra)
+	}
 	p.Envelopes = []envelopeJ{
 		{"canonical", e3.Envelope, true, rh},
 		{"url-safe-alphabet", mk(strings.NewReplacer("+", "-", "/", "_").Replace(std(pl)), one(kid, strings.NewReplacer("+", "-", "/", "_").Replace(std(sig)))), true, rh},
@@ -372,6 +375,14 @@ func buildProtocol(w *world, seal sealer) (*protocolJ, *logBuilder, error) {
 		{"other-keyid", mk(std(pl), one("other", std(sig))), true, rh},
 		{"no-keyid", mk(std(pl), fmt.Sprintf(`[{"sig":"%s"}]`, std(sig))), true, rh},
 		{"unknown-field", fmt.Sprintf(`{"payloadType":%q,"payload":"%s","signatures":%s,"x":1}`, ptype, std(pl), one(kid, std(sig))), true, rh},
+		{"unknown-field-float", env3(`,"x":1.5e3`, one(kid, std(sig))), true, rh},
+		{"unknown-field-negative-zero", env3(`,"x":-0`, one(kid, std(sig))), true, rh},
+		{"unknown-field-above-2^53", env3(`,"x":9007199254740993`, one(kid, std(sig))), true, rh},
+		{"unknown-field-in-signature-float", env3("", fmt.Sprintf(`[{"keyid":"%s","sig":"%s","x":1.0}]`, kid, std(sig))), true, rh},
+		{"unknown-field-nested", env3(`,"x":{"a":[1.5,-0,{"b":null}],"c":true}`, one(kid, std(sig))), true, rh},
+		{"duplicate-key-in-signature", env3("", fmt.Sprintf(`[{"keyid":"%s","sig":"%s","keyid":"%s"}]`, kid, std(sig), kid)), false, ""},
+		{"duplicate-key-in-unknown-object", env3(`,"x":{"a":1,"a":2}`, one(kid, std(sig))), false, ""},
+		{"unknown-field-outside-binary64", env3(`,"x":1e999`, one(kid, std(sig))), false, ""},
 		{"extra-whitespace", fmt.Sprintf("\n {\n \"payloadType\" : %q ,\n\t\"payload\" :\n \"%s\" ,\n \"signatures\" : [ {\n \"keyid\" : \"%s\" , \"sig\" : \"%s\" } ]\n }\n ", ptype, std(pl), kid, std(sig)), true, rh},
 		{"two-signatures", mk(std(pl), fmt.Sprintf(`[{"keyid":"%s","sig":"%s"},{"keyid":"%s","sig":"%s"}]`, kid, std(sig), w.B.idText, std(sig))), false, ""},
 		{"empty-signatures", mk(std(pl), "[]"), false, ""},

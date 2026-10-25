@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use snailfish_engine::codec;
+pub use snailfish_engine::codec::{Envelope, KeySetInfo, PayloadClass, PayloadInfo};
+pub use snailfish_engine::{Header, Request, Status};
 
 uniffi::setup_scaffolding!("snailfish");
 
@@ -59,95 +61,70 @@ impl From<snailfish_engine::EngineError> for SnailfishError {
 
 type Result<T> = std::result::Result<T, SnailfishError>;
 
-/// See [`codec::Envelope`].
-#[derive(Debug, Clone, uniffi::Record)]
+// The engine owns these types. `uniffi::remote` mirrors each definition for
+// the FFI only, and the compiler refuses a mirror that differs from the
+// engine type, so a new field or variant cannot be dropped here.
+
+/// One envelope after the reader of `PROTOCOL.md` section 4.
+#[uniffi::remote(Record)]
 pub struct Envelope {
-    /// The payload type.
     pub payload_type: String,
-    /// The exact payload bytes.
     pub payload: Vec<u8>,
-    /// The 64-byte signature.
     pub sig: Vec<u8>,
 }
 
-/// See [`codec::PayloadInfo`].
-#[derive(Debug, Clone, uniffi::Record)]
+/// The routing fields and key sets of a parsed log record payload.
+#[uniffi::remote(Record)]
 pub struct PayloadInfo {
-    /// The log ID text.
     pub log: String,
-    /// The author ID text.
     pub author: String,
-    /// The base position.
     pub base_position: u64,
-    /// The base digest.
     pub base_digest: Vec<u8>,
-    /// The change ID bytes of a change record.
     pub change_id: Option<Vec<u8>>,
-    /// True for a security record.
     pub is_security: bool,
+    pub key_sets: Vec<KeySetInfo>,
 }
 
-/// See [`codec::KeySetInfo`].
-#[derive(Debug, Clone, uniffi::Record)]
+/// One key set of a security record.
+#[uniffi::remote(Record)]
 pub struct KeySetInfo {
-    /// The recipient ID text.
     pub to: String,
-    /// The epochs.
     pub epochs: Vec<u64>,
-    /// `enc || ciphertext`.
     pub sealed: Vec<u8>,
 }
 
-/// See [`codec::PayloadClass`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+/// The class of a payload type (`PROTOCOL.md` 6.4).
+#[uniffi::remote(Enum)]
 pub enum PayloadClass {
-    /// A known log record type.
     Record,
-    /// A known statement type.
     Statement,
-    /// Skip the record and report `degraded`.
     UnknownContent,
-    /// Stop with `stopped: update required`.
     UpdateRequired,
 }
 
 /// The sync status (DESIGN.md "Sync status").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum SyncStatus {
-    /// Sync works.
+#[uniffi::remote(Enum)]
+pub enum Status {
     Ok,
-    /// `stopped: relay too old`.
+    RelayUnavailable,
     RelayTooOld,
 }
 
-/// One HTTP request for the host app to send.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct HttpRequest {
-    /// The HTTP method.
+/// One HTTP request for the host app to send. The app must not follow
+/// redirects.
+#[uniffi::remote(Record)]
+pub struct Request {
     pub method: String,
-    /// The full URL.
     pub url: String,
-    /// The headers, in order, as name and value pairs.
     pub headers: Vec<Header>,
-    /// The body bytes.
     pub body: Vec<u8>,
 }
 
 /// One HTTP header.
-#[derive(Debug, Clone, uniffi::Record)]
+#[uniffi::remote(Record)]
 pub struct Header {
-    /// The header name.
     pub name: String,
-    /// The header value.
     pub value: String,
-}
-
-fn envelope_in(e: &Envelope) -> codec::Envelope {
-    codec::Envelope {
-        payload_type: e.payload_type.clone(),
-        payload: e.payload.clone(),
-        sig: e.sig.clone(),
-    }
 }
 
 /// The frame of `PROTOCOL.md` 2.1.
@@ -204,12 +181,7 @@ pub fn recovery_id(sign_pk: &[u8], seal_pk: &[u8]) -> Result<String> {
 /// [`SnailfishError::Invalid`].
 #[uniffi::export]
 pub fn parse_envelope(text: &[u8]) -> Result<Envelope> {
-    let e = codec::parse_envelope(text)?;
-    Ok(Envelope {
-        payload_type: e.payload_type,
-        payload: e.payload,
-        sig: e.sig,
-    })
+    Ok(codec::parse_envelope(text)?)
 }
 
 /// The writer form of an envelope.
@@ -219,7 +191,7 @@ pub fn parse_envelope(text: &[u8]) -> Result<Envelope> {
 /// [`SnailfishError::Invalid`].
 #[uniffi::export]
 pub fn envelope_to_json(envelope: &Envelope, keyid: &str) -> Result<String> {
-    Ok(codec::envelope_to_json(&envelope_in(envelope), keyid)?)
+    Ok(codec::envelope_to_json(envelope, keyid)?)
 }
 
 /// The record hash.
@@ -293,30 +265,18 @@ pub fn verify_record(
 #[uniffi::export]
 #[must_use]
 pub fn classify(payload_type: &str) -> PayloadClass {
-    match codec::classify(payload_type) {
-        codec::PayloadClass::Record => PayloadClass::Record,
-        codec::PayloadClass::Statement => PayloadClass::Statement,
-        codec::PayloadClass::UnknownContent => PayloadClass::UnknownContent,
-        codec::PayloadClass::UpdateRequired => PayloadClass::UpdateRequired,
-    }
+    codec::classify(payload_type)
 }
 
-/// Parse a log record payload and return its routing fields.
+/// Parse a log record payload and return its routing fields and key sets.
+/// The result does not show that the record is valid in the log.
 ///
 /// # Errors
 ///
 /// [`SnailfishError::Invalid`].
 #[uniffi::export]
 pub fn check_payload(payload_type: &str, payload: &[u8]) -> Result<PayloadInfo> {
-    let i = codec::check_payload(payload_type, payload)?;
-    Ok(PayloadInfo {
-        log: i.log,
-        author: i.author,
-        base_position: i.base_position,
-        base_digest: i.base_digest,
-        change_id: i.change_id,
-        is_security: i.is_security,
-    })
+    Ok(codec::check_payload(payload_type, payload)?)
 }
 
 /// Parse a statement payload.
@@ -327,23 +287,6 @@ pub fn check_payload(payload_type: &str, payload: &[u8]) -> Result<PayloadInfo> 
 #[uniffi::export]
 pub fn check_statement(payload_type: &str, payload: &[u8]) -> Result<()> {
     Ok(codec::check_statement(payload_type, payload)?)
-}
-
-/// The key sets of a security record payload.
-///
-/// # Errors
-///
-/// [`SnailfishError::Invalid`].
-#[uniffi::export]
-pub fn key_sets(payload_type: &str, payload: &[u8]) -> Result<Vec<KeySetInfo>> {
-    Ok(codec::key_sets(payload_type, payload)?
-        .into_iter()
-        .map(|k| KeySetInfo {
-            to: k.to,
-            epochs: k.epochs,
-            sealed: k.sealed,
-        })
-        .collect())
 }
 
 /// The key commitment of the app key of one epoch.
@@ -465,11 +408,8 @@ impl Engine {
     /// # Errors
     ///
     /// [`SnailfishError::Engine`].
-    pub fn status(&self) -> Result<SyncStatus> {
-        Ok(match self.inner.lock().map_err(|_| poisoned())?.status() {
-            snailfish_engine::Status::Ok => SyncStatus::Ok,
-            snailfish_engine::Status::RelayTooOld => SyncStatus::RelayTooOld,
-        })
+    pub fn status(&self) -> Result<Status> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.status())
     }
 
     /// Start one exchange with the relay.
@@ -493,23 +433,13 @@ impl Sync {
     /// # Errors
     ///
     /// [`SnailfishError::Engine`].
-    pub fn next_request(&self) -> Result<Option<HttpRequest>> {
+    pub fn next_request(&self) -> Result<Option<Request>> {
         let engine = self.engine.inner.lock().map_err(|_| poisoned())?;
-        let req = self
+        Ok(self
             .inner
             .lock()
             .map_err(|_| poisoned())?
-            .next_request(&engine);
-        Ok(req.map(|r| HttpRequest {
-            method: r.method,
-            url: r.url,
-            headers: r
-                .headers
-                .into_iter()
-                .map(|(name, value)| Header { name, value })
-                .collect(),
-            body: r.body,
-        }))
+            .next_request(&engine))
     }
 
     /// Read the response to the last request.
@@ -517,16 +447,11 @@ impl Sync {
     /// # Errors
     ///
     /// [`SnailfishError::Engine`].
-    pub fn handle_response(&self, status: u16, headers: Vec<Header>, body: &[u8]) -> Result<()> {
+    pub fn handle_response(&self, status: u16, headers: &[Header], body: &[u8]) -> Result<()> {
+        // Lock order: the engine, then the exchange. `next_request` uses the
+        // same order, so two threads cannot deadlock.
         let mut engine = self.engine.inner.lock().map_err(|_| poisoned())?;
-        let headers: Vec<(String, String)> =
-            headers.into_iter().map(|h| (h.name, h.value)).collect();
-        self.inner.lock().map_err(|_| poisoned())?.handle_response(
-            &mut engine,
-            status,
-            &headers,
-            body,
-        )?;
-        Ok(())
+        let mut sync = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(sync.handle_response(&mut engine, status, headers, body)?)
     }
 }

@@ -23,8 +23,8 @@ pub struct Position {
 pub struct Keys {
     /// The Ed25519 public key.
     pub sign: [u8; 32],
-    /// The X-Wing public key.
-    pub seal: Vec<u8>,
+    /// The X-Wing public key. Boxed, so that [`Body`] stays small.
+    pub seal: Box<[u8; SEAL_PK_LEN]>,
 }
 
 /// A device in a genesis or grant record.
@@ -268,26 +268,21 @@ pub fn parse_payload(payload_type: &str, payload: &[u8]) -> Result<Record, Parse
     names.extend_from_slice(extra);
     let f = Fields::exact(&map, "payload", &names)?;
     let log = log_id(&f, "log")?;
-    let author = author(f.str("author")?)?;
+    let author = parse_author(f.str("author")?)?;
     let base = position(f.get("base")?, "base")?;
     let body = match payload_type {
         "snailfish.genesis.v1" => genesis(&f, &author, &log, &base)?,
         "snailfish.grant.v1" => grant(&f)?,
-
         "snailfish.epoch.v1" => epoch_record(&f)?,
+        "snailfish.recovery.v1" => recovery_record(&f, &author, &log)?,
 
-        "snailfish.recovery.v1" => recovery_record(&f, &author)?,
-
-        "snailfish.device.v1" => {
+        "snailfish.device.v1" | "snailfish.level.v1" => {
             require_device(&author)?;
-            Body::Device {
-                level: f.int("level", 1, 65535)?,
-            }
-        }
-        "snailfish.level.v1" => {
-            require_device(&author)?;
-            Body::Level {
-                level: f.int("level", 1, 65535)?,
+            let level = f.int("level", 1, 65535)?;
+            if payload_type == "snailfish.device.v1" {
+                Body::Device { level }
+            } else {
+                Body::Level { level }
             }
         }
         "snailfish.change.v1" => {
@@ -307,8 +302,7 @@ pub fn parse_payload(payload_type: &str, payload: &[u8]) -> Result<Record, Parse
                 ciphertext: ciphertext(&f)?,
             }
         }
-        // The match above leaves only the accept type.
-        _ => {
+        "snailfish.accept.v1" => {
             require_device(&author)?;
             let s = Fields::object(f.get("snapshot")?, "snapshot", &["position", "hash"])?;
             Body::Accept {
@@ -317,6 +311,7 @@ pub fn parse_payload(payload_type: &str, payload: &[u8]) -> Result<Record, Parse
                 applied: position(f.get("applied")?, "applied")?,
             }
         }
+        _ => return Err(bad(format!("unknown record type `{payload_type}`"))),
     };
     let is_genesis = matches!(body, Body::Genesis { .. });
     if !is_genesis && base.position == 0 {
@@ -342,7 +337,7 @@ pub fn parse_statement(payload_type: &str, payload: &[u8]) -> Result<Statement, 
     match payload_type {
         "snailfish.checkpoint.v1" => {
             let f = Fields::exact(&map, "checkpoint", &["log", "author", "position", "digest"])?;
-            let Author::Device(author) = author(f.str("author")?)? else {
+            let Author::Device(author) = parse_author(f.str("author")?)? else {
                 return Err(bad("checkpoint: rule 6.3: the author must be a device ID"));
             };
             Ok(Statement::Checkpoint {
@@ -358,7 +353,7 @@ pub fn parse_statement(payload_type: &str, payload: &[u8]) -> Result<Statement, 
             let f = Fields::exact(&map, "delete", &["log", "author", "head", "expires"])?;
             Ok(Statement::Delete {
                 log: log_id(&f, "log")?,
-                author: author(f.str("author")?)?,
+                author: parse_author(f.str("author")?)?,
                 head: position(f.get("head")?, "head")?,
                 expires: f.int("expires", 0, MAX_INT)?,
             })
@@ -384,6 +379,11 @@ fn epoch_record(f: &Fields<'_>) -> Result<Body, ParseError> {
     let stay = device_ids(f, "stay")?;
     if stay.is_empty() {
         return Err(bad("epoch: rule 6.2: stay is empty"));
+    }
+    // A device in both lists would get the key of the epoch that removes it.
+    // `stay` is sorted, so a binary search is valid.
+    if removed.iter().any(|d| stay.binary_search(d).is_ok()) {
+        return Err(bad("epoch: rule 6.2: a device is in both removed and stay"));
     }
     let commitment = bin32(f, "commitment")?;
     let keys = key_sets(f, "keys")?;
@@ -411,13 +411,24 @@ fn epoch_record(f: &Fields<'_>) -> Result<Body, ParseError> {
     })
 }
 
-fn recovery_record(f: &Fields<'_>, author: &Author) -> Result<Body, ParseError> {
+fn recovery_record(f: &Fields<'_>, author: &Author, log: &[u8; 16]) -> Result<Body, ParseError> {
     require_recovery(author)?;
     let recovery = keys_obj(f.get("recovery")?, "recovery")?;
     let proof: [u8; 64] = bin_exact(f, "proof", 64)?
         .try_into()
         .map_err(|_| bad("recovery.proof: rule 7: not 64 bytes"))?;
     let keys = key_sets(f, "keys")?;
+    // PROTOCOL.md 6.2: the record holds every input of the proof, so the
+    // parser checks it. keys_from already refused a weak or non-canonical key.
+    let msg = crate::encoding::frame(&[
+        b"snailfish.recovery-proof.v1",
+        log,
+        &recovery.sign,
+        &recovery.seal[..],
+    ]);
+    crate::sig::PublicKey::from_bytes(&recovery.sign)
+        .and_then(|pk| pk.verify_raw(&msg, &proof))
+        .map_err(|e| bad(format!("recovery.proof: rule 6.2: {e}")))?;
     let new_id = recovery_id(&recovery.sign, &recovery.seal);
     if !matches!(keys.as_slice(), [k] if k.to == Author::Recovery(new_id)) {
         return Err(bad(
@@ -498,7 +509,12 @@ fn log_id(f: &Fields<'_>, name: &str) -> Result<[u8; 16], ParseError> {
     decode_id::<16>(f.str(name)?, "l_").map_err(|e| bad(format!("{name}: rule 7: {e}")))
 }
 
-fn author(text: &str) -> Result<Author, ParseError> {
+/// Parse an author or recipient ID text: a device ID or a recovery ID.
+///
+/// # Errors
+///
+/// Refuses each text that is not `d_` or `r_` with 64 lowercase hex digits.
+pub fn parse_author(text: &str) -> Result<Author, ParseError> {
     if let Ok(id) = decode_id::<32>(text, "d_") {
         return Ok(Author::Device(id));
     }
@@ -548,7 +564,13 @@ fn keys_obj(value: &Value, what: &'static str) -> Result<Keys, ParseError> {
 
 fn keys_from(f: &Fields<'_>) -> Result<Keys, ParseError> {
     let sign = bin32(f, "sign")?;
-    let seal = bin_exact(f, "seal", SEAL_PK_LEN)?;
+    // PROTOCOL.md 6.1: a record must not introduce a key that no signature
+    // can verify, or a second encoding of one key.
+    crate::sig::PublicKey::from_bytes(&sign).map_err(|e| bad(format!("sign: rule 6.1: {e}")))?;
+    let seal: Box<[u8; SEAL_PK_LEN]> = bin_exact(f, "seal", SEAL_PK_LEN)?
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|_| bad("seal: rule 7: must be 1216 bytes"))?;
     Ok(Keys { sign, seal })
 }
 
@@ -592,7 +614,7 @@ fn key_sets(f: &Fields<'_>, name: &str) -> Result<Vec<KeySet>, ParseError> {
     let mut out: Vec<KeySet> = Vec::new();
     for v in f.arr(name)? {
         let k = Fields::object(v, "key set", &["to", "epochs", "sealed"])?;
-        let to = author(k.str("to")?)?;
+        let to = parse_author(k.str("to")?)?;
         let mut epochs: Vec<u64> = Vec::new();
         for e in k.arr("epochs")? {
             let Value::Int(n) = e else {
@@ -624,6 +646,252 @@ fn key_sets(f: &Fields<'_>, name: &str) -> Result<Vec<KeySet>, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// Each payload of the shared vectors, as `(payload_type, payload)`.
+    fn vector_payloads() -> Vec<(String, Vec<u8>)> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vectors/protocol.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut out = Vec::new();
+        for e in v["log"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(v["statements"].as_array().unwrap())
+        {
+            out.push((
+                e["payload_type"].as_str().unwrap().to_owned(),
+                e["payload"].as_str().unwrap().as_bytes().to_vec(),
+            ));
+        }
+        out
+    }
+
+    /// The vector payload of log entry `n` (from 1), as a JSON value.
+    fn entry(n: usize) -> (String, serde_json::Value) {
+        let (t, p) = vector_payloads().swap_remove(n.wrapping_sub(1));
+        (t, serde_json::from_slice(&p).unwrap())
+    }
+
+    fn reparse(t: &str, v: &serde_json::Value) -> Result<Record, ParseError> {
+        parse_payload(t, serde_json::to_string(v).unwrap().as_bytes())
+    }
+
+    /// The parsed body of each vector type, and the security class of
+    /// [VER-5]. Without this, a device record could parse as a level record,
+    /// and a change could count as a security record for [LOG-7].
+    #[test]
+    fn vector_bodies_and_security_class() {
+        let want = [
+            ("snailfish.genesis.v1", true),
+            ("snailfish.grant.v1", true),
+            ("snailfish.change.v1", false),
+            ("snailfish.snapshot.v1", false),
+            ("snailfish.accept.v1", false),
+            ("snailfish.device.v1", true),
+            ("snailfish.level.v1", true),
+        ];
+        for (i, (t, sec)) in want.iter().enumerate() {
+            let (ty, v) = entry(i.wrapping_add(1));
+            assert_eq!(ty, *t);
+            let r = reparse(&ty, &v).unwrap();
+            assert_eq!(r.is_security(), *sec, "{t}");
+            match (&r.body, *t) {
+                (Body::Device { level: 2 }, "snailfish.device.v1")
+                | (Body::Level { level: 2 }, "snailfish.level.v1")
+                | (Body::Genesis { .. }, "snailfish.genesis.v1")
+                | (Body::Grant { .. }, "snailfish.grant.v1")
+                | (Body::Change { .. }, "snailfish.change.v1")
+                | (Body::Snapshot { .. }, "snailfish.snapshot.v1")
+                | (Body::Accept { .. }, "snailfish.accept.v1") => {}
+                (b, t) => panic!("{t}: {b:?}"),
+            }
+        }
+    }
+
+    /// [LOG-2] and `PROTOCOL.md` 6.2: each type has a fixed author kind. A
+    /// change by a recovery ID, or a genesis or recovery record by a device,
+    /// is refused.
+    #[test]
+    fn author_kind_is_enforced() {
+        for n in [3, 4, 5, 6, 7] {
+            let (t, mut v) = entry(n);
+            let id = v["author"].as_str().unwrap().replacen("d_", "r_", 1);
+            v["author"] = id.into();
+            assert!(reparse(&t, &v).is_err(), "{t} by a recovery ID");
+        }
+        for n in [1, 11] {
+            let (t, mut v) = entry(n);
+            let id = v["author"].as_str().unwrap().replacen("r_", "d_", 1);
+            v["author"] = id.into();
+            assert!(reparse(&t, &v).is_err(), "{t} by a device ID");
+        }
+    }
+
+    /// `PROTOCOL.md` 6.2: genesis key sets go to the first device and the
+    /// recovery ID, each with epochs [1].
+    #[test]
+    fn genesis_key_sets_need_both_recipients() {
+        let (t, v) = entry(1);
+        assert!(reparse(&t, &v).is_ok());
+        // Only one key set.
+        let mut one = v.clone();
+        one["keys"].as_array_mut().unwrap().truncate(1);
+        assert!(reparse(&t, &one).is_err());
+        // The device key set goes to another device ID.
+        let mut other = v.clone();
+        other["keys"][0]["to"] = format!("d_{}", "00".repeat(32)).into();
+        assert!(reparse(&t, &other).is_err());
+        // The recovery key set goes to another recovery ID.
+        let mut rother = v.clone();
+        rother["keys"][1]["to"] = format!("r_{}", "ff".repeat(32)).into();
+        assert!(reparse(&t, &rother).is_err());
+        // Two recovery key sets: one to the right ID, one to another.
+        let mut two = v.clone();
+        two["keys"][0]["to"] = format!("r_{}", "00".repeat(32)).into();
+        assert!(reparse(&t, &two).is_err());
+        // Epochs [2] in one key set: same sealed length as [1].
+        let mut e2 = v.clone();
+        e2["keys"][1]["epochs"] = serde_json::json!([2]);
+        assert!(reparse(&t, &e2).is_err());
+        // A genesis base at position 0 with another digest.
+        let mut b = v;
+        b["base"]["digest"] = crate::encoding::encode_b64(&[0; 32]).into();
+        assert!(reparse(&t, &b).is_err());
+    }
+
+    /// `PROTOCOL.md` 6.2: an epoch record has one key set for each device in
+    /// `stay` and one for a recovery ID, and nothing else.
+    #[test]
+    fn epoch_key_sets_match_stay() {
+        let (t, v) = entry(9);
+        assert!(reparse(&t, &v).is_ok());
+        let keys = v["keys"].as_array().unwrap().clone();
+        // A device in stay without a key set: drop the first device set and
+        // add a second recovery-ID set at the end.
+        let mut missing = v.clone();
+        let mut ks = keys[1..].to_vec();
+        let mut extra = keys[2].clone();
+        extra["to"] = format!("r_{}", "ff".repeat(32)).into();
+        ks.push(extra);
+        missing["keys"] = ks.into();
+        assert!(reparse(&t, &missing).is_err());
+        // No recovery key set: replace it with a device that is not in stay.
+        let mut norec = v.clone();
+        let mut ks = keys.clone();
+        ks[2]["to"] = format!("d_{}", "ff".repeat(32)).into();
+        norec["keys"] = ks.into();
+        assert!(reparse(&t, &norec).is_err());
+        // One key set too few.
+        let mut few = v.clone();
+        few["keys"] = keys[..2].to_vec().into();
+        assert!(reparse(&t, &few).is_err());
+        // Each count is right, but a device in stay has no key set: the
+        // second device set goes to a device that is not in stay. The ID
+        // 99.. keeps the list sorted between 28.. and ab...
+        let mut other = v.clone();
+        let mut ks = keys.clone();
+        ks[1]["to"] = format!("d_99{}", "00".repeat(31)).into();
+        other["keys"] = ks.into();
+        assert!(reparse(&t, &other).is_err());
+        // Each device in stay and one recovery ID have a set, plus one more
+        // device set. The ID ab50.. sorts between ab3d.. and ab76...
+        let mut more = v;
+        let mut ks = keys.clone();
+        let mut extra = keys[1].clone();
+        extra["to"] = format!("d_ab50{}", "00".repeat(30)).into();
+        ks.insert(2, extra);
+        more["keys"] = ks.into();
+        assert!(reparse(&t, &more).is_err());
+    }
+
+    #[test]
+    fn vector_payloads_are_found_and_parse() {
+        let all = vector_payloads();
+        assert!(all.len() >= 5);
+        for (t, p) in &all {
+            let ok = parse_payload(t, p).is_ok() || parse_statement(t, p).is_ok();
+            assert!(ok, "{t}");
+        }
+    }
+
+    proptest! {
+        /// [WIR-4]: the parsers never panic on random bytes, for each
+        /// payload type.
+        #[test]
+        fn parsers_never_panic_on_random_bytes(
+            idx in 0usize..11,
+            bytes in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let types: Vec<&str> = RECORD_TYPES
+                .iter()
+                .copied()
+                .chain(["snailfish.checkpoint.v1", "snailfish.delete.v1"])
+                .collect();
+            let _ = parse_payload(types[idx], &bytes);
+            let _ = parse_statement(types[idx], &bytes);
+        }
+
+        /// [WIR-4]: a change, an insertion or a deletion of one byte of a
+        /// valid payload never panics. If the result is accepted, it is
+        /// valid UTF-8 (rule 1).
+        #[test]
+        fn parsers_survive_mutated_vector_payloads(
+            which in any::<usize>(),
+            pos in any::<usize>(),
+            byte in any::<u8>(),
+            mode in 0u8..3,
+        ) {
+            let all = vector_payloads();
+            let (t, p) = &all[which.checked_rem(all.len()).unwrap()];
+            let mut m = p.clone();
+            let i = pos.checked_rem(m.len()).unwrap();
+            match mode {
+                0 => m[i] = byte,
+                1 => m.insert(i, byte),
+                _ => { m.remove(i); }
+            }
+            if parse_payload(t, &m).is_ok() || parse_statement(t, &m).is_ok() {
+                prop_assert!(std::str::from_utf8(&m).is_ok());
+            }
+        }
+
+        /// [VER-5]: `classify` returns `Record` only for the 9 record types
+        /// and `Statement` only for the 2 statement types.
+        #[test]
+        fn classify_matches_the_type_tables(t in "snailfish\\.[a-z]{0,10}(\\.v[0-9]{0,2})?") {
+            let record = RECORD_TYPES.contains(&t.as_str());
+            let statement = t == "snailfish.checkpoint.v1" || t == "snailfish.delete.v1";
+            prop_assert_eq!(classify(&t) == TypeClass::Record, record);
+            prop_assert_eq!(classify(&t) == TypeClass::Statement, statement);
+        }
+    }
+
+    /// [VER-4] [VER-5]: after `snailfish.change.v`, the byte `1` is a known
+    /// record and each other ASCII byte is unknown content, never an update.
+    #[test]
+    fn classify_change_version_byte() {
+        for c in 0u8..128 {
+            let t = format!("snailfish.change.v{}", char::from(c));
+            let want = if c == b'1' {
+                TypeClass::Record
+            } else {
+                TypeClass::UnknownContent
+            };
+            assert_eq!(classify(&t), want, "{t:?}");
+        }
+    }
+
+    /// [VER-4]: one more name byte after a family name, not a dot, is an
+    /// unknown security record, so a client stops on it.
+    #[test]
+    fn classify_longer_family_name_needs_an_update() {
+        for c in (0u8..128).filter(|c| *c != b'.') {
+            let t = format!("snailfish.snapshot{}.v1", char::from(c));
+            assert_eq!(classify(&t), TypeClass::UpdateRequired, "{t:?}");
+        }
+    }
 
     #[test]
     fn classify_follows_protocol_6_4() {
@@ -642,7 +910,13 @@ mod tests {
 /// Kani proofs. Run with `cargo kani -p snailfish-protocol`.
 #[cfg(kani)]
 mod proofs {
-    use super::is_family;
+    use super::{TypeClass, classify, is_family};
+
+    // `classify` over full type names is checked exhaustively for one
+    // varying ASCII byte by the unit tests `classify_change_version_byte`
+    // and `classify_longer_family_name_needs_an_update`. As Kani harnesses,
+    // both ran for more than 5 minutes (the `str::from_utf8` call and the
+    // nine string compares), and the byte domain has only 128 values.
 
     /// [VER-5]: a type is in a family only if it is the family name, a dot
     /// and more bytes. Without this, `snailfish.changes.v1` could pass as a

@@ -136,9 +136,39 @@ pub fn derive(secret: &[u8; 16]) -> ([u8; 32], [u8; 32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app shows this text to a user who typed the key.
+    #[test]
+    fn check_error_tells_the_user_about_a_typing_error() {
+        assert_eq!(
+            RecoveryKeyError::BadCheck.to_string(),
+            "the recovery key has a typing error"
+        );
+    }
     use proptest::prelude::*;
 
     proptest! {
+        /// Different secrets give different seeds, and the signing seed
+        /// differs from the sealing seed, so one leak does not give the other
+        /// key (`PROTOCOL.md` section 9).
+        #[test]
+        fn derive_separates_secrets_and_purposes(a in any::<[u8; 16]>(), b in any::<[u8; 16]>()) {
+            let (sa, ea) = derive(&a);
+            let (sb, eb) = derive(&b);
+            prop_assert_ne!(sa, ea);
+            prop_assert_eq!(a == b, sa == sb);
+            prop_assert_eq!(a == b, ea == eb);
+            prop_assert_ne!(sa, [0u8; 32]);
+            prop_assert_ne!(ea, [0u8; 32]);
+            prop_assert_eq!(derive(&a), (sa, ea));
+        }
+
+        /// `parse` never panics on any text.
+        #[test]
+        fn parse_never_panics(text in ".{0,60}") {
+            let _ = parse(&text);
+        }
+
         #[test]
         fn display_round_trip(secret in any::<[u8; 16]>()) {
             let text = display(&secret);
@@ -156,5 +186,45 @@ mod tests {
             sym[pos] = ALPHABET[usize::from(old.wrapping_add(delta) % 32)];
             prop_assert_eq!(parse(std::str::from_utf8(&sym).unwrap()), Err(RecoveryKeyError::BadCheck));
         }
+    }
+}
+
+/// Kani proofs. Run with `cargo kani -p snailfish-protocol`.
+///
+/// No harness covers `display`, `parse`, `check` or `derive`. Each one runs
+/// SHA-256 or HKDF, which CBMC cannot finish, and the 5-bit packing in
+/// `display` and `parse` is not a separate function. The property tests
+/// `display_round_trip` and `one_symbol_change_fails_the_check` cover the
+/// packing. The fuzz target `recovery_key` covers `parse` on arbitrary text.
+#[cfg(kani)]
+mod proofs {
+    use super::{ALPHABET, symbol_value};
+
+    /// `PROTOCOL.md` section 9: the reader maps each of the 32 alphabet
+    /// symbols to its index, in both cases, maps `O` to 0 and `I` and `L` to
+    /// 1, and refuses each other byte. Exhaustive over all 256 bytes.
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn symbol_value_accepts_exactly_the_reader_alphabet() {
+        let c: u8 = kani::any();
+        let v = symbol_value(c);
+        let upper = c.to_ascii_uppercase();
+        let in_alphabet = ALPHABET.contains(&upper);
+        let alias = matches!(upper, b'O' | b'I' | b'L');
+        assert!(v.is_some() == (in_alphabet || alias));
+        if let Some(v) = v {
+            assert!(v < 32);
+            if in_alphabet {
+                assert!(ALPHABET[usize::from(v)] == upper);
+            }
+            if upper == b'O' {
+                assert!(v == 0);
+            }
+            if upper == b'I' || upper == b'L' {
+                assert!(v == 1);
+            }
+        }
+        // U is not in the alphabet (it is easy to read as V).
+        assert!(symbol_value(b'U').is_none() && symbol_value(b'u').is_none());
     }
 }

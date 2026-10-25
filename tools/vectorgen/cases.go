@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -55,7 +58,7 @@ type caseSpec struct {
 	valid             bool
 }
 
-func buildStrict(p *protocolJ) (*strictJ, error) {
+func buildStrict(p *protocolJ, w *world) (*strictJ, error) {
 	ent := func(n int) (string, fields) { e := p.Log.Entries[n-1]; return e.PayloadType, splitFields(e.Payload) }
 	ct, change := ent(3)
 	gt, genesis := ent(1)
@@ -156,7 +159,8 @@ func buildStrict(p *protocolJ) (*strictJ, error) {
 
 	// epoch record rules
 	add("epoch-valid", "6.2", et, epoch.render(), true)
-	rm := []string{p.Devices[1].ID, p.Devices[2].ID}
+	// Neither ID is in stay (A and B). The second one is a device that no record created.
+	rm := []string{p.Devices[2].ID, "d_" + hx(sha(s("snailfish.test.removed-device")))}
 	if rm[0] > rm[1] {
 		rm[0], rm[1] = rm[1], rm[0]
 	}
@@ -179,6 +183,8 @@ func buildStrict(p *protocolJ) (*strictJ, error) {
 	add("key-set-epochs-not-increasing", "6.2", rt, recov.set("keys", strings.Replace(rk, `"epochs":[1,2]`, `"epochs":[2,1]`, 1)).render(), false)
 	add("key-set-epochs-repeated", "6.2", rt, recov.set("keys", strings.Replace(rk, `"epochs":[1,2]`, `"epochs":[2,2]`, 1)).render(), false)
 
+	cs = append(cs, signKeyCases(p, w)...)
+
 	out := &strictJ{Version: 1}
 	for _, c := range cs {
 		raw := c.raw
@@ -200,6 +206,138 @@ func buildStrict(p *protocolJ) (*strictJ, error) {
 		out.Cases = append(out.Cases, sc)
 	}
 	return out, nil
+}
+
+var (
+	identityKey     = append([]byte{1}, make([]byte, 31)...)
+	nonCanonicalKey = append(append([]byte{1}, make([]byte, 30)...), 0x80)
+)
+
+type ksItem struct {
+	id     []byte
+	to     string
+	epochs []int
+	sealed string
+}
+
+// renderKeySets writes key sets sorted by the 32 ID bytes of `to`.
+func renderKeySets(items ...ksItem) string {
+	sort.Slice(items, func(i, j int) bool { return bytes.Compare(items[i].id, items[j].id) < 0 })
+	var raws []string
+	for _, it := range items {
+		raws = append(raws, obj("to", q(it.to), "epochs", intList(it.epochs), "sealed", q(it.sealed)))
+	}
+	return list(raws...)
+}
+
+// sealedOf returns the sealed field of the key set to `to` in a stored key set list.
+func sealedOf(keys, to string) string {
+	for _, it := range splitList(keys) {
+		if strings.Contains(it, to) {
+			i := strings.Index(it, `"sealed":"`) + len(`"sealed":"`)
+			return it[i : len(it)-2]
+		}
+	}
+	panic("no key set to " + to)
+}
+
+func deviceWithSign(p *party, sign []byte, name string, level int) (string, []byte) {
+	id := sha(frame(s("snailfish.device-id.v1"), sign, p.sealPk))
+	return obj("id", q("d_"+hx(id)), "sign", q(b64(sign)), "seal", q(b64(p.sealPk)),
+		"name", q(name), "level", fmt.Sprint(level)), id
+}
+
+func recoveryWithSign(p *party, sign []byte) (string, []byte) {
+	return obj("sign", q(b64(sign)), "seal", q(b64(p.sealPk))), sha(frame(s("snailfish.recovery-id.v1"), sign, p.sealPk))
+}
+
+// signKeyCases covers PROTOCOL.md 6.1 (sign keys) and 6.2 (recovery proof, epoch rules).
+// Each case breaks one rule and keeps every derived field consistent.
+func signKeyCases(p *protocolJ, w *world) []caseSpec {
+	field := func(n int) (string, fields) { e := p.Log.Entries[n-1]; return e.PayloadType, splitFields(e.Payload) }
+	var cs []caseSpec
+	add := func(name, ptype, payload string, valid bool) {
+		cs = append(cs, caseSpec{name: name, rule: "6.2", ptype: ptype, payload: payload, valid: valid})
+	}
+	idt := func(id []byte, prefix string) string { return prefix + hx(id) }
+
+	gt, genesis := field(1)
+	grt, grant := field(2)
+	et, epoch := field(9)
+	rt, recov := field(11)
+
+	// grant: device.sign
+	for _, c := range []struct {
+		name string
+		key  []byte
+	}{{"grant-device-sign-non-canonical", nonCanonicalKey}, {"grant-device-sign-small-order", identityKey}} {
+		dev, id := deviceWithSign(w.B, c.key, "Phone", 1)
+		keys := renderKeySets(ksItem{id, idt(id, "d_"), []int{1}, sealedOf(grant.get("keys"), w.B.idText)})
+		add(c.name, grt, grant.set("device", dev).set("keys", keys).render(), false)
+	}
+
+	// genesis: recovery.sign and device.sign
+	gk := genesis.get("keys")
+	genesisWith := func(recSign, devSign []byte) string {
+		rec, rid := recoveryWithSign(w.R1, recSign)
+		dev, did := deviceWithSign(w.A, devSign, "Laptop", 2)
+		keys := renderKeySets(
+			ksItem{did, idt(did, "d_"), []int{1}, sealedOf(gk, w.A.idText)},
+			ksItem{rid, idt(rid, "r_"), []int{1}, sealedOf(gk, w.R1.idText)})
+		return genesis.set("author", q(idt(rid, "r_"))).set("recovery", rec).set("device", dev).set("keys", keys).render()
+	}
+	add("genesis-recovery-sign-non-canonical", gt, genesisWith(nonCanonicalKey, w.A.signPk), false)
+	add("genesis-device-sign-small-order", gt, genesisWith(w.R1.signPk, identityKey), false)
+
+	// recovery record
+	rk := recov.get("keys")
+	recoveryWith := func(sign, proof []byte) string {
+		rec, rid := recoveryWithSign(w.R2, sign)
+		keys := renderKeySets(ksItem{rid, idt(rid, "r_"), []int{1, 2}, sealedOf(rk, w.R2.idText)})
+		return recov.set("recovery", rec).set("proof", q(b64(proof))).set("keys", keys).render()
+	}
+	proofMsg := frame(s("snailfish.recovery-proof.v1"), w.logID, w.R2.signPk, w.R2.sealPk)
+	good := ed25519.Sign(w.R2.signPriv, proofMsg)
+	// The identity key with R = identity and S = 0 is a valid Ed25519 signature, so only the key rule fails.
+	identityProof := append(append([]byte{}, identityKey...), make([]byte, 32)...)
+	idMsg := frame(s("snailfish.recovery-proof.v1"), w.logID, identityKey, w.R2.sealPk)
+	if !ed25519.Verify(identityKey, idMsg, identityProof) {
+		panic("identity proof does not verify")
+	}
+	add("recovery-sign-small-order", rt, func() string {
+		rec, rid := recoveryWithSign(w.R2, identityKey)
+		keys := renderKeySets(ksItem{rid, idt(rid, "r_"), []int{1, 2}, sealedOf(rk, w.R2.idText)})
+		return recov.set("recovery", rec).set("proof", q(b64(identityProof))).set("keys", keys).render()
+	}(), false)
+	add("recovery-proof-wrong-key", rt, recoveryWith(w.R2.signPk, ed25519.Sign(w.R1.signPriv, proofMsg)), false)
+	flipped := append([]byte{}, good...)
+	flipped[0] ^= 1
+	add("recovery-proof-flipped-byte", rt, recoveryWith(w.R2.signPk, flipped), false)
+
+	// epoch record
+	ek := epoch.get("keys")
+	ids := func(ps ...*party) []string {
+		sorted := sortParties(ps)
+		var out []string
+		for _, x := range sorted {
+			out = append(out, q(x.idText))
+		}
+		return out
+	}
+	add("epoch-device-in-removed-and-stay", et, epoch.set("removed", list(ids(w.A, w.C)...)).render(), false)
+	ksOf := func(ps ...*party) string {
+		var items []ksItem
+		for _, x := range ps {
+			src := x
+			if x == w.R2 {
+				src = w.R1 // same length, the parser does not open it
+			}
+			items = append(items, ksItem{x.id, x.idText, []int{2}, sealedOf(ek, src.idText)})
+		}
+		return renderKeySets(items...)
+	}
+	add("epoch-two-recovery-key-sets", et, epoch.set("stay", list(q(w.A.idText))).set("keys", ksOf(w.A, w.R1, w.R2)).render(), false)
+	return cs
 }
 
 func splitList(raw string) []string {

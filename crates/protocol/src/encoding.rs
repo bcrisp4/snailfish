@@ -168,6 +168,12 @@ mod tests {
         assert!(decode_id::<16>("c_0011223344556677889gaabbccddeeff", "c_").is_err());
     }
 
+    /// The error text reaches the app log.
+    #[test]
+    fn encoding_error_shows_its_cause() {
+        assert_eq!(EncodingError("x").to_string(), "x");
+    }
+
     #[test]
     fn strict_base64_has_one_form() {
         assert_eq!(decode_b64_strict("AAE="), Ok(vec![0, 1]));
@@ -210,7 +216,17 @@ mod tests {
 /// Kani proofs. Run with `cargo kani -p snailfish-protocol`.
 #[cfg(kani)]
 mod proofs {
-    use super::{decode_id, frame};
+    use super::{decode_id, frame, u64be};
+
+    /// `PROTOCOL.md` 2.1: `u64be` is the big-endian encoding. It round-trips
+    /// for each `u64`, and it keeps the order of the integers byte-wise.
+    #[kani::proof]
+    fn u64be_round_trips_and_orders() {
+        let a: u64 = kani::any();
+        let b: u64 = kani::any();
+        assert!(u64::from_be_bytes(u64be(a)) == a);
+        assert!((a < b) == (u64be(a) < u64be(b)));
+    }
 
     /// [LOG-3] [LOG-4] [LOG-5] rely on the frame: for two parts of up to 2
     /// bytes each, the frame is exactly the length prefixes and the parts.

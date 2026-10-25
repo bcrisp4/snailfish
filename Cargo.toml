@@ -21,6 +21,9 @@ publish = false
 snailfish-protocol = { path = "crates/protocol" }
 snailfish-engine = { path = "crates/engine" }
 proptest = "1"
+# One pin for the runtime and the generator: the generated code checks that
+# both use the same scaffolding contract.
+uniffi = "=0.32.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

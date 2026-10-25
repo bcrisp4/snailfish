@@ -65,7 +65,7 @@ func buildAll(sl sealer) (*protocolJ, *strictJ, *recoveryKeyJ, error) {
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	st, err := buildStrict(p)
+	st, err := buildStrict(p, w)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -328,7 +328,7 @@ func decodeLoose(t string) ([]byte, error) {
 
 // parseEnvelope is the reader of PROTOCOL.md section 4.
 func parseEnvelope(text string) (*parsedEnvelope, error) {
-	v, err := parseStrictAny([]byte(text))
+	v, err := parseLenient([]byte(text))
 	if err != nil {
 		return nil, err
 	}
@@ -368,11 +368,6 @@ func parseEnvelope(text string) (*parsedEnvelope, error) {
 		return nil, fmt.Errorf("sig has %d bytes", len(sig))
 	}
 	return &parsedEnvelope{pt, payload, sig}, nil
-}
-
-// parseStrictAny parses JSON with duplicate key detection but accepts any number form.
-func parseStrictAny(b []byte) (any, error) {
-	return parseStrict(b)
 }
 
 func checkEnvelopes(p *protocolJ) error {
