@@ -71,6 +71,28 @@ MAX_REC = "8"
 check_only = ["baseRule", "relayLogValid"]
 why = "Each 4-device run takes about 15 minutes. The baseline needs only the invariants that its mutants are caught by. honest checks the rest with 2 devices."
 
+# Small configs for TLC (make verify-deep). TLC checks every reachable state.
+[configs.tinyHonest]
+MAX_REC = "4"
+
+[configs.tinyHonest4]
+DEVS = "Set(1, 2, 3, 4)"
+MAX_REC = "3"
+check_only = ["baseRule", "relayLogValid"]
+why = "The base-rule mutants need 4 devices (finding S1). TLC checks only their invariants here."
+
+[configs.tinyThief]
+BAD = "Set(2)"
+FAULTS = 'Set("recovery")'
+MAX_REC = "4"
+
+[configs.tinyFork]
+FAULTS = 'Set("fork")'
+MAX_ATTACKS = "1"
+MAX_REC = "4"
+skip = ["noFork", "noStaleChangeStored", "relayLogValid"]
+why = "A fork breaks noFork and noStaleChangeStored (limits T7 and T8). relayLogValid holds only for an honest relay."
+
 # ---------------------------------------------------------------- known limits
 
 [[limits]]
@@ -140,3 +162,44 @@ base = "honest4"
 caught_by = "tests"
 test_module = "spacelogTest4"
 test = "resignTest"
+
+# ---------------------------------------------------------------- exhaustive (TLC)
+# TLC checks every reachable state of a small config, at any depth. Each listed
+# mutant must also fail on the same config, so the config is big enough to
+# matter.
+
+[[exhaustive]]
+config = "tinyHonest"
+invariants = [
+  "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
+  "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
+  "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
+  "noStaleChangeStored",
+]
+mutants = ["epochSealsToAll", "verifierIgnoresRemovals"]
+why = "An honest relay with 2 devices and 4 records: about 9 000 states, 13 seconds."
+
+[[exhaustive]]
+config = "tinyHonest4"
+invariants = ["baseRule", "relayLogValid"]
+mutants = ["noBaseRule", "relayNoBaseRule"]
+why = "Two grants on one base need 4 devices (finding S1). 3 records keep it to 29 seconds: 4 records did not finish in 15 minutes."
+
+[[exhaustive]]
+config = "tinyThief"
+invariants = [
+  "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
+  "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
+  "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
+  "noStaleChangeStored",
+]
+why = "A thief ignores its own removal: about 35 000 states, 77 seconds."
+
+[[exhaustive]]
+config = "tinyFork"
+invariants = [
+  "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
+  "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
+  "writeEpochCurrent", "logChangeEpoch",
+]
+why = "A relay that serves two branches, one attack: about 44 000 states, 91 seconds."

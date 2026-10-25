@@ -55,6 +55,8 @@ class Check:
         cwd: The directory to run in.
         expect_pass: True if the command must exit 0, False if it must fail.
         invariants: The invariants of a batched run, for the report.
+        min_states: For a TLC run, the fewest distinct states it must find. A
+            config with no initial state passes with 0 states and checks nothing.
     """
 
     label: str
@@ -62,6 +64,7 @@ class Check:
     cwd: Path
     expect_pass: bool
     invariants: tuple[str, ...] = ()
+    min_states: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,6 +198,21 @@ def validate(path: Path, data: dict[str, Any], source: str) -> Manifest:
     for name in data.get("witness_configs", []):
         if name not in configs:
             errors.append(f"witness config {name!r} is unknown")
+    for i, ex in enumerate(data.get("exhaustive", [])):
+        where = f"exhaustive[{i}]"
+        if ex.get("config") not in configs:
+            errors.append(f"{where} has unknown config {ex.get('config')!r}")
+            continue
+        if not ex.get("why"):
+            errors.append(f"{where} has no `why`")
+        for inv in ex.get("invariants", []):
+            if inv not in invariants:
+                errors.append(f"{where} checks unknown invariant {inv!r}")
+            elif inv in skipped_raw(data, ex["config"]):
+                errors.append(f"{where} checks {inv!r}, which config {ex['config']!r} skips")
+        for mut in ex.get("mutants", []):
+            if mut not in data.get("mutants", {}):
+                errors.append(f"{where} names unknown mutant {mut!r}")
     deep = data.get("deep")
     if deep:
         if deep.get("config") not in configs:
@@ -257,6 +275,11 @@ def generate(m: Manifest) -> Path:
         module = f"m_{name}"
         src = instance_source(m, module, bindings_for(m, mut["base"], bug=name))
         (gen / f"{module}.qnt").write_text(src)
+    for ex in m.data.get("exhaustive", []):
+        for bug in [None, *ex.get("mutants", [])]:
+            module = exhaustive_module(ex["config"], bug)
+            src = instance_source(m, module, bindings_for(m, ex["config"], bug=bug))
+            (gen / f"{module}.qnt").write_text(src)
     return gen
 
 
@@ -281,6 +304,16 @@ def run_argv(
     if seed:
         argv += ["--seed", seed]
     return tuple(argv)
+
+def skipped_raw(data: dict[str, Any], config: str) -> set[str]:
+    """Return the invariants that a config does not check, from the raw manifest."""
+    cfg = data["configs"][config]
+    limits = {lim["invariant"] for lim in data.get("limits", []) if lim["config"] == config}
+    skip = set(cfg.get("skip", [])) | limits
+    if "check_only" in cfg:
+        skip |= set(data.get("invariants", [])) - set(cfg["check_only"])
+    return skip
+
 
 def skipped(m: Manifest, config: str) -> set[str]:
     """Return the invariants that a config does not check.
@@ -308,8 +341,9 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
             "--main", deep["config"], "--invariants", *deep["invariants"],
             "--max-steps", str(deep["max_steps"]),
         )
-        label = f"verify {deep['config']}: {', '.join(deep['invariants'])} (<= {deep['max_steps']} steps)"
+        label = f"apalache {deep['config']}: {', '.join(deep['invariants'])} (<= {deep['max_steps']} steps)"
         checks.append(Check(label, argv, cwd, True, tuple(deep["invariants"])))
+        checks += exhaustive_checks(m)
         return checks
 
     samples, steps = EFFORT[tier]
@@ -356,6 +390,36 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
         checks.append(Check(
             label, run_argv(f"m_{name}", [mut["caught_by"]], samples, steps, seed), cwd, is_open,
         ))
+    return checks
+
+
+def exhaustive_module(config: str, bug: str | None) -> str:
+    """Return the module name of an exhaustive TLC run."""
+    return f"x_{config}" if bug is None else f"x_{config}_{bug}"
+
+
+def exhaustive_checks(m: Manifest) -> list[Check]:
+    """Return the TLC checks of each [[exhaustive]] entry.
+
+    TLC enumerates every reachable state of the config, so a pass holds at any
+    depth, but only for that config. Each mutant in the entry must make TLC
+    find a violation on the same config. If not, the config is too small for
+    the mutant to matter, and the pass proves less than it seems.
+    """
+    checks: list[Check] = []
+    for ex in m.data.get("exhaustive", []):
+        config, invs = ex["config"], list(ex["invariants"])
+        for bug in [None, *ex.get("mutants", [])]:
+            module = exhaustive_module(config, bug)
+            argv = (
+                "quint", "verify", f"{GEN_DIR}/{module}.qnt", "--main", module,
+                "--backend", "tlc", "--invariants", *invs,
+            )
+            if bug is None:
+                label = f"tlc {config}: {len(invs)} invariants, every reachable state"
+                checks.append(Check(label, argv, m.path, True, tuple(invs), min_states=2))
+            else:
+                checks.append(Check(f"tlc {config}: mutant {bug} caught", argv, m.path, False, tuple(invs)))
     return checks
 
 
@@ -412,10 +476,21 @@ def violated(output: str) -> list[str]:
     """Parse the names of the violated invariants of a batched quint run."""
     return re.findall(r"^\s*❌ (\w+)", output, re.MULTILINE)
 
+def tlc_states(output: str) -> int:
+    """Parse the number of distinct states of a finished TLC run (0 if absent)."""
+    found = re.findall(r"([\d,]+) distinct states found, 0 states left on queue", output)
+    return int(found[-1].replace(",", "")) if found else 0
+
+
 def execute(check: Check) -> tuple[Check, bool, str]:
     """Run one check. Return the check, its verdict and its full output."""
     proc = subprocess.run(check.argv, cwd=check.cwd, capture_output=True, text=True, check=False)
-    return check, (proc.returncode == 0) == check.expect_pass, proc.stdout + proc.stderr
+    output = proc.stdout + proc.stderr
+    good = (proc.returncode == 0) == check.expect_pass
+    if good and check.min_states and tlc_states(output) < check.min_states:
+        output += f"\nFAIL: TLC found {tlc_states(output)} distinct states, fewer than {check.min_states}"
+        good = False
+    return check, good, output
 
 def run_model(m: Manifest, tier: str, jobs: int, seed: str | None) -> bool:
     """Run every check of one tier for one model. Print a report. Return True if all pass."""
@@ -478,7 +553,10 @@ def main(argv: list[str] | None = None) -> int:
     # Apalache runs one server, so deep checks run one at a time.
     jobs = 1 if args.tier == "deep" else args.jobs
     ok = all([run_model(m, args.tier, jobs, args.seed) for m in manifests])
-    effort = "bounded exhaustive" if args.tier == "deep" else "sampled, not a proof"
+    effort = (
+        "Apalache bounded to max_steps, TLC every reachable state of small configs"
+        if args.tier == "deep" else "sampled, not a proof"
+    )
     print(f"\n{'ALL CHECKS PASSED' if ok else 'CHECKS FAILED'} ({args.tier}: {effort})")
     return 0 if ok else 1
 

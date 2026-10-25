@@ -64,6 +64,10 @@ Known limits. Each one must fail:
 1. `forkRelay noFork`. T7: a malicious relay serves two valid branches. Neither device sees a conflict until it fetches a record whose base is not in its log.
 2. `forkRelay noStaleChangeStored`. T8: a relay that withholds an epoch record from a stayed device can store that device's change under the old epoch.
 
+### Exhaustive results (TLC)
+
+`make verify-deep MODEL=spacelog` also runs TLC on `tinyHonest`, `tinyHonest4`, `tinyThief` and `tinyFork`. TLC checks every reachable state of each config, at any depth, and catches 4 mutants, among them the S1 base-rule mutants on `tinyHonest4`.
+
 ## Findings
 
 S1 (fixed). Four mutants (`noBaseRule`, `relayNoBaseRule`, `grantFromRemoved`, `resignReusesKey`) at first changed no verdict in any run. The cause was the check set, not the design. With 2 devices, each pair of security records fails another check before the base rule: a second removal of the same device, or a removal whose list of devices that stay is out of date after a grant. A removed honest device never signs, so `grantFromRemoved` needs a thief. Fix:

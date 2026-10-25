@@ -32,12 +32,12 @@ verify-fast:
 	$(VERIFY) fast $(MODEL)
 
 ## Every config, known limit, mutant and witness (sampled). Run before a merge.
-## All models take about 19 minutes. One model: make verify MODEL=delivery.
+## All models take about 22 minutes. One model: make verify MODEL=delivery.
 verify: verify-tools $(if $(MODEL),,verify-crypto)
 	$(RULES) check
 	$(VERIFY) full $(MODEL)
 
-## quint verify (Apalache): bounded exhaustive. About 5 minutes.
+## Apalache (bounded) and TLC (every reachable state of small configs). About 9 minutes.
 verify-deep:
 	$(VERIFY) deep $(MODEL)
 

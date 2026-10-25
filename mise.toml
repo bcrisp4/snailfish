@@ -21,3 +21,10 @@ taplo = "0.10.0"
 [settings]
 # The cargo backend downloads a prebuilt binary if one exists.
 cargo.binstall = true
+
+[env]
+# Quint 0.33.0 sets its Apalache gRPC deadline with Date.setMilliseconds, which
+# uses local time. Near a daylight saving change the deadline lands in the past,
+# and every quint verify and quint compile fails with "DEADLINE_EXCEEDED" or
+# "error: error". UTC has no daylight saving, so the deadline is always right.
+TZ = "UTC"

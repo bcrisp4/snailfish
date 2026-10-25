@@ -174,3 +174,30 @@ def test_full_tier_batches_the_invariants_of_each_config() -> None:
     # base checks "safe" only ("other" is its limit). faulty skips "safe" and checks "other".
     assert [(c.label.split(":")[0], c.invariants) for c in runs] == [("base", ("safe",)), ("faulty", ("other",))]
     assert runs[0].argv[runs[0].argv.index("--invariants") + 1] == "safe"
+
+
+# Captured from TLC 2026.10.25 through quint 0.33.0.
+TLC_DONE = "394837 states generated, 10716 distinct states found, 0 states left on queue.\n"
+TLC_EMPTY = "Finished computing initial states: 0 distinct states generated at 2026-10-25.\n"
+
+
+def test_tlc_states_counts_a_finished_run_only() -> None:
+    assert verify.tlc_states(TLC_DONE) == 10716
+    assert verify.tlc_states(TLC_EMPTY) == 0
+    assert verify.tlc_states("12048 states generated, 621 distinct states found, 350 states left on queue.") == 0
+
+
+def test_exhaustive_entry_needs_a_reason_and_known_names() -> None:
+    data = manifest(exhaustive=[{"config": "base", "invariants": ["typo"], "mutants": ["nope"]}])
+    with pytest.raises(verify.ManifestError) as err:
+        verify.validate(Path("x"), data, MODEL)
+    msg = str(err.value)
+    assert "no `why`" in msg and "unknown invariant 'typo'" in msg and "unknown mutant 'nope'" in msg
+
+
+def test_exhaustive_design_run_needs_states_and_mutant_run_must_fail() -> None:
+    ex = [{"config": "base", "invariants": ["safe"], "mutants": ["dropRow"], "why": "small"}]
+    m = verify.validate(Path("x"), manifest(exhaustive=ex), MODEL)
+    design, mutant = verify.exhaustive_checks(m)
+    assert design.expect_pass and design.min_states == 2 and "--backend" in design.argv
+    assert not mutant.expect_pass and mutant.argv[mutant.argv.index("--main") + 1] == "x_base_dropRow"

@@ -88,6 +88,17 @@ why = "Limit 2: an engine state loss and a relay restore lose a change (checked 
 [configs.engineOnly]
 FAULTS = 'Set("engineLoss")'
 
+# Small configs for TLC (make verify-deep). TLC checks every reachable state.
+[configs.tinyCrash]
+MAX_IDS = "2"
+MAX_FAULTS = "0"
+FAULTS = "Set()"
+
+[configs.tinyAppRestore]
+MAX_IDS = "2"
+MAX_FAULTS = "1"
+FAULTS = 'Set("appRestore")'
+
 # ---------------------------------------------------------------- known limits
 # Each limit must be violated. If one holds, the model changed or the limit is gone.
 
@@ -176,3 +187,19 @@ caught_by = "noSilentLoss"
 base = "restoreEngine"
 caught_by = "tests"
 test = "notRepairedMarkTest"
+
+# ---------------------------------------------------------------- exhaustive (TLC)
+# TLC checks every reachable state of a small config, at any depth. Each listed
+# mutant must also fail on the same config, so the config is big enough to
+# matter.
+
+[[exhaustive]]
+config = "tinyCrash"
+invariants = ["noDoubleApply", "noLostChange", "noLostChangeWeak", "appliedHeld", "caughtUpState", "noFork"]
+mutants = ["editSplitTxn", "pullSplitTxn", "relayNoDedupe", "appDropsRowOnEnqueue"]
+why = "Crashes and lost responses with 2 changes: about 10 000 states, 4 seconds."
+
+[[exhaustive]]
+config = "tinyAppRestore"
+invariants = ["noDoubleApply", "noLostChange", "noLostChangeWeak", "appliedHeld", "caughtUpState", "noFork"]
+why = "One app DB restore with 2 changes."

@@ -30,6 +30,8 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 - If sampling cannot reach a path, set `caught_by = "tests"`, name the test (`test = "..."`, and `test_module` if it is not the main one), and write that test in `test.qnt`. Do not raise the step count until it passes by luck.
 - A slow baseline can list `check_only` invariants with a `why`. `verify.py` refuses a mutant caught by an invariant that its baseline does not check.
 - `verify.py` checks all invariants of a config in one `quint run`, and counts the witnesses in the same run. This costs about the same as one invariant, because trace generation dominates. A failed run names each violated invariant. Limits and mutants keep one run each, because each must fail on one named invariant.
+- An `[[exhaustive]]` entry names a small config, its invariants and the mutants that TLC must catch on it. TLC enumerates every reachable state, so a pass holds at any depth, but only for that config. Keep each config under about 2 minutes: one more record or change can multiply the states by 50 or more. If a mutant needs a bigger config (for example 4 devices), give that config fewer records.
+- A TLC design run must find at least 2 distinct states. A config with no initial state passes with 0 states and checks nothing.
 - Report results with their scope: "sampled, 20000 traces x 50 steps" or "bounded exhaustive, 8 steps". Never "proven".
 
 ## Read a counterexample
@@ -46,6 +48,7 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | A config module cannot use a sum-type constructor of the spec in its import (QNT099). | Bind such consts as strings, for example `BUG: str` and `FAULTS: Set[str]`. |
 | A `.fail()` step in the middle of a `run` test leaves the state unset (QNT502). | Use `.fail()` only as the last step. In the middle, `.expect()` the guard predicate instead. |
 | A `def` cannot assign state (QNT200). | Use `action` for a helper that assigns `x'`. |
+| `quint verify` fails with `error: error` or `DEADLINE_EXCEEDED` near a daylight saving change. | Quint 0.33.0 sets its gRPC deadline in local time. `mise.toml` sets `TZ = "UTC"`, so run quint through `mise exec`. |
 | Apalache refuses a file with many instance modules ("String value length exceeds the maximum"). | Keep one instance module per file. `verify.py` generates them in `_gen/`. |
 | `quint run` does not report a deadlock. A short trace is the only sign. | Watch the trace length. Add a witness for the end state you expect. |
 | A mutant changes no verdict in any run (finding S1). | The baseline is too small for the bug to matter. Add a larger baseline (more devices, a thief) and a scripted test. Do not raise the step count until it passes by luck. |
@@ -71,7 +74,7 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | --- | --- |
 | `make verify-fast MODEL=<m>` | Rule ID check, typecheck, tests, short sampling of `fast_config`. Leave out `MODEL` for all models. |
 | `make verify MODEL=<m>` | Every config, limit, mutant and witness. Also the runner tests. Leave out `MODEL` for all models and ProVerif. |
-| `make verify-deep MODEL=<m>` | `quint verify` on `[deep]` invariants. |
+| `make verify-deep MODEL=<m>` | Apalache on `[deep]` invariants, and TLC on each `[[exhaustive]]` config with its mutants. |
 | `specs/tools/trace.py repro` | Find and print a counterexample. |
 | `specs/tools/trace.py show` | Print an ITF trace file. |
 | `make verify-drift` | Fail if a tagged `DESIGN.md` rule changed since `main` and no file in `specs/` changed. |

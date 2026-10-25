@@ -12,10 +12,10 @@ Run `mise install` once. It pins every tool. Do not use `cargo install`, `brew` 
 | --- | --- | --- |
 | After each edit to a model | `make verify-fast MODEL=<model>` | 10 s |
 | Before each commit | `make check`: Rust lint, tests and licences, rule IDs, fast Quint | 1 min |
-| Before a merge that touches `specs/`, `DESIGN.md` or `crates/protocol` | `make verify MODEL=<model>` for each changed model, then `make verify-drift` and `make rust-kani` | delivery 1 min, spacelog 19 min, Kani 2 min |
+| Before a merge that touches `specs/`, `DESIGN.md` or `crates/protocol` | `make verify MODEL=<model>` for each changed model, then `make verify-drift` and `make rust-kani` | delivery 1 min, spacelog 20 min, Kani 2 min |
 | Before a merge that touches `specs/enrollment` | `make verify-crypto` | 5 s |
-| Before a merge that changes shared tooling (`specs/tools/`, `Makefile`) | `make verify` (all models and ProVerif) | 19 min |
-| Before a merge that changes a `[deep]` invariant | `make verify-deep MODEL=<model>` | 5 min |
+| Before a merge that changes shared tooling (`specs/tools/`, `Makefile`) | `make verify` (all models and ProVerif) | 22 min |
+| Before a merge that changes a `[deep]` invariant or an `[[exhaustive]]` entry | `make verify-deep MODEL=<model>`: Apalache, and TLC on every reachable state of small configs | 9 min |
 | Before a merge that changes a parser | `make rust-fuzz` | 5 min per target |
 | Before a merge that changes Rust code | `make rust-mutants-diff`: mutants in the changed code only | 10 s now |
 
@@ -44,4 +44,4 @@ Models, each with a `README.md` of its scope and limits:
 - If Kani runs out of memory, shrink the harness and record the bound in a comment. Do not delete it.
 - A surviving `cargo-mutants` mutant needs a test, or an entry in `.cargo/mutants.toml` with a reason.
 - Tests check behaviour. Do not write a test that copies the implementation.
-- Report each result with its scope: "sampled", "bounded to N steps", or "for unbounded sessions (ProVerif)". Never "proven".
+- Report each result with its scope: "sampled", "bounded to N steps", "every reachable state of config X (TLC)", or "for unbounded sessions (ProVerif)". Never "proven".

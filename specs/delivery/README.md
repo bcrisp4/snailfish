@@ -46,6 +46,10 @@ The checks also confirm three known limits. Each one fails on purpose:
 2. An engine state loss and a second fault can lose a change. Each fault destroys one copy.
 3. A silent rollback, or an early hold release, can let a repair session return a change that an app already reverted after a refusal (F1). Configs: `faultyRelay`, `earlyReleaseOnly`, `silentOnly`.
 
+### Exhaustive results (TLC)
+
+`make verify-deep MODEL=delivery` also runs TLC on `tinyCrash` and `tinyAppRestore` (2 changes). TLC checks every reachable state of these configs, at any depth, and catches 4 mutants on `tinyCrash`.
+
 ## Findings fixed in DESIGN.md
 
 | ID | Fix | Check |
