@@ -5,6 +5,7 @@ members = [
   "crates/engine",
   "crates/bindings",
   "crates/relay",
+  "crates/uniffi-bindgen",
 ]
 
 [workspace.package]

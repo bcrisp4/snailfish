@@ -1,0 +1,87 @@
+{
+ "version": 1,
+ "valid": [
+  {
+   "text": "52XG-2KD0-MAFV-M8AY-AX43-24AJ-Z5YY-0SA9",
+   "secret": "28bb014da0a29fba215e5748311152f9"
+  },
+  {
+   "text": "8M7D-4GM3-Y5KZ-BPJ1-VJ5A-T312-VBP6-B1YB",
+   "secret": "450ed24283f167f5da41dc8aad0c22da"
+  },
+  {
+   "text": "52xg-2kd0-mafv-m8ay-ax43-24aj-z5yy-0sa9",
+   "secret": "28bb014da0a29fba215e5748311152f9"
+  },
+  {
+   "text": "52XG2KD0MAFVM8AYAX4324AJZ5YY0SA9",
+   "secret": "28bb014da0a29fba215e5748311152f9"
+  },
+  {
+   "text": "52XG 2KD0 MAFV M8AY AX43 24AJ Z5YY 0SA9",
+   "secret": "28bb014da0a29fba215e5748311152f9"
+  },
+  {
+   "text": "52xg - 2kd0 - mafv - m8ay - ax43 - 24aj - z5yy - 0sa9",
+   "secret": "28bb014da0a29fba215e5748311152f9"
+  },
+  {
+   "text": "87Z2-X5KP-9MWK-0WK7-4EQX-B1T4-FJRX-GZ46",
+   "secret": "41fe2e96764d3930726723afd587447c"
+  },
+  {
+   "text": "87Z2-X5KP-9MWK-OWK7-4EQX-B1T4-FJRX-GZ46",
+   "secret": "41fe2e96764d3930726723afd587447c"
+  },
+  {
+   "text": "87Z2-X5KP-9MWK-oWK7-4EQX-BiT4-FJRX-GZ46",
+   "secret": "41fe2e96764d3930726723afd587447c"
+  },
+  {
+   "text": "87Z2-X5KP-9MWK-0WK7-4EQX-BIT4-FJRX-GZ46",
+   "secret": "41fe2e96764d3930726723afd587447c"
+  },
+  {
+   "text": "87Z2-X5KP-9MWK-0WK7-4EQX-BLT4-FJRX-GZ46",
+   "secret": "41fe2e96764d3930726723afd587447c"
+  },
+  {
+   "text": "87Z2 X5KP 9MWK OWK7 4EQX BlT4 FJRX GZ46",
+   "secret": "41fe2e96764d3930726723afd587447c"
+  }
+ ],
+ "invalid": [
+  {
+   "name": "contains-U",
+   "text": "U2XG-2KD0-MAFV-M8AY-AX43-24AJ-Z5YY-0SA9"
+  },
+  {
+   "name": "contains-U-lowercase",
+   "text": "52xg-2kd0-mauv-m8ay-ax43-24aj-z5yy-0sa9"
+  },
+  {
+   "name": "wrong-check",
+   "text": "52XG-2KD0-MAFV-M8AY-AX43-24AJ-Z5YY-0SA0"
+  },
+  {
+   "name": "31-symbols",
+   "text": "52XG-2KD0-MAFV-M8AY-AX43-24AJ-Z5YY-0SA"
+  },
+  {
+   "name": "33-symbols",
+   "text": "52XG-2KD0-MAFV-M8AY-AX43-24AJ-Z5YY-0SA9-0"
+  },
+  {
+   "name": "empty",
+   "text": ""
+  },
+  {
+   "name": "only-dashes",
+   "text": "----"
+  },
+  {
+   "name": "contains-other-symbol",
+   "text": "52XG-2#D0-MAFV-M8AY-AX43-24AJ-Z5YY-0SA9"
+  }
+ ]
+}

@@ -6,6 +6,12 @@ all-features = true
 [advisories]
 # A RUSTSEC advisory on any dependency fails the check.
 yanked = "deny"
+ignore = [
+  # basic-toml is unmaintained, with no known vulnerability. Only the UniFFI
+  # code generator uses it (uniffi_bindgen 0.32.2 -> askama 0.16.1), at build
+  # time. No UniFFI release removes it yet. Remove this entry when one does.
+  { id = "RUSTSEC-2026-0374", reason = "unmaintained, build-time only through uniffi_bindgen" },
+]
 
 [licenses]
 # DESIGN.md "Licensing": every crate is MIT OR Apache-2.0, so each dependency

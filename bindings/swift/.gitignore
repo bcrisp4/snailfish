@@ -1,0 +1,6 @@
+# Written by `make bindings-swift`.
+build/
+Sources/Snailfish/Snailfish.swift
+Tests/SnailfishTests/vectors/
+.build/
+.swiftpm/

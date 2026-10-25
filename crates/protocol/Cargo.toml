@@ -9,8 +9,33 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = "0.23"
+chacha20poly1305 = "0.11"
+ed25519-dalek = "3"
+getrandom = "0.4"
+hkdf = "0.13"
+hpke = { version = "0.14", default-features = false, features = [
+  "alloc",
+  "mlkem",
+  "chacha",
+  "x25519",
+  "hkdfsha2",
+  "getrandom",
+] }
+serde = "1"
+serde_json = "1"
+sha2 = "0.11"
 
 [dev-dependencies]
+hex = "0.4"
+hpke = { version = "0.14", default-features = false, features = [
+  "alloc",
+  "mlkem",
+  "chacha",
+  "x25519",
+  "hkdfsha2",
+  "getrandom",
+] }
 proptest.workspace = true
 
 [lints]

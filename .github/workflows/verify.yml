@@ -47,6 +47,24 @@ jobs:
       - if: github.event_name != 'schedule'
         run: make rust-mutants-diff BASE="$BASE"
 
+  swift:
+    # DESIGN.md M1: the shared vectors through the Swift binding on an iOS
+    # simulator and on macOS. Linux runners have no Xcode.
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install --profile minimal
+      - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+      - uses: jdx/mise-action@v2
+      # The runner image chooses the simulator models. Use the first available iPhone.
+      - id: sim
+        run: |
+          id=$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | startswith("iPhone"))][0].udid')
+          test -n "$id" && test "$id" != null
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - run: make test-swift DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=${{ steps.sim.outputs.id }}"
+
   models:
     # The model list comes from specs/*/checks.toml, so a new model is picked up.
     runs-on: ubuntu-24.04

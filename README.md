@@ -1,6 +1,6 @@
 # Snailfish
 
-Snailfish is a self-hosted sync system for local-first apps. It keeps one person's devices in sync, and the server cannot read the data. The project is at milestone M1: the protocol crate and the verification toolchain.
+Snailfish is a self-hosted sync system for local-first apps. It keeps one person's devices in sync, and the server cannot read the data. The project is at milestone M1: `PROTOCOL.md`, the shared test vectors, the protocol crate, a skeleton sync engine, and the Python and Swift bindings.
 
 ## Problem
 
@@ -25,7 +25,8 @@ See [DESIGN.md](DESIGN.md) for the design and [PROTOCOL.md](PROTOCOL.md) for the
 1. Install [mise](https://mise.jdx.dev) and [rustup](https://rustup.rs).
 2. Run `mise install` in the repo root. It installs every dev tool at its pinned version.
 3. Run `make check` before each commit.
-4. Read [AGENTS.md](AGENTS.md) for the full verification workflow.
+4. On macOS with Xcode, run `make test-swift`. It runs the shared vectors on an iOS simulator and on macOS.
+5. Read [AGENTS.md](AGENTS.md) for the full verification workflow.
 
 ## Licence
 

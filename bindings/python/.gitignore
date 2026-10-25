@@ -1,0 +1,3 @@
+# Written by `make bindings-python`: the generated module and the native library.
+build/
+.venv/

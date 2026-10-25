@@ -1,0 +1,54 @@
+[project]
+name = "snailfish"
+version = "0.0.0"
+description = "Python binding for the Snailfish sync engine."
+requires-python = ">=3.13"
+license = "MIT OR Apache-2.0"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-markers", "-q"]
+testpaths = ["tests"]
+# `make bindings-python` writes snailfish.py and libsnailfish here.
+pythonpath = ["build", "tests"]
+
+[tool.ruff]
+line-length = 88
+extend-exclude = ["build"]
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "W",
+  "I",
+  "UP",
+  "B",
+  "SIM",
+  "TC",
+  "RUF",
+  "PTH",
+  "S",
+  "T20",
+  "ARG",
+  "FBT",
+  "A",
+  "C4",
+  "DTZ",
+  "ISC",
+  "PIE",
+  "RSE",
+  "RET",
+  "TID",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# pytest uses bare assert statements.
+"tests/*" = ["S101"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+include = ["tests"]
+extraPaths = ["build", "tests"]

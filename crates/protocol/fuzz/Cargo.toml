@@ -22,3 +22,24 @@ path = "fuzz_targets/pae_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "payload"
+path = "fuzz_targets/payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_key"
+path = "fuzz_targets/recovery_key.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,21 @@
+[package]
+name = "snailfish-uniffi-bindgen"
+description = "The UniFFI binding generator at the version that snailfish-bindings uses."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+# The version must equal the uniffi version of snailfish-bindings, because the
+# generated code checks the scaffolding contract version.
+uniffi = { version = "=0.32.2", features = ["cli"] }
+
+[lints]
+workspace = true

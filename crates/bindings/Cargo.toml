@@ -8,8 +8,15 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[lib]
+# cdylib for the Python binding, staticlib for the Swift XCFramework, and lib
+# for Rust tests and for crates/uniffi-bindgen.
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "snailfish"
+
 [dependencies]
 snailfish-engine.workspace = true
+uniffi = "=0.32.2"
 
 [lints]
 workspace = true
