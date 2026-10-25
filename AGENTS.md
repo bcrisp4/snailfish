@@ -17,7 +17,7 @@ Run `mise install` once. It pins every tool. Do not use `cargo install`, `brew` 
 | Before a merge that changes shared tooling (`specs/tools/`, `Makefile`) | `make verify` (all models and ProVerif) | 19 min |
 | Before a merge that changes a `[deep]` invariant | `make verify-deep MODEL=<model>` | 5 min |
 | Before a merge that changes a parser | `make rust-fuzz` | 5 min per target |
-| Before a merge that changes Rust tests or logic | `make rust-mutants` | 1 min |
+| Before a merge that changes Rust code | `make rust-mutants-diff`: mutants in the changed code only | 10 s now |
 
 Models, each with a `README.md` of its scope and limits:
 

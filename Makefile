@@ -10,9 +10,14 @@ CARGO := mise exec -- cargo
 NIGHTLY_NAME := nightly-2026-08-21
 NIGHTLY := +$(NIGHTLY_NAME)
 FUZZ_SECONDS ?= 300
+# Kani verifies this many harnesses in parallel. Each CBMC run can use several
+# GB of memory, so the default stays well below the core count.
+KANI_JOBS ?= 4
+# The git ref that `make rust-mutants-diff` compares against.
+BASE ?= main
 
 .PHONY: check verify-fast verify verify-deep verify-tools verify-drift \
-        rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-deny \
+        rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
         rust-nightly-check verify-crypto
 
 ## The gate for each commit: Rust lint and tests, then the fast Quint tier.
@@ -63,9 +68,9 @@ rust-test:
 	$(CARGO) nextest run --workspace
 	$(CARGO) test --workspace --doc
 
-## Kani proofs (bounded model checking). About 10 minutes. Run before a merge.
+## Kani proofs (bounded model checking), KANI_JOBS harnesses at a time. Run before a merge.
 rust-kani: rust-nightly-check
-	$(CARGO) kani --workspace
+	$(CARGO) kani --workspace -j $(KANI_JOBS) --output-format terse
 
 ## Fail if the nightly that Kani installed is not NIGHTLY_NAME.
 rust-nightly-check:
@@ -86,17 +91,30 @@ rust-fuzz: rust-nightly-check
 	  done; \
 	done
 
-## cargo-mutants on the protocol crate. A MISSED mutant fails the target.
-## The exit code is not enough: cargo-mutants exits 3 for a timeout also when
-## some mutants are missed. So the target reads mutants.out/missed.txt. A
-## timeout is an infinite loop that the tests detect, so it is a pass.
-rust-mutants:
-	@$(CARGO) mutants -p snailfish-protocol; rc=$$?; \
+## cargo-mutants. A MISSED mutant fails the target. The exit code alone is not
+## enough: cargo-mutants exits 3 for a timeout also when some mutants are
+## missed. So the check reads mutants.out/missed.txt. A timeout is an infinite
+## loop that the tests detect, so it is a pass.
+define check_mutants
+	rc=$$?; \
 	  missed=$$(wc -l < mutants.out/missed.txt 2>/dev/null | tr -d ' '); missed=$${missed:-0}; \
 	  if [ $$rc -ne 0 ] && [ $$rc -ne 2 ] && [ $$rc -ne 3 ]; then \
 	    echo "FAIL: cargo mutants exit $$rc"; exit $$rc; fi; \
 	  if [ "$$missed" -ne 0 ]; then echo "FAIL: $$missed missed mutants"; exit 2; fi; \
 	  echo "ok: no missed mutants"
+endef
+
+## Mutants of every crate in the workspace. Run nightly, and before a release.
+rust-mutants:
+	@$(CARGO) mutants --workspace; $(check_mutants)
+
+## Mutants in the Rust code that changed since BASE (default main). Run before a
+## merge. It does not see a test that a change made weaker in other code, so
+## rust-mutants still runs nightly.
+rust-mutants-diff:
+	@trap 'rm -f mutants.diff' EXIT; git diff $(BASE) -- '*.rs' > mutants.diff; \
+	  if [ ! -s mutants.diff ]; then echo "ok: no Rust change since $(BASE)"; exit 0; fi; \
+	  $(CARGO) mutants --workspace --in-diff mutants.diff; $(check_mutants)
 
 ## Licences, advisories and sources of every dependency.
 rust-deny:

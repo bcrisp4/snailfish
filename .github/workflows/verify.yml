@@ -30,6 +30,9 @@ jobs:
       # A pull request checkout has no local main branch.
       - run: git fetch origin main:main || true
       - run: make verify-drift
+      # Mutants in the Rust code that this pull request, or this push, changed.
+      # A push to main compares with the commit before the push.
+      - run: make rust-mutants-diff BASE=${{ github.event_name == 'pull_request' && 'main' || github.event.before }}
 
   full:
     # Every Quint config, limit, mutant and witness, one job per model. A CI
@@ -50,7 +53,8 @@ jobs:
       - run: mise exec -- uv run --script specs/tools/verify.py full ${{ matrix.model }} --samples 5000
 
   rust-mutants:
-    if: github.event_name != 'pull_request'
+    # Every mutant of every crate. The check job runs only the changed code.
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

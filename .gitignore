@@ -10,3 +10,4 @@ crates/*/fuzz/corpus/
 crates/*/fuzz/artifacts/
 crates/*/fuzz/target/
 crates/*/fuzz/coverage/
+mutants.diff

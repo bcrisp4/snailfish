@@ -59,7 +59,8 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | Pitfall | Fix |
 | --- | --- |
 | Kani: "CBMC appears to have run out of memory" with no failed check. | It is not a counterexample. Use concrete lengths, `assert!` instead of `assert_eq!`, and no `to_string()`. A symbolic `&str` that goes through `from_utf8` is very expensive. |
-| `cargo mutants` exits 3 (timeout) even when some mutants are missed. | Read `mutants.out/missed.txt`. `make rust-mutants` does this. |
+| `cargo mutants` exits 3 (timeout) even when some mutants are missed. | Read `mutants.out/missed.txt`. Both `make rust-mutants` targets do this. |
+| `--in-diff` skips a test that a change made weaker in other code, and a change to test code only. | That is why `make rust-mutants` (all mutants) still runs nightly. |
 | `cargo fuzz` needs nightly. | Use `+nightly-2026-08-21`, the nightly that Kani installs. `make rust-fuzz` does this. |
 | A fuzz target with no seeds finds little. | Put seed inputs in `crates/<crate>/fuzz/seeds/<target>/`. The PAE seeds raise coverage from 26 to 104 edges. |
 | clippy `arithmetic_side_effects` on `d - b'0'`. | Use `char::to_digit` or checked arithmetic. Do not allow the lint. |
@@ -77,8 +78,9 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | `specs/tools/rules.py list` | Print each rule ID with its first 80 characters. |
 | `specs/tools/rules.py check` | Fail on a duplicate, uncited or unknown rule ID. |
 | `make check` | The gate for each commit: Rust lint, tests and licences, then the fast Quint tier. |
-| `make rust-kani` | Kani proofs of the Rust crates (bounded). |
+| `make rust-kani` | Kani proofs of the Rust crates (bounded), `KANI_JOBS` (default 4) harnesses at a time. |
 | `make rust-fuzz` | Each fuzz target for `FUZZ_SECONDS` (default 300). |
-| `make rust-mutants` | cargo-mutants on the protocol crate. Fails on a missed mutant. |
+| `make rust-mutants-diff` | cargo-mutants on the Rust code that changed since `BASE` (default `main`). Before a merge. |
+| `make rust-mutants` | cargo-mutants on every crate. Nightly. Fails on a missed mutant. |
 | `make rust-deny` | Licences, advisories and sources of every dependency. |
 | `make verify-crypto` | Run the ProVerif models of `specs/enrollment` and compare each query with `expect.toml`. Needs ProVerif 2.05 (`opam install proverif`). |
