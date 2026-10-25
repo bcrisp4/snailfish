@@ -184,10 +184,13 @@ pub fn decrypt(key: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>,
 /// The HPKE `info` of a key set: `PROTOCOL.md` 7.3.
 #[must_use]
 pub fn key_set_info(log_id: &[u8; 16], recipient: &Hash32, epochs: &[u64]) -> Vec<u8> {
-    let encoded: Vec<[u8; 8]> = epochs.iter().map(|e| u64be(*e)).collect();
-    let mut parts: Vec<&[u8]> = vec![b"snailfish.keyset.v1", log_id, recipient];
-    parts.extend(encoded.iter().map(<[u8; 8]>::as_slice));
-    frame(&parts)
+    let mut out = frame(&[b"snailfish.keyset.v1", log_id, recipient]);
+    // Each epoch is one more 8-byte frame part. A frame of several lists is
+    // the concatenation of their frames, so this equals one frame of all.
+    for e in epochs {
+        out.extend_from_slice(&frame(&[&u64be(*e)]));
+    }
+    out
 }
 
 /// The length of the `sealed` bytes of a key set with `epochs` keys.
@@ -693,22 +696,21 @@ mod proofs {
 
     /// `PROTOCOL.md` 7.3: `key_set_info` is a frame of the label, the log
     /// ID, the recipient and one 8-byte part for each epoch, in order.
-    /// Bound: 1 symbolic epoch and a symbolic log ID and recipient. A run
-    /// with 2 epochs took 331 s, so the unit test
-    /// `key_set_info_is_injective` covers longer epoch lists (sampled).
+    /// Bound: 2 symbolic epochs, a symbolic log ID and recipient.
     #[kani::proof]
     #[kani::unwind(40)]
     fn key_set_info_layout() {
         let log: [u8; 16] = kani::any();
         let rcp: [u8; 32] = kani::any();
-        let e: u64 = kani::any();
-        let out = key_set_info(&log, &rcp, &[e]);
-        // 8 + 19, 8 + 16, 8 + 32, then 8 + 8
-        assert!(out.len() == 27 + 24 + 40 + 16);
+        let e: [u64; 2] = kani::any();
+        let out = key_set_info(&log, &rcp, &e);
+        // 8 + 19, 8 + 16, 8 + 32, then 2 * (8 + 8)
+        assert!(out.len() == 27 + 24 + 40 + 32);
         assert!(&out[8..27] == b"snailfish.keyset.v1");
         assert!(out[27 + 7] == 16 && &out[35..51] == &log[..]);
         assert!(out[51 + 7] == 32 && &out[59..91] == &rcp[..]);
-        assert!(out[91 + 7] == 8 && &out[99..107] == &e.to_be_bytes()[..]);
+        assert!(out[91 + 7] == 8 && &out[99..107] == &e[0].to_be_bytes()[..]);
+        assert!(out[107 + 7] == 8 && &out[115..123] == &e[1].to_be_bytes()[..]);
     }
 
     /// `PROTOCOL.md` 7.2: `change_aad` is a frame of the label, the log ID,

@@ -10,8 +10,9 @@ CARGO := mise exec -- cargo
 NIGHTLY_NAME := nightly-2026-08-21
 NIGHTLY := +$(NIGHTLY_NAME)
 FUZZ_SECONDS ?= 300
-# Kani verifies this many harnesses in parallel. Each CBMC run can use several
-# GB of memory, so the default stays well below the core count.
+# Kani verifies this many harnesses in parallel. One CBMC run can use about
+# 10.5 GB of memory (pae decode_never_panics), so set KANI_JOBS to the GB of
+# memory divided by 11. CI uses 1.
 KANI_JOBS ?= 4
 # The git ref that `make rust-mutants-diff` compares against.
 BASE ?= main
