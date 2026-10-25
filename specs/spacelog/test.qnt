@@ -111,5 +111,100 @@ module spacelogTest {
       .then(fetchOne(1, 1))
       .expect(dev(1).status == Forked and happened(EvForkDetected) and forkStops)
       .then(fetchOne(1, 0)).fail()
-
 }
+
+// Scripted tests for mutants that a 2-device sample seldom reaches. Each one
+// passes on the design and fails under the BUG that checks.toml names for it.
+module spacelogTest4 {
+  import spacelog(DEVS = Set(1, 2, 3, 4), BAD = Set(), MAX_REC = 9, MAX_ATTACKS = 0,
+                  FAULTS = Set(), BUG = "none").* from "./model"
+
+  action appendId(k: int): bool = {
+    nondet r = pending.filter(x => x.id == k).oneOf()
+    relayAppend(r)
+  }
+  action refuseId(k: int): bool = {
+    nondet r = pending.filter(x => x.id == k).oneOf()
+    relayRefuse(r)
+  }
+  // The relay appends the record if `check` accepts it, and refuses it if not.
+  action relayDecides(k: int): bool =
+    if (relayVerdict(pending.filter(x => x.id == k).getOnlyElement()) == Ok) appendId(k) else refuseId(k)
+  // Fetch one record if the branch has one more for device d. If not, change nothing.
+  action fetchIfAny(d: Key): bool =
+    if (branches.get(0).recs.length() > dev(d).log.recs.length() and dev(d).status == Running) fetchOne(d, 0)
+    else all { devs' = devs, branches' = branches, pending' = pending, env' = env }
+  action enrolTwo: bool =
+    init
+      .then(createSpace(1)).then(appendId(1))
+      .then(signGrant(1, 1, 2)).then(appendId(2))
+      .then(fetchOne(1, 0)).then(sendCheckpoint(1, 2))
+      .then(fetchOne(2, 0)).then(fetchOne(2, 0))
+
+  // Mutants noBaseRule and relayNoBaseRule ([LOG-7]). Two grants for two new
+  // devices on one base. The second grant is valid on the state after the
+  // first, so only the base rule refuses it. Two devices are not enough: each
+  // pair of security records with 2 devices fails another check first.
+  run concurrentGrantsTest =
+    enrolTwo
+      .then(signGrant(1, 1, 3))
+      .then(signGrant(2, 2, 4))
+      .then(appendId(3))
+      .then(relayDecides(4))
+      .then(fetchOne(1, 0))
+      .then(fetchIfAny(1))
+      .expect(baseRule and relayLogValid and branches.get(0).recs.length() == 3)
+
+  // Mutant resignReusesKey ([LOG-7] [LOG-8]). Device 2 signs a removal of
+  // device 3 (key K, sealed to devices 1, 2 and 4). A grant wins the race, so
+  // the relay refuses it under the base rule. Device 2 signs again: a removal
+  // of device 1. That record must carry a new key, because the refused record
+  // sealed K to device 1.
+  run resignTest =
+    enrolTwo
+      .then(signGrant(1, 1, 3)).then(appendId(3))
+      .then(fetchOne(1, 0)).then(fetchOne(2, 0))
+      .then(signGrant(1, 1, 4)).then(signEpoch(2, 2, 3))
+      .then(appendId(4)).then(refuseId(5))
+      .then(fetchOne(2, 0))
+      .then(signEpoch(2, 2, 1)).then(appendId(6))
+      .then(fetchOne(2, 0))
+      .expect(removedKeyIsolation)
+}
+
+// A thief (device 2) ignores its own removal.
+module spacelogTestThief {
+  import spacelog(DEVS = Set(1, 2, 3), BAD = Set(2), MAX_REC = 8, MAX_ATTACKS = 0,
+                  FAULTS = Set("recovery"), BUG = "none").* from "./model"
+
+  action appendId(k: int): bool = {
+    nondet r = pending.filter(x => x.id == k).oneOf()
+    relayAppend(r)
+  }
+  action refuseId(k: int): bool = {
+    nondet r = pending.filter(x => x.id == k).oneOf()
+    relayRefuse(r)
+  }
+  action relayDecides(k: int): bool =
+    if (relayVerdict(pending.filter(x => x.id == k).getOnlyElement()) == Ok) appendId(k) else refuseId(k)
+  action fetchIfAny(d: Key): bool =
+    if (branches.get(0).recs.length() > dev(d).log.recs.length() and dev(d).status == Running) fetchOne(d, 0)
+    else all { devs' = devs, branches' = branches, pending' = pending, env' = env }
+
+  // Mutant grantFromRemoved ([LOG-8], C35). The thief verifies its own removal
+  // and then grants a new device on the new tip. The relay and each verifier
+  // must refuse a grant from a removed author.
+  run thiefGrantTest =
+    init
+      .then(createSpace(1)).then(appendId(1))
+      .then(signGrant(1, 1, 2)).then(appendId(2))
+      .then(fetchOne(1, 0)).then(sendCheckpoint(1, 2))
+      .then(fetchOne(2, 0)).then(fetchOne(2, 0))
+      .then(signEpoch(1, 1, 2)).then(appendId(3))
+      .then(fetchOne(2, 0)).then(fetchOne(1, 0))
+      .then(signGrant(2, 2, 3))
+      .then(relayDecides(4))
+      .then(fetchIfAny(1))
+      .expect(authorActive)
+}
+

@@ -2,6 +2,7 @@
 # Run `mise install` once. It installs every tool at its pinned version.
 
 VERIFY := mise exec -- uv run --script specs/tools/verify.py
+MODEL ?=
 RULES := mise exec -- uv run --script specs/tools/rules.py
 CARGO := mise exec -- cargo
 # Kani installs this nightly. cargo-fuzz reuses it, so there is one nightly.
@@ -19,19 +20,21 @@ check: rust verify-fast
 
 ## ---------------------------------------------------------------- Quint
 
-## Typecheck, scenario tests, short sampling of one config. Under 1 minute.
+## Typecheck, scenario tests, short sampling of one config. About 10 seconds.
+## MODEL=<name> limits every Quint target to one model in specs/.
 verify-fast:
 	$(RULES) check
-	$(VERIFY) fast
+	$(VERIFY) fast $(MODEL)
 
-## Every config, known limit, mutant and witness. About 6 minutes.
-verify: verify-tools verify-crypto
+## Every config, known limit, mutant and witness (sampled). Run before a merge.
+## All models take about 19 minutes. One model: make verify MODEL=delivery.
+verify: verify-tools $(if $(MODEL),,verify-crypto)
 	$(RULES) check
-	$(VERIFY) full
+	$(VERIFY) full $(MODEL)
 
 ## quint verify (Apalache): bounded exhaustive. About 5 minutes.
 verify-deep:
-	$(VERIFY) deep
+	$(VERIFY) deep $(MODEL)
 
 ## Tests of the verification runner itself.
 verify-tools:

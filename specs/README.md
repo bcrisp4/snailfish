@@ -11,7 +11,7 @@ These Quint models check parts of `DESIGN.md`. Each model is executable. The fas
 | `<model>/checks.toml` | Configs, invariants, known limits, mutants and witnesses. |
 | `<model>/README.md` | Coverage map, findings and the cases that the model leaves out. |
 | `<model>/_gen/` | Generated config modules and traces. Not committed. |
-| `tools/verify.py` | Runs the checks of each tier for each model. |
+| `tools/verify.py` | Runs the checks of each tier for each model. One `quint run` checks all invariants of a config and counts its witnesses. |
 | `tools/trace.py` | Finds and prints a counterexample with only the changed fields. |
 | `tools/proverif.py` | Runs the ProVerif files of `enrollment/` and compares each query with `enrollment/expect.toml`. |
 | `tools/rules.py` | Checks the rule IDs of `DESIGN.md` against the model citations (`.qnt`, `.pv` and `.pvl` files) and `coverage.toml`. Finds rule changes with no change in `specs/`. |
@@ -23,7 +23,7 @@ Each normative rule in `DESIGN.md` ends with an ID tag, for example `[DLV-3]`. A
 
 1. Run `mise exec -- uv run --script specs/tools/rules.py list` to see the rules.
 2. Run `make verify-fast`. It runs `rules.py check`.
-3. Run `make verify-drift` before you commit a design change. It fails if a rule changed and nothing in `specs/` changed since `main`.
+3. Run `make verify-drift` before you merge a design change. It fails if a rule changed and nothing in `specs/` changed since `main`.
 
 ## Models
 
@@ -36,9 +36,9 @@ Each normative rule in `DESIGN.md` ends with an ID tag, for example `[DLV-3]`. A
 ## Run the checks
 
 1. Run `mise install` in the repo root, once. It installs quint, Java and Python.
-2. Run `make verify-fast` while you change a model. It takes about 3 seconds.
-3. Run `make verify` before you commit. It takes about 6 minutes.
-4. Run `make verify-deep` after a change to a deep invariant. It takes about 5 minutes.
+2. Run `make verify-fast MODEL=<model>` while you change a model. It takes seconds.
+3. Run `make verify MODEL=<model>` before you merge. AGENTS.md "When to run what" gives the times.
+4. Run `make verify-deep MODEL=<model>` after a change to a deep invariant.
 5. To repeat a sampled result, add the seed: `mise exec -- uv run --script specs/tools/verify.py full --seed 0x1234`.
 
 ## Read a counterexample

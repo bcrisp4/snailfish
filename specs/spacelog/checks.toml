@@ -6,6 +6,8 @@ model = "model.qnt"
 module = "spacelog"
 tests = "test.qnt"
 test_module = "spacelogTest"
+# Extra test modules with other consts: 4 devices, and a thief.
+test_modules = ["spacelogTest4", "spacelogTestThief"]
 
 # Invariants that hold in every config unless a config lists it under `skip`
 # or a [[limits]] entry names it.
@@ -60,6 +62,15 @@ why = "A malicious relay appends records in any order, so its log is not valid b
 BAD = "Set(2)"
 FAULTS = 'Set("recovery")'
 
+# Baseline for the base-rule and key mutants. Two devices are not enough: with
+# 2 devices, each pair of security records fails another check before the base
+# rule, so those mutants change no verdict (finding S1).
+[configs.honest4]
+DEVS = "Set(1, 2, 3, 4)"
+MAX_REC = "8"
+check_only = ["baseRule", "relayLogValid"]
+why = "Each 4-device run takes about 15 minutes. The baseline needs only the invariants that its mutants are caught by. honest checks the rest with 2 devices."
+
 # ---------------------------------------------------------------- known limits
 
 [[limits]]
@@ -75,16 +86,12 @@ why = "T8 limit: a relay that withholds an epoch record from a stayed device can
 # ---------------------------------------------------------------- mutants
 
 [mutants.noBaseRule]
-base = "honest"
+base = "honest4"
 caught_by = "baseRule"
-open = true
-why = "no sampled trace or scripted test yet reaches two valid security records on one base: each pair tried is refused for another reason first (finding S1)"
 
 [mutants.relayNoBaseRule]
-base = "honest"
+base = "honest4"
 caught_by = "relayLogValid"
-open = true
-why = "same as noBaseRule (finding S1)"
 
 [mutants.relaySkipsCheck]
 base = "honest"
@@ -111,10 +118,10 @@ base = "forkRelay"
 caught_by = "baseInOwnLog"
 
 [mutants.grantFromRemoved]
-base = "honest"
-caught_by = "authorActive"
-open = true
-why = "no sampled trace reaches a removed device that signs a grant before it verifies its own removal and the relay appends it (finding S1)"
+base = "thief"
+caught_by = "tests"
+test_module = "spacelogTestThief"
+test = "thiefGrantTest"
 
 [mutants.regrantRemoved]
 base = "honest"
@@ -129,7 +136,7 @@ base = "honest"
 caught_by = "writeEpochCurrent"
 
 [mutants.resignReusesKey]
-base = "honest"
-caught_by = "removedKeyIsolation"
-open = true
-why = "the reused key reaches a removed device only on a long path that sampling does not reach (finding S1)"
+base = "honest4"
+caught_by = "tests"
+test_module = "spacelogTest4"
+test = "resignTest"

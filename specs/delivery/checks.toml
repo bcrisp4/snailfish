@@ -175,3 +175,4 @@ caught_by = "noSilentLoss"
 [mutants.freshClearsOnFetch]
 base = "restoreEngine"
 caught_by = "tests"
+test = "notRepairedMarkTest"

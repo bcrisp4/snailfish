@@ -17,16 +17,19 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 1. Read `specs/<model>/README.md` for the coverage map and the known limits.
 2. Change `model.qnt` first. Then change `DESIGN.md`. The model is the source of truth. Keep the `[ID]` tag at the end of each rule line. Cite the rule in a `// [ID]` comment in the model, or list it in `specs/coverage.toml` with a reason.
 3. If you add a rule, add a BUG value that breaks it, and a mutant in `checks.toml`.
-4. Run `make verify-fast` after each edit. It takes seconds.
-5. Run `make verify` before you commit. Run `make verify-deep` if a deep invariant changed.
-6. Update the model README: coverage, findings, limits and "Not covered".
+4. Run `make verify-fast MODEL=<model>` after each edit. It takes seconds.
+5. Run `make check` before each commit.
+6. Before the merge, run `make verify MODEL=<model>` and `make verify-drift`. Run `make verify-deep MODEL=<model>` if a `[deep]` invariant changed.
+7. Update the model README: coverage, findings, limits and "Not covered".
 
 ## Rules for checks
 
 - A mutant must fail an invariant that its baseline passes. `verify.py` refuses a manifest that breaks this, because the catch then proves nothing.
 - A known limit is a `[[limits]]` entry with a `why`. The check requires the violation. If a limit starts to hold, find out why before you delete it.
 - Each witness (`val w*`) must be reached. Zero traces means a dead action or an over-strong guard.
-- If sampling cannot reach a path, set `caught_by = "tests"` and write a scripted test in `test.qnt`. Do not raise the step count until it passes by luck.
+- If sampling cannot reach a path, set `caught_by = "tests"`, name the test (`test = "..."`, and `test_module` if it is not the main one), and write that test in `test.qnt`. Do not raise the step count until it passes by luck.
+- A slow baseline can list `check_only` invariants with a `why`. `verify.py` refuses a mutant caught by an invariant that its baseline does not check.
+- `verify.py` checks all invariants of a config in one `quint run`, and counts the witnesses in the same run. This costs about the same as one invariant, because trace generation dominates. A failed run names each violated invariant. Limits and mutants keep one run each, because each must fail on one named invariant.
 - Report results with their scope: "sampled, 20000 traces x 50 steps" or "bounded exhaustive, 8 steps". Never "proven".
 
 ## Read a counterexample
@@ -45,6 +48,8 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | A `def` cannot assign state (QNT200). | Use `action` for a helper that assigns `x'`. |
 | Apalache refuses a file with many instance modules ("String value length exceeds the maximum"). | Keep one instance module per file. `verify.py` generates them in `_gen/`. |
 | `quint run` does not report a deadlock. A short trace is the only sign. | Watch the trace length. Add a witness for the end state you expect. |
+| A mutant changes no verdict in any run (finding S1). | The baseline is too small for the bug to matter. Add a larger baseline (more devices, a thief) and a scripted test. Do not raise the step count until it passes by luck. |
+| A scripted test for a mutant fails for the wrong reason. | Name the test in `checks.toml` (`test = "..."`). `verify.py` then requires that test to fail and the other tests to pass. |
 | A `nondet x = S.oneOf()` with an empty `S` disables the action. | Put the guard `S != Set()` first, or pass the value as an action argument. |
 | `Map.set(k, v)` on a missing key is undefined. | Use `put`, or pre-populate the map in `init`. |
 | Ghost state (`env`) that a fault destroys must not count as "held". | Keep ghost sets for "stored", "exposed" and "reverted", and define invariants on them. |
@@ -63,9 +68,9 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 
 | Command | Purpose |
 | --- | --- |
-| `make verify-fast` | Rule ID check, typecheck, tests, short sampling of `fast_config`. |
-| `make verify` | Every config, limit, mutant and witness. Also the runner tests. |
-| `make verify-deep` | `quint verify` on `[deep]` invariants. |
+| `make verify-fast MODEL=<m>` | Rule ID check, typecheck, tests, short sampling of `fast_config`. Leave out `MODEL` for all models. |
+| `make verify MODEL=<m>` | Every config, limit, mutant and witness. Also the runner tests. Leave out `MODEL` for all models and ProVerif. |
+| `make verify-deep MODEL=<m>` | `quint verify` on `[deep]` invariants. |
 | `specs/tools/trace.py repro` | Find and print a counterexample. |
 | `specs/tools/trace.py show` | Print an ITF trace file. |
 | `make verify-drift` | Fail if a tagged `DESIGN.md` rule changed since `main` and no file in `specs/` changed. |

@@ -32,16 +32,30 @@ jobs:
       - run: make verify-drift
 
   full:
-    # Every Quint config, limit, mutant and witness, and the Rust mutants.
+    # Every Quint config, limit, mutant and witness, one job per model. A CI
+    # runner has fewer cores than a developer machine, so it samples 5000
+    # traces instead of 20000. A developer runs the full count before a merge.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [delivery, spacelog]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install --profile minimal
+      - uses: jdx/mise-action@v2
+      - run: make verify-tools
+      - run: mise exec -- uv run --script specs/tools/verify.py full ${{ matrix.model }} --samples 5000
+
+  rust-mutants:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
-      - run: mise exec -- cargo kani setup
-      - run: make verify-fast verify-tools
-      - run: mise exec -- uv run --script specs/tools/verify.py full
       - run: make rust-mutants
 
   deep:

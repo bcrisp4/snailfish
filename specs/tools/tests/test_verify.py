@@ -109,3 +109,68 @@ def test_open_mutant_check_expects_the_invariant_to_hold() -> None:
     assert len(checks) == 1
     assert checks[0].expect_pass is True
     assert checks[0].label.startswith("OPEN")
+
+
+def test_tests_mutant_without_named_test_is_refused() -> None:
+    data = manifest(mutants={"dropRow": {"base": "base", "caught_by": "tests"}})
+    with pytest.raises(verify.ManifestError, match="names no `test`"):
+        verify.validate(Path("x"), data, MODEL)
+
+
+def test_tests_mutant_must_fail_its_test_and_pass_the_others(tmp_path: Path) -> None:
+    (tmp_path / "model.qnt").write_text(MODEL)
+    (tmp_path / "t.qnt").write_text('import m(N = 2, BUG = "none").* from "./model"\n')
+    (tmp_path / "_gen").mkdir()
+    mutants = {"dropRow": {"base": "base", "caught_by": "tests", "test": "keepsRowTest"}}
+    data = manifest(mutants=mutants, tests="t.qnt", test_module="t")
+    m = verify.validate(tmp_path, data, MODEL)
+    checks = verify.mutant_test_checks(m)
+    assert [c.expect_pass for c in checks] == [False, True]
+    assert checks[0].argv[-2:] == ("--match", "^keepsRowTest$")
+    assert 'BUG = "dropRow"' in (tmp_path / "_gen" / "t_dropRow.qnt").read_text()
+
+
+def test_check_only_limits_the_invariants_of_a_config() -> None:
+    configs = {"base": {}, "faulty": {"skip": ["safe"], "why": "x"}, "big": {"check_only": ["safe"], "why": "slow"}}
+    m = verify.validate(Path("x"), manifest(configs=configs), MODEL)
+    assert verify.skipped(m, "big") == {"other"}
+
+
+def test_mutant_caught_by_invariant_outside_check_only_is_refused() -> None:
+    configs = {"base": {}, "faulty": {"skip": ["safe"], "why": "x"}, "big": {"check_only": ["other"], "why": "slow"}}
+    data = manifest(configs=configs, mutants={"dropRow": {"base": "big", "caught_by": "safe"}})
+    with pytest.raises(verify.ManifestError, match="proves nothing"):
+        verify.validate(Path("x"), data, MODEL)
+
+
+# Captured from quint 0.33.0 `quint run --verbosity 1`.
+FAILED_BATCH = """[violation] Found an issue (26ms at 731 traces/second).
+  \u274c appliedHeld
+  \u274c caughtUpState
+Use --seed=0x48d9c565d4610c18 --backend=rust to reproduce.
+error: Invariant violated
+"""
+PASSED_WITH_WITNESSES = """[ok] No violation found (45ms at 4444 traces/second).
+Witnesses:
+wEdit was witnessed in 200 trace(s) out of 200 explored (100.00%)
+wPushKnown was witnessed in 0 trace(s) out of 200 explored (0.00%)
+Use --seed=0x7c32db3b1d9f113a --backend=rust to reproduce.
+"""
+
+
+def test_batched_run_reports_each_violated_invariant() -> None:
+    assert verify.violated(FAILED_BATCH) == ["appliedHeld", "caughtUpState"]
+    assert verify.violated(PASSED_WITH_WITNESSES) == []
+
+
+def test_witness_counts_include_zero() -> None:
+    assert verify.witness_counts(PASSED_WITH_WITNESSES) == {"wEdit": 200, "wPushKnown": 0}
+
+
+def test_full_tier_batches_the_invariants_of_each_config() -> None:
+    data = manifest(tests="t.qnt", test_module="t", limits=[{"config": "base", "invariant": "other", "why": "x"}])
+    m = verify.validate(Path("x"), data, MODEL)
+    runs = [c for c in verify.plan(m, "full", None) if c.label.startswith(("base:", "faulty:"))]
+    # base checks "safe" only ("other" is its limit). faulty skips "safe" and checks "other".
+    assert [(c.label.split(":")[0], c.invariants) for c in runs] == [("base", ("safe",)), ("faulty", ("other",))]
+    assert runs[0].argv[runs[0].argv.index("--invariants") + 1] == "safe"

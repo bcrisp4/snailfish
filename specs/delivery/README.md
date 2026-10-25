@@ -38,7 +38,7 @@
 
 ## Results
 
-`make verify` passes. The sampled checks found no violation of the invariants that must hold, in any config. Each mutant fails at least one invariant. Each witness is reached in at least one trace.
+`make verify MODEL=delivery` passes in about 1 minute. The sampled checks found no violation of the invariants that must hold, in any config. Each mutant fails at least one invariant. Each witness is reached in at least one trace.
 
 The checks also confirm three known limits. Each one fails on purpose:
 
@@ -72,4 +72,4 @@ Mutant `freshClearsOnFetch` needs a restore, an engine state loss and a fetch, i
 
 ## When to update
 
-If a delivery rule in `DESIGN.md` changes, change `model.qnt` first and run `make verify`. Then change the design text.
+If a delivery rule in `DESIGN.md` changes, change `model.qnt` first and run `make verify MODEL=delivery`. Then change the design text.

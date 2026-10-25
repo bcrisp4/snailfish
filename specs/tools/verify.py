@@ -37,6 +37,8 @@ TIERS = frozenset({"fast", "full", "deep"})
 # Sampling effort per tier: (samples, steps).
 EFFORT = {"fast": (2000, 30), "full": (20000, 50)}
 GEN_DIR = "_gen"
+# Keys of a [configs.*] table that are not consts of the model.
+CONFIG_KEYS = frozenset({"skip", "why", "check_only"})
 
 
 class ManifestError(Exception):
@@ -52,12 +54,14 @@ class Check:
         argv: The quint command line.
         cwd: The directory to run in.
         expect_pass: True if the command must exit 0, False if it must fail.
+        invariants: The invariants of a batched run, for the report.
     """
 
     label: str
     argv: tuple[str, ...]
     cwd: Path
     expect_pass: bool
+    invariants: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,6 +74,7 @@ class Manifest:
         consts: The const names that model.qnt declares.
         invariants: The `val` names in model.qnt.
         bugs: The BUG values that model.qnt allows.
+        witnesses: The witness names (`val w<Upper>...`) of model.qnt.
     """
 
     path: Path
@@ -77,6 +82,7 @@ class Manifest:
     consts: frozenset[str]
     invariants: frozenset[str]
     bugs: frozenset[str]
+    witnesses: tuple[str, ...] = ()
 
     @property
     def name(self) -> str:
@@ -131,7 +137,12 @@ def validate(path: Path, data: dict[str, Any], source: str) -> Manifest:
         if inv not in vals:
             errors.append(f"invariant {inv!r} is not a val in the model")
     for name, cfg in configs.items():
-        bound = set(defaults) | {k for k in cfg if k not in ("skip", "why")}
+        bound = set(defaults) | {k for k in cfg if k not in CONFIG_KEYS}
+        for inv in cfg.get("check_only", []):
+            if inv not in invariants:
+                errors.append(f"config {name!r} checks unknown invariant {inv!r}")
+        if "check_only" in cfg and not cfg.get("why"):
+            errors.append(f"config {name!r} has `check_only` with no `why`")
         missing = consts - bound
         extra = bound - consts
         if missing:
@@ -161,10 +172,20 @@ def validate(path: Path, data: dict[str, Any], source: str) -> Manifest:
         if mut.get("open") and not mut.get("why"):
             errors.append(f"open mutant {name!r} has no `why`")
         if caught == "tests":
+            module = mut.get("test_module")
+            if module and module not in [data.get("test_module"), *data.get("test_modules", [])]:
+                errors.append(f"mutant {name!r} names unknown test module {module!r}")
+            if not mut.get("test"):
+                errors.append(
+                    f"mutant {name!r} is caught by tests but names no `test`: any failing"
+                    " test would count, also one that fails for another reason"
+                )
             continue
         if caught not in invariants:
             errors.append(f"mutant {name!r} is caught by unknown invariant {caught!r}")
-        elif caught in configs[base].get("skip", []) or any(
+        elif caught in configs[base].get("skip", []) or (
+            "check_only" in configs[base] and caught not in configs[base]["check_only"]
+        ) or any(
             lim["config"] == base and lim["invariant"] == caught for lim in data.get("limits", [])
         ):
             errors.append(
@@ -187,7 +208,8 @@ def validate(path: Path, data: dict[str, Any], source: str) -> Manifest:
             errors.append(f"BUG values with no mutant: {sorted(untested)}")
     if errors:
         raise ManifestError(f"{path / 'checks.toml'}:\n  " + "\n  ".join(errors))
-    return Manifest(path, data, consts, vals, bugs)
+    witnesses = tuple(re.findall(r"^\s*val (w[A-Z]\w*)\s*:", source, re.MULTILINE))
+    return Manifest(path, data, consts, vals, bugs, witnesses)
 
 
 def instance_source(m: Manifest, module: str, bindings: dict[str, str]) -> str:
@@ -213,7 +235,7 @@ def instance_source(m: Manifest, module: str, bindings: dict[str, str]) -> str:
 
 def bindings_for(m: Manifest, config: str, bug: str | None = None) -> dict[str, str]:
     """Return the const bindings of a config, with an optional BUG override."""
-    cfg = {k: v for k, v in m.data["configs"][config].items() if k not in ("skip", "why")}
+    cfg = {k: v for k, v in m.data["configs"][config].items() if k not in CONFIG_KEYS}
     out = {**m.data.get("defaults", {}), **cfg}
     if bug is not None:
         out["BUG"] = f'"{bug}"'
@@ -238,17 +260,27 @@ def generate(m: Manifest) -> Path:
     return gen
 
 
-def run_argv(module: str, invariant: str, samples: int, steps: int, seed: str | None) -> tuple[str, ...]:
-    """Return the argv of one sampled quint run."""
+def run_argv(
+    module: str, invariants: list[str], samples: int, steps: int, seed: str | None,
+    witnesses: list[str] | None = None,
+) -> tuple[str, ...]:
+    """Return the argv of one sampled quint run.
+
+    One run checks every invariant in `invariants` on each state of each
+    trace, and counts each witness. It costs about the same as a run with one
+    invariant, because trace generation dominates. Verbosity 1 prints the name
+    of each violated invariant and the witness counts.
+    """
     argv = [
         "quint", "run", f"{GEN_DIR}/{module}.qnt", "--main", module,
-        "--invariant", invariant, "--max-samples", str(samples),
-        "--max-steps", str(steps), "--verbosity", "0",
+        "--invariants", *invariants, "--max-samples", str(samples),
+        "--max-steps", str(steps), "--verbosity", "1",
     ]
+    if witnesses:
+        argv += ["--witnesses", *witnesses]
     if seed:
         argv += ["--seed", seed]
     return tuple(argv)
-
 
 def skipped(m: Manifest, config: str) -> set[str]:
     """Return the invariants that a config does not check.
@@ -256,8 +288,12 @@ def skipped(m: Manifest, config: str) -> set[str]:
     A config skips each invariant in its `skip` list and each invariant that a
     limit says it violates. The limit check then requires the violation.
     """
+    cfg = m.data["configs"][config]
     limits = {lim["invariant"] for lim in m.data.get("limits", []) if lim["config"] == config}
-    return set(m.data["configs"][config].get("skip", [])) | limits
+    skip = set(cfg.get("skip", [])) | limits
+    if "check_only" in cfg:
+        skip |= set(m.data["invariants"]) - set(cfg["check_only"])
+    return skip
 
 
 def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
@@ -267,33 +303,44 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
     cwd = m.path
     if tier == "deep":
         deep = d["deep"]
-        for inv in deep["invariants"]:
-            argv = (
-                "quint", "verify", f"{GEN_DIR}/{deep['config']}.qnt",
-                "--main", deep["config"], "--invariant", inv,
-                "--max-steps", str(deep["max_steps"]),
-            )
-            checks.append(Check(f"verify {deep['config']} {inv} (<= {deep['max_steps']} steps)", argv, cwd, True))
+        argv = (
+            "quint", "verify", f"{GEN_DIR}/{deep['config']}.qnt",
+            "--main", deep["config"], "--invariants", *deep["invariants"],
+            "--max-steps", str(deep["max_steps"]),
+        )
+        label = f"verify {deep['config']}: {', '.join(deep['invariants'])} (<= {deep['max_steps']} steps)"
+        checks.append(Check(label, argv, cwd, True, tuple(deep["invariants"])))
         return checks
 
     samples, steps = EFFORT[tier]
     checks.append(Check("typecheck model", ("quint", "typecheck", d["model"]), cwd, True))
-    checks.append(Check(
-        "scenario tests",
-        ("quint", "test", d["tests"], "--main", d["test_module"]), cwd, True,
-    ))
+    for module in test_modules(m):
+        checks.append(Check(
+            f"scenario tests ({module})",
+            ("quint", "test", d["tests"], "--main", module), cwd, True,
+        ))
     configs = list(d["configs"]) if tier == "full" else [d.get("fast_config", next(iter(d["configs"])))]
+    witnesses = witness_names(m) if tier == "full" else []
     for name in configs:
         skip = skipped(m, name)
-        for inv in d["invariants"]:
-            if inv not in skip:
-                checks.append(Check(f"{name} {inv}", run_argv(name, inv, samples, steps, seed), cwd, True))
+        invs = [inv for inv in d["invariants"] if inv not in skip]
+        with_w = witnesses if name in d.get("witness_configs", []) else []
+        if not invs and not with_w:
+            continue
+        # A witness config reports its witness counts with the steps that
+        # witness_steps sets. The invariants then run with those steps too.
+        run_steps = d.get("witness_steps", steps) if with_w else steps
+        checks.append(Check(
+            f"{name}: {len(invs)} invariants" + (f", {len(with_w)} witnesses" if with_w else ""),
+            run_argv(name, invs or ["true"], samples, max(steps, run_steps), seed, with_w),
+            cwd, True, tuple(invs),
+        ))
     if tier == "fast":
         return checks
     for limit in d.get("limits", []):
         checks.append(Check(
             f"limit {limit['config']} {limit['invariant']} is violated ({limit['why']})",
-            run_argv(limit["config"], limit["invariant"], samples, steps, seed), cwd, False,
+            run_argv(limit["config"], [limit["invariant"]], samples, steps, seed), cwd, False,
         ))
     for name, mut in d.get("mutants", {}).items():
         if mut["caught_by"] == "tests":
@@ -307,13 +354,24 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
             if is_open else f"mutant {name} caught by {mut['caught_by']}"
         )
         checks.append(Check(
-            label, run_argv(f"m_{name}", mut["caught_by"], samples, steps, seed), cwd, is_open,
+            label, run_argv(f"m_{name}", [mut["caught_by"]], samples, steps, seed), cwd, is_open,
         ))
     return checks
 
 
+def test_modules(m: Manifest) -> list[str]:
+    """Return the test modules: `test_module`, then each extra one in `test_modules`."""
+    extra = [t for t in m.data.get("test_modules", []) if t != m.data["test_module"]]
+    return [m.data["test_module"], *extra]
+
+
 def mutant_test_checks(m: Manifest) -> list[Check]:
-    """Return a check that runs the scenario tests with the BUG of each "tests" mutant."""
+    """Return checks that run the scenario tests with the BUG of each "tests" mutant.
+
+    The named test must fail under the mutant, and each other test must still
+    pass. If another test also failed, the mutant would break the test set for
+    a reason that the named test does not check, so the catch would prove less.
+    """
     checks: list[Check] = []
     tests = (m.path / m.data["tests"]).read_text()
     for name, mut in m.data.get("mutants", {}).items():
@@ -327,40 +385,37 @@ def mutant_test_checks(m: Manifest) -> list[Check]:
             raise ManifestError(f"{m.data['tests']} binds no BUG = \"none\" to replace")
         path = m.path / GEN_DIR / f"t_{name}.qnt"
         path.write_text(patched)
+        module = mut.get("test_module", m.data["test_module"])
+        base = ("quint", "test", f"{GEN_DIR}/{path.name}", "--main", module)
+        test = mut["test"]
         checks.append(Check(
-            f"mutant {name} caught by scenario tests",
-            ("quint", "test", f"{GEN_DIR}/{path.name}", "--main", m.data["test_module"]),
-            m.path, False,
+            f"mutant {name} caught by test {test}", (*base, "--match", f"^{test}$"), m.path, False,
+        ))
+        checks.append(Check(
+            f"mutant {name}: the other tests still pass",
+            (*base, "--match", f"^(?!{test}$).*Test$"), m.path, True,
         ))
     return checks
 
 
-def witness_report(m: Manifest, samples: int, seed: str | None) -> list[tuple[str, int]]:
-    """Return each witness with the number of traces that reached it."""
-    source = (m.path / m.data["model"]).read_text()
-    witnesses = re.findall(r"^\s*val (w[A-Z]\w*)\s*:", source, re.MULTILINE)
-    totals = dict.fromkeys(witnesses, 0)
-    for config in m.data.get("witness_configs", []):
-        argv = [
-            "quint", "run", f"{GEN_DIR}/{config}.qnt", "--main", config,
-            "--invariant", "true", "--max-samples", str(samples),
-            "--max-steps", str(m.data.get("witness_steps", 50)), "--witnesses", *witnesses,
-        ]
-        if seed:
-            argv += ["--seed", seed]
-        out = subprocess.run(argv, cwd=m.path, capture_output=True, text=True, check=False).stdout
-        for w, n in re.findall(r"^(\w+) was witnessed in (\d+) trace", out, re.MULTILINE):
-            totals[w] += int(n)
-    return sorted(totals.items())
+def witness_names(m: Manifest) -> list[str]:
+    """Return the witnesses of a model: each `val w<Upper>...`."""
+    return list(m.witnesses)
 
+
+def witness_counts(output: str) -> dict[str, int]:
+    """Parse "<w> was witnessed in N trace(s)" lines of a quint run."""
+    return {w: int(n) for w, n in re.findall(r"^(\w+) was witnessed in (\d+) trace", output, re.MULTILINE)}
+
+
+def violated(output: str) -> list[str]:
+    """Parse the names of the violated invariants of a batched quint run."""
+    return re.findall(r"^\s*❌ (\w+)", output, re.MULTILINE)
 
 def execute(check: Check) -> tuple[Check, bool, str]:
-    """Run one check. Return the check, its verdict and the tail of its output."""
+    """Run one check. Return the check, its verdict and its full output."""
     proc = subprocess.run(check.argv, cwd=check.cwd, capture_output=True, text=True, check=False)
-    passed = proc.returncode == 0
-    tail = (proc.stdout + proc.stderr).strip().splitlines()[-5:]
-    return check, passed == check.expect_pass, "\n".join(tail)
-
+    return check, (proc.returncode == 0) == check.expect_pass, proc.stdout + proc.stderr
 
 def run_model(m: Manifest, tier: str, jobs: int, seed: str | None) -> bool:
     """Run every check of one tier for one model. Print a report. Return True if all pass."""
@@ -370,20 +425,25 @@ def run_model(m: Manifest, tier: str, jobs: int, seed: str | None) -> bool:
         checks += mutant_test_checks(m)
     print(f"== {m.name} ({tier})")
     ok = True
+    totals: dict[str, int] = dict.fromkeys(witness_names(m) if tier == "full" else [], 0)
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        for check, good, tail in pool.map(execute, checks):
+        for check, good, output in pool.map(execute, checks):
+            for w, n in witness_counts(output).items():
+                totals[w] = totals.get(w, 0) + n
             print(f"  {'ok  ' if good else 'FAIL'}  {check.label}")
             if not good:
                 ok = False
+                bad = violated(output)
+                if check.invariants and bad:
+                    print(f"        violated: {', '.join(bad)}")
                 print("        " + " ".join(check.argv))
-                print("        " + tail.replace("\n", "\n        "))
-    if tier == "full":
-        for w, n in witness_report(m, EFFORT["full"][0], seed):
-            good = n > 0
-            ok = ok and good
-            print(f"  {'ok  ' if good else 'FAIL'}  witness {w} ({n} traces)")
+                tail = output.strip().splitlines()[-5:]
+                print("        " + "\n        ".join(tail))
+    for w, n in sorted(totals.items()):
+        good = n > 0
+        ok = ok and good
+        print(f"  {'ok  ' if good else 'FAIL'}  witness {w} ({n} traces)")
     return ok
-
 
 def load(path: Path) -> Manifest:
     """Load and validate the manifest of one model directory."""
@@ -398,7 +458,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("models", nargs="*", help="model directories in specs/ (default: all)")
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     parser.add_argument("--seed", help="seed for every sampled run, to repeat a result")
+    parser.add_argument(
+        "--samples", type=int,
+        help="traces for each sampled run (default: 2000 fast, 20000 full). CI uses fewer to fit its time limit",
+    )
     args = parser.parse_args(argv)
+    if args.samples:
+        for tier in EFFORT:
+            EFFORT[tier] = (args.samples, EFFORT[tier][1])
     if shutil.which("quint") is None:
         print("quint is not on PATH. Run `mise install` in the repo root.", file=sys.stderr)
         return 2

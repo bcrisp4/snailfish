@@ -35,6 +35,7 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | `forgeRelay` | The relay offers records with no signature. |
 | `reorderRelay` | The relay appends records in any order, also when `check` refuses them. |
 | `thief` | A device that the attacker controls ignores its own removal. |
+| `honest4` | An honest relay with 4 devices. The baseline of the base-rule and key mutants. |
 
 ## Invariants
 
@@ -56,7 +57,7 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 
 ## Results
 
-`verify.py full spacelog` passes: 95 checks in 47 minutes on an M5 Max (sampled, 20 000 traces of 50 steps, not a proof). This covers all invariants in each config, 2 known limits, 10 caught mutants, 4 open mutants and 18 witnesses. `verify.py deep spacelog` passes: `authorActive`, `noKeyToRemoved`, `baseRule` and `activeSetDeterministic` on `honest`, for every trace of up to 8 steps (bounded exhaustive, 83 seconds). 8 steps reach a genesis, one grant, one checkpoint and a few fetches, so the deep tier does not reach the S1 paths either.
+`verify.py full spacelog` passes in 19 minutes on an M5 Max (sampled, 20 000 traces of 50 steps, not a proof). It covers every invariant in each config, 2 known limits, 14 caught mutants and 18 witnesses. The 4-device baseline `honest4` takes about 16 of the 19 minutes. `verify.py deep spacelog` passes: `authorActive`, `noKeyToRemoved`, `baseRule` and `activeSetDeterministic` on `honest`, for every trace of up to 8 steps (bounded exhaustive). 8 steps reach a genesis, one grant, one checkpoint and a few fetches, so the deep tier does not reach the S1 paths.
 
 Known limits. Each one must fail:
 
@@ -65,7 +66,12 @@ Known limits. Each one must fail:
 
 ## Findings
 
-S1. Four mutants are open: `noBaseRule`, `relayNoBaseRule`, `grantFromRemoved` and `resignReusesKey`. No sampled run and no scripted test yet reaches a state where the mutant changes a verdict. Each pair of security records tried in a scripted test was refused for another reason before the base rule (for example, the second record was no longer valid on the state after the first). This is a gap in the checks, not in the design: the base rule is not checked by any sampled trace in this model. `verify.py` reports each one as "OPEN" and fails if one starts to be caught, so the manifest must then move it out of `open`. Next step: write a scripted test with two security records that are both valid on the state after either one, for example two epoch records that each remove a different device from a set of four.
+S1 (fixed). Four mutants (`noBaseRule`, `relayNoBaseRule`, `grantFromRemoved`, `resignReusesKey`) at first changed no verdict in any run. The cause was the check set, not the design. With 2 devices, each pair of security records fails another check before the base rule: a second removal of the same device, or a removal whose list of devices that stay is out of date after a grant. A removed honest device never signs, so `grantFromRemoved` needs a thief. Fix:
+
+- The baseline `honest4` has 4 devices. Two grants for two new devices on one base are then both valid except for the base rule. Sampling catches `noBaseRule` and `relayNoBaseRule` in seconds.
+- `thiefGrantTest` (thief config) catches `grantFromRemoved`. `resignTest` (4 devices) catches `resignReusesKey`. Each test passes on the design and fails under its mutant, and the other tests still pass.
+
+Lesson: a mutant baseline must be large enough for the bug to change a verdict.
 
 ## Not covered
 
