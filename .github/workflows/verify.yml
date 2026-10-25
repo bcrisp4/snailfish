@@ -40,6 +40,8 @@ jobs:
       # cargo kani setup installs the nightly that fuzz and the fuzz lint need.
       # A restored mise cache skips the postinstall hook, so run it here.
       - run: mise exec -- cargo kani setup
+      # The Kani nightly has no clippy or rustfmt. The fuzz crate lint needs both.
+      - run: make rust-nightly-components
       - run: make check
       - if: github.event_name != 'schedule'
         run: make verify-drift BASE="$BASE"
@@ -124,7 +126,9 @@ jobs:
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
       - run: mise exec -- cargo kani setup
-      - run: make rust-kani
+      # A runner has 16 GB. Four CBMC runs at once exhausted it, and the runner
+      # stopped after 22 minutes.
+      - run: make rust-kani KANI_JOBS=2
 
   crypto:
     # ProVerif 2.05 models of enrollment. setup-ocaml installs opam and an OCaml compiler.

@@ -19,7 +19,7 @@ BASE ?= main
 .PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
-        rust-nightly-check verify-crypto
+        rust-nightly-check rust-nightly-components verify-crypto
 
 ## The gate for each commit: Rust lint and tests, the shared vectors in Go and
 ## Python, runner tests, then the fast Quint tier. `make test-swift` needs Xcode,
@@ -80,6 +80,10 @@ rust-test:
 ## Kani proofs (bounded model checking), KANI_JOBS harnesses at a time. Run before a merge.
 rust-kani: rust-nightly-check
 	$(CARGO) kani --workspace -j $(KANI_JOBS) --output-format terse
+
+## Add clippy and rustfmt to the Kani nightly. The fuzz crate lint needs both.
+rust-nightly-components:
+	rustup component add --toolchain $(NIGHTLY_NAME) clippy rustfmt
 
 ## Fail if the nightly that Kani installed is not NIGHTLY_NAME.
 rust-nightly-check:
