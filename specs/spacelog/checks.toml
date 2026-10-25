@@ -7,7 +7,7 @@ module = "spacelog"
 tests = "test.qnt"
 test_module = "spacelogTest"
 # Extra test modules with other consts: 4 devices, and a thief.
-test_modules = ["spacelogTest4", "spacelogTestThief"]
+test_modules = ["spacelogTest4", "spacelogTestThief", "spacelogTestCompromised"]
 
 # Invariants that hold in every config unless a config lists it under `skip`
 # or a [[limits]] entry names it.
@@ -15,10 +15,12 @@ invariants = [
   "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
   "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
   "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
-  "noStaleChangeStored",
+  "noStaleChangeStored", "grantSealsAllKeys", "epochSequential", "noSelfRemoval",
+  "grantSubjectNew",
 ]
 
-witness_configs = ["honest", "forkRelay", "forgeRelay", "reorderRelay", "thief"]
+witness_configs = ["honest", "forkRelay", "forgeRelay", "reorderRelay", "thief",
+                   "compromisedHonest", "compromisedReorder"]
 witness_steps = 40
 
 fast_config = "honest"
@@ -62,6 +64,26 @@ why = "A malicious relay appends records in any order, so its log is not valid b
 BAD = "Set(2)"
 FAULTS = 'Set("recovery")'
 
+# A device key that an attacker controls signs bounded invalid records (signInvalid).
+# The adversary has MAX_ATTACKS actions in total, shared with the malicious relay.
+# Honest relay: the relay must refuse each invalid record.
+[configs.compromisedHonest]
+DEVS = "Set(1, 2, 3)"
+BAD = "Set(2)"
+FAULTS = 'Set("signedInvalid")'
+MAX_ATTACKS = "1"
+MAX_REC = "4"
+
+# Malicious relay that stores any signed record: each device must reject it.
+[configs.compromisedReorder]
+DEVS = "Set(1, 2, 3)"
+BAD = "Set(2)"
+FAULTS = 'Set("signedInvalid", "reorder")'
+MAX_ATTACKS = "2"
+MAX_REC = "4"
+skip = ["relayLogValid", "noStaleChangeStored"]
+why = "A malicious relay stores records in any order, so its log is not valid by design (relayLogValid), and can store a stale change (limit T8)."
+
 # Baseline for the base-rule and key mutants. Two devices are not enough: with
 # 2 devices, each pair of security records fails another check before the base
 # rule, so those mutants change no verdict (finding S1).
@@ -92,6 +114,15 @@ MAX_ATTACKS = "1"
 MAX_REC = "4"
 skip = ["noFork", "noStaleChangeStored", "relayLogValid"]
 why = "A fork breaks noFork and noStaleChangeStored (limits T7 and T8). relayLogValid holds only for an honest relay."
+
+[configs.tinyCompromised]
+DEVS = "Set(1, 2)"
+BAD = "Set(2)"
+FAULTS = 'Set("signedInvalid", "reorder")'
+MAX_ATTACKS = "2"
+MAX_REC = "3"
+skip = ["relayLogValid", "noStaleChangeStored", "noFork"]
+why = "A malicious relay stores records in any order (relayLogValid, T8). Two attacks give no two running honest devices, so noFork is moot here."
 
 # ---------------------------------------------------------------- known limits
 
@@ -163,6 +194,25 @@ caught_by = "tests"
 test_module = "spacelogTest4"
 test = "resignTest"
 
+# Each mutant weakens one field check of the protocol crate. A compromised key
+# signs the invalid record, so the relay (or a malicious relay) stores it and the
+# device accepts it. The reference invariant reads only the prefix.
+[mutants.grantSealedUnchecked]
+base = "compromisedReorder"
+caught_by = "grantSealsAllKeys"
+
+[mutants.epochSkipAllowed]
+base = "compromisedReorder"
+caught_by = "epochSequential"
+
+[mutants.selfRemovalAllowed]
+base = "compromisedReorder"
+caught_by = "noSelfRemoval"
+
+[mutants.grantActiveSubject]
+base = "compromisedHonest"
+caught_by = "grantSubjectNew"
+
 # ---------------------------------------------------------------- exhaustive (TLC)
 # TLC checks every reachable state of a small config, at any depth. Each listed
 # mutant must also fail on the same config, so the config is big enough to
@@ -203,3 +253,14 @@ invariants = [
   "writeEpochCurrent", "logChangeEpoch",
 ]
 why = "A relay that serves two branches, one attack: about 44 000 states, 91 seconds."
+
+[[exhaustive]]
+config = "tinyCompromised"
+invariants = [
+  "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
+  "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
+  "writeEpochCurrent", "logChangeEpoch", "grantSealsAllKeys", "epochSequential",
+  "noSelfRemoval", "grantSubjectNew",
+]
+mutants = ["grantSealedUnchecked", "epochSkipAllowed"]
+why = "A compromised key and a malicious relay, 2 devices, 3 records, 2 adversary actions (bounded templates only)."

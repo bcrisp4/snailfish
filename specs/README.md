@@ -1,6 +1,10 @@
 # Quint specs
 
-These Quint models check parts of `DESIGN.md`. Each model is executable. The fast and full tiers sample traces with `quint run`, so a pass is evidence, not a proof. The deep tier runs `quint verify` (Apalache), which is exhaustive up to a step bound.
+These models check parts of `DESIGN.md`. Each model README states its assumptions and exclusions.
+
+The fast and full Quint tiers sample traces. Apalache checks every trace up to a step bound. TLC checks every reachable state of selected finite configurations.
+
+ProVerif checks enrollment queries for unbounded sessions under its symbolic attacker assumptions. None of these results establishes Rust conformance.
 
 ## Layout
 
@@ -16,21 +20,27 @@ These Quint models check parts of `DESIGN.md`. Each model is executable. The fas
 | `tools/proverif.py` | Runs the ProVerif files of `enrollment/` and compares each query with `enrollment/expect.toml`. |
 | `tools/rules.py` | Checks the rule IDs of `DESIGN.md` against the model citations (`.qnt`, `.pv` and `.pvl` files) and `coverage.toml`. Finds rule changes with no change in `specs/`. |
 | `coverage.toml` | The rules that no model encodes yet, each with a reason. |
+| [conformance.md](conformance.md) | Required model-to-Rust scenario tests, observable results, and persistence tests. |
 
 ## Rule IDs
 
-Each normative rule in `DESIGN.md` ends with an ID tag, for example `[DLV-3]`. A model cites the rules that it encodes in a comment, for example `// [DLV-3]`. A rule with no citation is listed in `coverage.toml` under `not_modelled`.
+Each normative rule in `DESIGN.md` ends with an ID tag, for example `[DLV-3]`. A model cites its rules in comments.
+
+`coverage.toml` lists rules with no model citation. A citation can cover part of a rule. It does not establish complete coverage.
+
+The rule check verifies references, not semantics. The drift check requires a relevant file change, not a correct model update.
 
 1. Run `mise exec -- uv run --script specs/tools/rules.py list` to see the rules.
 2. Run `make verify-fast`. It runs `rules.py check`.
-3. Run `make verify-drift` before you merge a design change. It fails if a rule changed and nothing in `specs/` changed since `main`.
+3. Run `make verify-drift BASE=<base>` before a design merge. A changed rule requires a model, scenario, manifest, or coverage change.
 
 ## Models
 
 | Model | Scope |
 | --- | --- |
 | [delivery](delivery/README.md) | Outbox, enqueue, push, pull, app DB restore, engine state loss, relay rollback, repair, restore hold. |
-| [spacelog](spacelog/README.md) | Genesis, grants, removal with key rotation, the base rule, a malicious relay (fork, forge, reorder). |
+| [spacelog](spacelog/README.md) | Genesis, grants, removal, key rotation, malicious relay behaviour, and bounded invalid records from compromised keys. |
+| [epochs](epochs/README.md) | Epoch retries, deduplication, removal during a hold, and security-record repair after relay restore. |
 | [enrollment](enrollment/README.md) | ProVerif (symbolic, Dolev-Yao): numeric comparison, commit before reveal, signed confirmation, grant and checkpoint, app key sealing. Run with `make verify-crypto`. |
 
 ## Run the checks
@@ -60,3 +70,33 @@ Each normative rule in `DESIGN.md` ends with an ID tag, for example `[DLV-3]`. A
 - A known limit must fail. If it holds, the model changed or the limit is gone: update the manifest and the README.
 - Each witness must be reached in at least one trace. A witness at 0 traces shows a dead action.
 - If sampling cannot reach a mutant, set `caught_by = "tests"` and add a scenario test that the mutant fails.
+
+## Assurance boundaries
+
+| Evidence | What it does not establish |
+| --- | --- |
+| A scenario test | Correctness for all interleavings or all input values. |
+| A sampled invariant check | Absence of a counterexample outside the sampled traces. |
+| An Apalache result | Safety beyond its step bound or outside its configuration. |
+| A TLC result | Safety for more devices, records, faults, or other configurations. |
+| A ProVerif result | Security of real cryptographic code, code-guess probabilities, or excluded state transitions. |
+
+The model READMEs define their fault domains. The epochs model checks selected delivery/security interactions, not the complete product of both models.
+
+Rust property tests, Kani harnesses, and fuzz targets check implementation properties within their own input domains.
+
+For protocol implementation changes, follow [Model-to-Rust conformance](conformance.md). Report model evidence and implementation evidence separately.
+
+## CI
+
+Each pull request and push to `main` runs Rust checks, runner tests, workflow lint, every model tier, ProVerif, and Kani.
+
+CI discovers Quint models through `specs/*/checks.toml`. Full CI checks sample 5,000 traces per check, not the local default of 20,000.
+
+Nightly jobs also run all Rust mutants and longer fuzz checks. The workflow does not use path filters.
+
+`make verify-workflows` checks workflow syntax, expressions, and action inputs with pinned actionlint.
+
+GitHub branch protection must require the verification jobs before merge. A workflow file alone does not prevent a merge after failed checks.
+
+GitHub execution and branch protection remain unverified.

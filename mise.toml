@@ -17,6 +17,7 @@ cargo-binstall = "1.26.0"
 "cargo:cargo-deny" = "0.20.2"
 "cargo:kani-verifier" = { version = "0.68.0", postinstall = "cargo kani setup" }
 taplo = "0.10.0"
+actionlint = "1.7.12"
 
 [settings]
 # The cargo backend downloads a prebuilt binary if one exists.

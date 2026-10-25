@@ -99,6 +99,14 @@ MAX_IDS = "2"
 MAX_FAULTS = "1"
 FAULTS = 'Set("appRestore")'
 
+[configs.tinyRecovery]
+DEVS = "Set(1)"
+MAX_IDS = "1"
+MAX_FAULTS = "2"
+FAULTS = 'Set("relayRestore", "engineLoss", "warnedRelease")'
+skip = ["noLostChange"]
+why = "An engine state loss and relay restore can destroy both copies. The weak property excludes these exposed changes."
+
 # ---------------------------------------------------------------- known limits
 # Each limit must be violated. If one holds, the model changed or the limit is gone.
 
@@ -203,3 +211,9 @@ why = "Crashes and lost responses with 2 changes: about 10 000 states, 4 seconds
 config = "tinyAppRestore"
 invariants = ["noDoubleApply", "noLostChange", "noLostChangeWeak", "appliedHeld", "caughtUpState", "noFork"]
 why = "One app DB restore with 2 changes."
+
+[[exhaustive]]
+config = "tinyRecovery"
+invariants = ["noDoubleApply", "noLostChangeWeak", "appliedHeld", "caughtUpState", "refusedNotStored", "noStuckDevice", "noSilentLoss", "noFork"]
+mutants = ["noRepair", "noAheadReset", "releaseIgnoresFresh"]
+why = "One device and one change, with relay restore, engine state loss, repair, and warned hold release. At most two faults."

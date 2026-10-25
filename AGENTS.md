@@ -2,59 +2,55 @@
 
 ## Verification
 
-Verification is mandatory. A change is not complete until the checks for its kind of change pass. The models in `specs/` are the source of truth for protocol behaviour. If code and a model disagree, fix the code, or change the model first and then the code.
+The models in `specs/` define protocol behaviour. If Rust and a model disagree, resolve the disagreement before the merge.
 
-Run `mise install` once. It pins every tool. Do not use `cargo install`, `brew` or `npm -g` for dev tools. ProVerif is the exception: `opam install proverif`, then `eval $(opam env)`.
+Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `npm -g`. ProVerif uses `opam install proverif.2.05`.
 
-### When to run what
+### Before a change
 
-| When | Run | Time |
+| Change | Read first | Required evidence and reason |
 | --- | --- | --- |
-| After each edit to a model | `make verify-fast MODEL=<model>` | 10 s |
-| Before each commit | `make check`: Rust lint, tests and licences, rule IDs, fast Quint | 1 min |
-| Before a merge that touches `specs/`, `DESIGN.md` or `crates/protocol` | `make verify MODEL=<model>` for each changed model, then `make verify-drift` and `make rust-kani` | delivery 1 min, spacelog 20 min, Kani 2 min |
-| Before a merge that touches `specs/enrollment` | `make verify-crypto` | 5 s |
-| Before a merge that changes shared tooling (`specs/tools/`, `Makefile`) | `make verify` (all models and ProVerif) | 22 min |
-| Before a merge that changes a `[deep]` invariant or an `[[exhaustive]]` entry | `make verify-deep MODEL=<model>`: Apalache, and TLC on every reachable state of small configs | 9 min |
-| Before a merge that changes a parser | `make rust-fuzz` | 5 min per target |
-| Before a merge that changes Rust code | `make rust-mutants-diff`: mutants in the changed code only | 10 s now |
+| A protocol rule or model | `.agents/skills/snailfish-verification/SKILL.md`, the model README, `checks.toml`, and relevant `test.qnt` scenarios | Change the model before the protocol text or Rust. The model defines the required behaviour. |
+| A rule that no model covers | `.agents/skills/quint-modeling/SKILL.md`, `specs/README.md` | Add a model or record an explicit exclusion. A rule citation alone does not establish coverage. |
+| Protocol, engine, or relay Rust logic | `specs/conformance.md`, the relevant model actions and named scenarios | Add a real-path Rust test of the same scenario, with model path, scenario name, and rule IDs. Model results do not verify Rust behaviour. |
+| A function in `crates/protocol` | The model rule and `PROTOCOL.md` section | Add a property test and bounded Kani harness. Cite the rule ID. These checks address different input domains. |
+| Enrollment, removal, or key sealing | `specs/enrollment/README.md`, `lib.pvl`, and `expect.toml` | Update the security model and a broken variant. A symbolic security result depends on its attacker assumptions. |
+| A wire format or untrusted parser | `PROTOCOL.md`, existing vectors and fuzz seeds | Write the format and vectors before the code. Add a seeded fuzz target for each parser. Models omit byte-level faults. |
+| Verification tools or CI | `specs/README.md`, the runner tests, and `.github/workflows/verify.yml` | Reject tool errors and incomplete runs. An expected counterexample must identify the intended property. |
 
-Models, each with a `README.md` of its scope and limits:
+### After a change
 
-- `delivery` (Quint): outbox, sync, app and engine restore, relay rollback and repair.
-- `spacelog` (Quint): grants, removal and key rotation, the base rule, a malicious relay.
-- `enrollment` (ProVerif): the device pairing protocol against a network attacker.
-
-### What to add for each change
-
-| You change | First | Then add |
+| When | Run | Reason |
 | --- | --- | --- |
-| A protocol rule in `DESIGN.md` | Load the `snailfish-verification` skill. Change the model. | A `BUG` value and a mutant that the rule's invariant catches. Keep the rule's `[ID]` tag, and cite it in the model or in `specs/coverage.toml`. |
-| A rule that no model covers yet | Load the `quint-modeling` skill | A new model in `specs/<name>/`. Copy the shape of `specs/delivery/`. |
-| Enrollment, removal or key sealing | Change `specs/enrollment/*.pv` | A broken variant `.pv` file and its lines in `expect.toml`. |
-| A wire format | Write its `PROTOCOL.md` section with test vectors | The vectors as unit tests. |
-| A function in `crates/protocol` | Find the model rule that it implements | A `proptest` of its property, a Kani harness, and the rule `[ID]` in a comment. |
-| A parser of untrusted bytes | | A `cargo-fuzz` target with seeds in `fuzz/seeds/`. |
-| Engine or relay logic | Find the model action that it implements | A test of the same scenario as the model's `test.qnt`. |
-| A dependency | | Nothing new: `make check` runs `cargo deny`. |
+| After each model edit | `make verify-fast MODEL=<model>` | Typechecks and scenarios expose model errors before longer checks. |
+| Before each commit | `make check` | Rust checks, runner tests, workflow lint, rule IDs, and fast model checks form the local gate. |
+| Before a merge with model or protocol changes | `make verify MODEL=<model>` and `make verify-deep MODEL=<model>` for each affected model | Sampling and exhaustive finite configurations provide different evidence. |
+| Before a merge with a tagged design-rule change | `make verify-drift BASE=<base>` | A changed rule requires a model, scenario, manifest, or coverage change. |
+| Before a merge with shared-tool or CI changes | `make verify` and `make verify-deep` | Shared tools can invalidate results for every model and backend. |
+| Before a merge with enrollment model changes | `make verify-crypto` | Every design and broken-variant query must match its expectation. |
+| Before a merge with Rust changes | `make rust-kani` and `make rust-mutants-diff BASE=<base>` | Bounded harnesses and fault-sensitive tests check the implementation. |
+| Before a merge with parser changes | `make rust-fuzz` | Arbitrary bytes exercise parser failure paths. |
 
-### Rules
+`BASE` is the target branch for a pull request, or the previous commit for a direct push. The default is `main`.
 
-- A new invariant needs a mutant that breaks it, and the mutant's baseline must pass that invariant. If a mutant changes no verdict, make the baseline larger (more devices) or add a scripted test. A small baseline hid four mutants once (spacelog finding S1).
-- If Kani runs out of memory, shrink the harness and record the bound in a comment. Do not delete it.
-- A surviving `cargo-mutants` mutant needs a test, or an entry in `.cargo/mutants.toml` with a reason.
-- Tests check behaviour. Do not write a test that copies the implementation.
+Each model README states its scope and exclusions. `specs/README.md` describes the verification tiers and their limits.
 
-### Good and bad tests
+### Result requirements
 
-A test must fail when the code has a real bug. A green pipeline makes a reviewer trust the change, so a bad test is dangerous.
+| Requirement | Reason |
+| --- | --- |
+| A new invariant needs a mutant that breaks it and a baseline that passes it. | An unchanged verdict can hide an inadequate configuration. Increase the domain or add a named scenario. |
+| A known limit must reproduce its counterexample. Each required witness must occur. | A green result can otherwise describe an unreachable state or a missing failure path. |
+| If Kani exceeds available memory, reduce the harness and record its bound. Do not delete the harness. | Resource failure is not a counterexample or a successful check. |
+| A surviving Rust mutant needs a behavioural test or a justified `.cargo/mutants.toml` entry. | A surviving fault leaves the associated behaviour unverified. |
+| Report sampled traces, step bounds, finite configurations, and ProVerif assumptions explicitly. | No result covers inputs or behaviours outside its scope. Never report the system as "proven". |
 
-- Good: test observable behaviour, real inputs, boundaries and failure modes.
-- Good: mock only true external boundaries (network, clock, disk). Prefer a few real-path tests over many shallow ones.
-- Good: test the same scenario as the model's `test.qnt` when you change engine or relay logic.
-- Bad: tautological tests. They pass by construction. The expected value copies the implementation, or the test only asserts mock wiring.
-- Bad: change-detector tests. They fail on a harmless refactor and catch no real bug.
-- Bad: reflexive regression tests. They exist only because you fixed a bug, and they restate the fix.
+### Test requirements
 
-Before you add a test, a lint check or an alert, complete the sentence "without this, production would ...". If the sentence does not end in a concrete failure, do not add it.
-- Report each result with its scope: "sampled", "bounded to N steps", "every reachable state of config X (TLC)", or "for unbounded sessions (ProVerif)". Never "proven".
+Before a new test, lint rule, or alert, identify the concrete production failure that it detects.
+
+Test observable behaviour, boundaries, and failure modes. Mock external boundaries only. Use real databases for persistence scenarios.
+
+Do not copy the implementation into the expected result. Do not add tests that detect harmless refactors or assert mock calls alone.
+
+A skipped test leaves its obligation unverified. Do not weaken a check to obtain a green result.

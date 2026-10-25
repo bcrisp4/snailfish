@@ -217,3 +217,47 @@ def test_drift_cli_exit_codes(repo: Path) -> None:
     assert rules.main(["--root", str(repo), "drift", "--base", "main"]) == 0
     edit_rule(repo)
     assert rules.main(["--root", str(repo), "drift", "--base", "main"]) == 1
+
+
+@pytest.mark.parametrize(
+    "name", ["enrollment/enrollment.pv", "enrollment/lib.pvl", "enrollment/expect.toml"]
+)
+def test_drift_passes_when_a_proverif_file_changes_too(repo: Path, name: str) -> None:
+    edit_rule(repo)
+    path = repo / "specs" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("(* changed *)\n")
+    assert rules.drift(repo, "main") == []
+
+
+@pytest.mark.parametrize("name", ["m/notes.md", "m/other.toml", "m/sub/a.pv"])
+def test_drift_ignores_other_files_in_specs(repo: Path, name: str) -> None:
+    edit_rule(repo)
+    path = repo / "specs" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x\n")
+    assert rules.drift(repo, "main")
+
+
+def test_drift_raises_for_an_unknown_base(repo: Path) -> None:
+    edit_rule(repo)
+    (repo / "specs" / "m" / "model.qnt").write_text("// [DLV-1]\n// [DLV-2]\n// updated\n")
+    with pytest.raises(RuntimeError):
+        rules.drift(repo, "no-such-ref")
+
+
+def test_drift_cli_fails_closed_for_an_unknown_base(repo: Path) -> None:
+    edit_rule(repo)
+    (repo / "specs" / "m" / "model.qnt").write_text("// [DLV-1]\n// [DLV-2]\n// updated\n")
+    assert rules.main(["--root", str(repo), "drift", "--base", "0" * 40]) == 1
+
+
+def test_drift_allows_a_base_without_design_md(tmp_path: Path) -> None:
+    root = tmp_path
+    (root / "README").write_text("x\n")
+    git(root, "init", "-q", "-b", "main")
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", "empty")
+    (root / "DESIGN.md").write_text(DESIGN)
+    errors = rules.drift(root, "main")
+    assert errors and "DLV-1" in errors[0]

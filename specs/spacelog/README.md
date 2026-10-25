@@ -36,6 +36,8 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | `reorderRelay` | The relay appends records in any order, also when `check` refuses them. |
 | `thief` | A device that the attacker controls ignores its own removal. |
 | `honest4` | An honest relay with 4 devices. The baseline of the base-rule and key mutants. |
+| `compromisedHonest` | A compromised key signs bounded record templates. The honest relay must refuse invalid records. |
+| `compromisedReorder` | A malicious relay stores those signed records. Honest clients must reject invalid records. |
 
 ## Invariants
 
@@ -54,10 +56,20 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | `logChangeEpoch` | Each change in a verified log has the epoch of the state before it. |
 | `noFork` | Running honest devices never hold incomparable verified logs. |
 | `noStaleChangeStored` | The relay never stores a change with an epoch below a stored epoch record. |
+| `grantSealsAllKeys` | A verified grant seals exactly the keys from its preceding prefix. |
+| `epochSequential` | A verified rotation advances the epoch by one. |
+| `noSelfRemoval` | A verified rotation does not remove its own author. |
+| `grantSubjectNew` | A verified grant does not grant an active device again. |
 
 ## Results
 
-`verify.py full spacelog` passes in 19 minutes on an M5 Max (sampled, 20 000 traces of 50 steps, not a proof). It covers every invariant in each config, 2 known limits, 14 caught mutants and 18 witnesses. The 4-device baseline `honest4` takes about 16 of the 19 minutes. `verify.py deep spacelog` passes: `authorActive`, `noKeyToRemoved`, `baseRule` and `activeSetDeterministic` on `honest`, for every trace of up to 8 steps (bounded exhaustive). 8 steps reach a genesis, one grant, one checkpoint and a few fetches, so the deep tier does not reach the S1 paths.
+The full tier samples 20,000 traces of up to 50 steps per check. It includes 17 mutants, 22 witnesses, and two known limits.
+
+Each configuration checks its declared invariants, with explicit skips and the documented `honest4` subset. Sampling does not establish absence of other counterexamples.
+
+Apalache checks `authorActive`, `noKeyToRemoved`, `baseRule`, and `activeSetDeterministic` on `honest`, up to eight steps.
+
+That bound reaches initial enrollment but not the longer S1 paths. The TLC configurations check selected longer executions within finite domains.
 
 Known limits. Each one must fail:
 
@@ -66,7 +78,29 @@ Known limits. Each one must fail:
 
 ### Exhaustive results (TLC)
 
-`make verify-deep MODEL=spacelog` also runs TLC on `tinyHonest`, `tinyHonest4`, `tinyThief` and `tinyFork`. TLC checks every reachable state of each config, at any depth, and catches 4 mutants, among them the S1 base-rule mutants on `tinyHonest4`.
+The deep tier runs TLC on `tinyHonest`, `tinyHonest4`, `tinyThief`, `tinyFork`, and `tinyCompromised`.
+
+Each baseline must complete its reachable state graph. Each listed mutant must produce an invariant counterexample on the same configuration.
+
+`tinyCompromised` has two devices, three records, and two adversary actions. It checks signed invalid templates with one honest client.
+
+Each action chooses its own parameters. Unrelated nondeterministic choices do not multiply every transition's enumeration cost.
+
+## Compromised-key inputs
+
+`signInvalid` bypasses `selfOk`. Its generation guards do not call `check`, `stateOk`, or other verifier predicates.
+
+The action uses a key in `BAD` to sign one of five bounded templates on a relay branch.
+
+The templates include missing grant keys, an epoch skip, self-removal, an invalid base digest, and a grant for an active device.
+
+The last template can also produce a valid grant. Prefix-based properties judge each record where a verifier accepts it, not where the attacker created it.
+
+The independent field invariants use reference prefix functions. They do not read the attacker tags or call the verifier.
+
+Named scenarios check honest-relay refusal and client rejection after malicious-relay storage. Four additional mutants remove the corresponding field checks.
+
+This is a bounded template attacker, not arbitrary control of every record field. An authorised key holder can still disclose keys it already knows.
 
 ## Findings
 

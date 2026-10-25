@@ -48,7 +48,17 @@ The checks also confirm three known limits. Each one fails on purpose:
 
 ### Exhaustive results (TLC)
 
-`make verify-deep MODEL=delivery` also runs TLC on `tinyCrash` and `tinyAppRestore` (2 changes). TLC checks every reachable state of these configs, at any depth, and catches 4 mutants on `tinyCrash`.
+`make verify-deep MODEL=delivery` runs TLC on three finite configurations. Each result covers every reachable state, not larger configurations.
+
+| Configuration | Scope | Mutant checks |
+| --- | --- | --- |
+| `tinyCrash` | Two devices and two changes, without restore faults. | Split transactions, duplicate append, and an early outbox deletion. |
+| `tinyAppRestore` | Two devices and two changes, with one app restore. | No additional mutants. |
+| `tinyRecovery` | One device and one change, with at most two relay-restore or engine-loss faults. | Missing repair, missing reset, and a hold release without a required warning. |
+
+The `tinyRecovery` baseline visits 905 distinct states. It includes repair, status reports, and warned hold release.
+
+Its weak loss property excludes changes that an engine state loss exposes. It does not promise recovery after both surviving copies disappear.
 
 ## Findings fixed in DESIGN.md
 

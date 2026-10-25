@@ -1,0 +1,60 @@
+model = "model.qnt"
+module = "epochs"
+tests = "test.qnt"
+test_module = "epochsTest"
+invariants = ["knownIdFirst", "repairComplete", "relayAuthorised", "holdBlocksChanges", "noFork"]
+fast_config = "bounded"
+witness_configs = ["bounded"]
+witness_steps = 30
+
+[deep]
+config = "tiny"
+invariants = ["knownIdFirst", "repairComplete", "relayAuthorised", "holdBlocksChanges"]
+# TLC checks the complete tiny state graph. This is a bounded cross-check.
+max_steps = 4
+
+[defaults]
+MAX_RECORDS = "4"
+MAX_RESTORES = "1"
+BUG = '"none"'
+
+[configs.bounded]
+
+[configs.tiny]
+MAX_RECORDS = "3"
+
+[[limits]]
+config = "bounded"
+invariant = "noFork"
+why = "A security append during a restore hold can conflict with a lost change. Devices stop when they see the conflict, not before."
+
+[[limits]]
+config = "tiny"
+invariant = "noFork"
+why = "A removal during a restore hold can conflict with a lost change, also with three record envelopes."
+
+[mutants.epochBeforeDedupe]
+base = "bounded"
+caught_by = "knownIdFirst"
+
+[mutants.repairDropsRotation]
+base = "bounded"
+caught_by = "repairComplete"
+
+[mutants.ignoreRemoval]
+base = "bounded"
+caught_by = "relayAuthorised"
+
+[mutants.ignoreEpoch]
+base = "bounded"
+caught_by = "relayAuthorised"
+
+[mutants.ignoreHold]
+base = "bounded"
+caught_by = "holdBlocksChanges"
+
+[[exhaustive]]
+config = "tiny"
+invariants = ["knownIdFirst", "repairComplete", "relayAuthorised", "holdBlocksChanges"]
+mutants = ["epochBeforeDedupe", "repairDropsRotation", "ignoreRemoval", "ignoreEpoch", "ignoreHold"]
+why = "Two devices, at most three new record envelopes, one removal and one relay restore."

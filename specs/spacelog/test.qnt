@@ -208,3 +208,108 @@ module spacelogTestThief {
       .expect(authorActive)
 }
 
+
+// A compromised device key (device 2) signs invalid records. Each record has a
+// correct signature, so only the field checks of the verifier can refuse it.
+// Bounded scope: the five templates of signInvalid, not a Byzantine key.
+module spacelogTestCompromised {
+  import spacelog(DEVS = Set(1, 2, 3), BAD = Set(2), MAX_REC = 8, MAX_ATTACKS = 4,
+                  FAULTS = Set("signedInvalid", "reorder"), BUG = "none").* from "./model"
+
+  action appendId(k: int): bool = {
+    nondet r = pending.filter(x => x.id == k).oneOf()
+    relayAppend(r)
+  }
+  action refuseId(k: int): bool = {
+    nondet r = pending.filter(x => x.id == k).oneOf()
+    relayRefuse(r)
+  }
+  action appendAnyId(k: int, b: int): bool = {
+    nondet r = env.signed.filter(x => x.id == k).oneOf()
+    appendAny(r, b)
+  }
+  // Ids 1 and 2 are the genesis and the grant. Both devices hold the log.
+  action enrolTwo: bool =
+    init
+      .then(createSpace(1)).then(appendId(1))
+      .then(signGrant(1, 1, 2)).then(appendId(2))
+      .then(fetchOne(1, 0)).then(sendCheckpoint(1, 2))
+      .then(fetchOne(2, 0)).then(fetchOne(2, 0))
+
+  // The record with id 3 has a signature, and the prefix refuses it for a field
+  // reason, not for the signature. The honest relay refuses it and stores nothing.
+  def invalidSigned(v: Verdict): bool =
+    env.signed.filter(x => x.id == 3).size() == 1 and env.hostile.contains(3)
+      and relayVerdict(env.signed.filter(x => x.id == 3).getOnlyElement()) == v
+
+  // Honest relay: the compromised key signs a grant that seals no keys.
+  run honestRelayRefusesInvalidTest =
+    enrolTwo
+      .then(signInvalid(2, 0, 0, 3))
+      .expect(wInvalidSigned and invalidSigned(BadState))
+      .then(refuseId(3))
+      .expect(wInvalidRelayRefused and branches.get(0).recs.length() == 2 and pending == Set())
+      .expect(relayLogValid and grantSealsAllKeys)
+
+  // Honest relay: a grant for an active device, and a self removal.
+  run honestRelayRefusesActiveSubjectAndSelfRemovalTest =
+    enrolTwo
+      .then(signInvalid(2, 4, 0, 1))
+      .expect(invalidSigned(BadState))
+      .then(refuseId(3))
+      .then(signInvalid(2, 2, 0, 3))
+      .expect(relayVerdict(env.signed.filter(x => x.id == 4).getOnlyElement()) == BadState)
+      .then(refuseId(4))
+      .expect(branches.get(0).recs.length() == 2 and relayLogValid and grantSubjectNew and noSelfRemoval)
+
+  // Malicious relay: it stores a grant with the wrong sealed keys. Device 1 stops
+  // with rejected, and its verified log stays valid.
+  run clientRejectsWrongSealedTest =
+    enrolTwo
+      .then(signInvalid(2, 0, 0, 3))
+      .then(appendAnyId(3, 0))
+      .expect(wInvalidStored and branches.get(0).recs.length() == 3)
+      .then(fetchOne(1, 0))
+      .expect(wInvalidClientRejected and dev(1).status == Rejected and dev(1).log.recs.length() == 2)
+      .expect(grantSealsAllKeys and authorActive and baseInOwnLog)
+
+  // Malicious relay: epoch skip. The epoch number is 3, not 2.
+  run clientRejectsEpochSkipTest =
+    enrolTwo
+      .then(signInvalid(2, 1, 0, 1))
+      .expect(invalidSigned(BadState))
+      .then(appendAnyId(3, 0))
+      .then(fetchOne(1, 0))
+      .expect(wInvalidClientRejected and dev(1).status == Rejected and dev(1).log.sp.epoch == 1)
+      .expect(epochSequential and noKeyToRemoved)
+
+  // Malicious relay: the compromised key removes itself. Device 1 rejects it.
+  run clientRejectsSelfRemovalTest =
+    enrolTwo
+      .then(signInvalid(2, 2, 0, 3))
+      .then(appendAnyId(3, 0))
+      .then(fetchOne(1, 0))
+      .expect(wInvalidClientRejected and dev(1).status == Rejected and dev(1).log.sp.removed == Set())
+      .expect(noSelfRemoval)
+
+  // The same record meets both paths. The honest relay refuses it. A malicious
+  // relay replays it from the signed set, and device 1 rejects it (active subject).
+  run sameRecordRelayAndClientRejectTest =
+    enrolTwo
+      .then(signInvalid(2, 4, 0, 1))
+      .then(refuseId(3))
+      .expect(wInvalidRelayRefused and not(wInvalidStored) and branches.get(0).recs.length() == 2)
+      .then(appendAnyId(3, 0))
+      .expect(wInvalidStored)
+      .then(fetchOne(1, 0))
+      .expect(wInvalidClientRejected and dev(1).status == Rejected and grantSubjectNew)
+
+  // A grant with a base digest that is not in the log stops the device with fork.
+  run clientForksOnBadBaseTest =
+    enrolTwo
+      .then(signInvalid(2, 3, 0, 3))
+      .expect(relayVerdict(env.signed.filter(x => x.id == 3).getOnlyElement()) == BadBase)
+      .then(appendAnyId(3, 0))
+      .then(fetchOne(1, 0))
+      .expect(wInvalidClientRejected and dev(1).status == Forked and forkStops and baseInOwnLog)
+}

@@ -1,6 +1,16 @@
 # Verification in CI. The tiers match the Makefile and AGENTS.md.
 # Unverified: this workflow has not run on GitHub yet.
+#
+# Each pull request and push runs all model tiers, ProVerif, and Kani.
+# No path filter can omit a relevant model or shared-tool change.
 name: verify
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 on:
   push:
@@ -11,10 +21,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The commit that the drift and mutants-diff gates compare with.
+  # Pull request: the base branch tip. Push: the tip before the push.
+  # Both gates fail if this is not a valid commit, for example on a new branch.
+  BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
 
 jobs:
   check:
-    # The gate for each commit: Rust lint, tests, licences and the fast Quint tier.
+    # The gate for each commit: Rust lint, tests, licences, runner tests and the fast Quint tier.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -27,30 +41,82 @@ jobs:
       # A restored mise cache skips the postinstall hook, so run it here.
       - run: mise exec -- cargo kani setup
       - run: make check
-      # A pull request checkout has no local main branch.
-      - run: git fetch origin main:main || true
-      - run: make verify-drift
-      # Mutants in the Rust code that this pull request, or this push, changed.
-      # A push to main compares with the commit before the push.
-      - run: make rust-mutants-diff BASE=${{ github.event_name == 'pull_request' && 'main' || github.event.before }}
+      - if: github.event_name != 'schedule'
+        run: make verify-drift BASE="$BASE"
+      # Nightly checks every mutant in the rust-mutants job.
+      - if: github.event_name != 'schedule'
+        run: make rust-mutants-diff BASE="$BASE"
+
+  models:
+    # The model list comes from specs/*/checks.toml, so a new model is picked up.
+    runs-on: ubuntu-24.04
+    outputs:
+      models: ${{ steps.list.outputs.models }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          models=$(for f in specs/*/checks.toml; do test -f "$f" || exit 1; basename "$(dirname "$f")"; done | jq -R . | jq -sc .)
+          test "$models" != "[]"
+          echo "models=$models" >> "$GITHUB_OUTPUT"
 
   full:
     # Every Quint config, limit, mutant and witness, one job per model. A CI
     # runner has fewer cores than a developer machine, so it samples 5000
     # traces instead of 20000. A developer runs the full count before a merge.
-    if: github.event_name != 'pull_request'
+    needs: models
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        model: [delivery, spacelog]
+        model: ${{ fromJSON(needs.models.outputs.models) }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
       - run: make verify-tools
       - run: mise exec -- uv run --script specs/tools/verify.py full ${{ matrix.model }} --samples 5000
+
+  deep-quint:
+    # Apalache and TLC, one job per model.
+    needs: models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(needs.models.outputs.models) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install --profile minimal
+      - uses: jdx/mise-action@v2
+      - run: make verify-deep MODEL=${{ matrix.model }}
+
+  kani:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install --profile minimal
+      - uses: jdx/mise-action@v2
+      - run: mise exec -- cargo kani setup
+      - run: make rust-kani
+
+  crypto:
+    # ProVerif 2.05 models of enrollment. setup-ocaml installs opam and an OCaml compiler.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "4.14.2"
+      - run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk2.0-dev libexpat1-dev pkg-config
+      - run: opam install proverif.2.05 --yes
+      - uses: jdx/mise-action@v2
+      - run: make verify-crypto
 
   rust-mutants:
     # Every mutant of every crate. The check job runs only the changed code.
@@ -62,9 +128,8 @@ jobs:
       - uses: jdx/mise-action@v2
       - run: make rust-mutants
 
-  deep:
-    # Slow, bounded exhaustive checks. Nightly only.
-    # ProVerif (make verify-crypto) needs opam. It runs on developer machines only.
+  nightly-fuzz:
+    # Long fuzz runs. Nightly only.
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     steps:
@@ -72,6 +137,4 @@ jobs:
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
       - run: mise exec -- cargo kani setup
-      - run: make verify-deep
-      - run: make rust-kani
       - run: make rust-fuzz FUZZ_SECONDS=600

@@ -35,7 +35,10 @@ TAG_LIKE = re.compile(r"\[([A-Za-z]{2,5}-[0-9A-Za-z]+)\]")
 RULE_LINE = re.compile(r"^(?:- |\d+\. )")
 CITE = re.compile(r"\[([A-Z]{3}-[0-9]+)\]")
 # Files whose change counts as a model change for the drift check.
-MODEL_FILES = re.compile(r"^specs/(?:[^/]+/(?:model\.qnt|test\.qnt|checks\.toml)|coverage\.toml)$")
+# A ProVerif model counts too: `*.pv`, `*.pvl` and `expect.toml`.
+MODEL_FILES = re.compile(
+    r"^specs/(?:[^/]+/(?:model\.qnt|test\.qnt|checks\.toml|expect\.toml|[^/]+\.pvl?)|coverage\.toml)$"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -231,10 +234,16 @@ def drift(root: Path, base: str) -> list[str]:
 
     Returns:
         The error messages. An empty list means that there is no drift.
+
+    Raises:
+        RuntimeError: If git cannot resolve the ref or read a diff. The check
+            fails closed, because "no change" is not known in that case.
     """
-    try:
+    git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
+    # DESIGN.md can be absent at the base. Any other git failure must raise.
+    if git(root, "ls-tree", "--name-only", base, "--", "DESIGN.md").strip():
         old_text = git(root, "show", f"{base}:DESIGN.md")
-    except RuntimeError:
+    else:
         old_text = ""
     old = {r.rule_id: r.line for r in parse_rules(old_text)[0]}
     new = {r.rule_id: r.line for r in parse_rules((root / "DESIGN.md").read_text())[0]}
@@ -283,7 +292,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "check":
         count = len(parse_rules((root / "DESIGN.md").read_text())[0])
         return report(check(root), f"ok: {count} rule IDs")
-    return report(drift(root, args.base), f"ok: no rule drift since {args.base}")
+    try:
+        errors = drift(root, args.base)
+    except RuntimeError as error:
+        return report([f"cannot compare with {args.base!r}: {error}"], "")
+    return report(errors, f"ok: no rule drift since {args.base}")
 
 
 if __name__ == "__main__":

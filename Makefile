@@ -16,12 +16,12 @@ KANI_JOBS ?= 4
 # The git ref that `make rust-mutants-diff` compares against.
 BASE ?= main
 
-.PHONY: check verify-fast verify verify-deep verify-tools verify-drift \
+.PHONY: check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
         rust-nightly-check verify-crypto
 
-## The gate for each commit: Rust lint and tests, then the fast Quint tier.
-check: rust verify-fast
+## The gate for each commit: Rust lint and tests, runner tests, then the fast Quint tier.
+check: rust verify-tools verify-workflows verify-fast
 
 ## ---------------------------------------------------------------- Quint
 
@@ -45,9 +45,14 @@ verify-deep:
 verify-tools:
 	uv run --with pytest pytest -q specs/tools/tests
 
-## Fail if a DESIGN.md rule changed and no file in specs/ changed since main.
+## Check workflow syntax, expressions, and action inputs before a merge.
+verify-workflows:
+	mise exec -- actionlint
+
+## Fail if a DESIGN.md rule changed and no model file in specs/ changed since BASE.
+## It also fails if BASE is not a valid git commit. Default BASE is main.
 verify-drift:
-	$(RULES) drift --base main
+	$(RULES) drift --base $(BASE)
 
 ## ---------------------------------------------------------------- Rust
 
@@ -112,7 +117,9 @@ rust-mutants:
 ## merge. It does not see a test that a change made weaker in other code, so
 ## rust-mutants still runs nightly.
 rust-mutants-diff:
-	@trap 'rm -f mutants.diff' EXIT; git diff $(BASE) -- '*.rs' > mutants.diff; \
+	@trap 'rm -f mutants.diff' EXIT; \
+	  git rev-parse --verify --quiet '$(BASE)^{commit}' > /dev/null || { echo "FAIL: BASE '$(BASE)' is not a git commit"; exit 1; }; \
+	  git diff $(BASE) -- '*.rs' > mutants.diff || { echo "FAIL: git diff $(BASE) failed"; exit 1; }; \
 	  if [ ! -s mutants.diff ]; then echo "ok: no Rust change since $(BASE)"; exit 0; fi; \
 	  $(CARGO) mutants --workspace --in-diff mutants.diff; $(check_mutants)
 

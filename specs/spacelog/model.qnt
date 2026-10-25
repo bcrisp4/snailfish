@@ -34,6 +34,7 @@ module spacelog {
     | EvChangeAppended | EvNewEpochChange | EvRefusedBaseRule | EvRefusedAuthor | EvRefusedOther
     | EvCheckpoint | EvEnrolled | EvEpochVerified | EvForkBranch | EvForkDetected
     | EvForgedRejected | EvDeviceRejected | EvForged | EvReplayed | EvStaleWrite | EvThiefSigned
+    | EvInvalidSigned | EvInvalidRelayRefused | EvInvalidStored | EvInvalidClientRejected
 
   type LogRec = {
     id: int,               // unique for each signature. Stands for the signature bytes.
@@ -76,6 +77,7 @@ module spacelog {
     nextId: int,
     attacks: int,              // actions of a malicious relay so far
     signed: Set[LogRec],       // every record that a key signed
+    hostile: Set[int],         // ids of the invalid records that a compromised key signed. Only witnesses read it.
     conflictSeen: Set[Key],    // honest devices that received a record whose base conflicts
     badWrite: bool,            // an honest device wrote with an epoch that is not its verified epoch
     staleStored: bool,         // a relay stored a change with an epoch below a stored epoch record
@@ -88,7 +90,7 @@ module spacelog {
   const DEVS: Set[Key]
   const BAD: Set[Key]        // devices that an attacker controls. They ignore their own removal.
   const MAX_REC: int         // bound on the records that keys sign
-  const MAX_ATTACKS: int     // bound on the actions of a malicious relay
+  const MAX_ATTACKS: int     // bound on the adversary actions: malicious relay steps and signInvalid
   const FAULTS: Set[str]     // the relay capabilities and key uses that this config enables
   const BUG: str
 
@@ -100,6 +102,7 @@ module spacelog {
     "reorder",    // the relay appends any signed record to any branch, in any order, also a replay
     "forge",      // the relay appends a grant or a change with a signature that nobody made
     "recovery",   // the recovery key can sign a grant or an epoch record
+    "signedInvalid", // a compromised device key (BAD) signs a record from a bounded set of invalid templates
   )
 
   pure val BR: Set[int] = if (FAULTS.contains("fork")) Set(0, 1) else Set(0)
@@ -119,6 +122,10 @@ module spacelog {
     "epochUnchecked",       // a change with a past epoch is valid
     "staleWriteEpoch",      // a device keeps its write epoch after it verifies an epoch record
     "resignReusesKey",      // the engine signs a refused epoch record again with the same key
+    "grantSealedUnchecked", // a grant need not seal exactly the keys of the space
+    "epochSkipAllowed",     // an epoch record need not carry the next epoch number
+    "selfRemovalAllowed",   // an epoch record can remove its own author
+    "grantActiveSubject",   // a grant for a device that is already active is valid
   )
 
   pure val DEVICE_ONLY: Set[str] = Set("trustsRelayVerdict", "baseUnchecked", "staleWriteEpoch")
@@ -198,11 +205,12 @@ module spacelog {
   // Rules: [LOG-8]
   pure def stateOk(sp: Space, r: LogRec, bug: str): bool = match r.kind {
     | Genesis => true
-    | Grant => not(sp.active.contains(r.subject))
+    | Grant => (bug == "grantActiveSubject" or not(sp.active.contains(r.subject)))
                and (bug == "regrantRemoved" or not(sp.removed.contains(r.subject)))
-               and r.sealed == sp.keys
-    | Epoch => r.removed.subseteq(sp.active) and not(r.removed.contains(r.author))
-               and r.epoch == sp.epoch + 1
+               and (bug == "grantSealedUnchecked" or r.sealed == sp.keys)
+    | Epoch => r.removed.subseteq(sp.active)
+               and (bug == "selfRemovalAllowed" or not(r.removed.contains(r.author)))
+               and (bug == "epochSkipAllowed" or r.epoch == sp.epoch + 1)
                and (bug == "epochSealsToAll" or r.stay == sp.active.exclude(r.removed))
     | Change => bug == "epochUnchecked" or r.epoch == sp.epoch
   }
@@ -249,6 +257,15 @@ module spacelog {
 
   pure def refEpoch(recs: List[LogRec]): int =
     if (recs == List()) 0 else recs.foldl(1, (e, r) => if (r.kind == Epoch) e + 1 else e)
+
+  // The keys of a prefix: the key of the genesis record and of each epoch record.
+  pure def refKeys(recs: List[LogRec]): Set[int] =
+    recs.foldl(Set(), (k, r) => match r.kind {
+      | Genesis => Set(r.key)
+      | Grant => k
+      | Epoch => k.union(Set(r.key))
+      | Change => k
+    })
 
   // The position of the last security record in a prefix. 0 if none.
   pure def refLastSec(recs: List[LogRec]): int =
@@ -299,7 +316,7 @@ module spacelog {
     devs' = DEVS.mapBy(_ => freshDevice),
     branches' = BR.mapBy(_ => emptyLog),
     pending' = Set(),
-    env' = { nextId: 1, attacks: 0, signed: Set(), conflictSeen: Set(),
+    env' = { nextId: 1, attacks: 0, signed: Set(), hostile: Set(), conflictSeen: Set(),
              badWrite: false, staleStored: false, lastKey: DEVS.mapBy(_ => 0), events: Set() },
   }
 
@@ -442,7 +459,9 @@ module spacelog {
       pending' = pending.exclude(Set(r)),
       branches' = branches,
       devs' = devs,
-      env' = ev(if (v == BaseRule) EvRefusedBaseRule else if (v == BadAuthor) EvRefusedAuthor else EvRefusedOther),
+      env' = evs(Set(
+        if (v == BaseRule) EvRefusedBaseRule else if (v == BadAuthor) EvRefusedAuthor else EvRefusedOther,
+        if (env.hostile.contains(r.id)) EvInvalidRelayRefused else EvRefusedOther)),
     }
   }
 
@@ -472,7 +491,9 @@ module spacelog {
     branches' = branches.set(b, appendRec(branches.get(b), r, relayBug(BUG))),
     pending' = pending.exclude(Set(r)),
     devs' = devs,
-    env' = { ...storedEnv(r), events: storedEnv(r).events.union(Set(EvReplayed)), attacks: env.attacks + 1 },
+    env' = { ...storedEnv(r),
+             events: storedEnv(r).events.union(Set(EvReplayed)).union(if (env.hostile.contains(r.id)) Set(EvInvalidStored) else Set()),
+             attacks: env.attacks + 1 },
   }
 
   // The relay appends a grant or a change that names a real author, with a signature that
@@ -496,6 +517,51 @@ module spacelog {
       devs' = devs,
       pending' = pending,
       env' = { ...ev(EvForged), attacks: env.attacks + 1 },
+    }
+  }
+
+  // ---- a compromised device key. Bounded adversary: a device in BAD signs one of
+  // five invalid templates on the tip of a relay branch. The guard reads no
+  // verifier predicate: it does not call `selfOk` or `check`, so the verifiers
+  // meet the record, not a prefilter. The record is correctly signed. It enters
+  // `pending` for the honest relay and `env.signed` for a malicious relay.
+  //  t = 0: a grant that seals no keys.
+  //  t = 1: an epoch record that skips an epoch number, and removes `subject`.
+  //  t = 2: an epoch record that removes its own author.
+  //  t = 3: a grant with a base digest that is not in the log, sealing no keys.
+  //  t = 4: a grant for an active `subject`.
+  // Out of scope: other field values, more than the template set, a key that is
+  // not in BAD, and any signature that no key made (forgeRecord).
+  action signInvalid(d: Key, t: int, b: int, subject: Key): bool = {
+    val br = branches.get(b)
+    val base = blank(env.nextId, Grant, d, br)
+    val good = { ...base, subject: subject, sealed: br.sp.keys }
+    val r =
+      if (t == 0) { ...good, sealed: Set() }
+      else if (t == 1)
+        { ...base, kind: Epoch, removed: Set(subject), stay: br.sp.active.exclude(Set(subject)),
+                   epoch: br.sp.epoch + 2, key: base.id }
+      else if (t == 2)
+        { ...base, kind: Epoch, removed: Set(d), stay: br.sp.active.exclude(Set(d)),
+                   epoch: br.sp.epoch + 1, key: base.id }
+      else if (t == 3) { ...good, bdig: base.bdig + 1, sealed: Set() }
+      else good
+    all {
+      FAULTS.contains("signedInvalid"),
+      BAD.contains(d),
+      env.attacks < MAX_ATTACKS,
+      0 <= t, t <= 4,
+      subject != RK,
+      br.recs.length() >= 1,
+      // A key that seals the space keys to a removed device is an authorised leak.
+      // removedKeyIsolation does not cover it (README finding C1), so t = 4 names an active subject.
+      t != 4 or br.sp.active.contains(subject),
+      r.id <= MAX_REC,
+      devs' = devs,
+      branches' = branches,
+      pending' = pending.union(Set(r)),
+      env' = { ...ev(EvInvalidSigned), nextId: env.nextId + 1, attacks: env.attacks + 1,
+               signed: env.signed.union(Set(r)), hostile: env.hostile.union(Set(r.id)) },
     }
   }
 
@@ -534,34 +600,49 @@ module spacelog {
                 if (ok and not(cpFail) and dv.cp.pos > 0 and newLen == dv.cp.pos) Set(EvEnrolled) else Set(),
                 if ((not(ok) and v == BadBase) or (ok and cpFail)) Set(EvForkDetected) else Set(),
                 if (not(ok) and v == BadSig) Set(EvForgedRejected) else Set(),
+                if (not(ok) and env.hostile.contains(rec.id)) Set(EvInvalidClientRejected) else Set(),
                 if (not(ok) and v != BadSig and v != BadBase) Set(EvDeviceRejected) else Set(),
               ).flatten()),
                conflictSeen: if (saw and HON.contains(d)) env.conflictSeen.union(Set(d)) else env.conflictSeen },
     }
   }
 
-  action step: bool = {
-    nondet d = DEVS.oneOf()
-    nondet signer = (if (FAULTS.contains("recovery")) Set(d, RK) else Set(d)).oneOf()
-    nondet subject = DEVS.oneOf()
-    nondet gone = DEVS.oneOf()
-    nondet b = BR.oneOf()
-    nondet n = 1.to(MAX_REC).oneOf()
-    nondet kind = Set(Grant, Epoch, Change).oneOf()
-    nondet author = DEVS.union(Set(RK)).oneOf()
-    any {
-      createSpace(d),
-      signGrant(d, signer, subject),
-      signEpoch(d, signer, gone),
-      signChange(d),
-      sendCheckpoint(d, subject),
-      { nondet r = pending.oneOf() relayAppend(r) },
-      { nondet r = pending.oneOf() relayRefuse(r) },
-      { nondet r = env.signed.oneOf() appendAny(r, b) },
-      forkBranch(n),
-      forgeRecord(b, kind, author, subject),
-      fetchOne(d, b),
-    }
+  // Action-local choices avoid a Cartesian product of unrelated parameters.
+  action step: bool = any {
+    { nondet d = DEVS.oneOf() createSpace(d) },
+    {
+      nondet d = DEVS.oneOf()
+      nondet signer = (if (FAULTS.contains("recovery")) Set(d, RK) else Set(d)).oneOf()
+      nondet subject = DEVS.oneOf()
+      signGrant(d, signer, subject)
+    },
+    {
+      nondet d = DEVS.oneOf()
+      nondet signer = (if (FAULTS.contains("recovery")) Set(d, RK) else Set(d)).oneOf()
+      nondet gone = DEVS.oneOf()
+      signEpoch(d, signer, gone)
+    },
+    { nondet d = DEVS.oneOf() signChange(d) },
+    { nondet d = DEVS.oneOf() nondet subject = DEVS.oneOf() sendCheckpoint(d, subject) },
+    { nondet r = pending.oneOf() relayAppend(r) },
+    { nondet r = pending.oneOf() relayRefuse(r) },
+    { nondet r = env.signed.oneOf() nondet b = BR.oneOf() appendAny(r, b) },
+    { nondet n = 1.to(MAX_REC).oneOf() forkBranch(n) },
+    {
+      nondet b = BR.oneOf()
+      nondet kind = Set(Grant, Epoch, Change).oneOf()
+      nondet author = DEVS.union(Set(RK)).oneOf()
+      nondet subject = DEVS.oneOf()
+      forgeRecord(b, kind, author, subject)
+    },
+    {
+      nondet d = BAD.oneOf()
+      nondet t = 0.to(4).oneOf()
+      nondet b = BR.oneOf()
+      nondet subject = DEVS.oneOf()
+      signInvalid(d, t, b, subject)
+    },
+    { nondet d = DEVS.oneOf() nondet b = BR.oneOf() fetchOne(d, b) },
   }
 
   // ---------------------------------------------------------------- invariants
@@ -669,6 +750,48 @@ module spacelog {
   // such a change, and a relay that withholds the record can store it.
   val noStaleChangeStored: bool = not(env.staleStored)
 
+  // Field constraints of a verified log. Each one reads only the prefix before the
+  // record, through the ref* definitions. None calls `check` or `stateOk`, and none
+  // reads the signed or hostile ghost sets: a record is valid or not by its prefix.
+
+  // I12. A grant in a verified log seals exactly the keys of its prefix. A wrong
+  // set gives the new device a missing key, or a key it must not hold.
+  val grantSealsAllKeys: bool = HON.forall(d => {
+    val recs = dev(d).log.recs
+    recs.indices().forall(i => {
+      val r = recs.nth(i)
+      r.kind == Grant implies r.sealed == refKeys(recs.slice(0, i))
+    })
+  })
+
+  // I13. An epoch record in a verified log carries the next epoch number. A skip
+  // makes the change epoch check of every later change disagree with its author.
+  val epochSequential: bool = HON.forall(d => {
+    val recs = dev(d).log.recs
+    recs.indices().forall(i => {
+      val r = recs.nth(i)
+      r.kind == Epoch implies r.epoch == refEpoch(recs.slice(0, i)) + 1
+    })
+  })
+
+  // I14. An epoch record in a verified log does not remove its own author.
+  val noSelfRemoval: bool = HON.forall(d => {
+    val recs = dev(d).log.recs
+    recs.indices().forall(i => {
+      val r = recs.nth(i)
+      r.kind == Epoch implies not(r.removed.contains(r.author))
+    })
+  })
+
+  // I15. A grant in a verified log is for a device that is not active in its prefix.
+  val grantSubjectNew: bool = HON.forall(d => {
+    val recs = dev(d).log.recs
+    recs.indices().forall(i => {
+      val r = recs.nth(i)
+      r.kind == Grant implies not(refActive(recs.slice(0, i)).contains(r.subject))
+    })
+  })
+
   // ---------------------------------------------------------------- witnesses
 
   def happened(e: Event): bool = env.events.contains(e)
@@ -692,4 +815,12 @@ module spacelog {
   val wStaleStored: bool = env.staleStored
   // A device stopped on a record that is not a fork, for example a record from a removed device.
   val wDeviceRejected: bool = happened(EvDeviceRejected)
+  // A compromised key signed an invalid record.
+  val wInvalidSigned: bool = happened(EvInvalidSigned)
+  // The honest relay refused such a record.
+  val wInvalidRelayRefused: bool = happened(EvInvalidRelayRefused)
+  // A malicious relay stored such a record.
+  val wInvalidStored: bool = happened(EvInvalidStored)
+  // An honest device stopped on such a record.
+  val wInvalidClientRejected: bool = happened(EvInvalidClientRejected)
 }

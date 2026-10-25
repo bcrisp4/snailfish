@@ -39,6 +39,7 @@ EFFORT = {"fast": (2000, 30), "full": (20000, 50)}
 GEN_DIR = "_gen"
 # Keys of a [configs.*] table that are not consts of the model.
 CONFIG_KEYS = frozenset({"skip", "why", "check_only"})
+BACKENDS = frozenset({"exit", "run", "test", "tlc", "apalache"})
 
 
 class ManifestError(Exception):
@@ -53,10 +54,20 @@ class Check:
         label: Text for the report.
         argv: The quint command line.
         cwd: The directory to run in.
-        expect_pass: True if the command must exit 0, False if it must fail.
+        expect_pass: True if the command must succeed, False if it must give
+            the failure that `catches` names.
         invariants: The invariants of a batched run, for the report.
         min_states: For a TLC run, the fewest distinct states it must find. A
             config with no initial state passes with 0 states and checks nothing.
+        backend: How to read the output (see `failure_reason`): "exit" (exit
+            status only, for a command with no output to read), "run" (sampled
+            `quint run`), "test" (`quint test`), "tlc" or "apalache" (`quint
+            verify`).
+        catches: For a check with `expect_pass` False on a "run" or "test"
+            backend, the invariant or test that must fail. TLC does not name
+            the invariant that it violates, so a TLC catch has none.
+        excluded_test: The named mutant test that the remainder selector
+            excludes. A one-test module then has no other tests to execute.
     """
 
     label: str
@@ -65,6 +76,26 @@ class Check:
     expect_pass: bool
     invariants: tuple[str, ...] = ()
     min_states: int = 0
+    backend: str = "exit"
+    catches: str = ""
+    excluded_test: str = ""
+
+    def __post_init__(self) -> None:
+        """Refuse a check that expects failure and cannot tell which failure."""
+        if self.backend not in BACKENDS:
+            raise ValueError(f"unknown backend {self.backend!r}")
+        if not self.expect_pass and self.backend == "exit":
+            raise ValueError("a check that expects failure names the failure: use a backend")
+        if not self.expect_pass and self.backend in {"run", "test"} and not self.catches:
+            raise ValueError(f"{self.label!r} expects failure but names no `catches`")
+        if self.excluded_test:
+            if self.backend != "test" or not self.expect_pass:
+                raise ValueError("only a passing test-remainder check can exclude a test")
+            if "--main" not in self.argv or "--match" not in self.argv:
+                raise ValueError("a test-remainder check needs --main and --match")
+            selector = self.argv[self.argv.index("--match") + 1]
+            if selector != f"^(?!{self.excluded_test}$).*Test$":
+                raise ValueError("a test-remainder selector must exclude only its named test")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -294,6 +325,10 @@ def run_argv(
     invariant, because trace generation dominates. Verbosity 1 prints the name
     of each violated invariant and the witness counts.
     """
+    # quint 0.33.0 prints the name of a violated invariant only when it checks
+    # more than one, so a lone invariant is padded with `true`.
+    if len(invariants) == 1 and invariants[0] != "true":
+        invariants = [*invariants, "true"]
     argv = [
         "quint", "run", f"{GEN_DIR}/{module}.qnt", "--main", module,
         "--invariants", *invariants, "--max-samples", str(samples),
@@ -342,7 +377,7 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
             "--max-steps", str(deep["max_steps"]),
         )
         label = f"apalache {deep['config']}: {', '.join(deep['invariants'])} (<= {deep['max_steps']} steps)"
-        checks.append(Check(label, argv, cwd, True, tuple(deep["invariants"])))
+        checks.append(Check(label, argv, cwd, True, tuple(deep["invariants"]), backend="apalache"))
         checks += exhaustive_checks(m)
         return checks
 
@@ -351,7 +386,7 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
     for module in test_modules(m):
         checks.append(Check(
             f"scenario tests ({module})",
-            ("quint", "test", d["tests"], "--main", module), cwd, True,
+            ("quint", "test", d["tests"], "--main", module), cwd, True, backend="test",
         ))
     configs = list(d["configs"]) if tier == "full" else [d.get("fast_config", next(iter(d["configs"])))]
     witnesses = witness_names(m) if tier == "full" else []
@@ -367,7 +402,7 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
         checks.append(Check(
             f"{name}: {len(invs)} invariants" + (f", {len(with_w)} witnesses" if with_w else ""),
             run_argv(name, invs or ["true"], samples, max(steps, run_steps), seed, with_w),
-            cwd, True, tuple(invs),
+            cwd, True, tuple(invs), backend="run",
         ))
     if tier == "fast":
         return checks
@@ -375,6 +410,7 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
         checks.append(Check(
             f"limit {limit['config']} {limit['invariant']} is violated ({limit['why']})",
             run_argv(limit["config"], [limit["invariant"]], samples, steps, seed), cwd, False,
+            backend="run", catches=limit["invariant"],
         ))
     for name, mut in d.get("mutants", {}).items():
         if mut["caught_by"] == "tests":
@@ -389,6 +425,7 @@ def plan(m: Manifest, tier: str, seed: str | None) -> list[Check]:
         )
         checks.append(Check(
             label, run_argv(f"m_{name}", [mut["caught_by"]], samples, steps, seed), cwd, is_open,
+            backend="run", catches="" if is_open else mut["caught_by"],
         ))
     return checks
 
@@ -417,9 +454,9 @@ def exhaustive_checks(m: Manifest) -> list[Check]:
             )
             if bug is None:
                 label = f"tlc {config}: {len(invs)} invariants, every reachable state"
-                checks.append(Check(label, argv, m.path, True, tuple(invs), min_states=2))
+                checks.append(Check(label, argv, m.path, True, tuple(invs), min_states=2, backend="tlc"))
             else:
-                checks.append(Check(f"tlc {config}: mutant {bug} caught", argv, m.path, False, tuple(invs)))
+                checks.append(Check(f"tlc {config}: mutant {bug} caught", argv, m.path, False, tuple(invs), backend="tlc"))
     return checks
 
 
@@ -454,10 +491,12 @@ def mutant_test_checks(m: Manifest) -> list[Check]:
         test = mut["test"]
         checks.append(Check(
             f"mutant {name} caught by test {test}", (*base, "--match", f"^{test}$"), m.path, False,
+            backend="test", catches=test,
         ))
         checks.append(Check(
             f"mutant {name}: the other tests still pass",
             (*base, "--match", f"^(?!{test}$).*Test$"), m.path, True,
+            backend="test", excluded_test=test,
         ))
     return checks
 
@@ -482,15 +521,93 @@ def tlc_states(output: str) -> int:
     return int(found[-1].replace(",", "")) if found else 0
 
 
+# quint 0.33.0 verdict lines. Each run prints exactly one of "[ok]", "[violation]",
+# "[error]" or "[failure]". An error before the run (parse, name resolution, missing
+# file) prints none of them.
+RUN_OK = "[ok] No violation found"
+RUN_VIOLATION = "[violation] Found an issue"
+# `quint test` reports each failure with its QNT code: 508 is a failed assert or
+# expect, 511 is a run that returned false (`.fail()`). Others, such as 503
+# (runtime error), are not a test catching a bug.
+TEST_FAILURE_CODES = frozenset({"QNT508", "QNT511"})
+TLC_COMPLETE = "Model checking completed. No error has been found."
+TLC_INVARIANT = re.compile(r"^Error: Invariant \w+ is violated\.", re.MULTILINE)
+APALACHE_OK = "The outcome is: NoError"
+
+
+def test_outcomes(output: str) -> tuple[list[str], list[str], dict[str, str]]:
+    """Parse a `quint test` report: passed names, failed names, and code of each failure."""
+    passed = re.findall(r"^\s+ok (\w+) passed", output, re.MULTILINE)
+    failed = re.findall(r"^\s+\d+\) (\w+) failed after", output, re.MULTILINE)
+    codes = dict(re.findall(r"^\s+\d+\) (\w+):\n\s+Error \[(QNT\d+)\]", output, re.MULTILINE))
+    return passed, failed, codes
+
+
+def failure_reason(check: Check, returncode: int, output: str) -> str | None:
+    """Return why a finished check is wrong, or None if it is right.
+
+    The check fails closed. A pass needs the tool's own success marker, not only
+    exit 0. A catch needs the tool's own violation marker, exit 1, and (where the
+    tool names it) the invariant or test in `check.catches`. A parse error, a
+    runtime error, a missing file, a bad name or a signal exits non-zero too, but
+    carries no marker, so it is never a catch.
+    """
+    backend = check.backend
+    if backend == "exit":
+        return None if returncode == 0 else f"exit status {returncode}"
+    if check.expect_pass:
+        if returncode != 0:
+            return f"exit status {returncode}, expected 0"
+        if backend == "test":
+            passed, failed, _ = test_outcomes(output)
+            if not failed and not passed and check.excluded_test and "--main" in check.argv:
+                # A one-test module has an empty remainder. Its baseline and
+                # named mutant check still require an actual test result.
+                main = check.argv[check.argv.index("--main") + 1]
+                if output.strip() == main:
+                    return None
+            if failed or not passed:
+                return f"{len(passed)} tests passed and {len(failed)} failed: need >= 1 and 0"
+            return None
+        marker = {"run": RUN_OK, "tlc": RUN_OK, "apalache": RUN_OK}[backend]
+        if marker not in output:
+            return f"no {marker!r} marker in the output"
+        if backend == "tlc" and TLC_COMPLETE not in output:
+            return "TLC did not report a completed search"
+        if backend == "apalache" and APALACHE_OK not in output:
+            return "Apalache did not report NoError"
+        if backend == "tlc" and check.min_states and tlc_states(output) < check.min_states:
+            return f"TLC found {tlc_states(output)} distinct states, fewer than {check.min_states}"
+        return None
+    if returncode != 1:
+        return f"exit status {returncode}, expected 1 from a violation"
+    if backend == "test":
+        _, failed, codes = test_outcomes(output)
+        if failed != [check.catches]:
+            return f"failed tests {failed}, expected only {check.catches!r}"
+        if codes.get(check.catches) not in TEST_FAILURE_CODES:
+            return f"{check.catches!r} failed with {codes.get(check.catches)}, not an assertion"
+        return None
+    if RUN_VIOLATION not in output:
+        return f"no {RUN_VIOLATION!r} marker: the failure is not an invariant violation"
+    if backend == "tlc":
+        return None if TLC_INVARIANT.search(output) else "TLC reported no violated invariant"
+    if check.catches and check.catches not in violated(output):
+        return f"{check.catches!r} is not among the violated invariants {violated(output)}"
+    return None
+
+
 def execute(check: Check) -> tuple[Check, bool, str]:
     """Run one check. Return the check, its verdict and its full output."""
-    proc = subprocess.run(check.argv, cwd=check.cwd, capture_output=True, text=True, check=False)
+    try:
+        proc = subprocess.run(check.argv, cwd=check.cwd, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return check, False, f"FAIL: cannot run {check.argv[0]}: {exc}"
     output = proc.stdout + proc.stderr
-    good = (proc.returncode == 0) == check.expect_pass
-    if good and check.min_states and tlc_states(output) < check.min_states:
-        output += f"\nFAIL: TLC found {tlc_states(output)} distinct states, fewer than {check.min_states}"
-        good = False
-    return check, good, output
+    reason = failure_reason(check, proc.returncode, output)
+    if reason:
+        output += f"\nFAIL: {reason}"
+    return check, reason is None, output
 
 def run_model(m: Manifest, tier: str, jobs: int, seed: str | None) -> bool:
     """Run every check of one tier for one model. Print a report. Return True if all pass."""
