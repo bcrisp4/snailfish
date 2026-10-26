@@ -45,9 +45,6 @@ jobs:
       - run: make check
       - if: github.event_name != 'schedule'
         run: make verify-drift BASE="$BASE"
-      # Nightly checks every mutant in the rust-mutants job.
-      - if: github.event_name != 'schedule'
-        run: make rust-mutants-diff BASE="$BASE"
 
   swift:
     # DESIGN.md M1: the shared vectors through the Swift binding on an iOS
@@ -202,15 +199,27 @@ jobs:
       - uses: jdx/mise-action@v2
       - run: make verify-crypto
 
-  rust-mutants:
-    # Every mutant of every crate. The check job runs only the changed code.
-    if: github.event_name == 'schedule'
+  mutants:
+    # cargo-mutants in 8 shards. Each mutant runs the whole workspace test
+    # suite, so one runner needs hours. A pull request and a push check the
+    # mutants of the changed Rust code. The nightly run checks every mutant.
+    # Sharding is by mutant index, so the shards cover each mutant once.
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
-      - run: make rust-mutants
+      - if: github.event_name != 'schedule'
+        run: make rust-mutants-diff BASE="$BASE" MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
+      - if: github.event_name == 'schedule'
+        run: make rust-mutants MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
 
   nightly-fuzz:
     # Long fuzz runs. Nightly only.

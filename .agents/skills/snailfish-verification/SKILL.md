@@ -83,7 +83,7 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | `make check` | The gate for each commit: Rust lint, tests and licences, then the fast Quint tier. |
 | `make rust-kani` | Kani proofs of the Rust crates (bounded), `KANI_JOBS` (default 4) harnesses at a time. |
 | `make rust-fuzz` | Each fuzz target for `FUZZ_SECONDS` (default 300). |
-| `make rust-mutants-diff` | cargo-mutants on the Rust code that changed since `BASE` (default `main`). Before a merge. |
+| `make rust-mutants-diff` | cargo-mutants on the Rust code that changed since `BASE` (default `main`). Before a merge. `MUTANTS_JOBS` (default 4) and `MUTANTS_SHARD=k/n` control the run. |
 | `make rust-mutants` | cargo-mutants on every crate. Nightly. Fails on a missed mutant. |
 | `make rust-deny` | Licences, advisories and sources of every dependency. |
 | `make verify-crypto` | Run the ProVerif models of `specs/enrollment` and compare each query with `expect.toml`. Needs ProVerif 2.05 (`opam install proverif`). |

@@ -16,6 +16,15 @@ FUZZ_SECONDS ?= 300
 KANI_JOBS ?= 4
 # The git ref that `make rust-mutants-diff` compares against.
 BASE ?= main
+# cargo-mutants: parallel jobs, an optional shard (for example 3/8), and the
+# lowest test timeout. Each mutant runs the whole workspace test suite, and
+# parallel jobs slow each run, so a timeout from one unmutated run is too
+# short. A timeout counts as caught, so a short timeout hides a missed mutant.
+MUTANTS_JOBS ?= 4
+MUTANTS_SHARD ?=
+MUTANTS_MIN_TIMEOUT ?= 120
+MUTANTS_ARGS = --workspace --features snailfish-relay/webauthn -j $(MUTANTS_JOBS) \
+  --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT) $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD))
 
 .PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-powerloss \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
@@ -119,8 +128,9 @@ define check_mutants
 endef
 
 ## Mutants of every crate in the workspace. Run nightly, and before a release.
+## MUTANTS_SHARD=k/n runs one shard. CI runs 8 shards in parallel.
 rust-mutants:
-	@$(CARGO) mutants --workspace --features snailfish-relay/webauthn; $(check_mutants)
+	@$(CARGO) mutants $(MUTANTS_ARGS); $(check_mutants)
 
 ## Mutants in the Rust code that changed since BASE (default main). Run before a
 ## merge. It does not see a test that a change made weaker in other code, so
@@ -130,7 +140,7 @@ rust-mutants-diff:
 	  git rev-parse --verify --quiet '$(BASE)^{commit}' > /dev/null || { echo "FAIL: BASE '$(BASE)' is not a git commit"; exit 1; }; \
 	  git diff $(BASE) -- '*.rs' > mutants.diff || { echo "FAIL: git diff $(BASE) failed"; exit 1; }; \
 	  if [ ! -s mutants.diff ]; then echo "ok: no Rust change since $(BASE)"; exit 0; fi; \
-	  $(CARGO) mutants --workspace --features snailfish-relay/webauthn --in-diff mutants.diff; $(check_mutants)
+	  $(CARGO) mutants $(MUTANTS_ARGS) --in-diff mutants.diff; $(check_mutants)
 
 ## Licences, advisories and sources of every dependency.
 rust-deny:
