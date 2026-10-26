@@ -18,6 +18,7 @@ pub mod sig;
 pub mod space;
 pub mod strict;
 pub mod wire;
+pub mod write;
 
 #[cfg(test)]
 mod testutil {

@@ -192,3 +192,60 @@ fn genesis_check_refuses_other_logs_signers_and_types() {
     bad.sig[5] ^= 1;
     assert!(check_genesis(&bad, &log, None).is_err());
 }
+
+/// The writer gives the exact Go payload bytes of the genesis record, the
+/// grant and the change (`PROTOCOL.md` section 3 writer form).
+#[test]
+fn writer_gives_go_payload_bytes() {
+    use snailfish_protocol::records::{Body, parse_payload};
+    use snailfish_protocol::write;
+    let v = vectors();
+    for n in [1, 2, 3, 10] {
+        let e = env(&v, n);
+        let r = parse_payload(&e.payload_type, &e.payload).unwrap();
+        let out = match &r.body {
+            Body::Genesis {
+                app,
+                recovery,
+                level,
+                device,
+                commitment,
+                keys,
+                ..
+            } => write::genesis(
+                &r.log,
+                &r.author,
+                &r.base,
+                &write::Genesis {
+                    app,
+                    recovery,
+                    level: *level,
+                    device,
+                    commitment,
+                    keys,
+                },
+            ),
+            Body::Grant { device, keys } => {
+                write::grant(&r.log, &r.author, &r.base, device, &keys[0])
+            }
+            Body::Change {
+                epoch,
+                change_id,
+                ciphertext,
+            } => write::change(
+                &r.log,
+                r.author.id(),
+                &r.base,
+                *epoch,
+                change_id,
+                ciphertext,
+            ),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(e.payload).unwrap(),
+            "entry {n}"
+        );
+    }
+}
