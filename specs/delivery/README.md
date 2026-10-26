@@ -7,9 +7,11 @@
 | DESIGN.md rule | Model |
 | --- | --- |
 | Edit and outbox row in one transaction | `edit`, mutant `editSplitTxn` |
-| `enqueue_many` after each commit and at startup, no effect if known, a known `change_id` with other bytes in `refused` | `enqueue`, mutant `appDropsRowOnEnqueue` |
+| `enqueue_many` after each commit and at startup, no effect if known [DLV-5] | `enqueue`, mutant `appDropsRowOnEnqueue`. A `change_id` with other bytes in `refused` is not encoded (see Not covered). |
 | Batches in `enqueue_many` and `changes_after` | One action for each row. A batch in one transaction allows fewer interleavings, so a safe result for single rows also holds for batches. |
-| Retry sends the stored envelope. The relay returns the original position. | `push` with a lost response, mutant `relayNoDedupe` |
+| Retry sends the stored envelope. The relay returns the original position. [DLV-7] | `push` with a lost response, mutant `relayNoDedupe` |
+| Same `change_id` and record hash: `Known`. Same `change_id`, other record hash: `Conflict`. Both come before the size and base checks. [WIR-6] | `verdict`, `push`, mutant `relayConflictAppends`, test `pushConflictTest` |
+| On `Conflict` the engine treats the change as stored, and keeps the envelope until the verified log holds the `change_id`. [DLV-6] [DLV-8] | `push`, `applyFetch`, mutant `conflictRefuses`, test `conflictTreatedAsStoredTest` |
 | Engine keeps an own envelope until the verified log holds it | `applyFetch`, mutant `engineDropsOnAccept` |
 | Known `change_id` check before other refusals | `verdict`, mutant `sizeBeforeDedupe` |
 | Permanent refusal: `degraded`, the app reverts or splits | `push`, `resolveRefused` |
@@ -26,12 +28,12 @@
 
 | Name | Property |
 | --- | --- |
-| `noDoubleApply` | Each device applies each change once. |
+| `noDoubleApply` | Each device applies each change once. A relay that appends a known `change_id` with another record hash breaks it. |
 | `noLostChange` | A change that `enqueue` stored, and that no app reverted, stays where sync can deliver it. |
 | `noLostChangeWeak` | `noLostChange` for changes that no engine state loss touched. |
 | `appliedHeld` | A change in an app state is never only in that app state. |
 | `caughtUpState` | A caught-up device holds the relay changes and its own pending edits, and nothing else. |
-| `refusedNotStored` | No log holds a change that an app reverted after a refusal. |
+| `refusedNotStored` | No log holds a change that an app reverted after a refusal. An engine that refuses on `Conflict` breaks it. |
 | `noStuckDevice` | A device that fetched to the relay head, with no hold, can pull or reset. |
 | `noSilentLoss` | No hold ends without a warning while the release loses a change. |
 | `noFork` | Running devices never hold conflicting verified logs. |
@@ -48,17 +50,24 @@ The checks also confirm three known limits. Each one fails on purpose:
 
 ### Exhaustive results (TLC)
 
-`make verify-deep MODEL=delivery` runs TLC on three finite configurations. Each result covers every reachable state, not larger configurations.
+`make verify-deep MODEL=delivery` runs TLC on four finite configurations. Each result covers every reachable state, not larger configurations.
 
 | Configuration | Scope | Mutant checks |
 | --- | --- | --- |
 | `tinyCrash` | Two devices and two changes, without restore faults. | Split transactions, duplicate append, and an early outbox deletion. |
 | `tinyAppRestore` | Two devices and two changes, with one app restore. | No additional mutants. |
 | `tinyRecovery` | One device and one change, with at most two relay-restore or engine-loss faults. | Missing repair, missing reset, and a hold release without a required warning. |
+| `tinyConflict` | Two devices and two changes, with one engine state loss. The engine encrypts a change again, so the relay answers `Conflict`. | A relay that appends after `Conflict`, and an engine that refuses on `Conflict`. |
 
-The `tinyRecovery` baseline visits 905 distinct states. It includes repair, status reports, and warned hold release.
+The `tinyRecovery` baseline visits 1,437 distinct states. It includes repair, status reports, and warned hold release.
+
+The `tinyConflict` baseline visits 138,724 distinct states and takes about 9 seconds. Mutant `relayConflictAppends` fails after 4,649 states and `conflictRefuses` after 1,147 states. `tinyCrash` visits 10,716 states and `tinyAppRestore` visits 240,712.
 
 Its weak loss property excludes changes that an engine state loss exposes. It does not promise recovery after both surviving copies disappear.
+
+## Record hashes
+
+A log entry is a record hash: an int that holds the change ID and a counter `gen` of the engine state losses of the device (`entry = id + MAX_IDS * gen`). `enqueue` signs a new record with the current `gen`, so an engine that lost its state and enqueues the change again sends another record hash with the same `change_id`. The relay compares the `change_id` and then the record hash. The ID of an entry is `rid(entry)`.
 
 ## Findings fixed in DESIGN.md
 
@@ -78,7 +87,8 @@ Mutant `freshClearsOnFetch` needs a restore, an engine state loss and a fetch, i
 - Log compaction: snapshots, stubs, accept records and `is_covered`.
 - Fork repair (export, import, enroll again).
 - A malicious relay. The relay in this model is honest, but it can lose data.
-- The bytes of a change, so the "same `change_id` with different bytes" refusal in `enqueue_many`.
+- The bytes of a change. The content of a `change_id` is fixed, so the model does not encode the "same `change_id` with different bytes" refusal in `enqueue_many` [DLV-5], and it does not encode a `Conflict` whose record holds other content. In the design the engine marks such a change as refused, reports `degraded` and the app reverts or splits it, as for a size refusal. The `Conflict` case with the same content is encoded.
+- The position in the `Known` and `Conflict` replies, and the fetch of the record at that position. The model treats the fetch as always showing the same content.
 - Security records during a restore hold. The relay accepts them, but the model has no security records.
 - The snapshot acceptance rules from review D. They need a compaction model.
 - Liveness. The model checks safety only.

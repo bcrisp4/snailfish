@@ -4,8 +4,14 @@
 //
 // Abstractions:
 //  - A change is an opaque int id. In the design it is 128 random bits, so ids
-//    never collide. A log entry is the change id. The bytes of a change are fixed
-//    per id, so a record hash adds nothing here.
+//    never collide. The bytes of a change are fixed per id, so the content hash
+//    of a change is the same for every record of an id. The model has no way to
+//    give one change_id two contents (an app fault). See "Not covered" in the README.
+//  - A log entry is a record: an int that stands for the record hash. Each
+//    encryption of a change gives a new hash (random nonce). The model encodes
+//    entry = id + MAX_IDS * gen, where gen counts the engine state losses of the
+//    device, so an engine that lost its state encrypts the same change again with
+//    another hash. rid(entry) is the change_id of a record.
 //  - The app state is the set of applied change ids. This is the merge contract:
 //    the state depends on the set of changes, not on their order.
 //  - Each app DB transaction and each engine transaction is one atomic action.
@@ -21,6 +27,7 @@
 module delivery {
   type Dev = int
   type Id = int
+  type Rcd = int            // a record hash: one encryption of a change
 
   type Stop = Running | Forked
 
@@ -28,31 +35,35 @@ module delivery {
     | EvEdit | EvPushStored | EvPushKnown | EvPushRefused | EvPushBadBase
     | EvFetch | EvPull | EvPullOwn | EvAppRestore | EvRelayRestore | EvRelayFault
     | EvRepair | EvHoldReleased | EvEarlyRelease | EvForkDetected | EvReverted
-    | EvSplit | EvEngineLoss | EvResetRequired | EvLimitLowered | EvResetAhead | EvWarnedRelease
+    | EvSplit | EvPushConflict | EvEngineLoss | EvResetRequired | EvLimitLowered | EvResetAhead | EvWarnedRelease
 
   // The durable part of the app DB that a backup copies.
-  type AppImage = { applied: Set[Id], outbox: Set[Id], appliedLog: List[Id] }
+  type AppImage = { applied: Set[Id], outbox: Set[Id], appliedLog: List[Rcd] }
 
   type App = {
     applied: Set[Id],      // the changes in the app state
     outbox: Set[Id],       // app outbox rows
-    appliedLog: List[Id],  // applied position: the log prefix that the app handled
+    appliedLog: List[Rcd], // applied position: the log prefix that the app handled
     backup: AppImage,
     dups: int,             // ghost: count of changes applied twice. A restore keeps it.
   }
 
+  type Pending = { base: List[Rcd], rec: Rcd }
+
   type Engine = {
-    outbox: Id -> List[Id],// envelopes that the verified log does not hold, with the
-                           // signed base: the verified log when enqueue signed the record
+    outbox: Id -> Pending, // envelopes that the verified log does not hold, with the
+                           // record hash and the signed base (the verified log when
+                           // enqueue signed the record)
     refused: Set[Id],      // envelopes that the relay refused for ever (degraded)
-    log: List[Id],         // verified log
+    log: List[Rcd],        // verified log
+    gen: int,              // ghost: engine state losses so far. It makes the record hash new.
     stop: Stop,
     fresh: bool,           // a new state file since the last hold ended. The status
                            // report carries it until a hold ends (F3).
   }
 
   type Relay = {
-    log: List[Id],
+    log: List[Rcd],
     hold: bool,            // restore hold: appends are refused
     reported: Set[Dev],    // devices that reported a tip at or below the head since the restore
     limitLow: bool,        // the relay operator lowered the change size limit
@@ -96,6 +107,8 @@ module delivery {
     "appDropsRowOnEnqueue", // app deletes the outbox row when enqueue returns
     "engineDropsOnAccept",  // engine deletes the envelope when the relay stores it
     "relayNoDedupe",        // relay appends a known change_id again
+    "relayConflictAppends", // relay appends a known change_id with another record hash [WIR-6]
+    "conflictRefuses",      // engine treats a Conflict as a permanent refusal [DLV-6]
     "sizeBeforeDedupe",     // relay checks the size limit before the known change_id
     "pullSplitTxn",         // pull applies the change and moves the position in two transactions
     "noRepair",             // engine accepts a shorter relay log and does not repair
@@ -110,14 +123,16 @@ module delivery {
 
   // ---------------------------------------------------------------- pure logic
 
-  pure def ids(l: List[Id]): Set[Id] = l.foldl(Set(), (s, x) => s.union(Set(x)))
+  pure def rid(r: Rcd): Id = r % MAX_IDS
 
-  pure def isPrefix(a: List[Id], b: List[Id]): bool =
+  pure def ids(l: List[Rcd]): Set[Id] = l.foldl(Set(), (s, x) => s.union(Set(rid(x))))
+
+  pure def isPrefix(a: List[Rcd], b: List[Rcd]): bool =
     a.length() <= b.length() and b.slice(0, a.length()) == a
 
-  pure def comparable(a: List[Id], b: List[Id]): bool = isPrefix(a, b) or isPrefix(b, a)
+  pure def comparable(a: List[Rcd], b: List[Rcd]): bool = isPrefix(a, b) or isPrefix(b, a)
 
-  pure def without(m: Id -> List[Id], ks: Set[Id]): Id -> List[Id] =
+  pure def without(m: Id -> Pending, ks: Set[Id]): Id -> Pending =
     m.keys().exclude(ks).mapBy(k => m.get(k))
 
   pure def image(a: App): AppImage =
@@ -125,7 +140,7 @@ module delivery {
 
   pure val emptyImage: AppImage = { applied: Set(), outbox: Set(), appliedLog: List() }
   pure val freshApp: App = { applied: Set(), outbox: Set(), appliedLog: List(), dups: 0, backup: emptyImage }
-  pure val freshEngine: Engine = { outbox: Map(), refused: Set(), log: List(), stop: Running, fresh: false }
+  pure val freshEngine: Engine = { outbox: Map(), refused: Set(), log: List(), gen: 0, stop: Running, fresh: false }
 
   // ---- app
 
@@ -139,13 +154,13 @@ module delivery {
   pure def canPull(a: App, e: Engine): bool =
     isPrefix(a.appliedLog, e.log) and e.log.length() > a.appliedLog.length()
 
-  pure def nextEntry(a: App, e: Engine): Id = e.log.nth(a.appliedLog.length())
+  pure def nextEntry(a: App, e: Engine): Rcd = e.log.nth(a.appliedLog.length())
 
   // Handle the next change in one transaction. If the outbox row exists, the app
   // applied the edit at edit time: it deletes the row and does not apply again.
   // Rules: [DLV-11]
   pure def applyPull(a: App, e: Engine, crash: bool, bug: str): App = {
-    val id = nextEntry(a, e)
+    val id = rid(nextEntry(a, e))
     val moved = e.log.slice(0, a.appliedLog.length() + 1)
     if (a.outbox.contains(id))
       { ...a, outbox: a.outbox.exclude(Set(id)), appliedLog: moved }
@@ -179,13 +194,14 @@ module delivery {
 
   // Enqueue has no effect if the engine already knows the change_id.
   // Rules: [DLV-5]
+  // Partial: a change_id has one content, so the different-bytes refusal is not encoded.
   pure def canEnqueue(a: App, e: Engine, id: Id): bool =
     a.outbox.contains(id) and not(knows(e, id))
 
   // An own envelope leaves the outbox only when the verified log holds it.
   // Rules: [DLV-8]
   // Partial: stubs are not modelled, so the replacement of a covered record is not encoded.
-  pure def applyFetch(e: Engine, newLog: List[Id], bug: str): Engine =
+  pure def applyFetch(e: Engine, newLog: List[Rcd], bug: str): Engine =
     { ...e, log: newLog, outbox: without(e.outbox, ids(newLog)),
       fresh: e.fresh and not(bug == "freshClearsOnFetch" and newLog.length() > 0) }
 
@@ -193,15 +209,22 @@ module delivery {
 
   // Refused is permanent (size limit). BadBase is transient: the signed base is
   // not an entry of the relay log, after a rollback or on another branch.
-  type Verdict = Stored | Known | Refused | BadBase
+  // Known: the change_id is in the log with the same record hash (the original
+  // position). Conflict: the change_id is in the log with another record hash.
+  // The reply names the original position. The model does not carry the position,
+  // because the content of every record of an id is the same.
+  type Verdict = Stored | Known | Conflict | Refused | BadBase
 
-  // Rules: [DLV-5] [DLV-7] [DLV-9] [LOG-6] [WIR-6]
-  // Partial: change bytes and record hashes are not modelled, so DLV-5 (different bytes) and WIR-6 (conflict) are not encoded. Epochs are not modelled, so DLV-7 (new epoch) is not encoded.
-  pure def verdict(r: Relay, id: Id, base: List[Id], big: bool, bug: str): Verdict = {
+  // Known and Conflict come before the size and base checks.
+  // Rules: [DLV-7] [DLV-9] [LOG-6] [WIR-6]
+  // Partial: epochs are not modelled, so DLV-7 (new epoch) is not encoded.
+  pure def verdict(r: Relay, id: Id, rec: Rcd, base: List[Rcd], big: bool, bug: str): Verdict = {
     val known = ids(r.log).contains(id)
+    val sameRec = r.log.foldl(false, (b, x) => b or x == rec)
     val tooBig = big and r.limitLow
     if (bug == "sizeBeforeDedupe" and tooBig) Refused
-    else if (known and bug != "relayNoDedupe") Known
+    else if (known and sameRec and bug != "relayNoDedupe") Known
+    else if (known and not(sameRec) and bug != "relayNoDedupe" and bug != "relayConflictAppends") Conflict
     else if (tooBig) Refused
     else if (not(isPrefix(base, r.log))) BadBase
     else Stored
@@ -210,6 +233,7 @@ module delivery {
   pure def verdictEvent(v: Verdict): Event = match v {
     | Stored => EvPushStored
     | Known => EvPushKnown
+    | Conflict => EvPushConflict
     | Refused => EvPushRefused
     | BadBase => EvPushBadBase
   }
@@ -264,7 +288,7 @@ module delivery {
       canEnqueue(app(d), eng(d), id),
       engines' = engines.set(d,
         if (tooBig) { ...eng(d), refused: eng(d).refused.union(Set(id)) }
-        else { ...eng(d), outbox: eng(d).outbox.put(id, eng(d).log) }),
+        else { ...eng(d), outbox: eng(d).outbox.put(id, { base: eng(d).log, rec: id + MAX_IDS * eng(d).gen }) }),
       apps' = if (BUG == "appDropsRowOnEnqueue")
                 apps.set(d, { ...app(d), outbox: app(d).outbox.exclude(Set(id)) })
               else apps,
@@ -275,16 +299,24 @@ module delivery {
 
   // The engine sends one stored envelope. If the response is lost, the engine
   // learns nothing and sends the same envelope again later.
-  // Rules: [DLV-7] [DLV-9] [LOG-14]
+  // On Conflict (the relay holds the change_id with another record hash, which
+  // happens after an engine state loss) the engine fetches the record at the
+  // reported position. The content of a change_id is fixed in this model, so the
+  // record holds the same content hash and the engine treats the change as stored:
+  // it keeps the envelope until a fetch shows the change_id in the verified log
+  // (DLV-8, in applyFetch). Mutant conflictRefuses refuses it for ever instead.
+  // Partial: a record with other content under the same change_id is not encoded.
+  // Rules: [DLV-6] [DLV-7] [DLV-9] [LOG-14]
   action push(d: Dev, id: Id, lost: bool): bool = {
-    val v = verdict(relay, id, eng(d).outbox.get(id), env.changes.get(id).big, BUG)
+    val p = eng(d).outbox.get(id)
+    val v = verdict(relay, id, p.rec, p.base, env.changes.get(id).big, BUG)
     all {
       eng(d).outbox.keys().contains(id),
       running(d),
       not(relay.hold),
-      relay' = if (v == Stored) { ...relay, log: relay.log.append(id) } else relay,
+      relay' = if (v == Stored) { ...relay, log: relay.log.append(p.rec) } else relay,
       engines' =
-        if (v == Refused and not(lost))
+        if ((v == Refused or (v == Conflict and BUG == "conflictRefuses")) and not(lost))
           engines.set(d, { ...eng(d), outbox: without(eng(d).outbox, Set(id)),
                                       refused: eng(d).refused.union(Set(id)) })
         else if (v == Stored and BUG == "engineDropsOnAccept" and not(lost))
@@ -453,8 +485,8 @@ module delivery {
     val e = eng(d)
     all {
       canFault("engineLoss"),
-      e != { ...freshEngine, fresh: e.fresh },
-      engines' = engines.set(d, { ...freshEngine, fresh: true }),
+      { ...e, gen: 0 } != { ...freshEngine, fresh: e.fresh },
+      engines' = engines.set(d, { ...freshEngine, fresh: true, gen: e.gen + 1 }),
       apps' = apps,
       relay' = relay,
       env' = { ...fault(EvEngineLoss),
@@ -609,6 +641,7 @@ module delivery {
   val wEdit: bool = happened(EvEdit)
   val wPushStored: bool = happened(EvPushStored)
   val wPushKnown: bool = happened(EvPushKnown)
+  val wPushConflict: bool = happened(EvPushConflict)
   val wPushRefused: bool = happened(EvPushRefused)
   val wPushBadBase: bool = happened(EvPushBadBase)
   val wResetAhead: bool = happened(EvResetAhead)
