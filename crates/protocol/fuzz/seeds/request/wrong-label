@@ -1,0 +1,5 @@
+content-digest: sha-256=:RBNvo1WzZ4oRRq0W9+hknpT7T8If536DEMBg9hyq/4o=:
+signature-input: x=("@method" "@authority" "@path" "@query" "content-digest");created=1767225600;expires=1767225900;nonce="01010101010101010101010101010101";keyid="d_0909090909090909090909090909090909090909090909090909090909090909";alg="ed25519";tag="snailfish.request.v1"
+signature: sf=:mhQL09M/3esVGjOMHK3AsDRyyoWugKeshUZufSXgXKqgQw9obxL+ITVwiEhiP8K/uu8b/hR1jybvNSW5g1pLAQ==:
+snailfish-authority: sync.example.net
+snailfish-time: 1767225600

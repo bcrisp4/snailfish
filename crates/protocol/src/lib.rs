@@ -13,8 +13,11 @@ pub mod keys;
 pub mod pae;
 pub mod records;
 pub mod recovery;
+pub mod request;
 pub mod sig;
+pub mod space;
 pub mod strict;
+pub mod wire;
 
 #[cfg(test)]
 mod testutil {

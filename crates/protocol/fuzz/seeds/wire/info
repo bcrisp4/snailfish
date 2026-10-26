@@ -1,0 +1,1 @@
+{"levels":[1],"limits":{"max_append_envelopes":100,"max_change_bytes":65536,"max_fetch_entries":500,"max_request_bytes":4194304,"max_snapshot_bytes":16777216},"time":1}
