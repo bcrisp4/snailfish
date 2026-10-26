@@ -1,0 +1,137 @@
+"""The demo task app CLI.
+
+Usage:
+    snailfish-demo setup --relay URL --tenant T DIR_A DIR_B
+    snailfish-demo --dir DIR edit TASK FIELD VALUE
+    snailfish-demo --dir DIR sync
+    snailfish-demo --dir DIR list
+
+`SNAILFISH_DEMO_CRASH_AT=N` makes the process exit at the Nth crash point
+of the run, with no cleanup, as a kill does. The crash points are before
+and after each HTTP request, and around each app transaction. The crash
+tests use them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import httpx
+import snailfish as sf
+
+from snailfish_demo import app
+
+
+class Crasher:
+    """Exits at once at the Nth crash point, as a kill does.
+
+    `SNAILFISH_DEMO_CRASH_AT` sets N. Without it, no crash point exits.
+    """
+
+    def __init__(self) -> None:
+        """Read N from the environment."""
+        at = os.environ.get("SNAILFISH_DEMO_CRASH_AT")
+        self.at = int(at) if at else None
+        self.count = 0
+
+    def __call__(self, name: str) -> None:
+        """Count one crash point, and exit if it is the Nth."""
+        if self.at is None:
+            return
+        self.count += 1
+        if self.count == self.at:
+            sys.stderr.write(f"crash at point {self.count}: {name}\n")
+            sys.stderr.flush()
+            os._exit(137)
+
+
+def http_transport(client: httpx.Client, crash_point: Crasher) -> app.Transport:
+    """Return a transport that sends each request with `client`.
+
+    The client follows no redirects, because the request signature covers
+    the relay authority (DESIGN.md "App integration").
+    """
+
+    def send(req: sf.Request) -> tuple[int, list[sf.Header], bytes]:
+        crash_point(f"before {req.method} {req.url}")
+        resp = client.request(
+            req.method,
+            req.url,
+            headers=[(h.name, h.value) for h in req.headers],
+            content=req.body,
+            follow_redirects=False,
+        )
+        crash_point(f"after {req.method} {req.url}")
+        return (
+            resp.status_code,
+            [sf.Header(name=k, value=v) for k, v in resp.headers.multi_items()],
+            resp.content,
+        )
+
+    return send
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the CLI."""
+    p = argparse.ArgumentParser(prog="snailfish-demo")
+    p.add_argument("--dir", type=Path)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("setup")
+    s.add_argument("--relay", required=True)
+    s.add_argument("--tenant", required=True)
+    s.add_argument("dir_a", type=Path)
+    s.add_argument("dir_b", type=Path)
+    e = sub.add_parser("edit")
+    e.add_argument("task")
+    e.add_argument("field", choices=app.FIELDS)
+    e.add_argument("value")
+    sub.add_parser("sync")
+    sub.add_parser("list")
+    sub.add_parser("dump")
+    args = p.parse_args(argv)
+
+    if args.cmd == "setup":
+        key = app.create_space(args.relay, args.tenant, args.dir_a, args.dir_b)
+        print(f"recovery key (write it down): {key}")
+        return 0
+    if args.dir is None:
+        p.error("--dir is required")
+    crasher = Crasher()
+    dev = app.Device(args.dir, crash_point=crasher)
+    try:
+        if args.cmd == "edit":
+            value: object = args.value == "true" if args.field == "done" else args.value
+            dev.edit(args.task, args.field, value)
+        elif args.cmd == "sync":
+            with httpx.Client(timeout=30) as client:
+                status = dev.sync(http_transport(client, crasher))
+            print(f"status: {status}")
+            return 0 if status.is_ok() else 1
+        elif args.cmd == "list":
+            for line in app.iter_tasks(dev.tasks()):
+                print(line)
+        elif args.cmd == "dump":
+            print(
+                json.dumps(
+                    {
+                        "tasks": dev.tasks(),
+                        "outbox": [c.hex() for c in dev.outbox_ids()],
+                        "handled": [c.hex() for c in dev.handled_ids()],
+                        "engine_outbox": dev.engine.outbox_len(),
+                        "applied": dev.applied_position().position,
+                        "status": str(dev.engine.status()),
+                    },
+                    sort_keys=True,
+                )
+            )
+    finally:
+        dev.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

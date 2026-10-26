@@ -1,0 +1,44 @@
+[project]
+name = "snailfish-demo"
+version = "0.0.0"
+description = "The Snailfish demo task app: a CLI on the Python binding."
+requires-python = ">=3.13"
+license = "MIT OR Apache-2.0"
+dependencies = ["httpx==0.28.1"]
+
+[project.scripts]
+snailfish-demo = "snailfish_demo.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-markers", "-q"]
+testpaths = ["tests"]
+# `make bindings-python` writes snailfish.py and libsnailfish here.
+pythonpath = ["../bindings/python/build", "src", "tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W", "I", "UP", "B", "SIM", "TC", "RUF", "PTH", "S", "T20",
+  "ARG", "FBT", "A", "C4", "DTZ", "ISC", "PIE", "RSE", "RET", "TID",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# pytest uses bare assert statements. The tests start the relay and the demo
+# CLI as child processes with fixed argument lists.
+"tests/*" = ["S101", "S603", "T201"]
+# The CLI prints its output.
+"src/snailfish_demo/cli.py" = ["T201"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+include = ["src", "tests"]
+extraPaths = ["../bindings/python/build", "src", "tests"]
