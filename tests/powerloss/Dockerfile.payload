@@ -1,0 +1,40 @@
+# The payload of the power-loss VM: Linux builds of the relay, the Python
+# binding and the demo app with its dependencies. The guest needs no
+# network and no compiler.
+FROM rust:1.99.1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates crates
+RUN cargo build --locked --release -p snailfish-relay -p snailfish-bindings -p snailfish-uniffi-bindgen \
+ && mkdir -p /payload/python \
+ && target/release/uniffi-bindgen generate --library target/release/libsnailfish.so \
+      --language python --out-dir /payload/python \
+ && cp target/release/libsnailfish.so /payload/python/ \
+ && cp target/release/snailfish-relay /payload/
+
+FROM python:3.13-slim-trixie AS wheels
+COPY demo/uv.lock /tmp/uv.lock
+# httpx and its dependencies, at the versions of demo/uv.lock.
+RUN python3 - <<'EOF' > /tmp/req.txt
+import tomllib
+lock = tomllib.load(open("/tmp/uv.lock", "rb"))
+for p in lock["package"]:
+    if p["name"] in ("anyio", "certifi", "h11", "httpcore", "httpx", "idna", "sniffio", "typing-extensions"):
+        print(f'{p["name"]}=={p["version"]}')
+EOF
+RUN pip download --no-deps --only-binary=:all: -r /tmp/req.txt -d /wheels \
+ && pip install --no-deps --no-index --target /site /wheels/*.whl
+
+FROM debian:trixie-slim AS image
+RUN apt-get update && apt-get install -y --no-install-recommends e2fsprogs && rm -rf /var/lib/apt/lists/*
+COPY --from=build /payload /payload
+COPY --from=wheels /site /payload/site
+COPY demo/src /payload/demo
+COPY tests/powerloss/guest.sh tests/powerloss/check.py /payload/
+# The data disk: the payload under /payload, and an empty /state for the
+# relay and the device directories. -E root_owner keeps uid 0.
+RUN mkdir -p /disk/state && cp -a /payload /disk/payload \
+ && chmod +x /disk/payload/guest.sh /disk/payload/snailfish-relay \
+ && truncate -s 1G /data.img \
+ && mkfs.ext4 -q -L sfdata -d /disk -E root_owner=0:0 /data.img
