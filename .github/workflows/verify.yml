@@ -220,6 +220,9 @@ jobs:
         run: make rust-mutants-diff BASE="$BASE" MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
       - if: github.event_name == 'schedule'
         run: make rust-mutants MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
+      # passkey.rs compiles only with the webauthn feature. One shard checks it.
+      - if: matrix.shard == 0
+        run: make rust-mutants-passkey MUTANTS_JOBS=2
 
   nightly-fuzz:
     # Long fuzz runs. Nightly only.

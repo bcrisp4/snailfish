@@ -10,6 +10,10 @@ CARGO := mise exec -- cargo
 NIGHTLY_NAME := nightly-2026-08-21
 NIGHTLY := +$(NIGHTLY_NAME)
 FUZZ_SECONDS ?= 300
+# cargo-fuzz builds for the target that it was compiled for. A prebuilt
+# cargo-fuzz for Linux is a musl binary, and the address sanitizer does not
+# work with a static libc. So pass the host target of rustc.
+FUZZ_TARGET ?= $(shell mise exec -- rustc -vV 2>/dev/null | sed -n 's/^host: //p')
 # Kani verifies this many harnesses in parallel. One CBMC run can use about
 # 10.5 GB of memory (pae decode_never_panics), so set KANI_JOBS to the GB of
 # memory divided by 11. CI uses 1.
@@ -23,13 +27,13 @@ BASE ?= main
 MUTANTS_JOBS ?= 4
 MUTANTS_SHARD ?=
 MUTANTS_MIN_TIMEOUT ?= 120
-MUTANTS_ARGS = --workspace --features snailfish-relay/webauthn -j $(MUTANTS_JOBS) \
+MUTANTS_ARGS = --workspace -j $(MUTANTS_JOBS) \
   --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT) $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD))
 
 .PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-powerloss \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
-        rust-nightly-check rust-nightly-components verify-crypto
+        rust-nightly-check rust-nightly-components rust-mutants-passkey verify-crypto
 
 ## The gate for each commit: Rust lint and tests, the shared vectors in Go and
 ## Python, runner tests, then the fast Quint tier. `make test-swift` needs Xcode,
@@ -109,7 +113,7 @@ rust-fuzz: rust-nightly-check
 	  for target in $$(cd $$dir && $(CARGO) $(NIGHTLY) fuzz list); do \
 	    echo "== fuzz $$dir $$target ($(FUZZ_SECONDS)s)"; \
 	    mkdir -p $$dir/corpus/$$target; \
-	    (cd $$dir && $(CARGO) $(NIGHTLY) fuzz run $$target corpus/$$target seeds/$$target \
+	    (cd $$dir && $(CARGO) $(NIGHTLY) fuzz run --target $(FUZZ_TARGET) $$target corpus/$$target seeds/$$target \
 	      -- -max_total_time=$(FUZZ_SECONDS)) || exit 1; \
 	  done; \
 	done
@@ -131,6 +135,13 @@ endef
 ## MUTANTS_SHARD=k/n runs one shard. CI runs 8 shards in parallel.
 rust-mutants:
 	@$(CARGO) mutants $(MUTANTS_ARGS); $(check_mutants)
+
+## Mutants of crates/relay/src/passkey.rs, which only the `webauthn` feature
+## compiles. A feature flag is valid for one package only, so the workspace
+## runs above cannot enable it.
+rust-mutants-passkey:
+	@$(CARGO) mutants -p snailfish-relay --features webauthn -f crates/relay/src/passkey.rs \
+	  -j $(MUTANTS_JOBS) --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT); $(check_mutants)
 
 ## Mutants in the Rust code that changed since BASE (default main). Run before a
 ## merge. It does not see a test that a change made weaker in other code, so
