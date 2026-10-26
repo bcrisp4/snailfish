@@ -249,3 +249,135 @@ fn writer_gives_go_payload_bytes() {
         );
     }
 }
+
+/// The genesis record of the Go log, rewritten with write level `level` and
+/// signed by recovery key R1.
+fn genesis_at_level(v: &Value, level: u64) -> Envelope {
+    use snailfish_protocol::records::{Body, parse_payload};
+    use snailfish_protocol::write;
+    let e = env(v, 1);
+    let r = parse_payload(&e.payload_type, &e.payload).unwrap();
+    let Body::Genesis {
+        app,
+        recovery,
+        device,
+        commitment,
+        keys,
+        ..
+    } = &r.body
+    else {
+        panic!("entry 1 is a genesis record");
+    };
+    let payload = write::genesis(
+        &r.log,
+        &r.author,
+        &r.base,
+        &write::Genesis {
+            app,
+            recovery,
+            level,
+            device,
+            commitment,
+            keys,
+        },
+    );
+    let seed: [u8; 32] = hex::decode(v["recovery"][0]["sign_seed"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let sig = SecretKey::from_seed(&seed).sign_record(&e.payload_type, &payload);
+    Envelope {
+        payload_type: e.payload_type,
+        payload,
+        sig,
+    }
+}
+
+/// A grant of device B with device level `level`, by A, on top of `head`.
+fn grant_b(v: &Value, level: u64, head: (u64, [u8; 32])) -> Envelope {
+    use snailfish_protocol::records::{Author, Body, Position, parse_payload};
+    use snailfish_protocol::write;
+    let e = env(v, 2);
+    let r = parse_payload(&e.payload_type, &e.payload).unwrap();
+    let (a, ka) = device(v, "A");
+    let Body::Grant { device: dev, keys } = &r.body else {
+        panic!("entry 2 is a grant record");
+    };
+    let mut new_device = dev.clone();
+    new_device.level = level;
+    let payload = write::grant(
+        &r.log,
+        &Author::Device(a),
+        &Position {
+            position: head.0,
+            digest: head.1,
+        },
+        &new_device,
+        &keys[0],
+    );
+    let sig = ka.sign_record(&e.payload_type, &payload);
+    Envelope {
+        payload_type: e.payload_type,
+        payload,
+        sig,
+    }
+}
+
+/// [VER-7] The write level of the space comes from the genesis record. A
+/// grant of a device below that level is refused, and a device at the level
+/// is accepted. Without this, a relay would let a device that cannot read the
+/// future record formats join the space.
+#[test]
+fn grant_below_the_genesis_write_level_is_refused() {
+    let v = vectors();
+    let log = decode_id::<16>(v["log"]["log_id"].as_str().unwrap(), "l_").unwrap();
+    let (a, _) = device(&v, "A");
+    let mut s = MemorySpace::new(log);
+    let g = check_genesis(&genesis_at_level(&v, 2), &log, Some(&a)).unwrap();
+    s.apply(&g);
+    assert_eq!(s.level, 2);
+    let head = (1, g.digest);
+    match check_append(&s, &grant_b(&v, 1, head), relay(a)) {
+        Verdict::Refused(Refusal::InvalidRecord(why)) => assert!(why.contains("write level")),
+        other => panic!("expected invalid_record, got {other:?}"),
+    }
+    stored(check_append(&s, &grant_b(&v, 2, head), relay(a)));
+}
+
+/// [DLV-5] A change of exactly `max_change_bytes` is stored. One byte more is
+/// `too_large`. Without this, a relay would refuse changes at the limit that
+/// the engine is allowed to send, or store changes above it.
+#[test]
+fn change_size_limit_is_inclusive() {
+    use snailfish_protocol::records::Position;
+    use snailfish_protocol::write;
+    let v = vectors();
+    let space = setup(&v);
+    let (a, ka) = device(&v, "A");
+    let payload = write::change(
+        &space.log_id,
+        &a,
+        &Position {
+            position: 3,
+            digest: digest(&v, 3),
+        },
+        1,
+        &[0x77; 16],
+        &[9; 100],
+    );
+    let ty = "snailfish.change.v1";
+    let env = Envelope {
+        payload_type: ty.to_owned(),
+        sig: ka.sign_record(ty, &payload),
+        payload,
+    };
+    let at = |max| Mode::Relay {
+        signer: a,
+        max_change_bytes: max,
+    };
+    stored(check_append(&space, &env, at(env.payload.len())));
+    assert_eq!(
+        check_append(&space, &env, at(env.payload.len() - 1)),
+        Verdict::Refused(Refusal::TooLarge)
+    );
+}

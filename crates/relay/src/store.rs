@@ -85,7 +85,7 @@ impl Kind {
     }
 }
 
-/// A storage failure. The class is the only part that the relay reports.
+/// A storage failure. The relay never sends its text to a client.
 #[derive(Debug)]
 pub enum StoreError {
     /// SQLite refused an operation.
@@ -101,25 +101,6 @@ pub enum StoreError {
     },
     /// Stored data breaks an invariant of the relay.
     Corrupt(&'static str),
-}
-
-impl StoreError {
-    /// A short class name. It holds no identifier.
-    #[must_use]
-    pub fn class(&self) -> &'static str {
-        match self {
-            Self::Sqlite(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::DatabaseBusy
-                    || e.code == rusqlite::ErrorCode::DatabaseLocked =>
-            {
-                "busy"
-            }
-            Self::Sqlite(_) => "sqlite",
-            Self::Io(_) => "io",
-            Self::SchemaTooNew { .. } => "schema_too_new",
-            Self::Corrupt(_) => "corrupt",
-        }
-    }
 }
 
 impl fmt::Display for StoreError {
@@ -196,11 +177,10 @@ pub fn open(path: &Path, kind: Kind, create: bool) -> Result<Connection, StoreEr
             return Err(StoreError::Corrupt("the file has no schema"));
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let again: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if again < SCHEMA_VERSION {
-            tx.execute_batch(kind.ddl())?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
+        // Every statement of the DDL is `IF NOT EXISTS`, so a second creator
+        // that waited for the lock repeats it without harm.
+        tx.execute_batch(kind.ddl())?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
     }
     Ok(conn)

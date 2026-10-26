@@ -172,22 +172,61 @@ final class VectorTests: XCTestCase {
         }
     }
 
-    func testEngineSkeleton() throws {
+    func testEngineThroughTheBinding() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let engine = try Engine.open(dataDir: dir.path, relayUrl: "https://r.example/", appId: "com.example.tasks")
-        XCTAssertThrowsError(try Engine.open(dataDir: dir.path, relayUrl: "https://r.example", appId: "a")) { error in
+        var ka = try newDeviceKeys()
+        let kb = try newDeviceKeys()
+        XCTAssertEqual([ka.signSeed.count, ka.sealSeed.count, ka.appKey.count], [32, 32, 32])
+        let setup = try createSpace(
+            appId: "com.example.tasks",
+            first: NewDevice(keys: ka, name: "A"),
+            others: [NewDevice(keys: kb, name: "B")])
+        XCTAssertEqual(setup.envelopes.count, 2)
+        XCTAssertEqual(try parseEnvelope(text: Data(setup.envelopes[0].utf8)).payloadType, "snailfish.genesis.v1")
+        XCTAssertEqual(try parseEnvelope(text: Data(setup.envelopes[1].utf8)).payloadType, "snailfish.grant.v1")
+        XCTAssertEqual(try recoveryParse(text: setup.recoveryKey).count, 16)
+        ka.appKey = setup.appKey
+        let space = SpaceRef(
+            relayUrl: "https://r.example/", tenant: "t_" + String(repeating: "0", count: 32),
+            logId: setup.logId, appId: "com.example.tasks")
+        try installSetup(dataDir: dir.path, space: space, keys: ka, envelopes: setup.envelopes)
+        let engine = try Engine.open(dataDir: dir.path, space: space, keys: ka)
+        XCTAssertThrowsError(try Engine.open(dataDir: dir.path, space: space, keys: ka)) { error in
             XCTAssertEqual(error as? SnailfishError, .Locked)
         }
-        XCTAssertEqual(try engine.newChangeId().count, 16)
+        let cid = try engine.newChangeId()
+        XCTAssertEqual(cid.count, 16)
+        let row = OutboxRow(changeId: cid, changeBytes: Data("x".utf8))
+        XCTAssertEqual(try engine.enqueueMany(rows: [row]).stored, [cid])
+        XCTAssertEqual(
+            try engine.enqueueMany(rows: [OutboxRow(changeId: cid, changeBytes: Data("y".utf8))]).refused, [cid])
+        XCTAssertEqual(try engine.outboxLen(), 1)
+        let base = try engine.genesisBase()
+        XCTAssertEqual(base.position, 0)
+        XCTAssertEqual(try engine.changesAfter(applied: base, maxChanges: 500), [])
+
         let sync = try engine.startSync()
-        let req = try XCTUnwrap(try sync.nextRequest())
-        XCTAssertEqual(req.url, "https://r.example/v1/info")
-        try sync.handleResponse(status: 200, headers: [], body: Data(#"{"levels":[0]}"#.utf8))
-        XCTAssertEqual(try engine.status(), .relayTooOld)
+        let info = try XCTUnwrap(try sync.nextRequest())
+        XCTAssertEqual(info.url, "https://r.example/v1/info")
+        try sync.handleResponse(
+            status: 200,
+            headers: [Header(name: "snailfish-time", value: "1767225600")],
+            body: Data(#"{"levels":[1],"limits":{"max_request_bytes":4194304,"max_change_bytes":65536,"max_snapshot_bytes":16777216,"max_append_envelopes":100,"max_fetch_entries":500},"time":1767225600}"#.utf8))
+        let create = try XCTUnwrap(try sync.nextRequest())
+        XCTAssertEqual(create.method, "PUT")
+        XCTAssertEqual(create.url, "https://r.example/v1/t/" + space.tenant + "/s/" + setup.logId)
+        let names = create.headers.map { $0.name }
+        XCTAssertEqual(
+            Array(names.suffix(4)), ["content-digest", "signature-input", "signature", "snailfish-authority"])
+        XCTAssertEqual(create.headers.last?.value, "r.example")
+        try sync.handleResponse(status: 421, headers: [], body: Data(#"{"error":"wrong_authority","message":""}"#.utf8))
+        XCTAssertEqual(try engine.status(), .relayAuthority)
+        XCTAssertNil(try sync.nextRequest())
+
         let again = try engine.startSync()
         _ = try again.nextRequest()
-        try again.handleResponse(status: 503, headers: [Header(name: "retry-after", value: "5")], body: Data())
+        try again.handleResponse(status: 503, headers: [], body: Data())
         XCTAssertEqual(try engine.status(), .relayUnavailable)
         XCTAssertThrowsError(try deviceId(signPk: Data(count: 32), sealPk: Data(count: 1215)))
     }

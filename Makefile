@@ -17,7 +17,7 @@ KANI_JOBS ?= 4
 # The git ref that `make rust-mutants-diff` compares against.
 BASE ?= main
 
-.PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift \
+.PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-powerloss \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
         rust-nightly-check rust-nightly-components verify-crypto
@@ -25,7 +25,7 @@ BASE ?= main
 ## The gate for each commit: Rust lint and tests, the shared vectors in Go and
 ## Python, runner tests, then the fast Quint tier. `make test-swift` needs Xcode,
 ## so it runs on macOS only.
-check: rust vectors-check test-python verify-tools verify-workflows verify-fast
+check: rust vectors-check test-python test-demo verify-tools verify-workflows verify-fast
 
 ## ---------------------------------------------------------------- Quint
 
@@ -120,7 +120,7 @@ endef
 
 ## Mutants of every crate in the workspace. Run nightly, and before a release.
 rust-mutants:
-	@$(CARGO) mutants --workspace; $(check_mutants)
+	@$(CARGO) mutants --workspace --features snailfish-relay/webauthn; $(check_mutants)
 
 ## Mutants in the Rust code that changed since BASE (default main). Run before a
 ## merge. It does not see a test that a change made weaker in other code, so
@@ -130,7 +130,7 @@ rust-mutants-diff:
 	  git rev-parse --verify --quiet '$(BASE)^{commit}' > /dev/null || { echo "FAIL: BASE '$(BASE)' is not a git commit"; exit 1; }; \
 	  git diff $(BASE) -- '*.rs' > mutants.diff || { echo "FAIL: git diff $(BASE) failed"; exit 1; }; \
 	  if [ ! -s mutants.diff ]; then echo "ok: no Rust change since $(BASE)"; exit 0; fi; \
-	  $(CARGO) mutants --workspace --in-diff mutants.diff; $(check_mutants)
+	  $(CARGO) mutants --workspace --features snailfish-relay/webauthn --in-diff mutants.diff; $(check_mutants)
 
 ## Licences, advisories and sources of every dependency.
 rust-deny:
@@ -167,10 +167,31 @@ bindings-python:
 bindings-swift:
 	DEVELOPER_DIR=$(DEVELOPER_DIR) bindings/scripts/build.sh swift
 
-## The shared vectors through the Python binding, with ruff and pyright.
+## The shared vectors and a two-device sync through the Python binding, with
+## ruff and pyright. The sync test needs a relay, so with-relay.sh starts one.
 test-python: bindings-python
+	$(CARGO) build -p snailfish-relay
 	cd bindings/python && mise exec -- uv run --locked ruff check . && mise exec -- uv run --locked ruff format --check . \
-	  && mise exec -- uv run --locked pyright && mise exec -- uv run --locked pytest
+	  && mise exec -- uv run --locked pyright
+	SNAILFISH_RELAY_BIN=target/debug/snailfish-relay bindings/scripts/with-relay.sh \
+	  sh -c 'cd bindings/python && mise exec -- uv run --locked pytest'
+
+
+## The M2 acceptance tests: the demo app on the Python binding against a relay
+## process. Sync between two devices, a plaintext scan of the relay files,
+## merge order, and a client crash at each step of push and pull.
+test-demo: bindings-python
+	$(CARGO) build -p snailfish-relay
+	cd demo && mise exec -- uv run --locked ruff check . && mise exec -- uv run --locked ruff format --check . \
+	  && mise exec -- uv run --locked pyright \
+	  && SNAILFISH_RELAY_BIN=$(CURDIR)/target/debug/snailfish-relay mise exec -- uv run --locked pytest
+
+## The power-loss test: SIGKILL a QEMU VM during push and pull, KILLS times.
+## About 5 minutes for 20 kills on an M5 with HVF, after the first boot.
+ARCH ?=
+KILLS ?= 20
+test-powerloss:
+	mise exec -- uv run --script tests/powerloss/run.py $(if $(ARCH),--arch $(ARCH)) --kills $(KILLS)
 
 ## The shared vectors through the Swift binding on an iOS simulator and on macOS.
 test-swift: bindings-swift

@@ -1807,6 +1807,7 @@ dependencies = [
  "hex",
  "serde_json",
  "snailfish-engine",
+ "snailfish-relay",
  "tempfile",
  "uniffi",
 ]

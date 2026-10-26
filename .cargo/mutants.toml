@@ -7,6 +7,8 @@ test_tool = "nextest"
 # workspace, also crates/bindings/tests.
 test_workspace = true
 timeout_multiplier = 3.0
+# The relay `webauthn` feature gates crates/relay/src/passkey.rs. The
+# Makefile targets enable it, so cargo-mutants tests its mutants too.
 # Kani proofs and fuzz targets are not unit tests. Do not mutate them.
 exclude_globs = ["**/fuzz/**"]
 exclude_re = [
@@ -20,6 +22,8 @@ exclude_re = [
   "replace \\| with \\^ in decode_id",
   "replace \\| with \\^ in display",
   "replace \\| with \\^ in parse",
+  # SQLite open flags are distinct bits, so `|` and `^` give the same value.
+  "replace \\| with \\^ in open",
   # serde calls `expecting` only for a value type that the visitor does not
   # handle. The visitor handles every JSON type, so serde_json never calls it.
   "Visitor<'de> for Visit>::expecting",

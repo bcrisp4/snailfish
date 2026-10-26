@@ -23,5 +23,7 @@ workspace = true
 
 [dev-dependencies]
 hex = "0.4"
+# The real relay core for the sync test through the binding.
+snailfish-relay = { path = "../relay" }
 serde_json = "1"
 tempfile = "3"

@@ -395,6 +395,21 @@ pub struct Info {
     pub limits: Limits,
 }
 
+/// The `levels` list of a `GET /v1/info` body ([VER-11]).
+///
+/// # Errors
+///
+/// Refuses a body without a `levels` list of integers.
+pub fn parse_levels(body: &[u8]) -> Result<Vec<u64>, WireError> {
+    object(body)?
+        .get("levels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad("levels is not a list"))?
+        .iter()
+        .map(|v| v.as_u64().ok_or_else(|| bad("a level is not an integer")))
+        .collect()
+}
+
 /// Parse a `GET /v1/info` body. Unknown fields are ignored ([VER-13]).
 ///
 /// # Errors
@@ -402,14 +417,8 @@ pub struct Info {
 /// Refuses a body without a `levels` list of integers or without the
 /// limits.
 pub fn parse_info(body: &[u8]) -> Result<Info, WireError> {
+    let levels = parse_levels(body)?;
     let m = object(body)?;
-    let levels = m
-        .get("levels")
-        .and_then(Value::as_array)
-        .ok_or_else(|| bad("levels is not a list"))?
-        .iter()
-        .map(|v| v.as_u64().ok_or_else(|| bad("a level is not an integer")))
-        .collect::<Result<Vec<_>, _>>()?;
     let l = m.get("limits").ok_or_else(|| bad("limits is missing"))?;
     let get = |name: &str| {
         l.get(name)
@@ -448,6 +457,13 @@ pub fn parse_error(body: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The relay puts the text of a `WireError` in an error response. Without
+    /// this, the client would get an empty message.
+    #[test]
+    fn wire_error_displays_its_text() {
+        assert_eq!(bad("genesis body: x").to_string(), "genesis body: x");
+    }
 
     fn env_json() -> String {
         Envelope {
@@ -537,6 +553,8 @@ mod tests {
         );
         assert!(parse_info(br#"{"levels":[1]}"#).is_err());
         assert!(parse_info(br#"{"levels":"1","limits":{}}"#).is_err());
+        assert_eq!(parse_levels(br#"{"levels":[0,2]}"#), Ok(vec![0, 2]));
+        assert!(parse_levels(br#"{"levels":[-1]}"#).is_err());
         assert_eq!(
             parse_error(&error_body("expired", "x")).as_deref(),
             Some("expired")

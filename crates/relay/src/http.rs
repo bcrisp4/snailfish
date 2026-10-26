@@ -45,14 +45,6 @@ async fn handler(relay: Relay, req: HttpRequest<Body>) -> HttpResponse {
             (relay.config().clock)(),
         ))
     };
-    let declared = parts
-        .headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    if declared.is_some_and(|n| n > max) {
-        return too_large();
-    }
     let Ok(body) = to_bytes(body, max).await else {
         return too_large();
     };

@@ -29,6 +29,13 @@ enum Command {
         #[arg(long, env = "SNAILFISH_AUTHORITY")]
         authority: Option<String>,
     },
+    /// Check the health route of a running relay. Exit 0 if it answers
+    /// 200. The container image has no curl, so its HEALTHCHECK uses this.
+    Health {
+        /// The health URL: `http://` with an IP address or host and a port.
+        #[arg(long, default_value = "http://127.0.0.1:8080/v1/health")]
+        url: String,
+    },
     /// Manage users.
     User {
         #[command(subcommand)]
@@ -53,6 +60,12 @@ fn fail(msg: &str) -> ExitCode {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Command::Health { url } = &cli.command {
+        return match health(url) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        };
+    }
     let Some(data) = cli.data else {
         return fail("set --data or SNAILFISH_DATA");
     };
@@ -70,6 +83,7 @@ async fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Command::Health { .. } => ExitCode::SUCCESS,
         Command::Serve { listen, authority } => {
             let Some(authority) = authority.filter(|a| !a.is_empty()) else {
                 return fail(
@@ -94,8 +108,20 @@ async fn serve(data: PathBuf, listen: &str, authority: String) -> ExitCode {
         Ok(l) => l,
         Err(e) => return fail(&format!("cannot listen: {e}")),
     };
+    // A container stop sends SIGTERM, and a terminal sends SIGINT.
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        let term = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = term => {}
+        }
     };
     match axum::serve(listener, router(relay))
         .with_graceful_shutdown(shutdown)
@@ -103,5 +129,38 @@ async fn serve(data: PathBuf, listen: &str, authority: String) -> ExitCode {
     {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&format!("server error: {e}")),
+    }
+}
+
+/// One `GET` of a plain HTTP health URL, with a 5 second limit.
+fn health(url: &str) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("the health URL must start with http://")?;
+    let (host, path) = rest
+        .split_once('/')
+        .map_or((rest, "/"), |(h, _)| (h, &rest[h.len()..]));
+    let timeout = std::time::Duration::from_secs(5);
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(host)
+        .map_err(|e| format!("health: {e}"))?
+        .next()
+        .ok_or("health: no address")?;
+    let mut s =
+        std::net::TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("health: {e}"))?;
+    s.set_read_timeout(Some(timeout))
+        .map_err(|e| format!("health: {e}"))?;
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|e| format!("health: {e}"))?;
+    let mut head = [0u8; 12];
+    s.read_exact(&mut head)
+        .map_err(|e| format!("health: {e}"))?;
+    if head.starts_with(b"HTTP/1.1 200") {
+        Ok(())
+    } else {
+        Err(format!("health: {}", String::from_utf8_lossy(&head)))
     }
 }
