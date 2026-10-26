@@ -15,7 +15,7 @@ Before the first public release, formats can change without notice, and the vect
 | 7. Signatures and keys | Done | `snailfish_protocol::sig`, `snailfish_protocol::keys` | `vectors/third_party/`, `vectors/protocol.json` |
 | 8. Request signatures | Done | `snailfish_protocol::request` | `vectors/http.json` |
 | 9. Recovery key encoding | Done | `snailfish_protocol::recovery` | `vectors/protocol.json`, `vectors/recovery-key.json` |
-| 10. HTTP API | Done (M2 routes) | `snailfish-relay`, `snailfish_engine::wire` | `vectors/http.json` |
+| 10. HTTP API | Done (M2 routes) | `snailfish_protocol::wire`, `snailfish-relay` | `vectors/http.json` |
 
 `vectors/README.md` describes each vector file and the programs that make and check them.
 

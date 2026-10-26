@@ -32,6 +32,8 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | Before a merge with Rust changes | `make rust-kani` and `make rust-mutants-diff BASE=<base>` | Bounded harnesses and fault-sensitive tests check the implementation. |
 | Before a merge with parser changes | `make rust-fuzz` | Arbitrary bytes exercise parser failure paths. |
 | Before a merge with format, vector or binding changes | `make test-swift` on macOS | Linux has no Xcode, so `make check` skips the Swift binding. CI runs it in the `swift` job. |
+| Before a merge with engine, relay storage or demo changes | `make test-powerloss` | A SIGKILL of a VM finds a missing fsync that a process crash cannot find. `make check` runs only the process crash tests (`make test-demo`). |
+| Before a merge with `Dockerfile` or relay dependency changes | `docker build .` and the `image` CI job | The static musl and vendored OpenSSL build fails only in the container. |
 | After a change to `PROTOCOL.md` bytes | `make vectors`, then `make vectors-check` | Go `crypto/hpke` takes no fixed ephemeral key, so a regeneration changes every `sealed` value. Regenerate only for a format change. |
 
 `BASE` is the target branch for a pull request, or the previous commit for a direct push. The default is `main`.

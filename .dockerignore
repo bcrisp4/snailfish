@@ -1,0 +1,12 @@
+target/
+.agents/
+**/.venv/
+**/__pycache__/
+bindings/python/build/
+bindings/swift/build/
+bindings/swift/.build/
+crates/*/fuzz/target/
+crates/*/fuzz/corpus/
+mutants.out*/
+specs/
+.scratch/

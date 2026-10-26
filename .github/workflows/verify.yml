@@ -72,6 +72,62 @@ jobs:
           echo "id=$id" >> "$GITHUB_OUTPUT"
       - run: make test-swift DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=${{ steps.sim.outputs.id }}"
 
+  image:
+    # DESIGN.md "Relay deployment": the static musl image for each
+    # architecture, with vendored OpenSSL. Each runner builds its own
+    # architecture natively. CI does not push the image.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --platform linux/${{ matrix.arch }} -t snailfish-relay:ci .
+      - name: The container reports healthy and serves /v1/info
+        run: |
+          docker run -d --name relay -e SNAILFISH_AUTHORITY=localhost:8080 -p 8080:8080 snailfish-relay:ci
+          for _ in $(seq 60); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' relay)
+            if [ "$s" = healthy ]; then break; fi
+            sleep 1
+          done
+          test "$s" = healthy
+          test "$(docker image inspect -f '{{.Config.User}}' snailfish-relay:ci)" = nonroot:nonroot
+          curl -fsS localhost:8080/v1/info | jq -e '.levels == [1]'
+          docker stop -t 10 relay
+          test "$(docker inspect -f '{{.State.ExitCode}}' relay)" = 0
+      - name: The relay does not start without an authority
+        run: |
+          if docker run --rm snailfish-relay:ci; then exit 1; fi
+
+  powerloss:
+    # DESIGN.md M2: SIGKILL a QEMU VM during push and pull. The disks use
+    # cache=none. This covers Linux fsync in the guest, under KVM.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and allow KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-utils genisoimage
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -w /dev/kvm
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/snailfish-qemu
+          key: debian-13-genericcloud-amd64-20261021-2638
+      - run: make test-powerloss ARCH=amd64 KILLS=20
+
   models:
     # The model list comes from specs/*/checks.toml, so a new model is picked up.
     runs-on: ubuntu-24.04
