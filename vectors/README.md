@@ -7,6 +7,7 @@ The `protocol` crate, the sync engine, the Python binding and the Swift binding 
 | `protocol.json` | `tools/vectorgen` (Go) | One valid space log with every record type of `PROTOCOL.md` section 6, envelope variants, frames, IDs, key sets, change ciphertexts and recovery keys |
 | `strict-json.json` | `tools/vectorgen` (Go) | Payloads that `PROTOCOL.md` section 3 accepts or refuses, one case for each rule, and the section 6 rules for `sign` keys, recovery proofs and epoch records |
 | `recovery-key.json` | `tools/vectorgen` (Go) | Valid and invalid recovery key text forms (`PROTOCOL.md` section 9) |
+| `http.json` | `tools/vectorgen` (Go) | Request signatures (`PROTOCOL.md` section 8) and append and fetch results of the HTTP API (section 10) |
 | `third_party/cctv-ed25519.json` | C2SP CCTV, commit `50a8ecf2a220f4c8bdc4f085789b8e85c26829e7`, BSD-3-Clause (`third_party/CCTV-LICENSE`) | The 914 Ed25519 edge-case vectors |
 | `third_party/hpke-rfc9180.json` | `cfrg/draft-irtf-cfrg-hpke` commit `b1f7cb0cdeab6906c61b3d6574e8bdfdbe1cd3fb` | RFC 9180 vector for base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305 |
 | `third_party/hpke-pq.json` | `hpkewg/hpke-pq` commit `6433c8fce0b8b749dfc86c1095081a88698ccfab` | `draft-ietf-hpke-pq` vector for MLKEM768-X25519, HKDF-SHA256, ChaCha20Poly1305 |
@@ -71,3 +72,51 @@ All byte strings are lowercase hex, unless the field name ends in `_b64` or is a
 ```text
 { "version": 1, "valid": [ { "text", "secret": hex } ], "invalid": [ { "name", "text" } ] }
 ```
+
+## Format of `http.json`
+
+All times are Unix seconds. Byte strings are lowercase hex, unless the field is a header value, a JSON body string or a signature base.
+
+```text
+{
+  "version": 1,
+  "authority": "sync.example.net",    the configured relay authority
+  "now": n,                           the relay time for every case
+  "limits": { the limits object of PROTOCOL.md 10.4 },  small values, so a too large case stays small
+  "used_nonces": [ [keyid, nonce hex] ],                 nonces that the tenant file holds before each case
+  "tenant": "t_...", "log_id": "l_...",
+  "devices": [ { "name", "sign_seed", "id" } ],     A, B and C of protocol.json
+  "signed": [ {
+      "name", "signer": device name,
+      "method", "authority", "path", "query",         query without "?", "" for none
+      "body": str,                                    the exact body bytes as UTF-8
+      "created": n, "expires": n, "nonce": hex,
+      "content_digest": str, "signature_params": str, "signature_base": str,
+      "sig": hex,
+      "headers": [ [name, value] ]                    the four headers of section 8.1, in that order
+  } ],
+  "invalid": [ {
+      "name", "signer": device name or "",
+      "method", "path", "query", "body": str,
+      "headers": [ [name, value] ],
+      "error": code                                   the code of PROTOCOL.md 10.3 that the relay returns
+  } ],
+  "space": {
+      "genesis": envelope str, "genesis_digest": hex,
+      "log": [ { "position", "envelope": str, "record_hash": hex, "digest": hex } ]   positions 1..n after setup
+  },
+  "append": [ {
+      "name", "signer": device name,
+      "body": str,                                    the append request body of section 10.6
+      "results": [ { "status", "position": n or null, "error": code or null } ],
+      "head": { "position", "digest": hex }
+  } ],
+  "fetch": [ { "name", "after", "limit", "positions": [n], "head": n, "has_more": bool } ]
+}
+```
+
+- Each `signed` case verifies with the `sign_seed` public key of its signer. `headers` are the exact header values.
+- Each `invalid` case breaks one check of `PROTOCOL.md` 8.6. The relay returns `error` for it. The space has the devices of `space.log` as active devices.
+- `space.log` is the log of the space before each `append` case: genesis (recovery key R1, first device A), a change by A, a grant to B by A, and a change by B. Each `append` case starts from this log, so the cases are independent.
+- `append` covers a new change, an exact retry (`known`), the same `change_id` with another record hash (`conflict`), a second copy in one request, a bad base, a base at or after the new position, an author that differs from the request signer (a record by C that A sends), another log ID, an unsupported type, a wrong epoch, a too large change, a grant of an active device, and one request with mixed results.
+- `fetch` lists the positions that a fetch returns from `space.log`.
