@@ -27,7 +27,9 @@ BASE ?= main
 MUTANTS_JOBS ?= 4
 MUTANTS_SHARD ?=
 MUTANTS_MIN_TIMEOUT ?= 120
-MUTANTS_ARGS = --workspace -j $(MUTANTS_JOBS) \
+# passkey.rs compiles only with the webauthn feature, so the workspace runs
+# skip it: an uncompiled mutant shows as MISSED. rust-mutants-passkey tests it.
+MUTANTS_ARGS = --workspace --exclude crates/relay/src/passkey.rs -j $(MUTANTS_JOBS) \
   --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT) $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD))
 
 .PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-powerloss \
