@@ -10,6 +10,10 @@ and the Python demo client from a second disk (`guest.sh`). The host kills
 QEMU with SIGKILL during a push or a pull, boots again, and reads the state
 that the guest prints after it syncs both devices.
 
+The guest writes its markers to a virtio-serial port, which QEMU writes to a
+file on the host. The serial console also carries kernel and systemd output,
+which can split a marker line, so the host reads only the port file.
+
 The disks use `cache=none`, so the guest's flushes reach the host file
 before QEMU acknowledges them, and a SIGKILL drops only unflushed data. This
 covers Linux fsync in the guest. It does not cover Apple F_FULLFSYNC.
@@ -190,37 +194,60 @@ def qemu_cmd(arch: str, work: Path, disk: Path, data: Path, seed: Path) -> list[
 
 
 class Boot:
-    """One boot of the VM, with its serial console on stdout."""
+    """One boot of the VM. The console goes to a log file. The markers come
+    from a virtio-serial port that QEMU writes to a file of its own."""
 
-    def __init__(self, cmd: list[str], logfile: Path) -> None:
-        """Start QEMU."""
+    def __init__(self, cmd: list[str], logfile: Path, markers: Path) -> None:
+        """Start QEMU with the marker port on `markers`."""
         self.logf = logfile.open("ab")
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=self.logf)
+        markers.unlink(missing_ok=True)
+        self.markers_path = markers
+        port = [
+            "-chardev", f"file,id=sfm,path={markers}",
+            "-device", "virtio-serial-pci",
+            "-device", "virtserialport,chardev=sfm,name=sf.markers",
+        ]
+        self.proc = subprocess.Popen(
+            cmd + port, stdin=subprocess.DEVNULL, stdout=self.logf, stderr=self.logf
+        )
+        self.buf = b""
+        self.pos = 0
         self.lines: list[str] = []
 
+    def _read(self) -> list[str]:
+        """Return the complete marker lines written since the last read."""
+        try:
+            with self.markers_path.open("rb") as f:
+                f.seek(self.pos)
+                data = f.read()
+        except FileNotFoundError:
+            return []
+        self.pos += len(data)
+        self.buf += data
+        *done, self.buf = self.buf.split(b"\n")
+        return [x.decode(errors="replace").strip() for x in done if x.strip()]
+
     def wait_for(self, pred: str | tuple[str, ...], timeout: float) -> str:
-        """Read console lines until one starts with `pred`. Fail on SF-FAIL."""
+        """Read marker lines until one starts with `pred`. Fail on SF-FAIL."""
         prefixes = (pred,) if isinstance(pred, str) else pred
         deadline = time.monotonic() + timeout
-        assert self.proc.stdout is not None
+        pending: list[str] = []
         while time.monotonic() < deadline:
-            raw = self.proc.stdout.readline()
-            if not raw:
-                if self.proc.poll() is not None:
-                    sys.exit(f"FAIL: QEMU exited with {self.proc.returncode}; see {self.logf.name}")
-                continue
-            self.logf.write(raw)
-            line = raw.decode(errors="replace").strip()
-            # systemd prefixes service output on the console.
-            i = line.find("SF-")
-            if i < 0:
-                continue
-            line = line[i:]
+            if not pending:
+                pending = self._read()
+                if not pending:
+                    if self.proc.poll() is not None:
+                        sys.exit(f"FAIL: QEMU exited with {self.proc.returncode}; see {self.logf.name}")
+                    time.sleep(0.05)
+                    continue
+            line = pending.pop(0)
             self.lines.append(line)
             if line.startswith("SF-FAIL"):
                 self.kill()
                 sys.exit(f"FAIL: guest: {line}")
             if line.startswith(prefixes):
+                # Lines after the match stay unread for the next call.
+                self.buf = b"".join(x.encode() + b"\n" for x in pending) + self.buf
                 return line
         self.kill()
         sys.exit(f"FAIL: timeout waiting for {prefixes}; see {self.logf.name}")
@@ -229,20 +256,15 @@ class Boot:
         """SIGKILL QEMU: a power loss for the guest.
 
         Returns:
-            The SF- lines that the guest wrote before the kill and that the
+            The marker lines that the guest wrote before the kill and that the
             host did not read yet.
         """
         if self.proc.poll() is None:
             self.proc.send_signal(signal.SIGKILL)
         self.proc.wait()
-        rest: list[str] = []
-        if self.proc.stdout is not None and not self.logf.closed:
-            for raw in self.proc.stdout:
-                self.logf.write(raw)
-                line = raw.decode(errors="replace").strip()
-                i = line.find("SF-")
-                if i >= 0:
-                    rest.append(line[i:])
+        rest = self._read()
+        # A line without its newline is a write that the kill cut. Its edit
+        # did not return to the caller before the kill, so it is not counted.
         if not self.logf.closed:
             self.logf.close()
         return rest
@@ -254,7 +276,10 @@ class Boot:
 
 def check_state(line: str, edits: list[str]) -> dict[str, object]:
     """Check one SF-STATE line against the edits that returned."""
-    s = json.loads(line.removeprefix("SF-STATE "))
+    try:
+        s = json.loads(line.removeprefix("SF-STATE "))
+    except json.JSONDecodeError as e:
+        sys.exit(f"FAIL: the guest state line is not JSON ({e}): {line[:200]}")
     tasks = set(s["tasks"])
     missing = [e for e in edits if e not in tasks]
     if missing:
@@ -299,7 +324,7 @@ def main() -> int:
     states = 0
     for k in range(args.kills + 1):
         t0 = time.monotonic()
-        boot = Boot(cmd, consolelog)
+        boot = Boot(cmd, consolelog, work / f"markers-{k}.log")
         b = boot.wait_for("SF-BOOT", BOOT_TIMEOUT)
         t1 = time.monotonic()
         line = boot.wait_for("SF-STATE", BOOT_TIMEOUT)
