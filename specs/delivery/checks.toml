@@ -6,6 +6,7 @@ model = "model.qnt"
 module = "delivery"
 tests = "test.qnt"
 test_module = "deliveryTest"
+test_modules = ["deliveryTestHold"]
 
 # Invariants that hold in every config unless a config lists it under `limits`.
 invariants = [
@@ -183,7 +184,11 @@ caught_by = "noLostChangeWeak"
 
 [mutants.noHold]
 base = "restoreBase"
-caught_by = "refusedNotStored"
+# Sampling of refusedNotStored found the violation in 5 of 6 runs at 5000
+# traces, and CI run 41115310784 missed it. The scripted test fails on each run.
+caught_by = "tests"
+test_module = "deliveryTestHold"
+test = "restoreSetsHoldTest"
 
 [mutants.adoptFork]
 base = "forkBase"

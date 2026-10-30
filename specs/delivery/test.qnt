@@ -241,3 +241,22 @@ module deliveryTest {
       .then(pull(1, false))
       .expect(app(1).applied == Set(0) and app(1).outbox == Set() and app(1).dups == 0 and caughtUp(1))
 }
+
+// The mutant noHold (restoreRelay sets no hold) breaks the hold in each test
+// above that uses reportStatus, so its scripted test lives alone here.
+module deliveryTestHold {
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 3,
+                  FAULTS = Set("appRestore", "relayRestore"),
+                  BUG = "none").* from "./model"
+
+  // [LOG-14] F1: a restore puts the space on hold, so the relay refuses the
+  // stale outbox envelope of a change that the app reverted. Without the hold,
+  // the push of the reverted change stores it (refusedNotStored).
+  run restoreSetsHoldTest =
+    init
+      .then(edit(1, false, false)).then(enqueue(1, 0)).then(push(1, 0, false))
+      .then(edit(1, false, false)).then(enqueue(1, 1)).then(push(1, 1, false))
+      .then(restoreRelay(1))
+      .expect(relay.hold and relay.log == [0])
+      .then(push(1, 1, false).fail())
+}

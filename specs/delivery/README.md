@@ -81,6 +81,8 @@ A log entry is a record hash: an int that holds the change ID and a counter `gen
 
 Mutant `freshClearsOnFetch` needs a restore, an engine state loss and a fetch, in that order, during one hold. Random sampling seldom finds this path. `checks.toml` sets `caught_by = "tests"` for it, so `verify.py` runs the scenario tests with its `BUG`, and `notRepairedMarkTest` catches this one.
 
+Mutant `noHold` breaks `refusedNotStored`. Sampling of `restoreBase` at 5,000 traces found the violation in 5 of 6 local runs, and CI run 41115310784 missed it. `restoreSetsHoldTest` in module `deliveryTestHold` catches it on each run. The test lives in its own module, because the mutant also breaks the hold in each `deliveryTest` scenario that calls `reportStatus`.
+
 ## Not covered
 
 - Security records, epochs, the base rule for security records, enrollment and removal.
