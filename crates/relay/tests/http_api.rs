@@ -95,6 +95,25 @@ async fn body_over_the_limit_is_413_too_large() {
     }
 }
 
+/// PROTOCOL.md 10.9: the edge lets a repair body use the allowance above
+/// `max_request_bytes`, so a lost change of the largest size can be
+/// repaired. The core still refuses a body over the allowance.
+#[tokio::test]
+async fn repair_body_can_use_the_allowance() {
+    let fx = Fx::new();
+    let limit = usize::try_from(common::limits_of(&fx.h).max_request_bytes).unwrap();
+    let path = format!("/v1/t/{}/s/{}/repair", fx.tenant(), fx.log());
+    for (size, too_large) in [(limit + 1024, false), (limit + 1025, true)] {
+        let req = Request::builder()
+            .method("POST")
+            .uri(&path)
+            .body(Body::from(vec![b'x'; size]))
+            .unwrap();
+        let (st, _, _) = call(&fx, req).await;
+        assert_eq!(st == StatusCode::PAYLOAD_TOO_LARGE, too_large, "{size}");
+    }
+}
+
 /// A request body that fails, or never ends, before the limit.
 struct BadBody(bool);
 

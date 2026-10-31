@@ -555,9 +555,6 @@ impl Relay {
         Self::claim_nonce(&tenant, &v, now)?;
         let acc = check_genesis(&raw.envelope, &log_id, Some(&v.keyid))
             .map_err(|r| api(422, "invalid_record", r.to_string()))?;
-        // [STO-8]: no space file appears while a backup copies the files.
-        // The shared lock lasts until the end of this function.
-        let _backup = self.backup_shared()?;
 
         let mut tc = store::open(&tenant.db(), Kind::Tenant, false)?;
         let tx = tc.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -585,6 +582,10 @@ impl Relay {
                 "the space exists with another genesis record",
             ));
         }
+        // [STO-8]: no space file appears while a backup copies the files.
+        // The shared lock lasts until the end of this function. An exact
+        // retry above does not need it.
+        let _backup = self.backup_shared()?;
         let name = data_encoding::BASE32_NOPAD
             .encode(&random::<16>()?)
             .to_ascii_lowercase();
@@ -814,7 +815,11 @@ impl Relay {
                 params![
                     sp.log,
                     encode_id("d_", &v.keyid),
-                    to_i64(r.tip.position)?,
+                    to_i64(r.tip.position).map_err(|_| api(
+                        400,
+                        "bad_request",
+                        "tip.position is out of range"
+                    ))?,
                     r.tip.digest.as_slice(),
                     i64::from(r.fresh),
                     to_i64(now)?

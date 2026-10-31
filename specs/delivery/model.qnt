@@ -77,7 +77,8 @@ module delivery {
   type Relay = {
     log: List[Rcd],
     hold: bool,            // restore hold: appends are refused
-    tips: Dev -> List[Rcd],// the last reported verified log of each device since the restore
+    reporters: Set[Dev],   // devices that reported since the restore
+    tips: Dev -> List[Rcd],// the last reported verified log of each reporter (a total map)
     marked: Set[Dev],      // devices that reported a new engine state file since the restore
     limitLow: bool,        // the relay operator lowered the change size limit
     session: Session,
@@ -291,7 +292,7 @@ module delivery {
   // The devices of the space: each device outside LATE, and each LATE device that got a grant.
   def members: Set[Dev] = DEVS.filter(d => not(LATE.contains(d)) or env.granted.contains(d))
   // The relay reads a stored tip as reported if the log holds it now (PROTOCOL.md 10.8).
-  def reportedNow(d: Dev): bool = relay.tips.keys().contains(d) and isPrefix(relay.tips.get(d), relay.log)
+  def reportedNow(d: Dev): bool = relay.reporters.contains(d) and isPrefix(relay.tips.get(d), relay.log)
   def allReported: bool = members.forall(d => reportedNow(d))
   def canFault(f: str): bool = FAULTS.contains(f) and env.faults < MAX_FAULTS
   def fault(e: Event): Env = { ...ev(e), faults: env.faults + 1 }
@@ -304,7 +305,8 @@ module delivery {
     apps' = DEVS.mapBy(_ => freshApp),
     engines' = DEVS.mapBy(_ => freshEngine),
     LATE.subseteq(DEVS),
-    relay' = { log: List(), hold: false, tips: Map(), marked: Set(), limitLow: false, session: noSession },
+    relay' = { log: List(), hold: false, reporters: Set(), tips: DEVS.mapBy(_ => List()), marked: Set(),
+               limitLow: false, session: noSession },
     env' = { nextId: 0, changes: Map(), stored: Set(), exposed: Set(), reverted: Set(),
              lostAtRelease: Set(), silentLoss: false, granted: Set(), faults: 0, events: Set() },
   }
@@ -522,8 +524,8 @@ module delivery {
       relay.hold,
       running(d),
       active(d),
-      not(relay.tips.keys().contains(d)) or relay.tips.get(d) != eng(d).log or markNew,
-      relay' = { ...relay, tips: relay.tips.put(d, eng(d).log),
+      not(relay.reporters.contains(d)) or relay.tips.get(d) != eng(d).log or markNew,
+      relay' = { ...relay, reporters: relay.reporters.union(Set(d)), tips: relay.tips.set(d, eng(d).log),
                            marked: if (eng(d).fresh) relay.marked.union(Set(d)) else relay.marked },
       engines' = engines,
       apps' = apps,
@@ -538,7 +540,7 @@ module delivery {
   action endHold(e: Event, warned: bool): bool = {
     val newLoss = unheldApplied.exclude(env.lostAtRelease)
     all {
-      relay' = { ...relay, hold: false, tips: Map(), marked: Set() },
+      relay' = { ...relay, hold: false, reporters: Set(), tips: DEVS.mapBy(_ => List()), marked: Set() },
       engines' = engines,
       apps' = apps,
       env' = { ...ev(e), lostAtRelease: env.lostAtRelease.union(newLoss),
@@ -644,7 +646,8 @@ module delivery {
   action restoreRelay(k: int): bool = all {
     canFault("relayRestore"),
     0 <= k, k < relay.log.length(),
-    relay' = { ...relay, log: relay.log.slice(0, k), hold: BUG != "noHold", tips: Map(), marked: Set(),
+    relay' = { ...relay, log: relay.log.slice(0, k), hold: BUG != "noHold", reporters: Set(),
+               tips: DEVS.mapBy(_ => List()), marked: Set(),
                session: noSession },
     engines' = engines,
     apps' = apps,

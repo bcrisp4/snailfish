@@ -216,6 +216,14 @@ fn copy_file(src: &Path, dst: &Path) -> Result<(), OpsError> {
     Ok(())
 }
 
+fn remove_tree(path: &Path) -> Result<(), OpsError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StoreError::Io(e).into()),
+    }
+}
+
 fn remove_db(path: &Path) -> Result<(), OpsError> {
     for suffix in ["", "-wal", "-shm"] {
         let mut p = path.as_os_str().to_owned();
@@ -265,23 +273,27 @@ pub fn restore(
             "the data directory holds relay data: pass --replace to delete it first",
         ));
     }
-    if has_data {
-        remove_db(&data.join("directory.db"))?;
-        match std::fs::remove_dir_all(data.join("tenants")) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(StoreError::Io(e).into()),
-        }
-    }
+    // Copy the backup next to the data first, so a failed copy leaves the
+    // old data in place. The swap below only renames within one directory.
+    let tmp = data.join("restore.tmp");
+    remove_tree(&tmp)?;
     let ts = tenants(from)?;
     for (id, dir) in &ts {
-        let to = data.join("tenants").join(id);
+        let to = tmp.join("tenants").join(id);
         copy_file(&dir.join("tenant.db"), &to.join("tenant.db"))?;
         for (stem, path) in space_files(dir)? {
             copy_file(&path, &to.join("spaces").join(format!("{stem}.db")))?;
         }
     }
-    copy_file(&from.join("directory.db"), &data.join("directory.db"))?;
+    copy_file(&from.join("directory.db"), &tmp.join("directory.db"))?;
+    std::fs::create_dir_all(tmp.join("tenants")).map_err(StoreError::Io)?;
+    if has_data {
+        remove_db(&data.join("directory.db"))?;
+        remove_tree(&data.join("tenants"))?;
+    }
+    std::fs::rename(tmp.join("tenants"), data.join("tenants")).map_err(StoreError::Io)?;
+    std::fs::rename(tmp.join("directory.db"), data.join("directory.db")).map_err(StoreError::Io)?;
+    remove_tree(&tmp)?;
 
     let mut handles = Vec::new();
     let mut held = Vec::new();
@@ -561,6 +573,11 @@ fn read_report(tc: &Connection, sc: &Connection, log: &str) -> Result<HoldReport
         )?;
         let mut q = st.query([])?;
         while let Some(r) = q.next()? {
+            let started = from_i64(r.get(2)?)?;
+            // A session before the restore belongs to an earlier hold.
+            if since.is_some_and(|t| started < t) {
+                continue;
+            }
             let session: Vec<u8> = r.get(0)?;
             let device: Vec<u8> = r.get(1)?;
             let tip: Option<i64> = r.get(4)?;
@@ -568,7 +585,7 @@ fn read_report(tc: &Connection, sc: &Connection, log: &str) -> Result<HoldReport
             repairs.push(RepairRecord {
                 session: encode_id("", &session),
                 device: encode_id("d_", &device),
-                started: from_i64(r.get(2)?)?,
+                started,
                 base: from_i64(r.get(3)?)?,
                 finished: match (tip, finished) {
                     (Some(p), Some(t)) => Some((from_i64(p)?, from_i64(t)?)),

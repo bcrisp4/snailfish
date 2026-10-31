@@ -187,10 +187,19 @@ pub fn append_response(results: &[AppendResult], head: &Head) -> Vec<u8> {
 
 /// Refuse an object of a request with a field outside `keys`.
 fn only(v: Option<&Value>, what: &str, keys: &[&str]) -> Result<(), WireError> {
-    match v.and_then(Value::as_object) {
-        Some(m) if m.keys().all(|k| keys.contains(&k.as_str())) => Ok(()),
-        Some(_) => Err(bad(format!("{what} has an unknown field"))),
-        None => Err(bad(format!("{what} is not an object"))),
+    only_map(
+        v.and_then(Value::as_object)
+            .ok_or_else(|| bad(format!("{what} is not an object")))?,
+        what,
+        keys,
+    )
+}
+
+fn only_map(m: &Map<String, Value>, what: &str, keys: &[&str]) -> Result<(), WireError> {
+    if m.keys().all(|k| keys.contains(&k.as_str())) {
+        Ok(())
+    } else {
+        Err(bad(format!("{what} has an unknown field")))
     }
 }
 
@@ -424,11 +433,7 @@ pub fn status_body(r: &StatusReport) -> Vec<u8> {
 /// and a body with an unknown field.
 pub fn parse_status(body: &[u8]) -> Result<StatusReport, WireError> {
     let m = object(body)?;
-    only(
-        Some(&Value::Object(m.clone())),
-        "the body",
-        &["tip", "fresh"],
-    )?;
+    only_map(&m, "the body", &["tip", "fresh"])?;
     let tip = read_head_strict(m.get("tip"), "tip")?;
     let fresh = m
         .get("fresh")
@@ -590,11 +595,7 @@ pub fn parse_repair_chunk(body: &[u8], max: u64) -> Result<RepairChunk, WireErro
 /// Refuses a body without a `session` and a position object `tip`.
 pub fn parse_repair_finish(body: &[u8]) -> Result<RepairFinish, WireError> {
     let m = object(body)?;
-    only(
-        Some(&Value::Object(m.clone())),
-        "the body",
-        &["session", "tip"],
-    )?;
+    only_map(&m, "the body", &["session", "tip"])?;
     Ok(RepairFinish {
         session: session_of(m.get("session"))?,
         tip: read_head_strict(m.get("tip"), "tip")?,

@@ -36,7 +36,16 @@ fn respond(r: Response) -> HttpResponse {
 }
 
 async fn handler(relay: Relay, req: HttpRequest<Body>) -> HttpResponse {
-    let max = usize::try_from(relay.config().limits.max_request_bytes).unwrap_or(usize::MAX);
+    // The core checks the exact limit of each route. The repair routes
+    // accept the allowance of PROTOCOL.md 10.9 on top of max_request_bytes.
+    let max = usize::try_from(
+        relay
+            .config()
+            .limits
+            .max_request_bytes
+            .saturating_add(crate::core::REPAIR_ALLOWANCE),
+    )
+    .unwrap_or(usize::MAX);
     let (parts, body) = req.into_parts();
     let body = match to_bytes(body, max).await {
         Ok(b) => b,
