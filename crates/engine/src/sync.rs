@@ -29,7 +29,7 @@ enum Phase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Item {
+pub(crate) enum Item {
     Change([u8; 16]),
     Setup(i64),
 }
@@ -501,14 +501,14 @@ impl Sync {
     }
 }
 
-type Batches = VecDeque<Vec<(Item, String)>>;
+pub(crate) type Batches = VecDeque<Vec<(Item, String)>>;
 
 /// Split items into append requests of at most `max_append_envelopes`
 /// envelopes and `max_request_bytes` body bytes (`PROTOCOL.md` 10.4).
 /// Returns the batches and the changes that do not fit in any body alone.
 /// A setup record that does not fit goes alone, and the relay answer
 /// decides.
-fn batch(items: Vec<(Item, String)>, limits: &Limits) -> (Batches, Vec<[u8; 16]>) {
+pub(crate) fn batch(items: Vec<(Item, String)>, limits: &Limits) -> (Batches, Vec<[u8; 16]>) {
     let max_count = usize::try_from(limits.max_append_envelopes.max(1)).unwrap_or(usize::MAX);
     let max_bytes = usize::try_from(limits.max_request_bytes).unwrap_or(usize::MAX);
     // `{"envelopes":[` and `]}`, then one comma between two envelopes.

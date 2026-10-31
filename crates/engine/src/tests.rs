@@ -1413,6 +1413,48 @@ fn append_batches_fit_the_request_limit() {
     assert_eq!(on_relay, want);
 }
 
+/// The batch limits are exact: a body of exactly `max_request_bytes` and a
+/// batch of exactly `max_append_envelopes` are valid (`PROTOCOL.md` 10.4).
+/// Without this, a body one byte over the limit gets 413 at every sync, or
+/// the engine sends more requests than it must.
+#[test]
+fn batch_limits_are_exact() {
+    use sync::{Item, batch};
+    let limits = |bytes: u64, count: u64| snailfish_protocol::wire::Limits {
+        max_request_bytes: bytes,
+        max_append_envelopes: count,
+        ..snailfish_protocol::wire::Limits::default()
+    };
+    let change = |i: u8, len: usize| (Item::Change([i; 16]), "x".repeat(len));
+    let shape = |b: &sync::Batches| b.iter().map(Vec::len).collect::<Vec<_>>();
+    // `{"envelopes":[]}` is 16 bytes. Two envelopes of 10 bytes and a comma
+    // fill 37 bytes exactly.
+    let (b, big) = batch((0..3).map(|i| change(i, 10)).collect(), &limits(37, 100));
+    assert_eq!((shape(&b), big), (vec![2, 1], vec![]));
+    let (b, _) = batch((0..3).map(|i| change(i, 10)).collect(), &limits(36, 100));
+    assert_eq!(shape(&b), vec![1, 1, 1]);
+    for x in &b {
+        let envs: Vec<String> = x.iter().map(|(_, e)| e.clone()).collect();
+        assert!(snailfish_protocol::wire::append_body(&envs).len() <= 36);
+    }
+    // One envelope that fills the body exactly is sent. One byte more is
+    // refused, and the next change still goes.
+    let (b, big) = batch(
+        vec![change(1, 21), change(2, 22), change(3, 5)],
+        &limits(37, 100),
+    );
+    assert_eq!((shape(&b), big), (vec![1, 1], vec![[2; 16]]));
+    // The count limit.
+    let (b, _) = batch((0..5).map(|i| change(i, 1)).collect(), &limits(1_000, 2));
+    assert_eq!(shape(&b), vec![2, 2, 1]);
+    // A setup record that does not fit goes alone: the relay answer decides.
+    let (b, big) = batch(
+        vec![change(1, 5), (Item::Setup(2), "x".repeat(40)), change(3, 5)],
+        &limits(37, 100),
+    );
+    assert_eq!((shape(&b), big), (vec![1, 1, 1], vec![]));
+}
+
 /// A 413 `too_large` answer is `degraded` (`PROTOCOL.md` 10.3), and a 422
 /// `invalid_record` answer to the create request is `stopped: fork`.
 #[test]
