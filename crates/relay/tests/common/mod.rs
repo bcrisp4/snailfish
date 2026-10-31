@@ -347,6 +347,57 @@ impl Fx {
     }
 }
 
+impl Fx {
+    /// Put a space on restore hold, or end the hold, as `restore` and
+    /// `release-hold` do in the tenant file.
+    pub fn set_hold(&self, handle: &str, on: bool) {
+        let c = rusqlite::Connection::open(self.tenant_db(handle)).unwrap();
+        if on {
+            c.execute(
+                "INSERT OR REPLACE INTO holds (log_id, since) VALUES (?1, ?2)",
+                rusqlite::params![
+                    self.log(),
+                    i64::try_from(self.now.load(Ordering::SeqCst)).unwrap()
+                ],
+            )
+            .unwrap();
+        } else {
+            c.execute("DELETE FROM holds", []).unwrap();
+            c.execute("DELETE FROM hold_reports", []).unwrap();
+        }
+    }
+
+    /// Cut the log to positions 1..=n, as a restore of an older space file
+    /// does.
+    pub fn cut_log(&self, handle: &str, n: u64) {
+        let c = rusqlite::Connection::open(self.space_file(handle)).unwrap();
+        let n = i64::try_from(n).unwrap();
+        c.execute("DELETE FROM entries WHERE position > ?1", [n])
+            .unwrap();
+        c.execute("DELETE FROM devices WHERE position > ?1", [n])
+            .unwrap();
+    }
+
+    /// A signed POST to a route under the space path.
+    pub fn post(&self, handle: &str, route: &str, body: &[u8], signer: &str) -> Response {
+        let path = format!("{}/{route}", self.space_path(handle, self.log()));
+        self.relay
+            .handle(&self.signed("POST", &path, "", body, signer))
+    }
+
+    /// The record hashes of the relay log, read through a fetch.
+    pub fn record_hashes(&self, handle: &str) -> Vec<String> {
+        let page = wire::parse_fetch(&self.fetch(handle, 0, 500).body).unwrap();
+        page.entries
+            .into_iter()
+            .map(|(_, e)| match e {
+                wire::FetchEntry::Envelope(r) => hex::encode(r.envelope.record_hash()),
+                wire::FetchEntry::Stub(s) => hex::encode(s.hash),
+            })
+            .collect()
+    }
+}
+
 pub fn error_code(r: &Response) -> String {
     wire::parse_error(&r.body).unwrap_or_default()
 }

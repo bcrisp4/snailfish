@@ -92,12 +92,14 @@ fn invalid_requests_return_the_vector_error() {
     }
 }
 
-#[test]
-fn append_cases_return_the_vector_results() {
+fn run_append_cases(section: &str, hold: bool) {
     let h = common::load("http.json");
-    for c in h["append"].as_array().unwrap() {
+    let cases = h[section].as_array().unwrap();
+    assert!(!cases.is_empty(), "{section}");
+    for c in cases {
         let name = s(&c["name"]);
         let fx = fresh(&h, s(&h["authority"]), true);
+        fx.set_hold(fx.tenant(), hold);
         let path = format!("{}/append", fx.space_path(fx.tenant(), fx.log()));
         let req = fx.signed("POST", &path, "", s(&c["body"]).as_bytes(), s(&c["signer"]));
         let r = fx.relay.handle(&req);
@@ -136,12 +138,28 @@ fn append_cases_return_the_vector_results() {
     }
 }
 
+/// 10.6, with the base rule for security records ([LOG-7],
+/// `specs/spacelog/test.qnt::concurrentGrantsTest`).
+#[test]
+fn append_cases_return_the_vector_results() {
+    run_append_cases("append", false);
+}
+
+/// 10.6 step 3 ([LOG-14]): during a hold the relay refuses changes with
+/// `on_hold` and checks security records as usual.
+#[test]
+fn append_hold_cases_return_the_vector_results() {
+    run_append_cases("append_hold", true);
+}
+
 #[test]
 fn fetch_cases_return_the_vector_positions() {
     let h = common::load("http.json");
     let fx = fresh(&h, s(&h["authority"]), true);
     for c in h["fetch"].as_array().unwrap() {
         let name = s(&c["name"]);
+        let hold = c["hold"].as_bool().unwrap();
+        fx.set_hold(fx.tenant(), hold);
         let r = fx.fetch(
             fx.tenant(),
             c["after"].as_u64().unwrap(),
@@ -159,6 +177,9 @@ fn fetch_cases_return_the_vector_positions() {
         assert_eq!(positions, want, "{name}");
         assert_eq!(page.head.position, c["head"].as_u64().unwrap(), "{name}");
         assert_eq!(page.has_more, c["has_more"].as_bool().unwrap(), "{name}");
+        // 10.7: the relay always sends `hold`.
+        let raw: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(raw["hold"].as_bool(), Some(hold), "{name}");
         for (pos, e) in page.entries {
             let wire::FetchEntry::Envelope(e) = e else {
                 panic!("stub")
@@ -166,5 +187,111 @@ fn fetch_cases_return_the_vector_positions() {
             let want = s(&fx.h["space"]["log"][usize::try_from(pos).unwrap() - 1]["envelope"]);
             assert_eq!(e.json, want, "{name}: stored text is served as received");
         }
+    }
+}
+
+/// 10.8 ([LOG-14]): the status report answers the hold state, and during a
+/// hold the relay stores the report and reads its tip against the log.
+#[test]
+fn status_cases_return_the_vector_results() {
+    let h = common::load("http.json");
+    let cases = h["status"].as_array().unwrap();
+    assert!(cases.len() >= 5);
+    for c in cases {
+        let name = s(&c["name"]);
+        let fx = fresh(&h, s(&h["authority"]), true);
+        fx.set_hold(fx.tenant(), c["hold"].as_bool().unwrap());
+        let r = fx.post(
+            fx.tenant(),
+            "status",
+            s(&c["body"]).as_bytes(),
+            s(&c["signer"]),
+        );
+        if let Some(code) = c["error"].as_str() { assert_eq!(error_code(&r), code, "{name}") } else {
+            assert_eq!(
+                r.status,
+                200,
+                "{name}: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+            assert_eq!(
+                wire::parse_status_response(&r.body),
+                Ok(c["response"]["hold"].as_bool().unwrap()),
+                "{name}"
+            );
+        }
+        let report = snailfish_relay::ops::hold_report(fx.dir.path(), "sam", fx.log()).unwrap();
+        let (_, _, id) = fx.key(s(&c["signer"]));
+        let mine = report.devices.iter().find(|d| d.device == id);
+        match c["tip_in_log"].as_bool() {
+            None => assert!(mine.is_none(), "{name}: no report is stored"),
+            Some(want) => assert_eq!(
+                mine.map(|d| d.state == snailfish_relay::ops::TipState::Reported),
+                Some(want),
+                "{name}"
+            ),
+        }
+    }
+}
+
+/// 10.9 ([LOG-10] to [LOG-12], [LOG-14]): each repair case on a cut log,
+/// step by step, and the relay log after the last step.
+#[test]
+fn repair_cases_return_the_vector_results() {
+    let h = common::load("http.json");
+    let cases = h["repair"].as_array().unwrap();
+    assert!(cases.len() >= 15);
+    for c in cases {
+        let name = s(&c["name"]);
+        let fx = fresh(&h, s(&h["authority"]), true);
+        fx.cut_log(fx.tenant(), c["log_prefix"].as_u64().unwrap());
+        fx.set_hold(fx.tenant(), c["hold"].as_bool().unwrap());
+        let mut session = String::new();
+        for (i, st) in c["steps"].as_array().unwrap().iter().enumerate() {
+            fx.now.store(
+                st["at"].as_u64().unwrap(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let route = match s(&st["route"]) {
+                "start" => "repair",
+                "chunk" => "repair/chunk",
+                _ => "repair/finish",
+            };
+            let body = s(&st["body"]).replace("{{session}}", &session);
+            let r = fx.post(fx.tenant(), route, body.as_bytes(), s(&st["signer"]));
+            let why = format!("{name} step {i}: {}", String::from_utf8_lossy(&r.body));
+            assert_eq!(u64::from(r.status), st["status"].as_u64().unwrap(), "{why}");
+            match st["error"].as_str() {
+                Some(code) => assert_eq!(error_code(&r), code, "{why}"),
+                None if r.status == 201 => {
+                    let (id, next) = wire::parse_repair_started(&r.body).unwrap();
+                    session = hex::encode(id);
+                    assert_eq!(Some(next), st["next"].as_u64(), "{why}");
+                }
+                None if st["head"].is_null() => {
+                    assert_eq!(
+                        wire::parse_repair_next(&r.body).ok(),
+                        st["next"].as_u64(),
+                        "{why}"
+                    );
+                }
+                None => {
+                    let head = wire::parse_repair_finished(&r.body).unwrap();
+                    assert_eq!(
+                        Some(head.position),
+                        st["head"]["position"].as_u64(),
+                        "{why}"
+                    );
+                    assert_eq!(hex::encode(head.digest), s(&st["head"]["digest"]), "{why}");
+                }
+            }
+        }
+        let want: Vec<String> = c["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| s(x).to_owned())
+            .collect();
+        assert_eq!(fx.record_hashes(fx.tenant()), want, "{name}");
     }
 }

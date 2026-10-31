@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use snailfish_relay::core::{Config, OpenError, Relay};
 use snailfish_relay::http::router;
+use snailfish_relay::ops;
 
 #[derive(Parser)]
 #[command(name = "snailfish-relay", version)]
@@ -40,6 +41,40 @@ enum Command {
     User {
         #[command(subcommand)]
         action: UserAction,
+    },
+    /// Copy the data directory with the SQLite online backup API, while the
+    /// relay runs. The relay refuses space creation until it ends.
+    Backup {
+        /// The backup directory. It must be empty or absent.
+        dir: PathBuf,
+    },
+    /// Restore a backup into the data directory. Stop the relay first. Each
+    /// restored space goes on restore hold.
+    Restore {
+        /// The backup directory.
+        dir: PathBuf,
+        /// Delete the relay data in the data directory first.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Print the restore hold of a space: the device reports and the repair
+    /// sessions. Changes nothing.
+    HoldStatus {
+        /// The user name.
+        user: String,
+        /// The log ID text.
+        log: String,
+    },
+    /// End the restore hold of a space.
+    ReleaseHold {
+        /// The user name.
+        user: String,
+        /// The log ID text.
+        log: String,
+        /// Release also while a device is "not repaired". The release can
+        /// lose changes that only its app database holds.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -84,6 +119,42 @@ async fn main() -> ExitCode {
             }
         }
         Command::Health { .. } => ExitCode::SUCCESS,
+        Command::Backup { dir } => match ops::backup(&data, &dir) {
+            Ok(s) => {
+                println!("backup: {} tenants, {} spaces", s.tenants, s.spaces);
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Command::Restore { dir, replace } => {
+            match ops::restore(&data, &dir, replace, snailfish_relay::core::system_time()) {
+                Ok(s) => {
+                    println!("restore: {} tenants", s.tenants);
+                    for log in &s.held {
+                        println!("on hold: {log}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+        Command::HoldStatus { user, log } => match ops::hold_report(&data, &user, &log) {
+            Ok(r) => {
+                print!("{r}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Command::ReleaseHold { user, log, force } => {
+            match ops::release_hold(&data, &user, &log, force) {
+                Ok(r) => {
+                    print!("{r}");
+                    println!("released: {log}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
         Command::Serve { listen, authority } => {
             let Some(authority) = authority.filter(|a| !a.is_empty()) else {
                 return fail(
@@ -96,6 +167,11 @@ async fn main() -> ExitCode {
 }
 
 async fn serve(data: PathBuf, listen: &str, authority: String) -> ExitCode {
+    // Held until the process ends, so `restore` cannot run beside it.
+    let _lock = match ops::serve_lock(&data) {
+        Ok(l) => l,
+        Err(e) => return fail(&e.to_string()),
+    };
     #[cfg(feature = "webauthn")]
     if let Err(e) = snailfish_relay::passkey::check_builder(&authority) {
         return fail(&e);

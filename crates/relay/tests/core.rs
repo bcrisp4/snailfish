@@ -456,7 +456,11 @@ fn every_file_kind_has_the_storage_settings() {
         assert_eq!(pragma(&c, "synchronous"), "2", "{kind:?}");
         assert_eq!(pragma(&c, "secure_delete"), "1", "{kind:?}");
         assert_eq!(pragma(&c, "auto_vacuum"), "2", "{kind:?}");
-        assert_eq!(pragma(&c, "user_version"), "1", "{kind:?}");
+        assert_eq!(
+            pragma(&c, "user_version"),
+            snailfish_relay::store::SCHEMA_VERSION.to_string(),
+            "{kind:?}"
+        );
     }
 }
 

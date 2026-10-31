@@ -22,7 +22,7 @@ pub enum Kind {
 }
 
 /// The schema version of every file kind.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 impl Kind {
     fn ddl(self) -> &'static str {
@@ -58,6 +58,19 @@ impl Kind {
                  CREATE INDEX IF NOT EXISTS nonces_expires ON nonces (expires);
                  CREATE TABLE IF NOT EXISTS deletion_markers (
                     log_id TEXT PRIMARY KEY
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS holds (
+                    log_id TEXT PRIMARY KEY,
+                    since INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS hold_reports (
+                    log_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    digest BLOB NOT NULL,
+                    fresh INTEGER NOT NULL,
+                    time INTEGER NOT NULL,
+                    PRIMARY KEY (log_id, device_id)
                  ) WITHOUT ROWID;"
             }
             Self::Space => {
@@ -79,6 +92,32 @@ impl Kind {
                     device_id BLOB PRIMARY KEY,
                     sign_key BLOB NOT NULL,
                     position INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS repair (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    session BLOB NOT NULL,
+                    device_id BLOB NOT NULL,
+                    base_position INTEGER NOT NULL,
+                    base_digest BLOB NOT NULL,
+                    last_activity INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS staging (
+                    position INTEGER PRIMARY KEY,
+                    payload_type TEXT NOT NULL,
+                    change_id BLOB UNIQUE,
+                    record_hash BLOB NOT NULL,
+                    digest BLOB NOT NULL,
+                    envelope TEXT NOT NULL,
+                    device_id BLOB,
+                    sign_key BLOB
+                 );
+                 CREATE TABLE IF NOT EXISTS repairs (
+                    session BLOB PRIMARY KEY,
+                    device_id BLOB NOT NULL,
+                    started INTEGER NOT NULL,
+                    base_position INTEGER NOT NULL,
+                    tip INTEGER,
+                    finished INTEGER
                  ) WITHOUT ROWID;"
             }
         }
@@ -173,9 +212,11 @@ pub fn open(path: &Path, kind: Kind, create: bool) -> Result<Connection, StoreEr
         });
     }
     if version < SCHEMA_VERSION {
-        if !create {
+        if version == 0 && !create {
             return Err(StoreError::Corrupt("the file has no schema"));
         }
+        // An older schema migrates forward: every statement of the DDL is
+        // `IF NOT EXISTS`, and each version only adds tables ([VER-14]).
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Every statement of the DDL is `IF NOT EXISTS`, so a second creator
         // that waited for the lock repeats it without harm.
