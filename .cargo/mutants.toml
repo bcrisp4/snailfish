@@ -33,6 +33,15 @@ exclude_re = [
   # no lost entry. Sync::next_request skips an empty repair, and the fetch
   # already handled the head as caught up, so the result is the same.
   "replace < with <= in Sync::fetch",
+  # Only an I/O fault other than NotFound reaches these error arms, and a
+  # test cannot make one portably. The `restore` tests cover the NotFound
+  # and success paths.
+  "replace match guard e.kind\\(\\) == std::io::ErrorKind::NotFound with true in remove_tree",
+  "replace match guard e.kind\\(\\) == std::io::ErrorKind::NotFound with true in remove_db",
+  # restore renames the copied directory.db over the old one, so a
+  # remove_db that does nothing leaves only -wal and -shm files of a
+  # closed database, which hold no frames. The result is the same.
+  "replace remove_db -> Result<\\(\\), OpsError> with Ok\\(\\(\\)\\)",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`

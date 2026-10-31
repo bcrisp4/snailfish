@@ -320,3 +320,94 @@ fn repair_checks_the_request_before_the_body() {
     let req = fx.signed_with("POST", &path, "", b"{", "A", [0x77; 16], now - 1000);
     assert_eq!(error_code(&fx.relay.handle(&req)), "expired");
 }
+
+/// [LOG-12], PROTOCOL.md 10.9 chunk step 3: a chunk for a session that the
+/// relay does not hold runs no chain check, so its entries cannot make the
+/// signer active. B, whose grant is lost, gets `unknown_device`.
+#[test]
+fn chunk_without_a_session_activates_no_signer() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    fx.cut_log(fx.tenant(), 2);
+    let chunk =
+        wire::repair_chunk_body(&[9; 16], &[(3, envelope(&fx, 3)), (4, envelope(&fx, 4))]).unwrap();
+    let r = fx.post(fx.tenant(), "repair/chunk", &chunk, "B");
+    assert_eq!(error_code(&r), "unknown_device");
+}
+
+/// [STO-3]: backup and restore follow only names that the relay made. A
+/// stray directory in `tenants` and a stray file in `spaces` are left out.
+/// A restore of two spaces of one tenant holds both.
+#[test]
+fn backup_and_restore_follow_only_relay_names() {
+    let mut fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let space = fx.space_file(fx.tenant());
+    // A second space of the same tenant: the same file with another log ID.
+    let second = space.with_file_name(format!("{}.db", "b".repeat(26)));
+    std::fs::copy(&space, &second).unwrap();
+    let other_log = format!("l_{}", "ab".repeat(16));
+    let c = rusqlite::Connection::open(&second).unwrap();
+    c.execute(
+        "UPDATE space SET log_id = ?1",
+        [hex::decode("ab".repeat(16)).unwrap()],
+    )
+    .unwrap();
+    drop(c);
+    std::fs::create_dir_all(fx.dir.path().join("tenants").join("junk")).unwrap();
+    std::fs::write(space.with_file_name("notes.db"), b"x").unwrap();
+    let out = tempfile::TempDir::new().unwrap();
+    let dst = out.path().join("b");
+    let sum = ops::backup(fx.dir.path(), &dst).unwrap();
+    assert_eq!((sum.tenants, sum.spaces), (1, 2));
+    let res = ops::restore(fx.dir.path(), &dst, true, 1).unwrap();
+    let mut want = vec![fx.log().to_owned(), other_log];
+    want.sort();
+    assert_eq!(res.held, want);
+    fx.restart(common::limits_of(&fx.h));
+    assert_eq!(fx.record_hashes(fx.tenant()).len(), 4);
+}
+
+/// `restore` refuses to replace relay data without `--replace`, also when
+/// only `directory.db` or only `tenants` exists. An empty data directory
+/// needs no flag.
+#[test]
+fn restore_needs_replace_only_over_relay_data() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let out = tempfile::TempDir::new().unwrap();
+    let dst = out.path().join("b");
+    ops::backup(fx.dir.path(), &dst).unwrap();
+    let only_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(only_dir.path().join("directory.db"), b"").unwrap();
+    assert!(ops::restore(only_dir.path(), &dst, false, 1).is_err());
+    let only_tenants = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(only_tenants.path().join("tenants").join("a".repeat(32))).unwrap();
+    assert!(ops::restore(only_tenants.path(), &dst, false, 1).is_err());
+    let empty = tempfile::TempDir::new().unwrap();
+    let res = ops::restore(empty.path(), &dst, false, 1).unwrap();
+    assert_eq!(res.held, [fx.log().to_owned()]);
+}
+
+/// The text that `hold-status` prints names each device with its tip
+/// state and the "not repaired" mark, and each repair session.
+#[test]
+fn hold_report_text_names_devices_and_sessions() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    fx.cut_log(fx.tenant(), 3);
+    fx.set_hold(fx.tenant(), true);
+    let (sid, _) = start(&fx, "A", head_of(&fx, 3), 4, 4);
+    assert_eq!(finish(&fx, "A", sid, head_of(&fx, 4)), 200);
+    assert!(report(&fx, "B", head_of(&fx, 4), true));
+    let text = ops::hold_report(fx.dir.path(), "sam", fx.log())
+        .unwrap()
+        .to_string();
+    let (_, _, b) = fx.key("B");
+    assert!(
+        text.contains(&format!("{b} tip 4 (reported, NOT REPAIRED)")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("{} by", hex::encode(sid))), "{text}");
+    assert!(text.contains("finished"), "{text}");
+}
