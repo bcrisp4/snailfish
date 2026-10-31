@@ -190,7 +190,7 @@ module deliveryTest {
       .then(reportStatus(1)).then(reportStatus(2)).then(releaseHoldWarned)
       .then(editAndPush(2, 1))
       .then(enqueue(1, 0)).then(push(1, 0, false))
-      .expect(relay.log == [1, 0])
+      .expect(relay.log == [5, 4])
       .then(fetchExtend(2, 2))
       .expect(resetRequired(app(2), eng(2), relay, BUG) and not(canPull(app(2), eng(2))))
       .then(handleReset(2))
@@ -204,8 +204,59 @@ module deliveryTest {
       .then(editAndPush(1, 0))
       .then(fetchExtend(1, 1))
       .then(edit(1, false, false)).then(enqueue(1, 1))
-      .expect(eng(1).outbox.get(1) == [0])
+      .expect(eng(1).outbox.get(1).base == [0])
       .then(rollBackRelay(0))
       .then(push(1, 1, false))
       .expect(relay.log == [] and happened(EvPushBadBase) and eng(1).outbox.keys() == Set(1))
+
+  // [WIR-6] After an engine state loss the engine encrypts change 0 again. The
+  // record hash differs (4, not 0), so the relay answers Conflict, not Known, and
+  // does not append. A retry of the same envelope (same record hash) is Known.
+  run pushConflictTest =
+    init
+      .then(edit(1, false, false))
+      .then(enqueue(1, 0)).then(push(1, 0, false))
+      .then(loseEngine(1))
+      .then(enqueue(1, 0))
+      .expect(eng(1).outbox.get(0).rec == 4 and relay.log == [0])
+      .then(push(1, 0, false))
+      .expect(happened(EvPushConflict) and relay.log == [0])
+      .then(lowerLimit)
+      .then(push(1, 0, false))
+      .expect(happened(EvPushConflict) and eng(1).refused == Set())
+
+  // [DLV-6] On Conflict the engine treats the change as stored: no refusal, the
+  // envelope stays until the verified log holds the change_id, the app keeps the
+  // edit, and the change is applied once.
+  run conflictTreatedAsStoredTest =
+    init
+      .then(edit(1, false, false))
+      .then(enqueue(1, 0)).then(push(1, 0, false))
+      .then(loseEngine(1))
+      .then(enqueue(1, 0)).then(push(1, 0, false))
+      .expect(happened(EvPushConflict) and eng(1).refused == Set()
+              and eng(1).outbox.keys() == Set(0) and noLostChange)
+      .then(fetchExtend(1, 1))
+      .expect(eng(1).outbox == Map() and eng(1).log == [0])
+      .then(pull(1, false))
+      .expect(app(1).applied == Set(0) and app(1).outbox == Set() and app(1).dups == 0 and caughtUp(1))
+}
+
+// The mutant noHold (restoreRelay sets no hold) breaks the hold in each test
+// above that uses reportStatus, so its scripted test lives alone here.
+module deliveryTestHold {
+  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 3,
+                  FAULTS = Set("appRestore", "relayRestore"),
+                  BUG = "none").* from "./model"
+
+  // [LOG-14] F1: a restore puts the space on hold, so the relay refuses the
+  // stale outbox envelope of a change that the app reverted. Without the hold,
+  // the push of the reverted change stores it (refusedNotStored).
+  run restoreSetsHoldTest =
+    init
+      .then(edit(1, false, false)).then(enqueue(1, 0)).then(push(1, 0, false))
+      .then(edit(1, false, false)).then(enqueue(1, 1)).then(push(1, 1, false))
+      .then(restoreRelay(1))
+      .expect(relay.hold and relay.log == [0])
+      .then(push(1, 1, false).fail())
 }

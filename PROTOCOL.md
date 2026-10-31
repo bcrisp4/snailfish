@@ -1,6 +1,6 @@
 # Snailfish protocol
 
-Status: draft for M1. This file gives the exact bytes of the protocol (DESIGN.md "Wire format", [WIR-1] to [WIR-9]). DESIGN.md gives the rules and the reasons. If the two differ, change the Quint model first, then DESIGN.md, then this file, then `tools/vectorgen`, then the Rust code.
+Status: draft for M2. This file gives the exact bytes of the protocol (DESIGN.md "Wire format", [WIR-1] to [WIR-9]). DESIGN.md gives the rules and the reasons. If the two differ, change the Quint model first, then DESIGN.md, then this file, then `tools/vectorgen`, then the Rust code.
 
 Before the first public release, formats can change without notice, and the vectors are regenerated (DESIGN.md "Versioning").
 
@@ -13,8 +13,9 @@ Before the first public release, formats can change without notice, and the vect
 | 5. Record hash, entry hash and log digest | Done | `snailfish_protocol::hash` | `vectors/protocol.json` |
 | 6. Record payloads | Done | `snailfish_protocol::records` | `vectors/protocol.json`, `vectors/strict-json.json` |
 | 7. Signatures and keys | Done | `snailfish_protocol::sig`, `snailfish_protocol::keys` | `vectors/third_party/`, `vectors/protocol.json` |
-| 8. Request signatures | To do (M2) | | RFC 9421 |
+| 8. Request signatures | Done | `snailfish_protocol::request` | `vectors/http.json` |
 | 9. Recovery key encoding | Done | `snailfish_protocol::recovery` | `vectors/protocol.json`, `vectors/recovery-key.json` |
+| 10. HTTP API | Done (M2 routes) | `snailfish_protocol::wire`, `snailfish-relay` | `vectors/http.json` |
 
 `vectors/README.md` describes each vector file and the programs that make and check them.
 
@@ -246,7 +247,108 @@ A key set holds the app keys of one or more epochs, sealed to one recipient.
 
 ## 8. Request signatures
 
-To do in M2: RFC 9421 HTTP Message Signatures with Ed25519.
+Each request on the sync surface carries an RFC 9421 HTTP message signature with Ed25519 (DESIGN.md "Cryptography", T5). Only `GET /v1/health` and `GET /v1/info` have no signature. This section fixes one form of RFC 9421. A reader refuses each other form, also a form that RFC 9421 allows.
+
+### 8.1 Headers
+
+A signed request has these four headers. Each header occurs once.
+
+| Header | Value |
+| --- | --- |
+| `content-digest` | `sha-256=:` + base64 of SHA-256 of the body bytes + `:` (RFC 9530). The body of a `GET` is empty. |
+| `signature-input` | `sf=` + the signature parameters (8.2) |
+| `signature` | `sf=:` + base64 of the 64-byte Ed25519 signature + `:` |
+| `snailfish-authority` | The authority that the signature covers (8.3) |
+
+- Base64 in these headers is standard base64 with padding (RFC 4648 section 4). A reader refuses each other form.
+- A header name is case-insensitive. A header value is case-sensitive.
+
+### 8.2 Signature parameters
+
+The signature parameters are one line in exactly this form, with no whitespace except the single spaces in the component list:
+
+```text
+("@method" "@authority" "@path" "@query" "content-digest");created=C;expires=E;nonce="N";keyid="K";alg="ed25519";tag="snailfish.request.v1"
+```
+
+| Parameter | Rule |
+| --- | --- |
+| component list | Exactly these five components, in this order |
+| `created` | Unix time in seconds, from the corrected device clock (8.5). A decimal integer from 1 to 2^53 - 1 with no leading zero. |
+| `expires` | `created + 300` or less, and more than `created`. Same integer form. |
+| `nonce` | 16 random bytes from the operating system CSPRNG, as 32 lowercase hex digits |
+| `keyid` | The device ID text of the signer (section 2.2) |
+| `alg` | `ed25519` |
+| `tag` | `snailfish.request.v1`. It separates request signatures from other uses of a key. |
+
+The `signature-input` header is `sf=` followed by this line. The label is `sf`. A header with another label, a second label or a parameter in another order is refused.
+
+### 8.3 Component values
+
+| Component | Value |
+| --- | --- |
+| `@method` | The HTTP method in uppercase, for example `POST` |
+| `@authority` | The host in lowercase, then `:` and the port if the port is not the default port of the scheme. For example `sync.example.net` or `relay.example.ts.net:8443`. |
+| `@path` | The path of the request target, exactly as sent, without the query. It starts with `/`. |
+| `@query` | `?` and the query of the request target exactly as sent. `?` alone if the target has no query (RFC 9421 section 2.2.7). |
+| `content-digest` | The value of the `content-digest` header |
+
+- The engine takes the authority from the relay URL. The host app must not follow redirects (DESIGN.md "App integration").
+- The relay uses the authority that the relay operator configures, not the `Host` or `X-Forwarded-Host` header. It does not start without this setting.
+- The engine also sends the authority in `snailfish-authority`. The signature covers the value through `@authority`, so this header only lets the relay report a distinct error (8.6).
+
+### 8.4 Signature base
+
+The signature base is the RFC 9421 section 2.5 form. It is six lines joined with one LF (0x0A), with no LF after the last line:
+
+```text
+"@method": <@method>
+"@authority": <@authority>
+"@path": <@path>
+"@query": <@query>
+"content-digest": <content-digest>
+"@signature-params": <the line of 8.2>
+```
+
+The signature is Ed25519 (RFC 8032) over the signature base bytes, with the device signing key. The relay verifies it with `verify_strict` and the key rules of section 7.1.
+
+Example:
+
+```text
+"@method": GET
+"@authority": sync.example.net
+"@path": /v1/t/t_00112233445566778899aabbccddeeff/s/l_00112233445566778899aabbccddeeff/entries
+"@query": ?after=0&limit=500
+"content-digest": sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:
+"@signature-params": ("@method" "@authority" "@path" "@query" "content-digest");created=1767225600;expires=1767225900;nonce="000102030405060708090a0b0c0d0e0f";keyid="d_...";alg="ed25519";tag="snailfish.request.v1"
+```
+
+`vectors/http.json` holds complete examples.
+
+### 8.5 Relay time and clock correction
+
+Each relay response carries the header `snailfish-time`: the relay time in Unix seconds, as a decimal integer ([WIR-7]). Error responses and the unsigned routes carry it too.
+
+- The engine keeps `offset = relay time - device time` from the last response with a valid `snailfish-time`.
+- The engine sets `created` to the device time plus `offset`, and `expires` to `created + 300`.
+- The engine reads `snailfish-time` from the `GET /v1/info` response at the start of each sync, so the first signed request of a sync uses a fresh offset.
+
+### 8.6 Relay checks
+
+The relay checks a signed request in this order. It returns the first error (section 10.3).
+
+1. If `snailfish-authority` is present and differs from the configured authority, return `wrong_authority`.
+2. If a header of 8.1 is missing, occurs twice or breaks its form, return `bad_signature`. A `signature-input` whose `expires` is not after `created`, or is more than 300 seconds after it, breaks its form.
+3. If `expires` is before the relay time, or `created` is more than 60 seconds after the relay time, return `expired`.
+4. If `content-digest` differs from the digest of the body, return `bad_digest`.
+5. If `keyid` names no device that is active in the space (10.2), return `unknown_device`.
+6. If the signature does not verify over the signature base of 8.4, return `bad_signature`.
+7. If the tenant file holds the pair (`keyid`, `nonce`), return `nonce_reused`. Otherwise store the pair with `expires`.
+
+- The relay keeps each nonce in the tenant file until its `expires` time, so a restart does not allow a replay (T5). It deletes expired nonces.
+- The relay stores a nonce only after the signature verifies, so a party without the key cannot use up nonces.
+- Steps 3 to 5 run before the signature check. Their errors therefore tell an unauthenticated caller only facts that the request itself holds.
+- A request that fails a check changes no stored state, except the nonce of step 7.
 
 ## 9. Recovery key encoding
 
@@ -278,3 +380,126 @@ seal_seed = HKDF-Expand(prk, "snailfish.recovery.seal.v1", 32)
 
 - `sign_seed` is the Ed25519 signing key. `seal_seed` is the X-Wing private key seed (section 7.3).
 - `vectors/recovery-key.json` holds valid and invalid text forms.
+
+## 10. HTTP API
+
+This section gives the sync surface routes of M2. Later milestones add routes under the same prefix ([VER-12]). Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
+
+### 10.1 Routes
+
+| Method | Path | Signed | Result |
+| --- | --- | --- | --- |
+| `GET` | `/v1/health` | No | `200` with `{"status":"ok"}` |
+| `GET` | `/v1/info` | No | `200` with the info object (10.4) ([WIR-8]) |
+| `PUT` | `/v1/t/{tenant}/s/{log}` | Yes, by the device of the genesis record | Create the space with its genesis record (10.5) |
+| `POST` | `/v1/t/{tenant}/s/{log}/append` | Yes, by an active device | Append records (10.6) |
+| `GET` | `/v1/t/{tenant}/s/{log}/entries?after={n}&limit={m}` | Yes, by an active device | Fetch entries after position `n` (10.7) |
+
+- `{tenant}` is the tenant handle: `t_` and 32 lowercase hex digits (128 bits, [STO-10]).
+- `{log}` is the log ID text (section 2.2).
+- The relay finds the tenant only through the handle, and the space only through the space index of the tenant file ([STO-3]).
+- M2 creates a space with a device signature only. M5 adds the setup token of the setup surface.
+
+### 10.2 Active devices
+
+A device is active in a space if the genesis record or a grant at a position in the log names it ([LOG-8]). M2 has no removal, so a device stays active. The device of a genesis record signs the `PUT` request that creates the space.
+
+### 10.3 Errors
+
+Each error response has an HTTP status and this body:
+
+```json
+{"error":"<code>","message":"<text>"}
+```
+
+`message` is for people and has no fixed form. A reader uses `error` only.
+
+| Code | HTTP status | Cause | Engine status |
+| --- | --- | --- | --- |
+| `bad_request` | 400 | The body or the query breaks this section | `paused: relay unavailable` |
+| `bad_digest` | 400 | `content-digest` differs from the body | `paused: relay unavailable` |
+| `bad_signature` | 401 | A signature header breaks section 8, or the signature does not verify | `paused: relay unavailable` |
+| `expired` | 401 | The request is outside its time window (8.6 step 3) | Correct the clock offset and send again once, then `stopped: clock skew` |
+| `nonce_reused` | 401 | The nonce was used before | `paused: relay unavailable` |
+| `unknown_device` | 403 | `keyid` names no active device of the space | `paused: relay unavailable` |
+| `unknown_tenant` | 404 | No tenant has the handle | `paused: relay unavailable` |
+| `unknown_space` | 404 | The tenant has no space with the log ID | `paused: relay unavailable` |
+| `not_found` | 404 | No route has the path | `paused: relay unavailable` |
+| `space_exists` | 409 | `PUT` with another genesis record for an existing log ID | `stopped: fork` |
+| `too_large` | 413 | The body is larger than `max_request_bytes` | `degraded` |
+| `wrong_authority` | 421 | `snailfish-authority` differs from the relay configuration (8.6 step 1) | `paused: relay authority` |
+| `internal` | 500 | A relay failure | `paused: relay unavailable` |
+
+A response that is not JSON, or JSON without a string `error`, is a fault outside the relay, for example a proxy page. The engine reports `paused: relay unavailable`.
+
+### 10.4 `GET /v1/info`
+
+```json
+{"levels":[1],"limits":{"max_request_bytes":4194304,"max_change_bytes":65536,"max_snapshot_bytes":16777216,"max_append_envelopes":100,"max_fetch_entries":500},"time":1767225600}
+```
+
+| Field | Content |
+| --- | --- |
+| `levels` | The protocol levels that the relay accepts ([VER-6], [VER-11]) |
+| `limits.max_request_bytes` | The largest request body |
+| `limits.max_change_bytes` | The largest decoded payload of a change record |
+| `limits.max_snapshot_bytes` | The largest decoded payload of a snapshot record ([CMP-3]) |
+| `limits.max_append_envelopes` | The most envelopes in one append request |
+| `limits.max_fetch_entries` | The most entries in one fetch response |
+| `time` | The relay time, as in `snailfish-time` |
+
+### 10.5 `PUT /v1/t/{tenant}/s/{log}`
+
+Request body: `{"genesis":<envelope>}`.
+
+The relay checks the genesis record: the envelope (section 4), the payload (section 6), the signature by the recovery key of the record, and `log` equal to `{log}`. The request signer must be the device of the record. The relay then creates the space file, with the genesis record at position 1.
+
+| Result | Status | Body |
+| --- | --- | --- |
+| Created | 201 | `{"position":1,"digest":"<base64>"}` |
+| The space exists with the same genesis record hash | 200 | `{"position":1,"digest":"<base64>"}`. This is an exact retry. |
+| The space exists with another genesis record | 409 | Error `space_exists` |
+| The record is not valid | 422 | `{"error":"invalid_record","message":"..."}` |
+
+### 10.6 `POST /v1/t/{tenant}/s/{log}/append`
+
+Request body: `{"envelopes":[<envelope>, ...]}`, with 1 to `max_append_envelopes` envelopes. An envelope is a JSON object in the form of section 4.
+
+The relay checks and appends the envelopes in list order, in one transaction in the space file ([STO-11]). Each envelope gets one result. A refusal of one envelope does not stop the others. The response is `200`:
+
+```json
+{"results":[{"status":"stored","position":7},{"status":"known","position":3},{"status":"conflict","position":4},{"status":"refused","error":"bad_base"}],"head":{"position":7,"digest":"<base64>"}}
+```
+
+The relay checks each envelope in this order:
+
+1. If the envelope or the payload breaks section 4 or 6, the result is `refused` with `invalid_record`.
+2. If the log holds a change with the same `change_id` and the same record hash, the result is `known` with its position. If the record hash differs, the result is `conflict` with the position of the stored change ([WIR-6]). The relay checks this before every other refusal, so a stored change is never refused ([DLV-5], [DLV-7]).
+3. If the decoded payload of a change is larger than `max_change_bytes`, the result is `refused` with `too_large`.
+4. If `log` differs from `{log}`, the result is `refused` with `invalid_record`.
+5. If `author` differs from the request `keyid`, the result is `refused` with `not_author`.
+6. If `author` is not an active device, the result is `refused` with `not_active`. Step 5 and 8.6 step 5 make this step unreachable on the relay. The engine applies steps 4 and 6 to 11 to each fetched record.
+7. If the signature does not verify with the signing key of `author` (section 7.1), the result is `refused` with `invalid_record`.
+8. If the base is not position 1 or later, or not before the new position, or its digest differs from the log digest at that position, the result is `refused` with `bad_base` ([LOG-6]).
+9. If the record type is not `snailfish.change.v1` or `snailfish.grant.v1`, the result is `refused` with `unsupported`. M2 accepts only these two types.
+10. If a change names an epoch other than the current epoch (1 in M2), the result is `refused` with `wrong_epoch`.
+11. If a grant names a device that is already active, or a level below the space write level, the result is `refused` with `invalid_record`.
+12. Otherwise the relay appends the record at the next position. Positions are dense ([LOG-1]). The relay stores the log digest of the new entry (section 5). The result is `stored` with the position.
+
+- `head` is the last position and its log digest after the transaction.
+- A known envelope earlier in the same request counts: a second copy in one request is `known`.
+- `bad_base` is transient. Each other refusal is permanent for that envelope ([DLV-9]).
+
+### 10.7 `GET /v1/t/{tenant}/s/{log}/entries`
+
+Query: `after` (integer from 0) and `limit` (integer from 1 to `max_fetch_entries`). Both are required, in this order, as decimal integers with no leading zero.
+
+```json
+{"entries":[{"position":1,"envelope":{"payloadType":"...","payload":"...","signatures":[{"keyid":"...","sig":"..."}]}},{"position":12,"stub":{"type":"snailfish.change.v1","change_id":"c_...","hash":"<base64>"}}],"head":{"position":12,"digest":"<base64>"},"has_more":false}
+```
+
+- `entries` holds the entries from position `after + 1`, in position order, with no gap, at most `limit` entries.
+- An entry holds the stored envelope in full, or a stub. M2 has no compaction, so the M2 relay sends no stubs. A stub has `type`, `change_id` (only for a change) and `hash`, the record hash ([CMP-1]).
+- The relay sends each envelope object as it stored it. The record hash does not depend on the layout ([WIR-3]).
+- `head` is the last position of the log and its log digest. `has_more` is true if the log holds entries after the last entry of the response.
+- If `after` is the head position or later, `entries` is empty. The engine compares `head` with its verified log.

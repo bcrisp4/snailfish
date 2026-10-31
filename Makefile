@@ -10,22 +10,37 @@ CARGO := mise exec -- cargo
 NIGHTLY_NAME := nightly-2026-08-21
 NIGHTLY := +$(NIGHTLY_NAME)
 FUZZ_SECONDS ?= 300
+# cargo-fuzz builds for the target that it was compiled for. A prebuilt
+# cargo-fuzz for Linux is a musl binary, and the address sanitizer does not
+# work with a static libc. So pass the host target of rustc.
+FUZZ_TARGET ?= $(shell mise exec -- rustc -vV 2>/dev/null | sed -n 's/^host: //p')
 # Kani verifies this many harnesses in parallel. One CBMC run can use about
 # 10.5 GB of memory (pae decode_never_panics), so set KANI_JOBS to the GB of
 # memory divided by 11. CI uses 1.
 KANI_JOBS ?= 4
 # The git ref that `make rust-mutants-diff` compares against.
 BASE ?= main
+# cargo-mutants: parallel jobs, an optional shard (for example 3/8), and the
+# lowest test timeout. Each mutant runs the whole workspace test suite, and
+# parallel jobs slow each run, so a timeout from one unmutated run is too
+# short. A timeout counts as caught, so a short timeout hides a missed mutant.
+MUTANTS_JOBS ?= 4
+MUTANTS_SHARD ?=
+MUTANTS_MIN_TIMEOUT ?= 120
+# passkey.rs compiles only with the webauthn feature, so the workspace runs
+# skip it: an uncompiled mutant shows as MISSED. rust-mutants-passkey tests it.
+MUTANTS_ARGS = --workspace --exclude crates/relay/src/passkey.rs -j $(MUTANTS_JOBS) \
+  --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT) $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD))
 
-.PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift \
+.PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-powerloss \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
-        rust-nightly-check rust-nightly-components verify-crypto
+        rust-nightly-check rust-nightly-components rust-mutants-passkey verify-crypto
 
 ## The gate for each commit: Rust lint and tests, the shared vectors in Go and
 ## Python, runner tests, then the fast Quint tier. `make test-swift` needs Xcode,
 ## so it runs on macOS only.
-check: rust vectors-check test-python verify-tools verify-workflows verify-fast
+check: rust vectors-check test-python test-demo verify-tools verify-workflows verify-fast
 
 ## ---------------------------------------------------------------- Quint
 
@@ -100,7 +115,7 @@ rust-fuzz: rust-nightly-check
 	  for target in $$(cd $$dir && $(CARGO) $(NIGHTLY) fuzz list); do \
 	    echo "== fuzz $$dir $$target ($(FUZZ_SECONDS)s)"; \
 	    mkdir -p $$dir/corpus/$$target; \
-	    (cd $$dir && $(CARGO) $(NIGHTLY) fuzz run $$target corpus/$$target seeds/$$target \
+	    (cd $$dir && $(CARGO) $(NIGHTLY) fuzz run --target $(FUZZ_TARGET) $$target corpus/$$target seeds/$$target \
 	      -- -max_total_time=$(FUZZ_SECONDS)) || exit 1; \
 	  done; \
 	done
@@ -119,8 +134,16 @@ define check_mutants
 endef
 
 ## Mutants of every crate in the workspace. Run nightly, and before a release.
+## MUTANTS_SHARD=k/n runs one shard. CI runs 8 shards in parallel.
 rust-mutants:
-	@$(CARGO) mutants --workspace; $(check_mutants)
+	@$(CARGO) mutants $(MUTANTS_ARGS); $(check_mutants)
+
+## Mutants of crates/relay/src/passkey.rs, which only the `webauthn` feature
+## compiles. A feature flag is valid for one package only, so the workspace
+## runs above cannot enable it.
+rust-mutants-passkey:
+	@$(CARGO) mutants -p snailfish-relay --features webauthn -f crates/relay/src/passkey.rs \
+	  -j $(MUTANTS_JOBS) --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT); $(check_mutants)
 
 ## Mutants in the Rust code that changed since BASE (default main). Run before a
 ## merge. It does not see a test that a change made weaker in other code, so
@@ -130,7 +153,7 @@ rust-mutants-diff:
 	  git rev-parse --verify --quiet '$(BASE)^{commit}' > /dev/null || { echo "FAIL: BASE '$(BASE)' is not a git commit"; exit 1; }; \
 	  git diff $(BASE) -- '*.rs' > mutants.diff || { echo "FAIL: git diff $(BASE) failed"; exit 1; }; \
 	  if [ ! -s mutants.diff ]; then echo "ok: no Rust change since $(BASE)"; exit 0; fi; \
-	  $(CARGO) mutants --workspace --in-diff mutants.diff; $(check_mutants)
+	  $(CARGO) mutants $(MUTANTS_ARGS) --in-diff mutants.diff; $(check_mutants)
 
 ## Licences, advisories and sources of every dependency.
 rust-deny:
@@ -167,10 +190,31 @@ bindings-python:
 bindings-swift:
 	DEVELOPER_DIR=$(DEVELOPER_DIR) bindings/scripts/build.sh swift
 
-## The shared vectors through the Python binding, with ruff and pyright.
+## The shared vectors and a two-device sync through the Python binding, with
+## ruff and pyright. The sync test needs a relay, so with-relay.sh starts one.
 test-python: bindings-python
+	$(CARGO) build -p snailfish-relay
 	cd bindings/python && mise exec -- uv run --locked ruff check . && mise exec -- uv run --locked ruff format --check . \
-	  && mise exec -- uv run --locked pyright && mise exec -- uv run --locked pytest
+	  && mise exec -- uv run --locked pyright
+	SNAILFISH_RELAY_BIN=target/debug/snailfish-relay bindings/scripts/with-relay.sh \
+	  sh -c 'cd bindings/python && mise exec -- uv run --locked pytest'
+
+
+## The M2 acceptance tests: the demo app on the Python binding against a relay
+## process. Sync between two devices, a plaintext scan of the relay files,
+## merge order, and a client crash at each step of push and pull.
+test-demo: bindings-python
+	$(CARGO) build -p snailfish-relay
+	cd demo && mise exec -- uv run --locked ruff check . && mise exec -- uv run --locked ruff format --check . \
+	  && mise exec -- uv run --locked pyright \
+	  && SNAILFISH_RELAY_BIN=$(CURDIR)/target/debug/snailfish-relay mise exec -- uv run --locked pytest
+
+## The power-loss test: SIGKILL a QEMU VM during push and pull, KILLS times.
+## About 5 minutes for 20 kills on an M5 with HVF, after the first boot.
+ARCH ?=
+KILLS ?= 20
+test-powerloss:
+	mise exec -- uv run --script tests/powerloss/run.py $(if $(ARCH),--arch $(ARCH)) --kills $(KILLS)
 
 ## The shared vectors through the Swift binding on an iOS simulator and on macOS.
 test-swift: bindings-swift

@@ -211,41 +211,133 @@ fn frames_statements_and_recovery_display() {
     }
 }
 
-/// The engine object through the binding: the directory lock, change IDs and
-/// the `GET /v1/info` exchange.
+fn space(log_id: &str, tenant: &str) -> snailfish::SpaceRef {
+    snailfish::SpaceRef {
+        relay_url: "https://sync.example.net".into(),
+        tenant: tenant.into(),
+        log_id: log_id.into(),
+        app_id: "com.example.tasks".into(),
+    }
+}
+
+/// Send each request of one exchange to the relay core, as a host app does.
+fn exchange(relay: &snailfish_relay::core::Relay, engine: &std::sync::Arc<snailfish::Engine>) {
+    let sync = engine.clone().start_sync().unwrap();
+    while let Some(req) = sync.next_request().unwrap() {
+        let url = req.url.strip_prefix("https://sync.example.net").unwrap();
+        let (path, query) = url.split_once('?').unwrap_or((url, ""));
+        let resp = relay.handle(&snailfish_relay::core::Request {
+            method: req.method,
+            path: path.into(),
+            query: query.into(),
+            headers: req.headers.into_iter().map(|h| (h.name, h.value)).collect(),
+            body: req.body,
+        });
+        let time = vec![snailfish::Header {
+            name: "snailfish-time".into(),
+            value: resp.time.to_string(),
+        }];
+        sync.handle_response(resp.status, &time, &resp.body)
+            .unwrap();
+    }
+}
+
+/// The engine object through the binding: setup, the directory lock, a
+/// change from A to B through the real relay core, and the status
+/// variants. A marshalling fault in any record fails here.
 #[test]
-fn engine_object() {
+fn engine_object_syncs_two_devices() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().to_str().unwrap();
-    let engine =
-        std::sync::Arc::new(snailfish::Engine::open(path, "https://r.example/", "a").unwrap());
-    let locked = snailfish::Engine::open(path, "https://r.example", "a")
-        .err()
-        .unwrap();
+    let relay = snailfish_relay::core::Relay::open(snailfish_relay::core::Config::new(
+        dir.path().join("relay"),
+        "sync.example.net",
+    ))
+    .unwrap();
+    let tenant = relay.add_user("sam").unwrap();
+    let mut ka = snailfish::new_device_keys().unwrap();
+    let mut kb = snailfish::new_device_keys().unwrap();
+    let dev = |k: &snailfish::DeviceKeys, n: &str| snailfish::NewDevice {
+        keys: k.clone(),
+        name: n.into(),
+    };
+    // The app key of a new device is not read: setup makes it.
+    let mut kb_no_app_key = kb.clone();
+    kb_no_app_key.app_key = vec![];
+    let setup = snailfish::create_space(
+        "com.example.tasks",
+        &dev(&ka, "A"),
+        &[dev(&kb_no_app_key, "B")],
+    )
+    .unwrap();
+    let short_seed = snailfish::DeviceKeys {
+        sign_seed: vec![1; 31],
+        ..ka.clone()
+    };
+    assert!(matches!(
+        snailfish::create_space("com.example.tasks", &dev(&short_seed, "A"), &[]),
+        Err(snailfish::SnailfishError::Invalid { .. })
+    ));
+    assert_eq!(setup.envelopes.len(), 2);
+    assert!(codec::recovery_parse(&setup.recovery_key).is_ok());
+    ka.app_key.clone_from(&setup.app_key);
+    kb.app_key.clone_from(&setup.app_key);
+    let sp = space(&setup.log_id, &tenant);
+    let pa = dir.path().join("a");
+    let pa = pa.to_str().unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), &ka).unwrap());
+    let locked = snailfish::Engine::open(pa, sp.clone(), &ka).err().unwrap();
     assert!(matches!(locked, snailfish::SnailfishError::Locked));
     assert_eq!(
         locked.to_string(),
         "another engine uses this data directory"
     );
-    let a = engine.new_change_id().unwrap();
-    assert_eq!(a.len(), 16);
-    assert_ne!(a, engine.new_change_id().unwrap());
-    let sync = engine.clone().start_sync().unwrap();
-    let req = sync.next_request().unwrap().unwrap();
-    assert_eq!(
-        (req.method.as_str(), req.url.as_str()),
-        ("GET", "https://r.example/v1/info")
-    );
-    assert_eq!(req.headers[0].name, "accept");
-    assert!(sync.next_request().unwrap().is_none());
-    sync.handle_response(200, &[], br#"{"levels":[0]}"#)
+    let short = snailfish::DeviceKeys {
+        app_key: vec![0; 31],
+        ..kb.clone()
+    };
+    let pb = dir.path().join("b");
+    let pb = pb.to_str().unwrap();
+    assert!(matches!(
+        snailfish::Engine::open(pb, sp.clone(), &short),
+        Err(snailfish::SnailfishError::Invalid { .. })
+    ));
+    let b = std::sync::Arc::new(snailfish::Engine::open(pb, sp, &kb).unwrap());
+
+    exchange(&relay, &a);
+    assert_eq!(a.status().unwrap(), snailfish::Status::Ok);
+    assert_eq!(a.verified_head().unwrap().position, 2);
+    let id = a.new_change_id().unwrap();
+    assert_eq!(id.len(), 16);
+    let r = a
+        .enqueue_many(&[snailfish::OutboxRow {
+            change_id: id.clone(),
+            change_bytes: b"rename".to_vec(),
+        }])
         .unwrap();
-    assert_eq!(engine.status().unwrap(), snailfish::Status::RelayTooOld);
-    let sync = engine.clone().start_sync().unwrap();
-    sync.next_request().unwrap();
-    sync.handle_response(503, &[], b"").unwrap();
+    assert_eq!((r.stored, r.refused), (vec![id.clone()], vec![]));
+    assert_eq!(a.outbox_len().unwrap(), 1);
+    exchange(&relay, &a);
+    assert_eq!(a.outbox_len().unwrap(), 0);
+    exchange(&relay, &b);
+    let base = b.genesis_base().unwrap();
+    assert_eq!((base.position, base.digest.len()), (0, 32));
+    let got = b.changes_after(&base, 500).unwrap();
+    assert_eq!(got.len(), 1);
     assert_eq!(
-        engine.status().unwrap(),
-        snailfish::Status::RelayUnavailable
+        (got[0].position, &got[0].change_id, &got[0].change_bytes[..]),
+        (3, &id, &b"rename"[..])
     );
+    let at = snailfish::Applied {
+        position: got[0].position,
+        digest: got[0].digest.clone(),
+    };
+    assert_eq!(b.changes_after(&at, 500).unwrap(), vec![]);
+    let mut wrong = at;
+    wrong.digest[0] ^= 1;
+    assert!(matches!(
+        b.changes_after(&wrong, 500),
+        Err(snailfish::SnailfishError::ResetRequired)
+    ));
+    assert_ne!(a.device_id().unwrap(), b.device_id().unwrap());
 }

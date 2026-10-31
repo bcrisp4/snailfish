@@ -45,9 +45,6 @@ jobs:
       - run: make check
       - if: github.event_name != 'schedule'
         run: make verify-drift BASE="$BASE"
-      # Nightly checks every mutant in the rust-mutants job.
-      - if: github.event_name != 'schedule'
-        run: make rust-mutants-diff BASE="$BASE"
 
   swift:
     # DESIGN.md M1: the shared vectors through the Swift binding on an iOS
@@ -71,6 +68,66 @@ jobs:
           test -n "$id" && test "$id" != null
           echo "id=$id" >> "$GITHUB_OUTPUT"
       - run: make test-swift DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=${{ steps.sim.outputs.id }}"
+
+  image:
+    # DESIGN.md "Relay deployment": the static musl image for each
+    # architecture, with vendored OpenSSL. Each runner builds its own
+    # architecture natively. CI does not push the image.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --platform linux/${{ matrix.arch }} -t snailfish-relay:ci .
+      - name: The container reports healthy and serves /v1/info
+        run: |
+          docker run -d --name relay -e SNAILFISH_AUTHORITY=localhost:8080 -p 8080:8080 snailfish-relay:ci
+          for _ in $(seq 60); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' relay)
+            if [ "$s" = healthy ]; then break; fi
+            sleep 1
+          done
+          test "$s" = healthy
+          test "$(docker image inspect -f '{{.Config.User}}' snailfish-relay:ci)" = nonroot:nonroot
+          curl -fsS localhost:8080/v1/info | jq -e '.levels == [1]'
+          docker stop -t 10 relay
+          test "$(docker inspect -f '{{.State.ExitCode}}' relay)" = 0
+      - name: The relay does not start without an authority
+        run: |
+          if docker run --rm snailfish-relay:ci; then exit 1; fi
+
+  powerloss:
+    # DESIGN.md M2: SIGKILL a QEMU VM during push and pull. The disks use
+    # cache=none. This covers Linux fsync in the guest, under KVM.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and allow KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-utils genisoimage
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          # Some runners apply the rule late. Set the mode directly too.
+          if [ -e /dev/kvm ] && [ ! -w /dev/kvm ]; then sudo chmod 0666 /dev/kvm; fi
+          ls -l /dev/kvm || { echo "FAIL: this runner has no /dev/kvm"; exit 1; }
+          test -w /dev/kvm
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/snailfish-qemu
+          key: debian-13-genericcloud-amd64-20261021-2638
+      - run: make test-powerloss ARCH=amd64 KILLS=20
 
   models:
     # The model list comes from specs/*/checks.toml, so a new model is picked up.
@@ -146,15 +203,30 @@ jobs:
       - uses: jdx/mise-action@v2
       - run: make verify-crypto
 
-  rust-mutants:
-    # Every mutant of every crate. The check job runs only the changed code.
-    if: github.event_name == 'schedule'
+  mutants:
+    # cargo-mutants in 8 shards. Each mutant runs the whole workspace test
+    # suite, so one runner needs hours. A pull request and a push check the
+    # mutants of the changed Rust code. The nightly run checks every mutant.
+    # Sharding is by mutant index, so the shards cover each mutant once.
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
-      - run: make rust-mutants
+      - if: github.event_name != 'schedule'
+        run: make rust-mutants-diff BASE="$BASE" MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
+      - if: github.event_name == 'schedule'
+        run: make rust-mutants MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
+      # passkey.rs compiles only with the webauthn feature. One shard checks it.
+      - if: matrix.shard == 0
+        run: make rust-mutants-passkey MUTANTS_JOBS=2
 
   nightly-fuzz:
     # Long fuzz runs. Nightly only.

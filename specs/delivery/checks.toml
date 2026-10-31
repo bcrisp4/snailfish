@@ -6,6 +6,7 @@ model = "model.qnt"
 module = "delivery"
 tests = "test.qnt"
 test_module = "deliveryTest"
+test_modules = ["deliveryTestHold"]
 
 # Invariants that hold in every config unless a config lists it under `limits`.
 invariants = [
@@ -107,6 +108,12 @@ FAULTS = 'Set("relayRestore", "engineLoss", "warnedRelease")'
 skip = ["noLostChange"]
 why = "An engine state loss and relay restore can destroy both copies. The weak property excludes these exposed changes."
 
+[configs.tinyConflict]
+DEVS = "Set(1, 2)"
+MAX_IDS = "2"
+MAX_FAULTS = "1"
+FAULTS = 'Set("engineLoss")'
+
 # ---------------------------------------------------------------- known limits
 # Each limit must be violated. If one holds, the model changed or the limit is gone.
 
@@ -155,6 +162,14 @@ caught_by = "noLostChangeWeak"
 base = "restoreBase"
 caught_by = "noDoubleApply"
 
+[mutants.relayConflictAppends]
+base = "engineOnly"
+caught_by = "noDoubleApply"
+
+[mutants.conflictRefuses]
+base = "engineOnly"
+caught_by = "refusedNotStored"
+
 [mutants.sizeBeforeDedupe]
 base = "restoreBase"
 caught_by = "refusedNotStored"
@@ -169,7 +184,11 @@ caught_by = "noLostChangeWeak"
 
 [mutants.noHold]
 base = "restoreBase"
-caught_by = "refusedNotStored"
+# Sampling of refusedNotStored found the violation in 5 of 6 runs at 5000
+# traces, and CI run 41115310784 missed it. The scripted test fails on each run.
+caught_by = "tests"
+test_module = "deliveryTestHold"
+test = "restoreSetsHoldTest"
 
 [mutants.adoptFork]
 base = "forkBase"
@@ -217,3 +236,9 @@ config = "tinyRecovery"
 invariants = ["noDoubleApply", "noLostChangeWeak", "appliedHeld", "caughtUpState", "refusedNotStored", "noStuckDevice", "noSilentLoss", "noFork"]
 mutants = ["noRepair", "noAheadReset", "releaseIgnoresFresh"]
 why = "One device and one change, with relay restore, engine state loss, repair, and warned hold release. At most two faults."
+
+[[exhaustive]]
+config = "tinyConflict"
+invariants = ["noDoubleApply", "noLostChange", "noLostChangeWeak", "appliedHeld", "caughtUpState", "refusedNotStored", "noFork"]
+mutants = ["relayConflictAppends", "conflictRefuses"]
+why = "Two devices and two changes, with one engine state loss: the engine encrypts the change again and the relay answers Conflict."

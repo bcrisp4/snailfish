@@ -43,3 +43,17 @@ path = "fuzz_targets/recovery_key.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false

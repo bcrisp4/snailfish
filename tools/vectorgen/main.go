@@ -17,23 +17,26 @@ import (
 
 func main() {
 	out := flag.String("out", "", "write vector files to this directory")
+	outHTTP := flag.String("out-http", "", "write only http.json to this directory, using the sealed values of protocol.json there")
 	check := flag.String("check", "", "check vector files in this directory")
 	openRust := flag.String("open-rust", "", "open key sets that Rust sealed (JSON file)")
 	flag.Parse()
 	n := 0
-	for _, v := range []string{*out, *check, *openRust} {
+	for _, v := range []string{*out, *outHTTP, *check, *openRust} {
 		if v != "" {
 			n++
 		}
 	}
 	if n != 1 {
-		fmt.Fprintln(os.Stderr, "give exactly one of -out, -check, -open-rust")
+		fmt.Fprintln(os.Stderr, "give exactly one of -out, -out-http, -check, -open-rust")
 		os.Exit(2)
 	}
 	var err error
 	switch {
 	case *out != "":
 		err = runOut(*out)
+	case *outHTTP != "":
+		err = runOutHTTP(*outHTTP)
 	case *check != "":
 		err = runCheck(*check)
 	default:
@@ -84,7 +87,15 @@ func runOut(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	for name, v := range map[string]any{"protocol.json": p, "strict-json.json": st, "recovery-key.json": rk} {
+	w, err := newWorld()
+	if err != nil {
+		return err
+	}
+	h, err := buildHTTP(w, httpSealer(p))
+	if err != nil {
+		return err
+	}
+	for name, v := range map[string]any{"protocol.json": p, "strict-json.json": st, "recovery-key.json": rk, "http.json": h} {
 		b, err := marshal(v)
 		if err != nil {
 			return err
@@ -94,6 +105,33 @@ func runOut(dir string) error {
 		}
 		fmt.Printf("wrote %s (%d bytes)\n", filepath.Join(dir, name), len(b))
 	}
+	return nil
+}
+
+// runOutHTTP writes http.json only. protocol.json holds the sealed key sets,
+// because Go cannot fix the HPKE ephemeral key.
+func runOutHTTP(dir string) error {
+	var p protocolJ
+	if err := load(filepath.Join(dir, "protocol.json"), &p); err != nil {
+		return err
+	}
+	w, err := newWorld()
+	if err != nil {
+		return err
+	}
+	h, err := buildHTTP(w, httpSealer(&p))
+	if err != nil {
+		return err
+	}
+	b, err := marshal(h)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "http.json")
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s (%d bytes)\n", path, len(b))
 	return nil
 }
 
@@ -193,6 +231,10 @@ func runCheck(dir string) error {
 	if err := load(filepath.Join(dir, "recovery-key.json"), &rk); err != nil {
 		return err
 	}
+	var hf httpJ
+	if err := load(filepath.Join(dir, "http.json"), &hf); err != nil {
+		return err
+	}
 	w, err := newWorld()
 	if err != nil {
 		return err
@@ -217,6 +259,16 @@ func runCheck(dir string) error {
 	if err := compare("recovery-key.json", &rk, rrk); err != nil {
 		return err
 	}
+	rh, err := buildHTTP(w, httpSealer(&p))
+	if err != nil {
+		return err
+	}
+	if err := compare("http.json", &hf, rh); err != nil {
+		return err
+	}
+	if err := checkHTTP(&hf, w); err != nil {
+		return fmt.Errorf("http.json: %w", err)
+	}
 	if err := checkEnvelopes(&p); err != nil {
 		return err
 	}
@@ -226,8 +278,8 @@ func runCheck(dir string) error {
 	if err := checkRecovery(&rk); err != nil {
 		return err
 	}
-	fmt.Printf("OK: %d entries, %d statements, %d key sets opened, %d ciphertexts, %d envelopes, %d strict cases, %d+%d recovery texts\n",
-		len(p.Log.Entries), len(p.Statements), len(p.KeySets), len(p.Ciphertexts), len(p.Envelopes), len(st.Cases), len(rk.Valid), len(rk.Invalid))
+	fmt.Printf("OK: %d entries, %d statements, %d key sets opened, %d ciphertexts, %d envelopes, %d strict cases, %d+%d recovery texts, http: %d signed, %d invalid, %d append, %d fetch\n",
+		len(p.Log.Entries), len(p.Statements), len(p.KeySets), len(p.Ciphertexts), len(p.Envelopes), len(st.Cases), len(rk.Valid), len(rk.Invalid), len(hf.Signed), len(hf.Invalid), len(hf.Append), len(hf.Fetch))
 	return nil
 }
 

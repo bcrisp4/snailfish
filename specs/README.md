@@ -93,7 +93,7 @@ Each pull request and push to `main` runs Rust checks, runner tests, workflow li
 
 CI discovers Quint models through `specs/*/checks.toml`. Full CI checks sample 5,000 traces per check, not the local default of 20,000.
 
-Nightly jobs also run all Rust mutants and longer fuzz checks. The workflow does not use path filters.
+The `mutants` job runs cargo-mutants in 8 shards: the changed Rust code for a pull request or push, and every mutant nightly. Nightly jobs also run longer fuzz checks. The workflow does not use path filters.
 
 `make verify-workflows` checks workflow syntax, expressions, and action inputs with pinned actionlint.
 

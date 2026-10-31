@@ -6,7 +6,6 @@
 "DLV-1" = "durable commit settings are an implementation rule, not a protocol state"
 "DLV-3" = "performance note on batching, no state to model"
 "DLV-4" = "batches and the 500 row limit are not modelled, one action is one row"
-"DLV-6" = "record hashes are not modelled, a change is an opaque ID"
 "DLV-13" = "decryption and parsing failures are not modelled"
 "DLV-14" = "app payload versions are not modelled"
 "MRG-2" = "app merge rules are outside the delivery model, the app owns them"
