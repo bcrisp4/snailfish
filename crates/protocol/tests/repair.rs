@@ -8,7 +8,7 @@ use serde_json::Value;
 use snailfish_protocol::encoding::decode_id;
 use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::repair::{ChainError, Item, check_chain};
-use snailfish_protocol::space::{MemorySpace, Refusal, SpaceView, check_genesis};
+use snailfish_protocol::space::{MemorySpace, Overlay, Refusal, SpaceView, check_genesis};
 
 fn vectors() -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/protocol.json");
@@ -126,4 +126,61 @@ fn first_failure_stops_the_check() {
         twice.failure,
         Some((2, ChainError::Invalid(Refusal::DuplicateChange)))
     );
+}
+
+/// A view with a write level, an epoch and a last security record that a
+/// genesis-only log cannot have, so the overlay must read them from it.
+struct Shifted(MemorySpace);
+
+impl SpaceView for Shifted {
+    fn log_id(&self) -> [u8; 16] {
+        self.0.log_id()
+    }
+    fn head(&self) -> u64 {
+        self.0.head()
+    }
+    fn digest_at(&self, p: u64) -> Option<[u8; 32]> {
+        self.0.digest_at(p)
+    }
+    fn device_key(&self, id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.0.device_key(id)
+    }
+    fn change(&self, c: &[u8; 16]) -> Option<(u64, [u8; 32])> {
+        self.0.change(c)
+    }
+    fn write_level(&self) -> u64 {
+        3
+    }
+    fn epoch(&self) -> u64 {
+        2
+    }
+    fn last_security(&self) -> u64 {
+        7
+    }
+}
+
+/// The overlay reads the space state of the log until an added record
+/// changes it: the write level and the epoch, and the last security record
+/// until an added security record ([LOG-7], [LOG-8]).
+#[test]
+fn overlay_reads_the_log_state_until_an_added_record_changes_it() {
+    let v = vectors();
+    let inner = Shifted(genesis_only(&v));
+    let mut over = Overlay::new(&inner);
+    assert_eq!(
+        (over.write_level(), over.epoch(), over.last_security()),
+        (3, 2, 7)
+    );
+    let (e2, e3) = (env(&v, 2), env(&v, 3));
+    let chain = check_chain(
+        &genesis_only(&v),
+        &[2, 3],
+        &[Item::Envelope(&e2), Item::Envelope(&e3)],
+    );
+    let mut added = chain.accepted.into_iter();
+    over.apply(added.next().unwrap());
+    assert_eq!(over.last_security(), 2, "the grant at 2");
+    over.apply(added.next().unwrap());
+    assert_eq!(over.last_security(), 2, "a change is not a security record");
+    assert_eq!(over.head(), 3);
 }

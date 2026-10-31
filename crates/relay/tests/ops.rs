@@ -284,3 +284,39 @@ fn schema_one_files_migrate_forward() {
     let (sid, _) = start(&fx, "A", head_of(&fx, 3), 4, 4);
     assert_eq!(finish(&fx, "A", sid, head_of(&fx, 4)), 200);
 }
+
+/// [LOG-11], PROTOCOL.md 10.9: a session expires at its start + 86,400
+/// seconds exactly. A chunk one second before goes in.
+#[test]
+fn session_expires_at_the_exact_second() {
+    use std::sync::atomic::Ordering;
+    for (later, ok) in [(86_399, true), (86_400, false)] {
+        let fx = Fx::new();
+        fx.setup_space(fx.tenant());
+        fx.cut_log(fx.tenant(), 2);
+        let t0 = fx.now.load(Ordering::SeqCst);
+        let (sid, _) = start(&fx, "A", head_of(&fx, 2), 3, 3);
+        fx.now.store(t0 + later, Ordering::SeqCst);
+        let chunk = wire::repair_chunk_body(&sid, &[(4, envelope(&fx, 4))]).unwrap();
+        let r = fx.post(fx.tenant(), "repair/chunk", &chunk, "A");
+        assert_eq!(
+            r.status == 200,
+            ok,
+            "{later}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+    }
+}
+
+/// PROTOCOL.md 8.6: a repair request runs steps 1 to 4 before the body
+/// parse, so an expired request with a malformed body is `expired`.
+#[test]
+fn repair_checks_the_request_before_the_body() {
+    use std::sync::atomic::Ordering;
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let path = format!("{}/repair", fx.space_path(fx.tenant(), fx.log()));
+    let now = fx.now.load(Ordering::SeqCst);
+    let req = fx.signed_with("POST", &path, "", b"{", "A", [0x77; 16], now - 1000);
+    assert_eq!(error_code(&fx.relay.handle(&req)), "expired");
+}

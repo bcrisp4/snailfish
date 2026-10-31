@@ -920,6 +920,11 @@ mod tests {
         assert!(parse_status(no_fresh.as_bytes()).is_err());
         let str_fresh = format!(r#"{{"tip":{{"position":1,"digest":"{d}"}},"fresh":"true"}}"#);
         assert!(parse_status(str_fresh.as_bytes()).is_err());
+        // A request refuses an unknown field, also inside the tip.
+        let extra = format!(r#"{{"tip":{{"position":1,"digest":"{d}","x":1}},"fresh":false}}"#);
+        assert!(parse_status(extra.as_bytes()).is_err());
+        let top = format!(r#"{{"tip":{{"position":1,"digest":"{d}"}},"fresh":false,"x":1}}"#);
+        assert!(parse_status(top.as_bytes()).is_err());
         let neg = format!(r#"{{"tip":{{"position":-1,"digest":"{d}"}},"fresh":false}}"#);
         assert!(parse_status(neg.as_bytes()).is_err());
         assert_eq!(parse_status_response(&status_response(true)), Ok(true));
