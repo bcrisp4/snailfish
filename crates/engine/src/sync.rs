@@ -516,12 +516,6 @@ impl Sync {
                 state::clear_fresh(&tx).map_err(Answer::Engine)?;
             }
         }
-        let lost = if shorter && self.phase == Phase::FirstFetch {
-            state::log_range(&tx, f.head.position.saturating_add(1), head)
-                .map_err(Answer::Engine)?
-        } else {
-            Vec::new()
-        };
         tx.commit().map_err(|e| Answer::Engine(e.into()))?;
         self.hold = f.hold;
         if let Some(cause) = degraded {
@@ -532,6 +526,8 @@ impl Sync {
         }
         if shorter {
             if self.phase == Phase::FirstFetch {
+                let lost = state::log_range(&engine.db, f.head.position.saturating_add(1), head)
+                    .map_err(Answer::Engine)?;
                 self.repair = Some(RepairRun {
                     base: f.head,
                     tip: Head {

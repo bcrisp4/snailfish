@@ -28,6 +28,11 @@ exclude_re = [
   # serde calls `expecting` only for a value type that the visitor does not
   # handle. The visitor handles every JSON type, so serde_json never calls it.
   "Visitor<'de> for Visit>::expecting",
+  # Equivalent mutant: with `<=`, a relay head equal to the verified head
+  # takes the repair branch, finds the same digest and plans a repair with
+  # no lost entry. Sync::next_request skips an empty repair, and the fetch
+  # already handled the head as caught up, so the result is the same.
+  "replace < with <= in Sync::fetch",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`

@@ -1617,6 +1617,10 @@ fn relay_restore_repair_and_release() {
     assert_eq!(ea.verified_head().unwrap().position, 4);
     assert_eq!(ea.take_repairs().unwrap(), [] as [Repair; 0]);
     w.restore(&backup);
+    // One entry per request, so the repair needs a start and a chunk.
+    let mut cfg = relay_config(&w.root);
+    cfg.limits.max_append_envelopes = 1;
+    w.relay = Relay::open(cfg).unwrap();
 
     a.edit(&ea, b"a2");
     a.enqueue(&mut ea);
@@ -1629,6 +1633,7 @@ fn relay_restore_repair_and_release() {
     );
     assert_eq!(ea.take_repairs().unwrap(), [Repair { first: 3, tip: 4 }]);
     assert!(ea.take_repairs().unwrap().is_empty(), "taken once");
+    assert_eq!(w.hold().repairs.len(), 1, "one session with two requests");
     w.exchange(&mut eb);
     assert_eq!(eb.status(), Status::RestoreHold);
     assert!(eb.take_repairs().unwrap().is_empty(), "A repaired first");
@@ -1811,4 +1816,79 @@ fn repair_chunks_fit_the_limits_exactly() {
     // An entry larger than the limit goes alone, for the relay allowance.
     l.max_request_bytes = 10;
     assert_eq!(chunk_sizes(&entries, &l), [1, 1, 1, 1, 1]);
+}
+
+/// [LOG-7] `specs/spacelog/test.qnt::concurrentGrantsTest`: the engine reads
+/// the last security record of its verified log, which the base rule of
+/// each fetched security record compares against. The log holds the
+/// genesis record (1), the grant to B (2) and a change (3).
+#[test]
+fn verified_log_knows_its_last_security_record() {
+    let (mut w, mut a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.verified_head().unwrap().position, 3);
+    let tx = Transaction::new_unchecked(&ea.db, TransactionBehavior::Deferred).unwrap();
+    let view = state::DbSpace {
+        tx: &tx,
+        log_id: ea.log_id,
+    };
+    assert_eq!(
+        snailfish_protocol::space::SpaceView::last_security(&view),
+        2
+    );
+}
+
+/// [LOG-10]: the relay refuses a verified entry in a repair request, so the
+/// two logs disagree and the engine stops with fork, with a repair cause.
+/// The same code for a create names the genesis record.
+#[test]
+fn refused_repair_entry_stops_with_fork() {
+    let (mut w, mut a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    w.cut_relay(2);
+    for code in ["uncovered_stub", "invalid_record"] {
+        let mut s = ea.start_sync();
+        while let Some(req) = s.next_request(&mut ea).unwrap() {
+            let resp = w.relay.handle(&to_relay(&req));
+            if req.url.ends_with("/repair") {
+                let body = snailfish_protocol::wire::error_body(code, "");
+                s.handle_response(&mut ea, 422, &time(&resp), &body)
+                    .unwrap();
+            } else {
+                s.handle_response(&mut ea, resp.status, &time(&resp), &resp.body)
+                    .unwrap();
+            }
+        }
+        match ea.status() {
+            Status::Fork { cause } => {
+                assert!(cause.contains(&format!("repair entry: {code}")), "{cause}");
+            }
+            other => panic!("{code}: expected fork, got {other:?}"),
+        }
+    }
+    let (w2, b2, _) = World::new();
+    let mut eb = w2.engine(&b2);
+    let mut s = eb.start_sync();
+    while let Some(req) = s.next_request(&mut eb).unwrap() {
+        if req.method == "PUT" {
+            let body = snailfish_protocol::wire::error_body("invalid_record", "");
+            s.handle_response(&mut eb, 422, &[], &body).unwrap();
+        } else {
+            let resp = w2.relay.handle(&to_relay(&req));
+            s.handle_response(&mut eb, resp.status, &time(&resp), &resp.body)
+                .unwrap();
+        }
+    }
+    match eb.status() {
+        Status::Fork { cause } => assert!(cause.contains("genesis"), "{cause}"),
+        other => panic!("expected fork, got {other:?}"),
+    }
 }

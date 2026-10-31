@@ -341,3 +341,49 @@ fn engine_object_syncs_two_devices() {
     ));
     assert_ne!(a.device_id().unwrap(), b.device_id().unwrap());
 }
+
+/// S6 through the binding: after a restore, the engine repairs the lost
+/// position, reports the repair through `take_repairs`, and the relay holds
+/// the space (`Status::RestoreHold`).
+#[test]
+fn engine_object_reports_a_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("relay");
+    let relay = snailfish_relay::core::Relay::open(snailfish_relay::core::Config::new(
+        &data,
+        "sync.example.net",
+    ))
+    .unwrap();
+    let tenant = relay.add_user("sam").unwrap();
+    let mut ka = snailfish::new_device_keys().unwrap();
+    let first = snailfish::NewDevice {
+        keys: ka.clone(),
+        name: "A".into(),
+    };
+    let setup = snailfish::create_space("com.example.tasks", &first, &[]).unwrap();
+    ka.app_key.clone_from(&setup.app_key);
+    let sp = space(&setup.log_id, &tenant);
+    let pa = dir.path().join("a");
+    let pa = pa.to_str().unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
+    exchange(&relay, &a);
+    let backup = dir.path().join("backup");
+    snailfish_relay::ops::backup(&data, &backup).unwrap();
+    let id = a.new_change_id().unwrap();
+    a.enqueue_many(&[snailfish::OutboxRow {
+        change_id: id,
+        change_bytes: b"x".to_vec(),
+    }])
+    .unwrap();
+    exchange(&relay, &a);
+    assert_eq!(a.verified_head().unwrap().position, 2);
+    snailfish_relay::ops::restore(&data, &backup, true, 1).unwrap();
+    assert_eq!(a.take_repairs().unwrap(), vec![]);
+    exchange(&relay, &a);
+    assert_eq!(a.status().unwrap(), snailfish::Status::RestoreHold);
+    assert_eq!(
+        a.take_repairs().unwrap(),
+        vec![snailfish::Repair { first: 2, tip: 2 }]
+    );
+}
