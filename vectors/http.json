@@ -613,6 +613,33 @@
    "error": "nonce_reused"
   },
   {
+   "name": "content-digest-non-canonical-base64",
+   "signer": "A",
+   "method": "GET",
+   "path": "/v1/t/t_e1628070e99419b786f08ffd6253a561/s/l_5fe3f50351eefac530786a2fdb9bb34c/entries",
+   "query": "after=0&limit=2",
+   "body": "",
+   "headers": [
+    [
+     "content-digest",
+     "sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFV=:"
+    ],
+    [
+     "signature-input",
+     "sf=(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\");created=1767225600;expires=1767225900;nonce=\"73a89a2bb58afdd812a354a1496bb759\";keyid=\"d_ab3d4a8d1bf3c6b80fdcd34fb3b71ad6a47d76df70b7a00305f6c8cc67af5744\";alg=\"ed25519\";tag=\"snailfish.request.v1\""
+    ],
+    [
+     "signature",
+     "sf=:xqPDGWHCaavYNUluCf9Ng9WNMpKq0GR/TJXT2V/YyqxKl9bL/7qFAzKlRv8sruB7/Ooj0v86bwXV4gUHbXfSDg==:"
+    ],
+    [
+     "snailfish-authority",
+     "sync.example.net"
+    ]
+   ],
+   "error": "bad_signature"
+  },
+  {
    "name": "wrong-authority",
    "signer": "A",
    "method": "GET",

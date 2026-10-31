@@ -289,6 +289,23 @@ impl Relay {
         let user_id = encode_id("u_", &random::<16>()?);
         let dir = self.cfg.data_dir.join("tenants").join(&tenant_id);
         std::fs::create_dir_all(dir.join("spaces")).map_err(StoreError::Io)?;
+        let made = self.add_tenant(name, handle, &tenant_id, &user_id, &dir);
+        if made.is_err() {
+            // The directory does not name the tenant, so nothing reaches its
+            // files. Best effort: a failed removal leaves an unused directory.
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        made
+    }
+
+    fn add_tenant(
+        &self,
+        name: &str,
+        handle: &str,
+        tenant_id: &str,
+        user_id: &str,
+        dir: &Path,
+    ) -> Result<(), OpenError> {
         let t = store::open(&dir.join("tenant.db"), Kind::Tenant, true)?;
         t.execute(
             "INSERT INTO tenant (id, handle) VALUES (1, ?1)",
@@ -472,6 +489,15 @@ impl Relay {
     ) -> ApiResult<(u16, Vec<u8>)> {
         self.guard(req)?;
         let tenant = self.tenant(tenant)?;
+        // 8.6 steps 1 to 4 run before the body parse. The device key comes
+        // from the body, so no key matches yet, and a request that passes
+        // steps 1 to 4 stops at step 5.
+        match self.verify(req, now, |_| None) {
+            Err(e) if e.code != "unknown_device" => return Err(e),
+            _ => {}
+        }
+        // The space does not exist yet, so a malformed log ID is a bad
+        // request, not `unknown_space`.
         let log_id = decode_id::<16>(log, "l_")
             .map_err(|_| api(400, "bad_request", "the log ID is malformed"))?;
         let raw = wire::parse_genesis(&req.body).map_err(|e| {

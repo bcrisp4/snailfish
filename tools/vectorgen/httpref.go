@@ -345,6 +345,11 @@ func (rs *relayState) verifyRequest(rq request) string {
 	if !digestRe.MatchString(cd) {
 		return "bad_signature"
 	}
+	// 8.1: standard base64 with padding and no other form, so non-zero
+	// trailing bits break the header form (step 2), not the digest (step 4).
+	if _, err := decodeB64(cd[len("sha-256=:") : len(cd)-1]); err != nil {
+		return "bad_signature"
+	}
 	if !strings.HasPrefix(si, "sf=") || !strings.HasPrefix(sg, "sf=:") || !strings.HasSuffix(sg, ":") || len(sg) < 5 {
 		return "bad_signature"
 	}

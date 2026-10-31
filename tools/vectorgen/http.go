@@ -497,6 +497,16 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		add(s, withHdr(s.Headers, "signature", sigHdr(sg)), "bad_signature")
 		s = newSigned("nonce-reused", w.A, "GET", httpAuthority, entriesPath, "after=0&limit=2", "", now, now+300, nonceFor("used-A"))
 		add(s, s.Headers, "nonce_reused")
+		// The last digest symbol has non-zero trailing bits. The signature
+		// covers this value, so a reader that skips the strict decode
+		// reaches step 4 and answers bad_digest.
+		s = mk("content-digest-non-canonical-base64")
+		const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+		cd := []byte(s.ContentDigest)
+		i := len(cd) - len("=:") - 1
+		cd[i] = alpha[strings.IndexByte(alpha, cd[i])^1]
+		sig = ed25519.Sign(w.A.signPriv, []byte(sigBase(s.Method, s.Authority, s.Path, s.Query, string(cd), s.SignatureParams)))
+		add(s, withHdr(withHdr(s.Headers, "content-digest", string(cd)), "signature", sigHdr(sig)), "bad_signature")
 		s = mk("wrong-authority")
 		add(s, withHdr(s.Headers, "snailfish-authority", otherAuth), "wrong_authority")
 		s = newSigned("signed-for-other-authority", w.A, "GET", otherAuth, entriesPath, "after=0&limit=2", "", now, now+300, nonceFor("other-auth"))

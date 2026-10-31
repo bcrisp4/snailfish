@@ -174,7 +174,8 @@ impl std::fmt::Debug for DeviceKeys {
 /// Where the space lives on the relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceRef {
-    /// The relay base URL, for example `https://sync.example.net`.
+    /// The relay base URL: `https://` or `http://` and the authority, with no
+    /// path, for example `https://sync.example.net`.
     pub relay_url: String,
     /// The tenant handle text (`t_` + 32 hex digits).
     pub tenant: String,
@@ -243,6 +244,24 @@ pub struct Engine {
     _lock: File,
 }
 
+/// Check a relay URL and remove one trailing `/`. The relay routes only
+/// `/v1/...` and the signature covers the path as sent, so a URL with a path
+/// prefix can never reach it (`PROTOCOL.md` 8.3).
+fn relay_base(url: &str) -> Result<String, EngineError> {
+    let bad = || {
+        EngineError::Invalid("relay URL: use http:// or https:// and the host, with no path".into())
+    };
+    let (scheme, rest) = url.split_once("://").ok_or_else(bad)?;
+    let auth = rest.strip_suffix('/').unwrap_or(rest);
+    if !(scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+        || auth.is_empty()
+        || auth.contains(['/', '?', '#', '@'])
+    {
+        return Err(bad());
+    }
+    Ok(url.strip_suffix('/').unwrap_or(url).to_owned())
+}
+
 fn system_time() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -262,8 +281,8 @@ impl Engine {
     ///
     /// [`EngineError::Locked`] if another engine holds the directory,
     /// [`EngineError::SchemaTooNew`] for a file from a newer engine,
-    /// [`EngineError::Invalid`] for a log ID or keys that do not match the
-    /// file, and [`EngineError::Storage`].
+    /// [`EngineError::Invalid`] for a relay URL with a path, or a log ID or
+    /// keys that do not match the file, and [`EngineError::Storage`].
     pub fn open(data_dir: &Path, space: SpaceRef, keys: &DeviceKeys) -> Result<Self, EngineError> {
         std::fs::create_dir_all(data_dir)?;
         let lock = File::options()
@@ -285,7 +304,7 @@ impl Engine {
         let db = Connection::open(data_dir.join(STATE_FILE))?;
         state::open(&db, &log_id, &device_id)?;
         let mut space = space;
-        space.relay_url = space.relay_url.trim_end_matches('/').to_owned();
+        space.relay_url = relay_base(&space.relay_url)?;
         Ok(Self {
             db,
             space,

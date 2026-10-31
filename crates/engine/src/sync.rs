@@ -52,7 +52,7 @@ pub struct Sync {
     retry: Option<Sent>,
     retried: bool,
     limits: Limits,
-    batches: VecDeque<Vec<(Item, String)>>,
+    batches: Batches,
     queued: bool,
     // Fetch pages in this exchange that added no entry. A relay that sends
     // `has_more` or a later head with no entries must not keep the app in
@@ -132,7 +132,6 @@ impl Sync {
     }
 
     fn queue(&mut self, engine: &mut Engine) -> Result<(), EngineError> {
-        let max = usize::try_from(self.limits.max_append_envelopes.max(1)).unwrap_or(1);
         let items: Vec<(Item, String)> = if self.phase == Phase::Setup {
             state::setup_appends(&engine.db)?
                 .into_iter()
@@ -144,7 +143,16 @@ impl Sync {
                 .map(|p| (Item::Change(p.change_id), p.envelope))
                 .collect()
         };
-        self.batches = items.chunks(max).map(<[_]>::to_vec).collect();
+        let (batches, too_large) = batch(items, &self.limits);
+        // A change that no request body can hold is refused for ever
+        // ([DLV-9]). A retry would get the same 413 at every sync.
+        for cid in too_large {
+            state::refuse(&engine.db, &cid, "too_large")?;
+            engine.status = Status::Degraded {
+                cause: "refused: too_large".into(),
+            };
+        }
+        self.batches = batches;
         self.queued = true;
         Ok(())
     }
@@ -189,8 +197,7 @@ impl Sync {
                 )
             }
         };
-        let (prefix, authority) = split_url(&sp.relay_url);
-        let full_path = format!("{prefix}{path}");
+        let authority = authority(&sp.relay_url);
         let mut headers = vec![Header {
             name: "accept".into(),
             value: "application/json".into(),
@@ -212,7 +219,7 @@ impl Sync {
             let t = Target {
                 method,
                 authority: &authority,
-                path: &full_path,
+                path: &path,
                 query: &query,
             };
             for (name, value) in request::sign(&engine.sign, &t, &body, &p).pairs() {
@@ -222,14 +229,10 @@ impl Sync {
                 });
             }
         }
-        let scheme_host = sp
-            .relay_url
-            .strip_suffix(prefix.as_str())
-            .unwrap_or(&sp.relay_url);
         let url = if query.is_empty() {
-            format!("{scheme_host}{full_path}")
+            format!("{}{path}", sp.relay_url)
         } else {
-            format!("{scheme_host}{full_path}?{query}")
+            format!("{}{path}?{query}", sp.relay_url)
         };
         self.sent = Some(s);
         Ok(Request {
@@ -311,6 +314,14 @@ impl Sync {
             Some("space_exists") => Status::Fork {
                 cause: "the relay holds another genesis record for this log".into(),
             },
+            Some("invalid_record") => Status::Fork {
+                cause: "the relay refused the genesis record".into(),
+            },
+            // The batch fits the limits of the last info, so the relay
+            // lowered them. The next sync reads them again.
+            Some("too_large") => Status::Degraded {
+                cause: "refused: too_large".into(),
+            },
             _ => Status::RelayUnavailable,
         };
         self.phase = Phase::Done;
@@ -371,6 +382,17 @@ impl Sync {
                     && app != &engine.space.app_id
                 {
                     return Err(stop("the genesis record names another app".into()));
+                }
+                // The device that made the space holds its genesis record
+                // from the setup (`specs/spacelog/model.qnt` `createSpace`).
+                // The relay must not replace it.
+                if state::setup_genesis_hash(&tx)
+                    .map_err(Answer::Engine)?
+                    .is_some_and(|h| h != a.record_hash)
+                {
+                    return Err(stop(
+                        "the relay holds another genesis record for this log".into(),
+                    ));
                 }
                 a
             } else {
@@ -479,6 +501,43 @@ impl Sync {
     }
 }
 
+type Batches = VecDeque<Vec<(Item, String)>>;
+
+/// Split items into append requests of at most `max_append_envelopes`
+/// envelopes and `max_request_bytes` body bytes (`PROTOCOL.md` 10.4).
+/// Returns the batches and the changes that do not fit in any body alone.
+/// A setup record that does not fit goes alone, and the relay answer
+/// decides.
+fn batch(items: Vec<(Item, String)>, limits: &Limits) -> (Batches, Vec<[u8; 16]>) {
+    let max_count = usize::try_from(limits.max_append_envelopes.max(1)).unwrap_or(usize::MAX);
+    let max_bytes = usize::try_from(limits.max_request_bytes).unwrap_or(usize::MAX);
+    // `{"envelopes":[` and `]}`, then one comma between two envelopes.
+    let empty = wire::append_body(&[]).len();
+    let mut out = VecDeque::new();
+    let mut too_large = Vec::new();
+    let mut cur: Vec<(Item, String)> = Vec::new();
+    let mut size = empty;
+    for (item, env) in items {
+        if empty.saturating_add(env.len()) > max_bytes
+            && let Item::Change(cid) = item
+        {
+            too_large.push(cid);
+            continue;
+        }
+        let add = env.len().saturating_add(usize::from(!cur.is_empty()));
+        if !cur.is_empty() && (cur.len() >= max_count || size.saturating_add(add) > max_bytes) {
+            out.push_back(std::mem::take(&mut cur));
+            size = empty;
+        }
+        size = size.saturating_add(env.len().saturating_add(usize::from(!cur.is_empty())));
+        cur.push((item, env));
+    }
+    if !cur.is_empty() {
+        out.push_back(cur);
+    }
+    (out, too_large)
+}
+
 enum Answer {
     Unreadable,
     Stop(Stop),
@@ -489,20 +548,17 @@ fn stop(cause: String) -> Answer {
     Answer::Stop(Stop(cause))
 }
 
-/// Split a relay URL into its path prefix and its authority (`PROTOCOL.md`
-/// 8.3): the host in lowercase, and the port if it is not the default port
-/// of the scheme.
-pub(crate) fn split_url(url: &str) -> (String, String) {
-    let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
-    let (auth, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+/// The authority of a relay URL that `relay_base` accepted
+/// (`PROTOCOL.md` 8.3): the host in lowercase, and the port if it is not the
+/// default port of the scheme.
+pub(crate) fn authority(url: &str) -> String {
+    let (scheme, auth) = url.split_once("://").unwrap_or(("https", url));
     let auth = auth.to_ascii_lowercase();
     let default = if scheme.eq_ignore_ascii_case("http") {
         ":80"
     } else {
         ":443"
     };
-    let auth = auth
-        .strip_suffix(default)
-        .map_or(auth.clone(), str::to_owned);
-    (path.trim_end_matches('/').to_owned(), auth)
+    auth.strip_suffix(default)
+        .map_or(auth.clone(), str::to_owned)
 }

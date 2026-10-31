@@ -92,7 +92,17 @@ pub fn create_space(
     first: &NewDevice,
     others: &[NewDevice],
 ) -> Result<SpaceSetup, EngineError> {
-    let log: [u8; 16] = rand()?;
+    make_space(rand()?, app_id, first, others)
+}
+
+/// [`create_space`] with a chosen log ID. Tests use it to make a second
+/// genesis record for one log.
+pub(crate) fn make_space(
+    log: [u8; 16],
+    app_id: &str,
+    first: &NewDevice,
+    others: &[NewDevice],
+) -> Result<SpaceSetup, EngineError> {
     let secret: [u8; 16] = rand()?;
     let app_key: [u8; 32] = rand()?;
     let (r_sign_seed, r_seal_seed) = recovery::derive(&secret);

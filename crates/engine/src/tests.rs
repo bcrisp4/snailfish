@@ -1335,20 +1335,159 @@ fn system_time_is_the_wall_clock() {
 }
 
 #[test]
-fn split_url_gives_the_signed_authority() {
+fn authority_is_the_signed_authority() {
     assert_eq!(
-        sync::split_url("https://Sync.Example.net"),
-        (String::new(), "sync.example.net".into())
+        sync::authority("https://Sync.Example.net"),
+        "sync.example.net"
     );
-    assert_eq!(
-        sync::split_url("https://h:443/x/"),
-        ("/x".into(), "h".into())
+    assert_eq!(sync::authority("https://h:443"), "h");
+    assert_eq!(sync::authority("http://h:80"), "h");
+    assert_eq!(sync::authority("http://h:8443"), "h:8443");
+    assert_eq!(sync::authority("https://h:80"), "h:80");
+}
+
+/// The relay routes only `/v1/...` and the signature covers the path as
+/// sent, so a relay URL with a path can never sync. Open refuses it.
+#[test]
+fn relay_url_with_a_path_is_refused() {
+    let (w, a, _) = World::new();
+    for bad in [
+        "https://h/prefix",
+        "https://h/prefix/",
+        "https://h?x=1",
+        "https://u@h",
+        "ftp://h",
+        "h",
+        "https://",
+    ] {
+        let mut sp = w.space();
+        sp.relay_url = bad.into();
+        assert!(
+            matches!(
+                Engine::open(&a.dir, sp, &w.keys[0]),
+                Err(EngineError::Invalid(_))
+            ),
+            "{bad}"
+        );
+    }
+    let mut sp = w.space();
+    sp.relay_url = format!("{URL}/");
+    let mut e = Engine::open(&a.dir, sp, &w.keys[0]).unwrap();
+    let req = e.start_sync().next_request(&mut e).unwrap().unwrap();
+    assert_eq!(req.url, format!("{URL}/v1/info"));
+}
+
+/// `specs/delivery/test.qnt::refusedAtPushTest`, [DLV-9]: a change that no
+/// append body can hold is refused for ever and reported as `degraded`. The
+/// other changes go in batches that fit `max_request_bytes`, so no request
+/// gets 413 (`PROTOCOL.md` 10.4).
+#[test]
+fn append_batches_fit_the_request_limit() {
+    let (mut w, mut a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let mut cfg = relay_config(&w.root);
+    cfg.limits.max_request_bytes = 8_000;
+    w.relay = Relay::open(cfg).unwrap();
+    let small: Vec<Vec<u8>> = (0..6u8).map(|i| a.edit(&ea, &[i; 1_000])).collect();
+    let big = a.edit(&ea, &[9; 7_000]);
+    a.enqueue(&mut ea);
+
+    let mut s = ea.start_sync();
+    let mut appends = 0;
+    while let Some(req) = s.next_request(&mut ea).unwrap() {
+        assert!(req.body.len() <= 8_000, "a body over the limit");
+        appends += usize::from(req.method == "POST");
+        let resp = w.relay.handle(&to_relay(&req));
+        assert_ne!(resp.status, 413);
+        s.handle_response(&mut ea, resp.status, &time(&resp), &resp.body)
+            .unwrap();
+    }
+    assert!(appends >= 2, "the changes need more than one request");
+    assert!(matches!(ea.status(), Status::Degraded { ref cause } if cause == "refused: too_large"));
+    assert_eq!(a.enqueue(&mut ea).refused, vec![big]);
+    let mut on_relay = w.relay_change_ids();
+    on_relay.sort();
+    let mut want = small;
+    want.sort();
+    assert_eq!(on_relay, want);
+}
+
+/// A 413 `too_large` answer is `degraded` (`PROTOCOL.md` 10.3), and a 422
+/// `invalid_record` answer to the create request is `stopped: fork`.
+#[test]
+fn too_large_degrades_and_refused_genesis_stops() {
+    let (w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    let mut s = ea.start_sync();
+    steps(&w, &mut ea, &mut s, 1);
+    let req = s.next_request(&mut ea).unwrap().unwrap();
+    assert_eq!(req.method, "PUT");
+    let body = snailfish_protocol::wire::error_body("invalid_record", "");
+    s.handle_response(&mut ea, 422, &[], &body).unwrap();
+    assert!(matches!(ea.status(), Status::Fork { .. }));
+
+    let (w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    let mut s = ea.start_sync();
+    steps(&w, &mut ea, &mut s, 1);
+    s.next_request(&mut ea).unwrap().unwrap();
+    let body = snailfish_protocol::wire::error_body("too_large", "");
+    s.handle_response(&mut ea, 413, &[], &body).unwrap();
+    assert!(matches!(ea.status(), Status::Degraded { ref cause } if cause == "refused: too_large"));
+}
+
+/// `specs/spacelog/test.qnt::creatorHoldsGenesisTest`, [LOG-9]: the device
+/// that made the space holds its genesis record from the setup. A relay
+/// that answers the create request and then serves another genesis record
+/// for the same log, with the same app and a valid signature, stops sync.
+#[test]
+fn relay_with_another_genesis_record_stops() {
+    let (w, a, _) = World::new();
+    let log = decode_id::<16>(&w.log_id, "l_").unwrap();
+    let other = crate::setup::make_space(
+        log,
+        APP,
+        &NewDevice {
+            keys: new_device_keys().unwrap(),
+            name: "X".into(),
+        },
+        &[],
+    )
+    .unwrap();
+    let genesis = &other.envelopes[0];
+    let env = snailfish_protocol::envelope::Envelope::parse(genesis.as_bytes()).unwrap();
+    let digest = snailfish_protocol::space::check_genesis(&env, &log, None)
+        .unwrap()
+        .digest;
+    let head = snailfish_protocol::wire::Head {
+        position: 1,
+        digest,
+    };
+
+    let mut ea = w.engine(&a);
+    let mut s = ea.start_sync();
+    steps(&w, &mut ea, &mut s, 1);
+    let req = s.next_request(&mut ea).unwrap().unwrap();
+    assert_eq!(req.method, "PUT");
+    s.handle_response(
+        &mut ea,
+        201,
+        &[],
+        &snailfish_protocol::wire::head_body(&head),
+    )
+    .unwrap();
+    let req = s.next_request(&mut ea).unwrap().unwrap();
+    assert!(req.url.contains("/entries?after=0&"));
+    let page =
+        snailfish_protocol::wire::fetch_response(&[(1, genesis.clone())], &head, false).unwrap();
+    s.handle_response(&mut ea, 200, &[], &page).unwrap();
+    assert!(
+        matches!(ea.status(), Status::Fork { ref cause } if cause.contains("genesis")),
+        "{:?}",
+        ea.status()
     );
-    assert_eq!(sync::split_url("http://h:80"), (String::new(), "h".into()));
-    assert_eq!(
-        sync::split_url("http://h:8443/p"),
-        ("/p".into(), "h:8443".into())
-    );
+    assert_eq!(ea.verified_head().unwrap().position, 0);
 }
 
 #[test]

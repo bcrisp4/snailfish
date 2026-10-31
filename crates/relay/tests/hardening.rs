@@ -260,7 +260,52 @@ fn malformed_handle_creates_no_tenant() {
         .unwrap()
         .count();
     assert_eq!(tenants, 1, "only the tenant of the fixture exists");
+    // A user name in use: no tenant files stay behind for a handle that the
+    // directory never names.
+    assert!(matches!(
+        fx.relay.add_user("sam"),
+        Err(snailfish_relay::core::OpenError::UserExists)
+    ));
+    let tenants = std::fs::read_dir(fx.dir.path().join("tenants"))
+        .unwrap()
+        .count();
+    assert_eq!(tenants, 1, "a refused user leaves no tenant directory");
     assert!(fx.relay.add_user("lee").is_ok(), "the name was not used");
+}
+
+/// `PROTOCOL.md` 8.6: a PUT runs steps 1 to 4 before it parses the body.
+/// Without this, a request with no signature, or with a body that differs
+/// from its digest, gets a parse error, and an unauthenticated caller reads
+/// parser detail.
+#[test]
+fn put_checks_the_request_before_the_body() {
+    let fx = Fx::new();
+    let path = fx.space_path(fx.tenant(), fx.log());
+    let unsigned = snailfish_relay::core::Request {
+        method: "PUT".into(),
+        path: path.clone(),
+        query: String::new(),
+        headers: Vec::new(),
+        body: b"not json".to_vec(),
+    };
+    let r = fx.relay.handle(&unsigned);
+    assert_eq!((r.status, error_code(&r).as_str()), (401, "bad_signature"));
+
+    let mut tampered = fx.signed("PUT", &path, "", br#"{"genesis":{}}"#, "A");
+    tampered.body = b"not json".to_vec();
+    let r = fx.relay.handle(&tampered);
+    assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_digest"));
+
+    // A body that is signed and well formed but holds no valid genesis
+    // record reaches the parse.
+    let r = fx
+        .relay
+        .handle(&fx.signed("PUT", &path, "", b"not json", "A"));
+    assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_request"));
+    let r = fx
+        .relay
+        .handle(&fx.signed("PUT", &path, "", br#"{"genesis":{}}"#, "A"));
+    assert_eq!((r.status, error_code(&r).as_str()), (422, "invalid_record"));
 }
 
 /// A failed create of a space leaves no file. Without this, each retry of a

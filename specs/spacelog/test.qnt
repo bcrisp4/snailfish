@@ -44,6 +44,17 @@ module spacelogTest {
       .then(appendId(3))
       .expect(branches.get(0).recs.length() == 3 and happened(EvChangeAppended))
 
+  // [LOG-9] The first device holds the genesis record from the setup, before
+  // any fetch. Its first fetch reads position 2, so the relay cannot give it
+  // another genesis record (crates/engine relay_with_another_genesis_record_stops).
+  run creatorHoldsGenesisTest =
+    init
+      .then(createSpace(1))
+      .expect(dev(1).log.recs.length() == 1 and dev(1).log.recs.nth(0).kind == Genesis
+              and dev(1).status == Running)
+      .then(appendId(1))
+      .then(fetchOne(1, 0)).fail()
+
   // A device with no checkpoint does not fetch.
   run noCheckpointNoFetchTest =
     init

@@ -294,6 +294,7 @@ The `signature-input` header is `sf=` followed by this line. The label is `sf`. 
 | `content-digest` | The value of the `content-digest` header |
 
 - The engine takes the authority from the relay URL. The host app must not follow redirects (DESIGN.md "App integration").
+- The relay URL is `https://` or `http://` and the authority, with no path. The relay serves the routes of section 10 at the root, and the signature covers `@path` as sent, so a proxy that adds or removes a path prefix breaks each signature.
 - The relay uses the authority that the relay operator configures, not the `Host` or `X-Forwarded-Host` header. It does not start without this setting.
 - The engine also sends the authority in `snailfish-authority`. The signature covers the value through `@authority`, so this header only lets the relay report a distinct error (8.6).
 
@@ -347,7 +348,8 @@ The relay checks a signed request in this order. It returns the first error (sec
 
 - The relay keeps each nonce in the tenant file until its `expires` time, so a restart does not allow a replay (T5). It deletes expired nonces.
 - The relay stores a nonce only after the signature verifies, so a party without the key cannot use up nonces.
-- Steps 3 to 5 run before the signature check. Their errors therefore tell an unauthenticated caller only facts that the request itself holds.
+- Steps 3 to 5 run before the signature check. The errors of steps 3 and 4 tell an unauthenticated caller only facts that the request itself holds. Step 5 tells a caller who knows the tenant handle and the log ID whether a device ID is active in the space. The tenant handle has 128 random bits ([STO-10]), so only a party that already holds it can ask.
+- For `PUT /v1/t/{tenant}/s/{log}`, step 5 takes the device key from the genesis record in the body. The relay therefore runs steps 1 to 4 before it parses the body (10.5).
 - A request that fails a check changes no stored state, except the nonce of step 7.
 
 ## 9. Recovery key encoding
@@ -416,16 +418,18 @@ Each error response has an HTTP status and this body:
 
 | Code | HTTP status | Cause | Engine status |
 | --- | --- | --- | --- |
-| `bad_request` | 400 | The body or the query breaks this section | `paused: relay unavailable` |
+| `bad_request` | 400 | The body, the query or the log ID breaks this section, or the relay cannot read the body | `paused: relay unavailable` |
 | `bad_digest` | 400 | `content-digest` differs from the body | `paused: relay unavailable` |
 | `bad_signature` | 401 | A signature header breaks section 8, or the signature does not verify | `paused: relay unavailable` |
 | `expired` | 401 | The request is outside its time window (8.6 step 3) | Correct the clock offset and send again once, then `stopped: clock skew` |
 | `nonce_reused` | 401 | The nonce was used before | `paused: relay unavailable` |
+| `timeout` | 408 | The request did not end within the relay time limit. An append can still commit after this answer. | `paused: relay unavailable` |
 | `unknown_device` | 403 | `keyid` names no active device of the space | `paused: relay unavailable` |
 | `unknown_tenant` | 404 | No tenant has the handle | `paused: relay unavailable` |
 | `unknown_space` | 404 | The tenant has no space with the log ID | `paused: relay unavailable` |
 | `not_found` | 404 | No route has the path | `paused: relay unavailable` |
 | `space_exists` | 409 | `PUT` with another genesis record for an existing log ID | `stopped: fork` |
+| `invalid_record` | 422 | The genesis record of a `PUT` breaks 10.5 | `stopped: fork` |
 | `too_large` | 413 | The body is larger than `max_request_bytes` | `degraded` |
 | `wrong_authority` | 421 | `snailfish-authority` differs from the relay configuration (8.6 step 1) | `paused: relay authority` |
 | `internal` | 500 | A relay failure | `paused: relay unavailable` |
@@ -452,7 +456,9 @@ A response that is not JSON, or JSON without a string `error`, is a fault outsid
 
 Request body: `{"genesis":<envelope>}`.
 
-The relay checks the genesis record: the envelope (section 4), the payload (section 6), the signature by the recovery key of the record, and `log` equal to `{log}`. The request signer must be the device of the record. The relay then creates the space file, with the genesis record at position 1.
+The relay runs 8.6 steps 1 to 4, then parses the body. It checks the genesis record: the envelope (section 4), the payload (section 6), the signature by the recovery key of the record, and `log` equal to `{log}`. The request signer must be the device of the record (8.6 steps 5 to 7). The relay then creates the space file, with the genesis record at position 1.
+
+The device that made the space holds its genesis record from the setup. If position 1 of the relay log has another record hash, the engine stops with `stopped: fork`.
 
 | Result | Status | Body |
 | --- | --- | --- |
@@ -489,6 +495,7 @@ The relay checks each envelope in this order:
 - `head` is the last position and its log digest after the transaction.
 - A known envelope earlier in the same request counts: a second copy in one request is `known`.
 - `bad_base` is transient. Each other refusal is permanent for that envelope ([DLV-9]).
+- The engine splits its envelopes into requests that fit `max_append_envelopes` and `max_request_bytes`. A change whose append body alone is larger than `max_request_bytes` is refused for ever with `too_large`, and the engine does not send it ([DLV-9]).
 
 ### 10.7 `GET /v1/t/{tenant}/s/{log}/entries`
 

@@ -556,6 +556,21 @@ pub(crate) fn setup_genesis(db: &Connection) -> Result<Option<String>, EngineErr
         .optional()?)
 }
 
+/// The record hash of the setup genesis record, if the verified log does
+/// not hold it.
+pub(crate) fn setup_genesis_hash(db: &Connection) -> Result<Option<Hash32>, EngineError> {
+    let h: Option<Vec<u8>> = db
+        .query_row("SELECT record_hash FROM setup WHERE seq = 1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    h.map(|h| {
+        Hash32::try_from(h)
+            .map_err(|_| EngineError::Storage("a stored record hash is not 32 bytes".into()))
+    })
+    .transpose()
+}
+
 /// The setup records after the genesis record.
 pub(crate) fn setup_appends(db: &Connection) -> Result<Vec<(i64, String)>, EngineError> {
     let mut st = db.prepare("SELECT seq, envelope FROM setup WHERE seq > 1 ORDER BY seq")?;

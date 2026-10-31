@@ -95,6 +95,52 @@ async fn body_over_the_limit_is_413_too_large() {
     }
 }
 
+/// A request body that fails, or never ends, before the limit.
+struct BadBody(bool);
+
+impl axum::body::HttpBody for BadBody {
+    type Data = axum::body::Bytes;
+    type Error = std::io::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.0 {
+            std::task::Poll::Ready(Some(Err(std::io::Error::other("reset"))))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+fn post_body(fx: &Fx, body: BadBody) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/v1/t/{}/s/{}/append", fx.tenant(), fx.log()))
+        .body(Body::new(body))
+        .unwrap()
+}
+
+/// A body read error that is not the size limit is `bad_request`. Without
+/// this, a dropped connection reports a size fault.
+#[tokio::test]
+async fn body_read_error_is_400_bad_request() {
+    let fx = Fx::new();
+    let (st, time, body) = call(&fx, post_body(&fx, BadBody(true))).await;
+    assert_eq!((st, time.is_some()), (StatusCode::BAD_REQUEST, true));
+    assert_eq!(wire::parse_error(&body).as_deref(), Some("bad_request"));
+}
+
+/// `PROTOCOL.md` 8.5 and 10.3: a request past the time limit gets a JSON
+/// `timeout` error with `snailfish-time`, not a bare status.
+#[tokio::test(start_paused = true)]
+async fn slow_request_is_408_timeout_with_time() {
+    let fx = Fx::new();
+    let (st, time, body) = call(&fx, post_body(&fx, BadBody(false))).await;
+    assert_eq!((st, time.is_some()), (StatusCode::REQUEST_TIMEOUT, true));
+    assert_eq!(wire::parse_error(&body).as_deref(), Some("timeout"));
+}
+
 /// A signed fetch through the router: the path, query and headers reach the
 /// core as the client sent them.
 #[tokio::test]
