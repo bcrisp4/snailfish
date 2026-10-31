@@ -13,6 +13,7 @@ pub mod keys;
 pub mod pae;
 pub mod records;
 pub mod recovery;
+pub mod repair;
 pub mod request;
 pub mod sig;
 pub mod space;

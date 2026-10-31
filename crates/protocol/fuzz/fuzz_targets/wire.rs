@@ -24,4 +24,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = wire::parse_append_response(data);
     let _ = wire::parse_info(data);
     let _ = wire::parse_error(data);
+    let _ = wire::parse_repair_started(data);
+    let _ = wire::parse_repair_next(data);
+    let _ = wire::parse_repair_finished(data);
 });

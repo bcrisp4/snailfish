@@ -1,10 +1,11 @@
-//! The minimal space-state check of M2 (`PROTOCOL.md` 10.5 and 10.6).
+//! The space-state check of M3 (`PROTOCOL.md` 10.5, 10.6 and 10.9).
 //!
 //! The relay and the engine use the same functions ([LOG-9]). They check the
 //! signature, the strict parse, dense positions, the digest chain, the base
-//! rule ([LOG-6]) and the active devices from the genesis record and the
-//! grants ([LOG-8]). Forks, the base rule for security records ([LOG-7]),
-//! removal and repair come in M3 and M4.
+//! rule ([LOG-6]), the base rule for security records ([LOG-7]) and the
+//! active devices from the genesis record and the grants ([LOG-8]). The
+//! relay also refuses changes during a restore hold ([LOG-14]). Removal
+//! comes in M7.
 //!
 //! The functions do no I/O. The caller gives the log state through
 //! [`SpaceView`], for example from SQLite.
@@ -32,8 +33,11 @@ pub trait SpaceView {
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)>;
     /// The space write level ([VER-9]).
     fn write_level(&self) -> u64;
-    /// The current epoch. M2 has no epoch record, so it is 1.
+    /// The current epoch. M3 has no epoch record, so it is 1.
     fn epoch(&self) -> u64;
+    /// The position of the last security record ([LOG-7]). 0 for an empty
+    /// log.
+    fn last_security(&self) -> u64;
 }
 
 /// Who checks the record.
@@ -45,9 +49,12 @@ pub enum Mode {
         signer: Hash32,
         /// `max_change_bytes` of `PROTOCOL.md` 10.4.
         max_change_bytes: usize,
+        /// The space is on restore hold ([LOG-14]).
+        hold: bool,
     },
-    /// The engine checks a record that it fetched. A known `change_id` is a
-    /// fault of the relay, because the relay never stores it twice
+    /// The engine checks a record that it fetched, and the relay checks a
+    /// repair entry (`PROTOCOL.md` 10.9). A known `change_id` is a fault of
+    /// the relay or of the repair, because the log never holds it twice
     /// ([WIR-6]).
     Verify,
 }
@@ -65,6 +72,12 @@ pub enum Refusal {
     NotActive,
     /// `bad_base`. Transient ([DLV-9]).
     BadBase,
+    /// `stale_base`: a security record with a security record after its
+    /// base ([LOG-7]). Transient.
+    StaleBase,
+    /// `on_hold`: a record that is not a security record during a restore
+    /// hold ([LOG-14]). Transient.
+    OnHold,
     /// `unsupported`.
     Unsupported,
     /// `wrong_epoch`.
@@ -83,6 +96,8 @@ impl Refusal {
             Self::NotAuthor => "not_author",
             Self::NotActive => "not_active",
             Self::BadBase => "bad_base",
+            Self::StaleBase => "stale_base",
+            Self::OnHold => "on_hold",
             Self::Unsupported => "unsupported",
             Self::WrongEpoch => "wrong_epoch",
             Self::DuplicateChange => "duplicate_change",
@@ -164,8 +179,20 @@ pub fn base_in_range(base: u64, head: u64) -> bool {
     base >= 1 && base <= head
 }
 
+/// True if the base of a record is valid against the last security record
+/// ([LOG-7]): a security record needs its base at or after the last
+/// security record. Changes after the base do not matter.
+#[must_use]
+pub fn security_base_ok(security: bool, base: u64, last_security: u64) -> bool {
+    !security || base >= last_security
+}
+
 /// Check one record for the next position (`PROTOCOL.md` 10.6, in that
 /// order). The genesis record has its own check, [`check_genesis`].
+///
+/// [WIR-2]: the parse before the signature check only finds the author.
+/// The function changes no state. The caller applies an [`Accepted`] only
+/// after it returns, so no state changes before the signature verifies.
 #[must_use]
 pub fn check_append(view: &impl SpaceView, env: &Envelope, mode: Mode) -> Verdict {
     let record = match records::parse_payload(&env.payload_type, &env.payload) {
@@ -187,6 +214,11 @@ pub fn check_append(view: &impl SpaceView, env: &Envelope, mode: Mode) -> Verdic
                 }
             }
         }
+    }
+    if let Mode::Relay { hold: true, .. } = mode
+        && !record.is_security()
+    {
+        return Verdict::Refused(Refusal::OnHold);
     }
     match judge(view, env, record, record_hash, mode) {
         Ok(a) => Verdict::Store(Box::new(a)),
@@ -235,6 +267,13 @@ fn judge(
         || view.digest_at(record.base.position) != Some(record.base.digest)
     {
         return Err(Refusal::BadBase);
+    }
+    if !security_base_ok(
+        record.is_security(),
+        record.base.position,
+        view.last_security(),
+    ) {
+        return Err(Refusal::StaleBase);
     }
     if !M2_TYPES.contains(&env.payload_type.as_str()) {
         return Err(Refusal::Unsupported);
@@ -346,6 +385,8 @@ pub struct MemorySpace {
     pub changes: std::collections::BTreeMap<[u8; 16], (u64, Hash32)>,
     /// The write level.
     pub level: u64,
+    /// The position of the last security record.
+    pub last_security: u64,
 }
 
 impl MemorySpace {
@@ -375,6 +416,9 @@ impl MemorySpace {
         if let Some(level) = genesis_level(&a.record) {
             self.level = level;
         }
+        if a.record.is_security() {
+            self.last_security = a.position;
+        }
     }
 }
 
@@ -403,6 +447,82 @@ impl SpaceView for MemorySpace {
     fn epoch(&self) -> u64 {
         1
     }
+    fn last_security(&self) -> u64 {
+        self.last_security
+    }
+}
+
+/// A [`SpaceView`] of a log and the accepted records after its head. The
+/// relay checks repair entries against the log and the entries before them
+/// (`PROTOCOL.md` 10.9), with no write to the log.
+pub struct Overlay<'a, V: SpaceView> {
+    inner: &'a V,
+    added: Vec<Accepted>,
+}
+
+impl<'a, V: SpaceView> Overlay<'a, V> {
+    /// An overlay with no added records.
+    pub fn new(inner: &'a V) -> Self {
+        Self {
+            inner,
+            added: Vec::new(),
+        }
+    }
+
+    /// Add an accepted record at the next position.
+    pub fn apply(&mut self, a: Accepted) {
+        self.added.push(a);
+    }
+
+    /// The added records, in position order.
+    #[must_use]
+    pub fn into_added(self) -> Vec<Accepted> {
+        self.added
+    }
+}
+
+impl<V: SpaceView> SpaceView for Overlay<'_, V> {
+    fn log_id(&self) -> [u8; 16] {
+        self.inner.log_id()
+    }
+    fn head(&self) -> u64 {
+        self.added
+            .last()
+            .map_or_else(|| self.inner.head(), |a| a.position)
+    }
+    fn digest_at(&self, position: u64) -> Option<Hash32> {
+        self.added
+            .iter()
+            .find(|a| a.position == position)
+            .map(|a| a.digest)
+            .or_else(|| self.inner.digest_at(position))
+    }
+    fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.added
+            .iter()
+            .find_map(|a| a.new_device.filter(|(d, _)| d == id).map(|(_, k)| k))
+            .or_else(|| self.inner.device_key(id))
+    }
+    fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
+        self.added
+            .iter()
+            .find(|a| a.record.change_id() == Some(change_id))
+            .map(|a| (a.position, a.record_hash))
+            .or_else(|| self.inner.change(change_id))
+    }
+    fn write_level(&self) -> u64 {
+        self.inner.write_level()
+    }
+    fn epoch(&self) -> u64 {
+        self.inner.epoch()
+    }
+    fn last_security(&self) -> u64 {
+        self.added
+            .iter()
+            .rev()
+            .find(|a| a.record.is_security())
+            .map_or_else(|| self.inner.last_security(), |a| a.position)
+    }
 }
 
 #[cfg(test)]
@@ -426,6 +546,8 @@ mod tests {
             Refusal::NotAuthor,
             Refusal::NotActive,
             Refusal::BadBase,
+            Refusal::StaleBase,
+            Refusal::OnHold,
             Refusal::Unsupported,
             Refusal::WrongEpoch,
             Refusal::DuplicateChange,
@@ -439,6 +561,8 @@ mod tests {
                 "not_author",
                 "not_active",
                 "bad_base",
+                "stale_base",
+                "on_hold",
                 "unsupported",
                 "wrong_epoch",
                 "duplicate_change"
@@ -464,6 +588,14 @@ mod tests {
         fn base_range(base in 0u64..1000, head in 0u64..1000) {
             prop_assert_eq!(base_in_range(base, head), (1..=head).contains(&base));
         }
+
+        /// [LOG-7]: a change passes with any base. A security record passes
+        /// only if no security record lies after its base.
+        #[test]
+        fn security_base(security: bool, base in 0u64..1000, last in 0u64..1000) {
+            let after_base = last > base;
+            prop_assert_eq!(security_base_ok(security, base, last), !(security && after_base));
+        }
     }
 }
 
@@ -483,6 +615,17 @@ mod proofs {
         } else {
             assert!(base == 0 || base > head);
         }
+    }
+
+    /// [LOG-7]: for every 64-bit base and last security position, a
+    /// security record passes only with its base at or after the last
+    /// security record, and a change always passes.
+    #[kani::proof]
+    fn security_base_rule() {
+        let base: u64 = kani::any();
+        let last: u64 = kani::any();
+        assert!(security_base_ok(false, base, last));
+        assert!(security_base_ok(true, base, last) == (base >= last));
     }
 
     /// [WIR-6]: a stored `change_id` never gives a new append, and the

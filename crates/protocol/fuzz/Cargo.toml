@@ -57,3 +57,17 @@ path = "fuzz_targets/wire.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "repair"
+path = "fuzz_targets/repair.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "status"
+path = "fuzz_targets/status.rs"
+test = false
+doc = false
+bench = false

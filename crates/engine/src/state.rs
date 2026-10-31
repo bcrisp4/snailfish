@@ -370,7 +370,25 @@ impl SpaceView for DbSpace<'_> {
     fn epoch(&self) -> u64 {
         1
     }
+    fn last_security(&self) -> u64 {
+        // Fail closed: on a read error every security record is stale, so
+        // the fetch stops instead of accepting a record that [LOG-7] refuses.
+        self.tx
+            .query_row(
+                &format!("SELECT COALESCE(MAX(position), 0) FROM log WHERE {NOT_SECURITY}"),
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+            .and_then(|p| u64::try_from(p).ok())
+            .unwrap_or(u64::MAX)
+    }
 }
+
+/// An SQL condition: the row is a security record ([VER-5], [LOG-7]).
+const NOT_SECURITY: &str = "payload_type NOT LIKE 'snailfish.change.%' \
+     AND payload_type NOT LIKE 'snailfish.snapshot.%' \
+     AND payload_type NOT LIKE 'snailfish.accept.%'";
 
 fn digest_at(
     db: &Connection,

@@ -388,6 +388,9 @@ seal_seed = HKDF-Expand(prk, "snailfish.recovery.seal.v1", 32)
 
 This section gives the sync surface routes of M3. Later milestones add routes under the same prefix ([VER-12]). Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
 
+- The relay refuses a request body, or an object inside it, with a field that this section does not name (`bad_request`). The relay is upgraded before the engines ([VER-11]), so a newer engine never meets an older relay. The envelopes inside a body follow the looser rule of section 4.
+- The engine ignores unknown fields in a response body ([VER-13]).
+
 ### 10.1 Routes
 
 | Method | Path | Signed | Result |

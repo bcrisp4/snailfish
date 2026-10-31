@@ -58,6 +58,7 @@ fn relay(signer: [u8; 32]) -> Mode {
     Mode::Relay {
         signer,
         max_change_bytes: 65536,
+        hold: false,
     }
 }
 
@@ -148,11 +149,12 @@ fn refusals_follow_the_protocol_order() {
         check_append(&s, &env(&v, 4), relay(b)),
         Verdict::Refused(Refusal::Unsupported)
     );
-    // A grant of B again.
-    assert!(matches!(
+    // A grant of B again, with its original base 1 before the grant at 2
+    // ([LOG-7] comes before the active-device check of the grant).
+    assert_eq!(
         check_append(&s, &env(&v, 2), relay(a)),
-        Verdict::Refused(Refusal::InvalidRecord(_))
-    ));
+        Verdict::Refused(Refusal::StaleBase)
+    );
     // The genesis record after position 1 has base 0.
     assert!(matches!(
         check_append(&s, &env(&v, 1), relay(a)),
@@ -162,6 +164,7 @@ fn refusals_follow_the_protocol_order() {
     let small = Mode::Relay {
         signer: a,
         max_change_bytes: 10,
+        hold: false,
     };
     let mut s2 = s.clone();
     s2.changes.clear();
@@ -374,10 +377,69 @@ fn change_size_limit_is_inclusive() {
     let at = |max| Mode::Relay {
         signer: a,
         max_change_bytes: max,
+        hold: false,
     };
     stored(check_append(&space, &env, at(env.payload.len())));
     assert_eq!(
         check_append(&space, &env, at(env.payload.len() - 1)),
         Verdict::Refused(Refusal::TooLarge)
     );
+}
+
+/// [LOG-7] `specs/spacelog/test.qnt::concurrentGrantsTest`: the log holds the
+/// genesis record (1), the grant to B (2) and a change by A (3). A grant with
+/// its base before the grant at 2 is `stale_base`, for the relay and for the
+/// engine. A base at 2 or 3 passes the rule: the change at 3 does not matter,
+/// and the grant then fails only because B is active. Without the rule, two
+/// devices could append two security records on the same space state.
+#[test]
+fn security_base_rule_refuses_a_grant_before_the_last_grant() {
+    let v = vectors();
+    let s = setup(&v);
+    let (a, _) = device(&v, "A");
+    let stale = grant_b(&v, 1, (1, digest(&v, 1)));
+    assert_eq!(
+        check_append(&s, &stale, relay(a)),
+        Verdict::Refused(Refusal::StaleBase)
+    );
+    assert_eq!(
+        check_append(&s, &stale, Mode::Verify),
+        Verdict::Refused(Refusal::StaleBase)
+    );
+    for n in [2, 3] {
+        let g = grant_b(&v, 1, (n, digest(&v, usize::try_from(n).unwrap())));
+        match check_append(&s, &g, relay(a)) {
+            Verdict::Refused(Refusal::InvalidRecord(why)) => {
+                assert!(why.contains("already active"), "{n}");
+            }
+            other => panic!("base {n}: expected invalid_record, got {other:?}"),
+        }
+    }
+}
+
+/// [LOG-14]: during a restore hold, the relay refuses a new change with
+/// `on_hold`, still answers `known` for a stored change, and checks a
+/// security record as usual. The engine (`Mode::Verify`) has no hold.
+#[test]
+fn hold_refuses_changes_but_not_security_records() {
+    let v = vectors();
+    let log = decode_id::<16>(v["log"]["log_id"].as_str().unwrap(), "l_").unwrap();
+    let (a, _) = device(&v, "A");
+    let hold = Mode::Relay {
+        signer: a,
+        max_change_bytes: 65536,
+        hold: true,
+    };
+    let mut g = MemorySpace::new(log);
+    g.apply(&check_genesis(&env(&v, 1), &log, Some(&a)).unwrap());
+    // The grant to B at position 2 is a security record.
+    let acc = stored(check_append(&g, &env(&v, 2), hold));
+    g.apply(&acc);
+    // The change by A at position 3 is not.
+    assert_eq!(
+        check_append(&g, &env(&v, 3), hold),
+        Verdict::Refused(Refusal::OnHold)
+    );
+    let s = setup(&v);
+    assert_eq!(check_append(&s, &env(&v, 3), hold), Verdict::Known(3));
 }

@@ -664,6 +664,7 @@ impl Relay {
                 let mode = Mode::Relay {
                     signer: v.keyid,
                     max_change_bytes,
+                    hold: false,
                 };
                 let verdict = check_append(&view, &raw.envelope, mode);
                 view.take_error()?;
@@ -711,7 +712,7 @@ impl Relay {
         }
         let last = rows.last().map_or(after, |(p, _)| *p);
         let has_more = last < head.position;
-        let body = wire::fetch_response(&rows, &head, has_more).map_err(|_| internal())?;
+        let body = wire::fetch_response(&rows, &head, has_more, false).map_err(|_| internal())?;
         Ok((200, body))
     }
 }
@@ -900,5 +901,24 @@ impl SpaceView for SqlView<'_> {
 
     fn epoch(&self) -> u64 {
         1
+    }
+
+    fn last_security(&self) -> u64 {
+        // On a read error the request fails through `take_error`.
+        self.query(
+            self.conn
+                .query_row(
+                    "SELECT COALESCE(MAX(position), 0) FROM entries
+                     WHERE payload_type NOT LIKE 'snailfish.change.%'
+                       AND payload_type NOT LIKE 'snailfish.snapshot.%'
+                       AND payload_type NOT LIKE 'snailfish.accept.%'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(StoreError::from)
+                .and_then(from_i64)
+                .map(Some),
+        )
+        .unwrap_or(u64::MAX)
     }
 }

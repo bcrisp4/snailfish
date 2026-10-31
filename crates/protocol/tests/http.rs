@@ -196,6 +196,7 @@ fn append_cases_give_the_go_results() {
                     Mode::Relay {
                         signer,
                         max_change_bytes: max_change,
+                        hold: false,
                     },
                 ) {
                     Verdict::Store(a) => {

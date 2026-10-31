@@ -809,6 +809,7 @@ fn shorter_relay_log_stops_and_proxy_page_pauses() {
             digest: [0; 32],
         },
         false,
+        false,
     )
     .unwrap();
     s.handle_response(&mut ea, 200, &[], &empty).unwrap();
@@ -856,6 +857,7 @@ fn empty_pages_with_has_more_end_the_exchange() {
             digest: head.digest,
         },
         true,
+        false,
     )
     .unwrap();
     let mut fetches: u32 = 0;
@@ -991,7 +993,8 @@ fn relay_head_with_another_digest_stops() {
                 digest,
             },
             false,
-        )
+        false,
+    )
         .unwrap();
         let mut s = ea.start_sync();
         steps(&w, &mut ea, &mut s, 1);
@@ -1196,6 +1199,7 @@ fn fetched_duplicate_change_id_stops() {
             position: head.position + 1,
             digest,
         },
+        false,
         false,
     )
     .unwrap();
@@ -1522,7 +1526,7 @@ fn relay_with_another_genesis_record_stops() {
     let req = s.next_request(&mut ea).unwrap().unwrap();
     assert!(req.url.contains("/entries?after=0&"));
     let page =
-        snailfish_protocol::wire::fetch_response(&[(1, genesis.clone())], &head, false).unwrap();
+        snailfish_protocol::wire::fetch_response(&[(1, genesis.clone())], &head, false, false).unwrap();
     s.handle_response(&mut ea, 200, &[], &page).unwrap();
     assert!(
         matches!(ea.status(), Status::Fork { ref cause } if cause.contains("genesis")),

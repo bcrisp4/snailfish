@@ -1,13 +1,15 @@
 //! The JSON bodies of the HTTP API (`PROTOCOL.md` section 10).
 //!
-//! The bodies are unsigned. A reader ignores unknown fields ([VER-13]). Each
+//! The bodies are unsigned. A reader of a response ignores unknown fields
+//! ([VER-13]). A reader of a request refuses them (`PROTOCOL.md` section
+//! 10). Each
 //! envelope inside a body goes through the strict envelope reader of
 //! section 4, so a body cannot carry an envelope that the log refuses.
 
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
-use crate::encoding::{Hash32, decode_b64_strict, encode_b64};
+use crate::encoding::{Hash32, decode_b64_strict, decode_id, encode_b64, encode_id};
 use crate::envelope::Envelope;
 
 /// The limits of `GET /v1/info` (`PROTOCOL.md` 10.4).
@@ -86,12 +88,14 @@ fn object(body: &[u8]) -> Result<Map<String, Value>, WireError> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AppendBody<'a> {
     #[serde(borrow)]
     envelopes: Vec<&'a RawValue>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GenesisBody<'a> {
     #[serde(borrow)]
     genesis: &'a RawValue,
@@ -181,6 +185,21 @@ pub fn append_response(results: &[AppendResult], head: &Head) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Refuse an object of a request with a field outside `keys`.
+fn only(v: Option<&Value>, what: &str, keys: &[&str]) -> Result<(), WireError> {
+    match v.and_then(Value::as_object) {
+        Some(m) if m.keys().all(|k| keys.contains(&k.as_str())) => Ok(()),
+        Some(_) => Err(bad(format!("{what} has an unknown field"))),
+        None => Err(bad(format!("{what} is not an object"))),
+    }
+}
+
+/// [`read_head`] for a request: no unknown field.
+fn read_head_strict(v: Option<&Value>, what: &str) -> Result<Head, WireError> {
+    only(v, what, &["position", "digest"])?;
+    read_head(v)
+}
+
 fn read_head(v: Option<&Value>) -> Result<Head, WireError> {
     let v = v.ok_or_else(|| bad("head is missing"))?;
     let position = v
@@ -261,7 +280,7 @@ pub struct Stub {
 pub enum FetchEntry {
     /// The full envelope.
     Envelope(RawEnvelope),
-    /// A stub. The M2 relay sends none.
+    /// A stub. The M3 relay sends none.
     Stub(Stub),
 }
 
@@ -274,6 +293,8 @@ pub struct Fetch {
     pub head: Head,
     /// More entries follow.
     pub has_more: bool,
+    /// The space is on restore hold ([LOG-14]).
+    pub hold: bool,
 }
 
 /// The body of a fetch response. Each envelope is the stored JSON text.
@@ -285,20 +306,27 @@ pub fn fetch_response(
     entries: &[(u64, String)],
     head: &Head,
     has_more: bool,
+    hold: bool,
 ) -> Result<Vec<u8>, WireError> {
-    let mut parts = Vec::with_capacity(entries.len());
-    for (pos, env) in entries {
-        // The stored text came from a parsed envelope, so it is JSON. Check
-        // it, so that a damaged row cannot break the response syntax.
-        serde_json::from_str::<&RawValue>(env).map_err(|e| bad(e.to_string()))?;
-        parts.push(format!("{{\"position\":{pos},\"envelope\":{env}}}"));
-    }
     let out = format!(
-        "{{\"entries\":[{}],\"head\":{},\"has_more\":{has_more}}}",
-        parts.join(","),
+        "{{\"entries\":[{}],\"head\":{},\"has_more\":{has_more},\"hold\":{hold}}}",
+        entry_list(entries)?,
         head_json(head)
     );
     Ok(out.into_bytes())
+}
+
+/// The JSON text of a list of envelope entries (`PROTOCOL.md` 10.7 and
+/// 10.9), without the brackets.
+fn entry_list(entries: &[(u64, String)]) -> Result<String, WireError> {
+    let mut parts = Vec::with_capacity(entries.len());
+    for (pos, env) in entries {
+        // The text came from a parsed envelope, so it is JSON. Check it, so
+        // that a damaged row cannot break the body syntax.
+        serde_json::from_str::<&RawValue>(env).map_err(|e| bad(e.to_string()))?;
+        parts.push(format!("{{\"position\":{pos},\"envelope\":{env}}}"));
+    }
+    Ok(parts.join(","))
 }
 
 #[derive(serde::Deserialize)]
@@ -307,6 +335,8 @@ struct FetchBody<'a> {
     entries: Vec<FetchItem<'a>>,
     head: Value,
     has_more: bool,
+    #[serde(default)]
+    hold: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -365,7 +395,304 @@ pub fn parse_fetch(body: &[u8]) -> Result<Fetch, WireError> {
         entries,
         head: read_head(Some(&parsed.head))?,
         has_more: parsed.has_more,
+        hold: parsed.hold,
     })
+}
+
+/// A status report (`PROTOCOL.md` 10.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusReport {
+    /// The verified head of the device.
+    pub tip: Head,
+    /// The engine state file is new ([LOG-14]).
+    pub fresh: bool,
+}
+
+/// The body of a status report.
+#[must_use]
+pub fn status_body(r: &StatusReport) -> Vec<u8> {
+    json!({"tip": head_json(&r.tip), "fresh": r.fresh})
+        .to_string()
+        .into_bytes()
+}
+
+/// Parse a status report body.
+///
+/// # Errors
+///
+/// Refuses a body without a position object `tip` and a boolean `fresh`,
+/// and a body with an unknown field.
+pub fn parse_status(body: &[u8]) -> Result<StatusReport, WireError> {
+    let m = object(body)?;
+    only(
+        Some(&Value::Object(m.clone())),
+        "the body",
+        &["tip", "fresh"],
+    )?;
+    let tip = read_head_strict(m.get("tip"), "tip")?;
+    let fresh = m
+        .get("fresh")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| bad("fresh is not a boolean"))?;
+    Ok(StatusReport { tip, fresh })
+}
+
+/// The body of a status report response.
+#[must_use]
+pub fn status_response(hold: bool) -> Vec<u8> {
+    json!({"hold": hold}).to_string().into_bytes()
+}
+
+/// Parse a status report response.
+///
+/// # Errors
+///
+/// Refuses a body without a boolean `hold`.
+pub fn parse_status_response(body: &[u8]) -> Result<bool, WireError> {
+    object(body)?
+        .get("hold")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| bad("hold is not a boolean"))
+}
+
+/// One entry of a repair request (`PROTOCOL.md` 10.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairItem {
+    /// An envelope in the form of section 4.
+    Envelope(RawEnvelope),
+    /// A stub.
+    Stub(Stub),
+    /// An envelope that breaks section 4. It fails the chain check, not the
+    /// body parse.
+    Invalid(String),
+}
+
+/// A repair start body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairStart {
+    /// The relay head that the device saw.
+    pub base: Head,
+    /// The first chunk: position and entry.
+    pub entries: Vec<(u64, RepairItem)>,
+}
+
+/// A repair chunk body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairChunk {
+    /// The session ID.
+    pub session: [u8; 16],
+    /// The entries.
+    pub entries: Vec<(u64, RepairItem)>,
+}
+
+/// A repair finish body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairFinish {
+    /// The session ID.
+    pub session: [u8; 16],
+    /// The verified head of the device ([LOG-10]).
+    pub tip: Head,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartBody<'a> {
+    base: Value,
+    #[serde(borrow)]
+    entries: Vec<RequestItem<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChunkBody<'a> {
+    session: Value,
+    #[serde(borrow)]
+    entries: Vec<RequestItem<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestItem<'a> {
+    position: u64,
+    #[serde(borrow, default)]
+    envelope: Option<&'a RawValue>,
+    #[serde(default)]
+    stub: Option<Value>,
+}
+
+fn session_of(v: Option<&Value>) -> Result<[u8; 16], WireError> {
+    v.and_then(Value::as_str)
+        .and_then(|s| decode_id::<16>(s, "").ok())
+        .ok_or_else(|| bad("session is not 32 lowercase hex digits"))
+}
+
+fn repair_entries(
+    items: Vec<RequestItem<'_>>,
+    max: u64,
+) -> Result<Vec<(u64, RepairItem)>, WireError> {
+    let n = items.len() as u64;
+    if n == 0 || n > max {
+        return Err(bad(format!(
+            "repair body: entries must hold 1 to {max} items"
+        )));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let entry = match (item.envelope, item.stub) {
+            (Some(raw), None) => match raw_envelope(raw) {
+                Ok(r) => RepairItem::Envelope(r),
+                Err(e) => RepairItem::Invalid(e),
+            },
+            (None, Some(s)) => {
+                only(Some(&s), "stub", &["type", "change_id", "hash"])?;
+                RepairItem::Stub(stub(&s)?)
+            }
+            _ => return Err(bad("an entry must hold one of envelope and stub")),
+        };
+        out.push((item.position, entry));
+    }
+    Ok(out)
+}
+
+/// Parse a repair start body.
+///
+/// # Errors
+///
+/// Refuses a body without a position object `base` and 1 to `max` entries
+/// in the form of 10.7, and a body with an unknown field. An envelope that
+/// breaks section 4 is an [`RepairItem::Invalid`] entry, not an error.
+pub fn parse_repair_start(body: &[u8], max: u64) -> Result<RepairStart, WireError> {
+    let parsed: StartBody<'_> =
+        serde_json::from_slice(body).map_err(|e| bad(format!("repair body: {e}")))?;
+    let base = read_head_strict(Some(&parsed.base), "base")?;
+    let entries = repair_entries(parsed.entries, max)?;
+    Ok(RepairStart { base, entries })
+}
+
+/// Parse a repair chunk body, as [`parse_repair_start`].
+///
+/// # Errors
+///
+/// Refuses a body without a `session` of 32 lowercase hex digits and 1 to
+/// `max` entries.
+pub fn parse_repair_chunk(body: &[u8], max: u64) -> Result<RepairChunk, WireError> {
+    let parsed: ChunkBody<'_> =
+        serde_json::from_slice(body).map_err(|e| bad(format!("repair body: {e}")))?;
+    let session = session_of(Some(&parsed.session))?;
+    let entries = repair_entries(parsed.entries, max)?;
+    Ok(RepairChunk { session, entries })
+}
+
+/// Parse a repair finish body.
+///
+/// # Errors
+///
+/// Refuses a body without a `session` and a position object `tip`.
+pub fn parse_repair_finish(body: &[u8]) -> Result<RepairFinish, WireError> {
+    let m = object(body)?;
+    only(
+        Some(&Value::Object(m.clone())),
+        "the body",
+        &["session", "tip"],
+    )?;
+    Ok(RepairFinish {
+        session: session_of(m.get("session"))?,
+        tip: read_head_strict(m.get("tip"), "tip")?,
+    })
+}
+
+/// The body of a repair start. Each envelope is its JSON text.
+///
+/// # Errors
+///
+/// Refuses an envelope text that is not JSON.
+pub fn repair_start_body(base: &Head, entries: &[(u64, String)]) -> Result<Vec<u8>, WireError> {
+    Ok(format!(
+        "{{\"base\":{},\"entries\":[{}]}}",
+        head_json(base),
+        entry_list(entries)?
+    )
+    .into_bytes())
+}
+
+/// The body of a repair chunk.
+///
+/// # Errors
+///
+/// Refuses an envelope text that is not JSON.
+pub fn repair_chunk_body(
+    session: &[u8; 16],
+    entries: &[(u64, String)],
+) -> Result<Vec<u8>, WireError> {
+    Ok(format!(
+        "{{\"session\":\"{}\",\"entries\":[{}]}}",
+        encode_id("", session),
+        entry_list(entries)?
+    )
+    .into_bytes())
+}
+
+/// The body of a repair finish.
+#[must_use]
+pub fn repair_finish_body(f: &RepairFinish) -> Vec<u8> {
+    json!({"session": encode_id("", &f.session), "tip": head_json(&f.tip)})
+        .to_string()
+        .into_bytes()
+}
+
+/// The body of a start response: the session and the next position.
+#[must_use]
+pub fn repair_started_body(session: &[u8; 16], next: u64) -> Vec<u8> {
+    json!({"session": encode_id("", session), "next": next})
+        .to_string()
+        .into_bytes()
+}
+
+/// Parse a start response.
+///
+/// # Errors
+///
+/// Refuses a body without a `session` and an integer `next`.
+pub fn parse_repair_started(body: &[u8]) -> Result<([u8; 16], u64), WireError> {
+    let m = object(body)?;
+    let next = m
+        .get("next")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| bad("next is not an integer"))?;
+    Ok((session_of(m.get("session"))?, next))
+}
+
+/// The body of a chunk response.
+#[must_use]
+pub fn repair_next_body(next: u64) -> Vec<u8> {
+    json!({"next": next}).to_string().into_bytes()
+}
+
+/// Parse a chunk response.
+///
+/// # Errors
+///
+/// Refuses a body without an integer `next`.
+pub fn parse_repair_next(body: &[u8]) -> Result<u64, WireError> {
+    object(body)?
+        .get("next")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| bad("next is not an integer"))
+}
+
+/// The body of a finish response.
+#[must_use]
+pub fn repair_finished_body(head: &Head) -> Vec<u8> {
+    json!({"head": head_json(head)}).to_string().into_bytes()
+}
+
+/// Parse a finish response.
+///
+/// # Errors
+///
+/// Refuses a body without a position object `head`.
+pub fn parse_repair_finished(body: &[u8]) -> Result<Head, WireError> {
+    read_head(object(body)?.get("head"))
 }
 
 /// The body of `GET /v1/info` (`PROTOCOL.md` 10.4).
@@ -478,7 +805,7 @@ mod tests {
     fn append_items_keep_the_exact_text_and_refuse_one_bad_envelope() {
         let e = env_json();
         let spaced = e.replace(',', " , ");
-        let body = format!(r#"{{"envelopes":[{e},{spaced},{{"payloadType":1}}],"future":true}}"#);
+        let body = format!(r#"{{"envelopes":[{e},{spaced},{{"payloadType":1}}]}}"#);
         let items = parse_append(body.as_bytes(), 8).unwrap();
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].as_ref().unwrap().json, e);
@@ -493,6 +820,9 @@ mod tests {
         assert!(parse_append(&three, 2).is_err());
         assert_eq!(parse_append(&three, 3).unwrap().len(), 3);
         assert!(parse_append(b"[]", 8).is_err());
+        // A request body refuses an unknown field (section 10).
+        let future = format!(r#"{{"envelopes":[{e}],"future":true}}"#);
+        assert!(parse_append(future.as_bytes(), 8).is_err());
     }
 
     #[test]
@@ -519,13 +849,16 @@ mod tests {
             position: 2,
             digest: [1; 32],
         };
-        let body = fetch_response(&[(1, e.clone()), (2, e.clone())], &h, true).unwrap();
+        let body = fetch_response(&[(1, e.clone()), (2, e.clone())], &h, true, true).unwrap();
         let f = parse_fetch(&body).unwrap();
         assert_eq!(f.head, h);
         assert!(f.has_more);
+        assert!(f.hold);
+        let no_hold = fetch_response(&[], &h, false, false).unwrap();
+        assert!(!parse_fetch(&no_hold).unwrap().hold);
         assert_eq!(f.entries.len(), 2);
         assert!(matches!(&f.entries[1], (2, FetchEntry::Envelope(r)) if r.json == e));
-        assert!(fetch_response(&[(1, "{".into())], &h, false).is_err());
+        assert!(fetch_response(&[(1, "{".into())], &h, false, false).is_err());
 
         let stub = format!(
             r#"{{"entries":[{{"position":1,"stub":{{"type":"snailfish.change.v1","change_id":"c_00","hash":"{}"}}}}],"head":{{"position":1,"digest":"{}"}},"has_more":false}}"#,
@@ -533,6 +866,8 @@ mod tests {
             encode_b64(&[1; 32])
         );
         let f = parse_fetch(stub.as_bytes()).unwrap();
+        // A reader treats a missing `hold` as false (10.7).
+        assert!(!f.hold);
         assert!(
             matches!(&f.entries[0].1, FetchEntry::Stub(s) if s.hash == [2; 32] && s.change_id.as_deref() == Some("c_00"))
         );
@@ -568,10 +903,112 @@ mod tests {
         assert_eq!(parse_head_body(&head_body(&h)).unwrap(), h);
     }
 
+    #[test]
+    fn status_round_trip_and_refusals() {
+        let r = StatusReport {
+            tip: Head {
+                position: 0,
+                digest: [3; 32],
+            },
+            fresh: true,
+        };
+        assert_eq!(parse_status(&status_body(&r)).unwrap(), r);
+        assert!(parse_status(br#"{"tip":{"position":1,"digest":"AA=="},"fresh":true}"#).is_err());
+        let d = encode_b64(&[3; 32]);
+        let no_fresh = format!(r#"{{"tip":{{"position":1,"digest":"{d}"}}}}"#);
+        assert!(parse_status(no_fresh.as_bytes()).is_err());
+        let str_fresh = format!(r#"{{"tip":{{"position":1,"digest":"{d}"}},"fresh":"true"}}"#);
+        assert!(parse_status(str_fresh.as_bytes()).is_err());
+        let neg = format!(r#"{{"tip":{{"position":-1,"digest":"{d}"}},"fresh":false}}"#);
+        assert!(parse_status(neg.as_bytes()).is_err());
+        assert_eq!(parse_status_response(&status_response(true)), Ok(true));
+        assert_eq!(parse_status_response(&status_response(false)), Ok(false));
+        assert!(parse_status_response(br#"{"hold":1}"#).is_err());
+    }
+
+    #[test]
+    fn repair_bodies_round_trip() {
+        let e = env_json();
+        let head = Head {
+            position: 4,
+            digest: [9; 32],
+        };
+        let start = repair_start_body(&head, &[(5, e.clone()), (6, e.clone())]).unwrap();
+        let p = parse_repair_start(&start, 2).unwrap();
+        assert_eq!(p.base, head);
+        assert_eq!(p.entries.len(), 2);
+        assert!(matches!(&p.entries[1], (6, RepairItem::Envelope(r)) if r.json == e));
+        assert!(parse_repair_start(&start, 1).is_err());
+        assert!(
+            parse_repair_chunk(&start, 2).is_err(),
+            "a start body has no session"
+        );
+
+        let sid = [0xab; 16];
+        let chunk = repair_chunk_body(&sid, &[(7, e.clone())]).unwrap();
+        let c = parse_repair_chunk(&chunk, 1).unwrap();
+        assert_eq!(c.session, sid);
+        assert_eq!(c.entries.len(), 1);
+        assert!(
+            parse_repair_start(&chunk, 1).is_err(),
+            "a chunk body has no base"
+        );
+
+        let f = RepairFinish {
+            session: sid,
+            tip: head,
+        };
+        assert_eq!(parse_repair_finish(&repair_finish_body(&f)), Ok(f));
+        assert_eq!(
+            parse_repair_started(&repair_started_body(&sid, 7)),
+            Ok((sid, 7))
+        );
+        assert_eq!(parse_repair_next(&repair_next_body(8)), Ok(8));
+        assert_eq!(parse_repair_finished(&repair_finished_body(&head)), Ok(head));
+    }
+
+    #[test]
+    fn repair_entries_keep_bad_envelopes_and_refuse_bad_forms() {
+        let d = encode_b64(&[1; 32]);
+        let body = |entries: &str| {
+            format!(r#"{{"base":{{"position":1,"digest":"{d}"}},"entries":[{entries}]}}"#)
+        };
+        let p = parse_repair_start(
+            body(r#"{"position":2,"envelope":{"payloadType":1}}"#).as_bytes(),
+            8,
+        )
+        .unwrap();
+        assert!(matches!(p.entries[0], (2, RepairItem::Invalid(_))));
+        let stub =
+            format!(r#"{{"position":2,"stub":{{"type":"snailfish.change.v1","hash":"{d}"}}}}"#);
+        let p = parse_repair_start(body(&stub).as_bytes(), 8).unwrap();
+        assert!(matches!(p.entries[0], (2, RepairItem::Stub(_))));
+        assert!(parse_repair_start(body("").as_bytes(), 8).is_err());
+        assert!(parse_repair_start(body(r#"{"position":2}"#).as_bytes(), 8).is_err());
+        let upper = format!(
+            r#"{{"session":"{}","tip":{{"position":1,"digest":"{d}"}}}}"#,
+            "AB".repeat(16)
+        );
+        assert!(parse_repair_finish(upper.as_bytes()).is_err());
+        let short = format!(
+            r#"{{"session":"{}","tip":{{"position":1,"digest":"{d}"}}}}"#,
+            "ab".repeat(15)
+        );
+        assert!(parse_repair_finish(short.as_bytes()).is_err());
+    }
+
     proptest! {
         /// The body readers never panic on any bytes.
         #[test]
         fn readers_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let _ = parse_status(&bytes);
+            let _ = parse_status_response(&bytes);
+            let _ = parse_repair_start(&bytes, 8);
+            let _ = parse_repair_chunk(&bytes, 8);
+            let _ = parse_repair_finish(&bytes);
+            let _ = parse_repair_started(&bytes);
+            let _ = parse_repair_next(&bytes);
+            let _ = parse_repair_finished(&bytes);
             let _ = parse_append(&bytes, 8);
             let _ = parse_genesis(&bytes);
             let _ = parse_fetch(&bytes);
