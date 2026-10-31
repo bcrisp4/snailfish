@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use snailfish_engine::codec;
 pub use snailfish_engine::codec::{Envelope, KeySetInfo, PayloadClass, PayloadInfo};
-pub use snailfish_engine::{EnqueueResult, Header, OutboxRow, Request, SpaceRef, Status};
+pub use snailfish_engine::{EnqueueResult, Header, OutboxRow, Repair, Request, SpaceRef, Status};
 
 uniffi::setup_scaffolding!("snailfish");
 
@@ -115,9 +115,17 @@ pub enum Status {
     Degraded { cause: String },
     RelayUnavailable,
     RelayAuthority,
+    RestoreHold,
     RelayTooOld,
     ClockSkew,
     Fork { cause: String },
+}
+
+/// A repair of the relay log that the engine made (S6).
+#[uniffi::remote(Record)]
+pub struct Repair {
+    pub first: u64,
+    pub tip: u64,
 }
 
 /// Where the space lives on the relay.
@@ -659,6 +667,16 @@ impl Engine {
                 change_bytes: c.change_bytes,
             })
             .collect())
+    }
+
+    /// Take the repairs of the relay log that this engine made since the
+    /// last call (S6). The app tells the user.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn take_repairs(&self) -> Result<Vec<Repair>> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.take_repairs()?)
     }
 
     /// The number of envelopes in the engine outbox.

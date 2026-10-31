@@ -127,7 +127,18 @@ Each row names the model scenario and the Rust test that runs it through the pub
 
 Each Rust test above fails with the corresponding fault in the Rust or Python code: `conflictRefuses`, `engineDropsOnAccept`, a conflict with other bytes treated as stored, `pullSplitTxn` and `appDropsRowOnEnqueue` were checked by hand. `make rust-mutants-diff` checks the Rust code by mutation.
 
-M2 has no restore hold, repair session, fork repair or snapshot. Scenarios `relayRestoreRepairTest`, `forkStopsTest`, `notRepairedMarkTest`, `resetRequiredTest` and `refusedSplitTest` have no Rust test yet. A shorter relay log stops the M2 engine with `stopped: fork` (`shorter_relay_log_stops_and_proxy_page_pauses`), where M3 repairs it.
+## Rust conformance (M3)
+
+| Scenario in `test.qnt` | Rules | Rust and demo tests |
+| --- | --- | --- |
+| `relayRestoreRepairTest` | [LOG-10] [LOG-11] [LOG-14] [LOG-15] | `crates/engine/src/tests.rs::relay_restore_repair_and_release`, `crates/relay/tests/ops.rs::restore_hold_repair_and_release`, `demo/tests/test_integrity.py::test_restore_repair_and_release` |
+| `restoreSetsHoldTest` | [LOG-14] | `crates/relay/tests/ops.rs::backup_and_restore_hold_each_space`, `demo/tests/test_integrity.py::test_change_during_hold_waits_in_the_outbox` |
+| `notRepairedMarkTest` | [LOG-14] [LOG-15] (F3) | `crates/engine/src/tests.rs::new_engine_state_file_is_not_repaired_until_the_hold_ends`, `crates/relay/tests/ops.rs::not_repaired_mark_stays_and_blocks_release_without_force`, `demo/tests/test_integrity.py::test_release_refuses_a_new_engine_state_file` |
+| `forkStopsTest` | [FRK-1] [LOG-6] | `crates/engine/src/tests.rs::record_with_a_base_outside_the_verified_log_stops_with_fork`, `demo/tests/test_integrity.py::test_record_with_a_foreign_base_stops_with_fork` |
+| `lateDeviceRepairTest` | [LOG-12] | `crates/relay/tests/ops.rs::device_with_a_lost_grant_repairs_the_log` (relay only, see Not covered) |
+| `oneRepairSessionTest`, `repairExpiryTest`, `repairStagesUntilFinishTest` | [LOG-11] | `vectors/http.json` `repair` cases `second-device-busy`, `session-after-expiry`, `start-and-chunks`, run by `crates/relay/tests/vectors.rs::repair_cases_return_the_vector_results` |
+
+`make rust-mutants-diff` checks these tests by mutation. Scenarios `resetRequiredTest` and `refusedSplitTest` have no Rust test yet.
 
 ## When to update
 

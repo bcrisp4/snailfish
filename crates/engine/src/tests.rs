@@ -148,6 +148,51 @@ impl World {
         }
     }
 
+    /// The relay data directory.
+    fn relay_data(&self) -> PathBuf {
+        self.root.join("relay")
+    }
+
+    /// `snailfish-relay backup` while the relay runs.
+    fn backup(&self, name: &str) -> PathBuf {
+        let out = self.root.join(name);
+        snailfish_relay::ops::backup(&self.relay_data(), &out).unwrap();
+        out
+    }
+
+    /// `snailfish-relay restore`: the relay core opens files per request, so
+    /// the same core serves the restored files.
+    fn restore(&self, from: &Path) {
+        snailfish_relay::ops::restore(&self.relay_data(), from, true, 1).unwrap();
+    }
+
+    /// The restore hold report of the space.
+    fn hold(&self) -> snailfish_relay::ops::HoldReport {
+        snailfish_relay::ops::hold_report(&self.relay_data(), "sam", &self.log_id).unwrap()
+    }
+
+    /// A storage fault: the relay log loses the entries after `n`, with no
+    /// restore command and no hold.
+    fn cut_relay(&self, n: i64) {
+        let tenants = self.relay_data().join("tenants");
+        let t = std::fs::read_dir(tenants)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let f = std::fs::read_dir(t.join("spaces"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "db"))
+            .unwrap();
+        let c = Connection::open(f).unwrap();
+        c.execute("DELETE FROM entries WHERE position > ?1", [n])
+            .unwrap();
+        c.execute("DELETE FROM devices WHERE position > ?1", [n])
+            .unwrap();
+    }
+
     /// Fetch the relay log through the public route, as a device of the space.
     fn relay_change_ids(&mut self) -> Vec<Vec<u8>> {
         let tmp = tempfile::tempdir().unwrap();
@@ -266,7 +311,9 @@ fn newer_schema_is_refused_and_not_changed() {
     assert_eq!(err, EngineError::SchemaTooNew { found: 7 });
     assert_eq!(
         err.to_string(),
-        "the engine state file has schema version 7, and this engine knows 2"
+        format!(
+            "the engine state file has schema version 7, and this engine knows {SCHEMA_VERSION}"
+        )
     );
     assert_eq!(std::fs::read(a.dir.join(STATE_FILE)).unwrap(), before);
 }
@@ -779,10 +826,11 @@ fn to_relay_any(req: &Request) -> RelayRequest {
     }
 }
 
-/// A relay that rolls back below the verified log stops sync with fork in
-/// M2 (repair comes in M3), and a proxy page is `relay unavailable`.
+/// A relay log that ends before the verified head with another digest than
+/// the verified log stops sync with fork ([FRK-1]), and a proxy page is
+/// `relay unavailable`.
 #[test]
-fn shorter_relay_log_stops_and_proxy_page_pauses() {
+fn shorter_relay_log_with_another_digest_stops_and_proxy_page_pauses() {
     let (mut w, a, _) = World::new();
     let mut ea = w.engine(&a);
     w.exchange(&mut ea);
@@ -993,8 +1041,8 @@ fn relay_head_with_another_digest_stops() {
                 digest,
             },
             false,
-        false,
-    )
+            false,
+        )
         .unwrap();
         let mut s = ea.start_sync();
         steps(&w, &mut ea, &mut s, 1);
@@ -1526,7 +1574,8 @@ fn relay_with_another_genesis_record_stops() {
     let req = s.next_request(&mut ea).unwrap().unwrap();
     assert!(req.url.contains("/entries?after=0&"));
     let page =
-        snailfish_protocol::wire::fetch_response(&[(1, genesis.clone())], &head, false, false).unwrap();
+        snailfish_protocol::wire::fetch_response(&[(1, genesis.clone())], &head, false, false)
+            .unwrap();
     s.handle_response(&mut ea, 200, &[], &page).unwrap();
     assert!(
         matches!(ea.status(), Status::Fork { ref cause } if cause.contains("genesis")),
@@ -1541,4 +1590,225 @@ fn change_ids_differ() {
     let (w, a, _) = World::new();
     let e = w.engine(&a);
     assert_ne!(e.new_change_id().unwrap(), e.new_change_id().unwrap());
+}
+
+/// S6, `specs/delivery/test.qnt::relayRestoreRepairTest` ([LOG-10],
+/// [LOG-11], [LOG-14], [LOG-15]): the operator restores a backup without
+/// the last two changes. The hold keeps a new change of A in its outbox
+/// (`paused: restore hold`). A repairs the log in a repair session and the
+/// app learns of the repair. Both devices report, the operator releases the
+/// hold, and the new change reaches the log. No change is lost or applied
+/// twice.
+#[test]
+fn relay_restore_repair_and_release() {
+    let (mut w, mut a, mut b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut eb);
+    let backup = w.backup("b1");
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    b.edit(&eb, b"b1");
+    b.enqueue(&mut eb);
+    w.exchange(&mut eb);
+    w.exchange(&mut ea);
+    assert_eq!(ea.verified_head().unwrap().position, 4);
+    assert_eq!(ea.take_repairs().unwrap(), [] as [Repair; 0]);
+    w.restore(&backup);
+
+    a.edit(&ea, b"a2");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::RestoreHold);
+    assert_eq!(
+        ea.outbox_len().unwrap(),
+        1,
+        "the change waits in the outbox"
+    );
+    assert_eq!(ea.take_repairs().unwrap(), [Repair { first: 3, tip: 4 }]);
+    assert!(ea.take_repairs().unwrap().is_empty(), "taken once");
+    w.exchange(&mut eb);
+    assert_eq!(eb.status(), Status::RestoreHold);
+    assert!(eb.take_repairs().unwrap().is_empty(), "A repaired first");
+    let rep = w.hold();
+    assert_eq!(rep.head, 4);
+    assert_eq!(rep.devices.len(), 2);
+    assert!(
+        rep.devices
+            .iter()
+            .all(|d| d.state == snailfish_relay::ops::TipState::Reported)
+    );
+    assert_eq!(rep.not_repaired(), [] as [&str; 0]);
+    assert_eq!(rep.repairs.len(), 1);
+
+    snailfish_relay::ops::release_hold(&w.relay_data(), "sam", &w.log_id, false).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Ok);
+    assert_eq!(ea.outbox_len().unwrap(), 0);
+    w.exchange(&mut eb);
+    assert_eq!(a.pull(&ea).unwrap(), 1);
+    assert_eq!(b.pull(&eb).unwrap(), 2);
+    let mut sa = a.state.clone();
+    let mut sb = b.state.clone();
+    sa.sort();
+    sb.sort();
+    assert_eq!(sa, sb);
+    assert_eq!(sa, [b"a1".to_vec(), b"a2".to_vec(), b"b1".to_vec()]);
+}
+
+/// `specs/delivery/test.qnt::notRepairedMarkTest` ([LOG-14], [LOG-15],
+/// F3): B loses its engine state file during a hold. Its new engine fetches
+/// during the hold and stays fresh, so the report marks B "not repaired".
+/// `release-hold` refuses without `--force`. After the release, a fetch to
+/// the relay head with no hold ends the fresh flag.
+#[test]
+fn new_engine_state_file_is_not_repaired_until_the_hold_ends() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut eb);
+    let backup = w.backup("b1");
+    w.restore(&backup);
+    drop(eb);
+    std::fs::remove_dir_all(&b.dir).unwrap();
+    let mut eb = w.engine(&b);
+    w.exchange(&mut eb);
+    w.exchange(&mut eb);
+    w.exchange(&mut ea);
+    let rep = w.hold();
+    assert_eq!(rep.not_repaired(), [eb.device_id().as_str()]);
+    assert!(snailfish_relay::ops::release_hold(&w.relay_data(), "sam", &w.log_id, false).is_err());
+    snailfish_relay::ops::release_hold(&w.relay_data(), "sam", &w.log_id, true).unwrap();
+    w.exchange(&mut eb);
+    assert_eq!(eb.status(), Status::Ok);
+    // A second restore: B now reports a state file that is not new.
+    w.restore(&backup);
+    w.exchange(&mut eb);
+    assert_eq!(w.hold().not_repaired(), [] as [&str; 0]);
+}
+
+/// `specs/delivery/test.qnt::forkStopsTest` ([FRK-1], [LOG-6], T7): a
+/// silent relay rollback, then B appends two changes. The second change has
+/// a base that is not in the verified log of A, so A stops with
+/// `stopped: fork` and stores nothing.
+#[test]
+fn record_with_a_base_outside_the_verified_log_stops_with_fork() {
+    let (mut w, mut a, mut b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut eb);
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.verified_head().unwrap().position, 3);
+    w.cut_relay(2);
+    b.edit(&eb, b"b1");
+    b.enqueue(&mut eb);
+    w.exchange(&mut eb);
+    b.edit(&eb, b"b2");
+    b.enqueue(&mut eb);
+    w.exchange(&mut eb);
+    assert_eq!(eb.verified_head().unwrap().position, 4);
+    let before = ea.verified_head().unwrap();
+    w.exchange(&mut ea);
+    match ea.status() {
+        Status::Fork { cause } => assert!(cause.contains("bad_base"), "{cause}"),
+        other => panic!("expected fork, got {other:?}"),
+    }
+    assert_eq!(ea.verified_head().unwrap(), before);
+}
+
+/// [WIR-2]: a fetched record with a bad signature changes no state: the
+/// engine stops with fork and its verified log is the same.
+#[test]
+fn fetched_record_with_a_bad_signature_changes_no_state() {
+    let (mut w, mut dev_a, dev_b) = World::new();
+    let mut ea = w.engine(&dev_a);
+    w.exchange(&mut ea);
+    dev_a.edit(&ea, b"a1");
+    dev_a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    let mut eb = w.engine(&dev_b);
+    let mut s = eb.start_sync();
+    let mut forged = false;
+    while let Some(req) = s.next_request(&mut eb).unwrap() {
+        let mut resp = w.relay.handle(&to_relay(&req));
+        if req.url.contains("/entries?") && !forged {
+            let body = String::from_utf8(resp.body).unwrap();
+            // Flip one base64 character of the last signature.
+            let i = body.rfind("\"sig\":\"").unwrap() + 7;
+            let mut bytes = body.into_bytes();
+            bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
+            resp.body = bytes;
+            forged = true;
+        }
+        s.handle_response(&mut eb, resp.status, &time(&resp), &resp.body)
+            .unwrap();
+    }
+    assert!(matches!(eb.status(), Status::Fork { .. }));
+    assert_eq!(eb.verified_head().unwrap().position, 0);
+}
+
+fn chunk_sizes(entries: &[(u64, String)], limits: &snailfish_protocol::wire::Limits) -> Vec<usize> {
+    let base = snailfish_protocol::wire::Head {
+        position: 9,
+        digest: [7; 32],
+    };
+    crate::sync::repair_chunks(entries.to_vec(), &base, limits)
+        .iter()
+        .map(Vec::len)
+        .collect()
+}
+
+/// [LOG-10], PROTOCOL.md 10.9: repair chunks hold at most
+/// `max_append_envelopes` entries, and each body is at most
+/// `max_request_bytes`, at the exact limits. A larger entry goes alone.
+#[test]
+fn repair_chunks_fit_the_limits_exactly() {
+    use snailfish_protocol::wire::{self, Head, Limits};
+    let base = Head {
+        position: 9,
+        digest: [7; 32],
+    };
+    let env = "{\"payloadType\":\"x\"}".to_owned();
+    let entries: Vec<(u64, String)> = (10..15).map(|p| (p, env.clone())).collect();
+    let mut l = Limits {
+        max_append_envelopes: 2,
+        ..Limits::default()
+    };
+    assert_eq!(chunk_sizes(&entries, &l), [2, 2, 1]);
+    l.max_append_envelopes = 5;
+    assert_eq!(chunk_sizes(&entries, &l), [5]);
+    // The start body of exactly two entries fits; one byte less does not.
+    let two = wire::repair_start_body(&base, &entries[..2]).unwrap().len();
+    l.max_request_bytes = two as u64;
+    let got = chunk_sizes(&entries, &l);
+    assert_eq!(got[0], 2);
+    l.max_request_bytes = two as u64 - 1;
+    assert_eq!(chunk_sizes(&entries, &l)[0], 1);
+    // Later chunks are chunk bodies: exactly two entries fit.
+    let chunk_two = wire::repair_chunk_body(&[0; 16], &entries[2..4])
+        .unwrap()
+        .len();
+    l.max_request_bytes = chunk_two.max(two) as u64;
+    let sizes = chunk_sizes(&entries, &l);
+    assert_eq!(sizes.iter().sum::<usize>(), 5);
+    for (i, c) in crate::sync::repair_chunks(entries.clone(), &base, &l)
+        .iter()
+        .enumerate()
+    {
+        let len = if i == 0 {
+            wire::repair_start_body(&base, c).unwrap().len()
+        } else {
+            wire::repair_chunk_body(&[0; 16], c).unwrap().len()
+        };
+        assert!(len as u64 <= l.max_request_bytes, "chunk {i}");
+    }
+    // An entry larger than the limit goes alone, for the relay allowance.
+    l.max_request_bytes = 10;
+    assert_eq!(chunk_sizes(&entries, &l), [1, 1, 1, 1, 1]);
 }

@@ -1,10 +1,12 @@
-//! One exchange with the relay: info, create, fetch, push, fetch
-//! (`PROTOCOL.md` section 10, `specs/delivery/model.qnt` actions `push`,
-//! `fetchExtend` and `fetchConflict`).
+//! One exchange with the relay: info, create, fetch, repair, status report,
+//! push, fetch (`PROTOCOL.md` section 10, `specs/delivery/model.qnt` actions
+//! `push`, `fetchExtend`, `fetchConflict`, `startRepair`, `chunkRepair`,
+//! `finishRepair` and `reportStatus`).
 //!
-//! The order is fixed. The first fetch gives the base of each new change.
-//! The last fetch shows the own changes in the verified log, so their
-//! envelopes leave the outbox only then ([DLV-8]).
+//! The order is fixed. The first fetch gives the base of each new change,
+//! and shows a relay log that ends before the verified head ([LOG-10]) and
+//! the restore hold ([LOG-14]). The last fetch shows the own changes in the
+//! verified log, so their envelopes leave the outbox only then ([DLV-8]).
 
 use std::collections::VecDeque;
 
@@ -12,7 +14,7 @@ use rusqlite::{Transaction, TransactionBehavior};
 use snailfish_protocol::encoding::encode_id;
 use snailfish_protocol::request::{self, Params, Target};
 use snailfish_protocol::space::{self, Mode, Verdict};
-use snailfish_protocol::wire::{self, AppendResult, FetchEntry, Limits};
+use snailfish_protocol::wire::{self, AppendResult, FetchEntry, Head, Limits};
 
 use crate::state::{self, DbSpace, Own};
 use crate::{Engine, EngineError, Header, MAX_LEVEL, Request, Status};
@@ -22,6 +24,8 @@ enum Phase {
     Info,
     Create,
     FirstFetch,
+    Repair,
+    Report,
     Setup,
     Push,
     LastFetch,
@@ -40,6 +44,21 @@ enum Sent {
     Create,
     Fetch,
     Append(Vec<(Item, String)>),
+    RepairStart(Vec<(u64, String)>),
+    RepairChunk(Vec<(u64, String)>),
+    RepairFinish,
+    Status,
+}
+
+/// A repair session in this exchange (`PROTOCOL.md` 10.9).
+#[derive(Debug)]
+struct RepairRun {
+    /// The relay head, where the lost range starts.
+    base: Head,
+    /// The verified head: the tip of the finish.
+    tip: Head,
+    session: Option<[u8; 16]>,
+    chunks: VecDeque<Vec<(u64, String)>>,
 }
 
 /// One exchange with the relay. The app calls [`Sync::next_request`], sends
@@ -58,6 +77,9 @@ pub struct Sync {
     // `has_more` or a later head with no entries must not keep the app in
     // a loop.
     empty_pages: u32,
+    // The last fetch showed a restore hold ([LOG-14]).
+    hold: bool,
+    repair: Option<RepairRun>,
 }
 
 /// The most fetch pages with no new entry in one exchange.
@@ -77,6 +99,8 @@ impl Sync {
             batches: VecDeque::new(),
             queued: false,
             empty_pages: 0,
+            hold: false,
+            repair: None,
         }
     }
 
@@ -106,6 +130,23 @@ impl Sync {
                     }
                 }
                 Phase::FirstFetch | Phase::LastFetch => Some(Sent::Fetch),
+                Phase::Repair => {
+                    let next = self.repair.as_mut().and_then(|r| {
+                        match (r.session, r.chunks.pop_front()) {
+                            (None, Some(c)) => Some(Sent::RepairStart(c)),
+                            (Some(_), Some(c)) => Some(Sent::RepairChunk(c)),
+                            (Some(_), None) => Some(Sent::RepairFinish),
+                            (None, None) => None,
+                        }
+                    });
+                    if next.is_none() {
+                        self.repair = None;
+                        self.phase = self.after_first_fetch();
+                        continue;
+                    }
+                    next
+                }
+                Phase::Report => Some(Sent::Status),
                 Phase::Setup | Phase::Push => {
                     if !self.queued {
                         self.queue(engine)?;
@@ -157,10 +198,38 @@ impl Sync {
         Ok(())
     }
 
-    fn send(&mut self, engine: &Engine, s: Sent) -> Result<Request, EngineError> {
+    /// The route and body of a repair request (`PROTOCOL.md` 10.9).
+    fn repair_body(&self, s: &Sent) -> Result<(&'static str, Vec<u8>), EngineError> {
+        let r = self
+            .repair
+            .as_ref()
+            .ok_or(EngineError::UnexpectedResponse)?;
+        let wire_err = |e: wire::WireError| EngineError::Storage(e.to_string());
+        match (s, r.session) {
+            (Sent::RepairStart(chunk), _) => Ok((
+                "repair",
+                wire::repair_start_body(&r.base, chunk).map_err(wire_err)?,
+            )),
+            (Sent::RepairChunk(chunk), Some(sid)) => Ok((
+                "repair/chunk",
+                wire::repair_chunk_body(&sid, chunk).map_err(wire_err)?,
+            )),
+            (Sent::RepairFinish, Some(session)) => Ok((
+                "repair/finish",
+                wire::repair_finish_body(&wire::RepairFinish {
+                    session,
+                    tip: r.tip,
+                }),
+            )),
+            _ => Err(EngineError::UnexpectedResponse),
+        }
+    }
+
+    /// The method, path, query, body and signature flag of a request.
+    fn target(&self, engine: &Engine, s: &Sent) -> Result<Target5, EngineError> {
         let sp = &engine.space;
         let space_path = format!("/v1/t/{}/s/{}", sp.tenant, sp.log_id);
-        let (method, path, query, body, signed) = match &s {
+        Ok(match s {
             Sent::Info => (
                 "GET",
                 "/v1/info".to_owned(),
@@ -196,7 +265,39 @@ impl Sync {
                     true,
                 )
             }
-        };
+            Sent::RepairStart(_) | Sent::RepairChunk(_) | Sent::RepairFinish => {
+                let (route, body) = self.repair_body(s)?;
+                (
+                    "POST",
+                    format!("{space_path}/{route}"),
+                    String::new(),
+                    body,
+                    true,
+                )
+            }
+            Sent::Status => {
+                let h = engine.verified_head()?;
+                let body = wire::status_body(&wire::StatusReport {
+                    tip: Head {
+                        position: h.position,
+                        digest: h.digest,
+                    },
+                    fresh: state::fresh(&engine.db)?,
+                });
+                (
+                    "POST",
+                    format!("{space_path}/status"),
+                    String::new(),
+                    body,
+                    true,
+                )
+            }
+        })
+    }
+
+    fn send(&mut self, engine: &Engine, s: Sent) -> Result<Request, EngineError> {
+        let sp = &engine.space;
+        let (method, path, query, body, signed) = self.target(engine, &s)?;
         let authority = authority(&sp.relay_url);
         let mut headers = vec![Header {
             name: "accept".into(),
@@ -283,6 +384,10 @@ impl Sync {
             }
             Sent::Fetch => self.fetch(engine, body),
             Sent::Append(items) => Self::append(engine, &items, body),
+            Sent::RepairStart(chunk) => self.repair_answer(&chunk, body, true),
+            Sent::RepairChunk(chunk) => self.repair_answer(&chunk, body, false),
+            Sent::RepairFinish => self.repair_finished(engine, body),
+            Sent::Status => self.status_answer(engine, body),
         };
         match result {
             Ok(()) => Ok(()),
@@ -314,6 +419,16 @@ impl Sync {
             Some("space_exists") => Status::Fork {
                 cause: "the relay holds another genesis record for this log".into(),
             },
+            // [LOG-10]: the relay refused a verified entry, so the two logs
+            // disagree. `repair_busy` and `bad_repair` pass: the next sync
+            // starts a new session.
+            Some(code @ ("invalid_record" | "uncovered_stub"))
+                if matches!(sent, Sent::RepairStart(_) | Sent::RepairChunk(_)) =>
+            {
+                Status::Fork {
+                    cause: format!("the relay refused a repair entry: {code}"),
+                }
+            }
             Some("invalid_record") => Status::Fork {
                 cause: "the relay refused the genesis record".into(),
             },
@@ -366,73 +481,28 @@ impl Sync {
             .map_err(|e| Answer::Engine(e.into()))?;
         let mut degraded = None;
         for (pos, entry) in &f.entries {
-            let view = DbSpace { tx: &tx, log_id };
-            let head = snailfish_protocol::space::SpaceView::head(&view);
-            if Some(*pos) != head.checked_add(1) {
-                return Err(stop(format!("the relay sent position {pos} after {head}")));
+            if let Some(cause) = verify_entry(engine, &tx, *pos, entry)? {
+                degraded = Some(cause);
             }
-            let FetchEntry::Envelope(raw) = entry else {
-                // [CMP-15]: M2 has no snapshot, so no stub is valid.
-                return Err(stop(format!("a stub at position {pos} with no snapshot")));
-            };
-            let accepted = if *pos == 1 {
-                let a = space::check_genesis(&raw.envelope, &log_id, None)
-                    .map_err(|r| stop(format!("genesis record: {r}")))?;
-                if let snailfish_protocol::records::Body::Genesis { app, .. } = &a.record.body
-                    && app != &engine.space.app_id
-                {
-                    return Err(stop("the genesis record names another app".into()));
-                }
-                // The device that made the space holds its genesis record
-                // from the setup (`specs/spacelog/model.qnt` `createSpace`).
-                // The relay must not replace it.
-                if state::setup_genesis_hash(&tx)
-                    .map_err(Answer::Engine)?
-                    .is_some_and(|h| h != a.record_hash)
-                {
-                    return Err(stop(
-                        "the relay holds another genesis record for this log".into(),
-                    ));
-                }
-                a
-            } else {
-                match space::check_append(&view, &raw.envelope, Mode::Verify) {
-                    Verdict::Store(a) => *a,
-                    Verdict::Refused(r) => return Err(stop(format!("position {pos}: {r}"))),
-                    Verdict::Known(_) | Verdict::Conflict(_) => {
-                        return Err(stop(format!("position {pos}: a duplicate change")));
-                    }
-                }
-            };
-            let content = if accepted.record.change_id().is_some() {
-                let c =
-                    state::decrypt_change(engine, &raw.envelope).map(|b| state::content_hash(&b));
-                if c.is_none() {
-                    // [DLV-13]: skip it, keep its position, report the author.
-                    degraded = Some(format!(
-                        "a change at position {pos} by {} does not decrypt",
-                        encode_id("d_", accepted.record.author.id())
-                    ));
-                }
-                c
-            } else {
-                None
-            };
-            let own = state::store_entry(&tx, &raw.envelope, &raw.json, &accepted, content)
-                .map_err(Answer::Engine)?;
-            if matches!(own, Own::Conflict) {
-                degraded = Some("refused: conflict".into());
-            }
-            state::drop_setup(&tx, &accepted.record_hash).map_err(Answer::Engine)?;
         }
         let (head, digest) = state::head(&tx, &log_id).map_err(Answer::Engine)?;
         let at_head = !f.has_more && f.head.position == head;
+        let mut shorter = false;
         if !f.has_more {
             if f.head.position < head {
-                return Err(stop(format!(
-                    "the relay log ends at {} before the verified position {head}",
-                    f.head.position
-                )));
+                // [LOG-10]: the relay log ends before the verified head.
+                // If the relay head is an entry of the verified log, the
+                // relay lost the entries after it: repair. Otherwise the
+                // relay shows another log ([FRK-1]).
+                let mine = state::verified_digest(&tx, &log_id, f.head.position)
+                    .map_err(Answer::Engine)?;
+                if f.head.position == 0 || mine != Some(f.head.digest) {
+                    return Err(stop(format!(
+                        "the relay log ends at {} with another digest than the verified log",
+                        f.head.position
+                    )));
+                }
+                shorter = true;
             }
             if f.head.position == head && f.head.digest != digest {
                 return Err(stop(format!("the relay head digest at {head} differs")));
@@ -440,10 +510,44 @@ impl Sync {
         }
         if at_head {
             state::set_caught_up(&tx, true).map_err(Answer::Engine)?;
+            // PROTOCOL.md 10.8: the fresh flag ends at a fetch that reaches
+            // the relay head with no hold. A fetch during a hold keeps it.
+            if !f.hold {
+                state::clear_fresh(&tx).map_err(Answer::Engine)?;
+            }
         }
+        let lost = if shorter && self.phase == Phase::FirstFetch {
+            state::log_range(&tx, f.head.position.saturating_add(1), head)
+                .map_err(Answer::Engine)?
+        } else {
+            Vec::new()
+        };
         tx.commit().map_err(|e| Answer::Engine(e.into()))?;
+        self.hold = f.hold;
         if let Some(cause) = degraded {
             engine.status = Status::Degraded { cause };
+        }
+        if f.hold {
+            engine.status = Status::RestoreHold;
+        }
+        if shorter {
+            if self.phase == Phase::FirstFetch {
+                self.repair = Some(RepairRun {
+                    base: f.head,
+                    tip: Head {
+                        position: head,
+                        digest,
+                    },
+                    session: None,
+                    chunks: repair_chunks(lost, &f.head, &self.limits),
+                });
+                self.phase = Phase::Repair;
+            } else {
+                // The relay lost entries during this exchange. The next
+                // sync repairs them.
+                self.phase = Phase::Done;
+            }
+            return Ok(());
         }
         if !at_head {
             // More entries, or the relay head moved past the page: fetch
@@ -458,9 +562,71 @@ impl Sync {
             return Ok(());
         }
         self.phase = match self.phase {
-            Phase::FirstFetch => Phase::Setup,
+            Phase::FirstFetch => self.after_first_fetch(),
             _ => Phase::Done,
         };
+        Ok(())
+    }
+
+    /// The answer to a status report (`PROTOCOL.md` 10.8).
+    fn status_answer(&mut self, engine: &mut Engine, body: &[u8]) -> Result<(), Answer> {
+        if wire::parse_status_response(body).map_err(|_| Answer::Unreadable)? {
+            engine.status = Status::RestoreHold;
+        }
+        self.phase = Phase::Setup;
+        Ok(())
+    }
+
+    /// The phase after the first fetch and the repair: a status report
+    /// during a hold ([LOG-14]), then the append requests.
+    fn after_first_fetch(&self) -> Phase {
+        if self.hold {
+            Phase::Report
+        } else {
+            Phase::Setup
+        }
+    }
+
+    /// The answer to a repair start or chunk: the relay staged the chunk.
+    fn repair_answer(
+        &mut self,
+        chunk: &[(u64, String)],
+        body: &[u8],
+        start: bool,
+    ) -> Result<(), Answer> {
+        let r = self.repair.as_mut().ok_or(Answer::Unreadable)?;
+        let next = if start {
+            let (sid, next) = wire::parse_repair_started(body).map_err(|_| Answer::Unreadable)?;
+            r.session = Some(sid);
+            next
+        } else {
+            wire::parse_repair_next(body).map_err(|_| Answer::Unreadable)?
+        };
+        let want = chunk.last().map(|(p, _)| p.saturating_add(1));
+        if Some(next) != want {
+            return Err(Answer::Unreadable);
+        }
+        Ok(())
+    }
+
+    /// The answer to a repair finish ([LOG-10]): the relay head must now be
+    /// the verified head.
+    fn repair_finished(&mut self, engine: &mut Engine, body: &[u8]) -> Result<(), Answer> {
+        let head = wire::parse_repair_finished(body).map_err(|_| Answer::Unreadable)?;
+        let r = self.repair.take().ok_or(Answer::Unreadable)?;
+        if head != r.tip {
+            return Err(stop(format!(
+                "after the repair the relay head is {}, not the verified head {}",
+                head.position, r.tip.position
+            )));
+        }
+        state::add_repair(
+            &engine.db,
+            r.base.position.saturating_add(1),
+            r.tip.position,
+        )
+        .map_err(Answer::Engine)?;
+        self.phase = self.after_first_fetch();
         Ok(())
     }
 
@@ -485,9 +651,15 @@ impl Sync {
                 // [DLV-6]: a conflict also waits for the fetch, which
                 // compares the change bytes at the reported position.
                 AppendResult::Stored(_) | AppendResult::Known(_) | AppendResult::Conflict(_) => {}
-                // [LOG-6]: transient. A later sync signs nothing again in
-                // M2; M3 adds the repair of a relay rollback.
-                AppendResult::Refused(code) if code == "bad_base" => {}
+                // [LOG-6]: transient. After a relay rollback the next sync
+                // repairs the log, and the base is in the log again.
+                // [LOG-7]: `stale_base` is for security records only.
+                AppendResult::Refused(code) if code == "bad_base" || code == "stale_base" => {}
+                // [LOG-14]: a change during a restore hold stays in the
+                // outbox and goes again after the hold.
+                AppendResult::Refused(code) if code == "on_hold" => {
+                    engine.status = Status::RestoreHold;
+                }
                 // [DLV-9]: a permanent refusal.
                 AppendResult::Refused(code) => {
                     state::refuse(&engine.db, cid, &code).map_err(Answer::Engine)?;
@@ -502,6 +674,50 @@ impl Sync {
 }
 
 pub(crate) type Batches = VecDeque<Vec<(Item, String)>>;
+
+/// The method, path, query, body and signature flag of a request.
+type Target5 = (&'static str, String, String, Vec<u8>, bool);
+
+/// Split lost entries into repair requests of at most
+/// `max_append_envelopes` entries and `max_request_bytes` body bytes
+/// (`PROTOCOL.md` 10.9). The first chunk goes in the start body, the others
+/// in chunk bodies. An entry that does not fit goes alone: the relay
+/// accepts the repair allowance for it.
+pub(crate) fn repair_chunks(
+    entries: Vec<(u64, String)>,
+    base: &Head,
+    limits: &Limits,
+) -> VecDeque<Vec<(u64, String)>> {
+    let max_count = usize::try_from(limits.max_append_envelopes.max(1)).unwrap_or(usize::MAX);
+    let max_bytes = usize::try_from(limits.max_request_bytes).unwrap_or(usize::MAX);
+    // The bodies with no entry. A session ID has a fixed length.
+    let start_empty = wire::repair_start_body(base, &[]).map_or(0, |b| b.len());
+    let chunk_empty = wire::repair_chunk_body(&[0; 16], &[]).map_or(0, |b| b.len());
+    let mut out = VecDeque::new();
+    let mut cur: Vec<(u64, String)> = Vec::new();
+    let mut size = start_empty;
+    for (pos, env) in entries {
+        let len = entry_len(pos, &env);
+        let add = len.saturating_add(usize::from(!cur.is_empty()));
+        if !cur.is_empty() && (cur.len() >= max_count || size.saturating_add(add) > max_bytes) {
+            out.push_back(std::mem::take(&mut cur));
+            size = chunk_empty;
+        }
+        size = size.saturating_add(len.saturating_add(usize::from(!cur.is_empty())));
+        cur.push((pos, env));
+    }
+    if !cur.is_empty() {
+        out.push_back(cur);
+    }
+    out
+}
+
+/// The length of one entry in a repair body: `{"position":N,"envelope":E}`.
+fn entry_len(pos: u64, env: &str) -> usize {
+    format!("{{\"position\":{pos},\"envelope\":}}")
+        .len()
+        .saturating_add(env.len())
+}
 
 /// Split items into append requests of at most `max_append_envelopes`
 /// envelopes and `max_request_bytes` body bytes (`PROTOCOL.md` 10.4).
@@ -536,6 +752,78 @@ pub(crate) fn batch(items: Vec<(Item, String)>, limits: &Limits) -> (Batches, Ve
         out.push_back(cur);
     }
     (out, too_large)
+}
+
+/// Verify and store one fetched entry inside the fetch transaction.
+/// Returns a `degraded` cause, if any. [WIR-2]: the check verifies the
+/// signature before `store_entry` changes any state.
+fn verify_entry(
+    engine: &Engine,
+    tx: &Transaction<'_>,
+    pos: u64,
+    entry: &FetchEntry,
+) -> Result<Option<String>, Answer> {
+    let log_id = engine.log_id;
+    let pos = &pos;
+    let mut degraded = None;
+    let view = DbSpace { tx, log_id };
+    let head = snailfish_protocol::space::SpaceView::head(&view);
+    if Some(*pos) != head.checked_add(1) {
+        return Err(stop(format!("the relay sent position {pos} after {head}")));
+    }
+    let FetchEntry::Envelope(raw) = entry else {
+        // [CMP-15]: M2 has no snapshot, so no stub is valid.
+        return Err(stop(format!("a stub at position {pos} with no snapshot")));
+    };
+    let accepted = if *pos == 1 {
+        let a = space::check_genesis(&raw.envelope, &log_id, None)
+            .map_err(|r| stop(format!("genesis record: {r}")))?;
+        if let snailfish_protocol::records::Body::Genesis { app, .. } = &a.record.body
+            && app != &engine.space.app_id
+        {
+            return Err(stop("the genesis record names another app".into()));
+        }
+        // The device that made the space holds its genesis record
+        // from the setup (`specs/spacelog/model.qnt` `createSpace`).
+        // The relay must not replace it.
+        if state::setup_genesis_hash(tx)
+            .map_err(Answer::Engine)?
+            .is_some_and(|h| h != a.record_hash)
+        {
+            return Err(stop(
+                "the relay holds another genesis record for this log".into(),
+            ));
+        }
+        a
+    } else {
+        match space::check_append(&view, &raw.envelope, Mode::Verify) {
+            Verdict::Store(a) => *a,
+            Verdict::Refused(r) => return Err(stop(format!("position {pos}: {r}"))),
+            Verdict::Known(_) | Verdict::Conflict(_) => {
+                return Err(stop(format!("position {pos}: a duplicate change")));
+            }
+        }
+    };
+    let content = if accepted.record.change_id().is_some() {
+        let c = state::decrypt_change(engine, &raw.envelope).map(|b| state::content_hash(&b));
+        if c.is_none() {
+            // [DLV-13]: skip it, keep its position, report the author.
+            degraded = Some(format!(
+                "a change at position {pos} by {} does not decrypt",
+                encode_id("d_", accepted.record.author.id())
+            ));
+        }
+        c
+    } else {
+        None
+    };
+    let own = state::store_entry(tx, &raw.envelope, &raw.json, &accepted, content)
+        .map_err(Answer::Engine)?;
+    if matches!(own, Own::Conflict) {
+        degraded = Some("refused: conflict".into());
+    }
+    state::drop_setup(tx, &accepted.record_hash).map_err(Answer::Engine)?;
+    Ok(degraded)
 }
 
 enum Answer {

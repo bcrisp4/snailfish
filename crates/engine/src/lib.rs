@@ -27,7 +27,7 @@ use snailfish_protocol::sig::SecretKey;
 pub use sync::Sync;
 
 /// The schema version of the engine state file ([VER-14]).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The protocol levels that this engine can write ([VER-6]).
 pub const MAX_LEVEL: u64 = 1;
@@ -117,6 +117,10 @@ pub enum Status {
     /// `paused: relay authority`: the signed authority differs from the
     /// relay configuration.
     RelayAuthority,
+    /// `paused: restore hold`: the relay operator restored a backup, and
+    /// the relay refuses changes until the user or the operator ends the
+    /// hold ([LOG-14]). The engine keeps each change in its outbox.
+    RestoreHold,
     /// `stopped: relay too old` ([VER-11]).
     RelayTooOld,
     /// `stopped: clock skew`: the relay refused a request as expired after
@@ -203,6 +207,17 @@ pub struct EnqueueResult {
     /// known `change_id` with other bytes, or a change that the relay
     /// refused for ever.
     pub refused: Vec<Vec<u8>>,
+}
+
+/// A repair of the relay log that this engine made (S6, [LOG-10]): the
+/// relay log ended before the verified head, and the engine uploaded the
+/// lost entries from `first` to `tip`. The app tells the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Repair {
+    /// The first position that the engine uploaded.
+    pub first: u64,
+    /// The verified head of the engine: the last uploaded position.
+    pub tip: u64,
 }
 
 /// The applied position of the app: the last change that it handled.
@@ -396,6 +411,19 @@ impl Engine {
         max_changes: usize,
     ) -> Result<Vec<Change>, EngineError> {
         state::changes_after(self, applied, max_changes.clamp(1, MAX_BATCH))
+    }
+
+    /// Take the repairs that this engine made since the last call, oldest
+    /// first (S6). The engine forgets them once it returns them.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Storage`].
+    pub fn take_repairs(&self) -> Result<Vec<Repair>, EngineError> {
+        Ok(state::take_repairs(&self.db)?
+            .into_iter()
+            .map(|(first, tip)| Repair { first, tip })
+            .collect())
     }
 
     /// The number of envelopes in the engine outbox.

@@ -7,6 +7,7 @@ integration"). A marshalling fault in a binding record fails here.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import os
 from typing import TYPE_CHECKING
@@ -138,3 +139,59 @@ def test_relay_down_is_unavailable(tmp_path: Path) -> None:
     assert (req.method, req.url) == ("GET", "https://r.example/v1/info")
     sync.handle_response(503, [], b"")
     assert a.status() == sf.Status.RELAY_UNAVAILABLE()
+
+
+def test_hold_and_repair_cross_the_binding(relay: Relay, tmp_path: Path) -> None:
+    """A fetch with a hold gives `paused: restore hold`, and a relay log that
+    ends before the verified head gives a repair session. The repair reaches
+    the app through `take_repairs` (S6, [LOG-10], [LOG-14])."""
+    ka = sf.new_device_keys()
+    kb = sf.new_device_keys()
+    setup = sf.create_space(
+        APP, sf.NewDevice(keys=ka, name="A"), [sf.NewDevice(keys=kb, name="B")]
+    )
+    ka.app_key = setup.app_key
+    space = sf.SpaceRef(
+        relay_url=relay.url, tenant=relay.tenant, log_id=setup.log_id, app_id=APP
+    )
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes)
+    a = sf.Engine.open(str(tmp_path / "a"), space, ka)
+    exchange(relay, a)
+    assert a.verified_head().position == 2
+    assert a.take_repairs() == []
+
+    g = sf.parse_envelope(setup.envelopes[0].encode())
+    eh = sf.entry_hash(
+        g.payload_type, None, sf.record_hash(g.payload_type, g.payload, g.sig)
+    )
+    d1 = sf.digest_next(sf.digest0(setup.log_id), 1, eh)
+    head = a.verified_head()
+    sync = a.start_sync()
+    req = sync.next_request()
+    assert req is not None
+    sync.handle_response(*relay.send(req.method, req.url, req.headers, req.body))
+    req = sync.next_request()
+    assert req is not None and "/entries?after=2" in req.url
+    d1_text = base64.b64encode(d1).decode()
+    shorter = (
+        '{"entries":[],"head":{"position":1,"digest":"'
+        + d1_text
+        + '"},"has_more":false,"hold":true}'
+    )
+    sync.handle_response(200, [], shorter.encode())
+    req = sync.next_request()
+    assert req is not None and req.url.endswith("/repair")
+    sync.handle_response(201, [], b'{"session":"' + b"ab" * 16 + b'","next":3}')
+    req = sync.next_request()
+    assert req is not None and req.url.endswith("/repair/finish")
+    done = (
+        '{"head":{"position":2,"digest":"'
+        + base64.b64encode(head.digest).decode()
+        + '"}}'
+    )
+    sync.handle_response(200, [], done.encode())
+    assert a.take_repairs() == [sf.Repair(first=2, tip=2)]
+    req = sync.next_request()
+    assert req is not None and req.url.endswith("/status")
+    sync.handle_response(200, [], b'{"hold":true}')
+    assert a.status() == sf.Status.RESTORE_HOLD()

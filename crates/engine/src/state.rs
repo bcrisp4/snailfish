@@ -46,7 +46,9 @@ pub(crate) fn open(db: &Connection, log_id: &[u8; 16], device: &Hash32) -> Resul
     match bound {
         None => {
             db.execute(
-                "INSERT INTO meta (id, log_id, device_id, caught_up) VALUES (1, ?1, ?2, 0)",
+                // A new state file is fresh until a fetch reaches the relay
+                // head with no hold ([LOG-14], PROTOCOL.md 10.8).
+                "INSERT INTO meta (id, log_id, device_id, caught_up, fresh) VALUES (1, ?1, ?2, 0, 1)",
                 params![&log_id[..], &device[..]],
             )?;
         }
@@ -108,7 +110,21 @@ fn migrate(db: &Connection) -> Result<(), EngineError> {
              COMMIT;",
         )?;
     }
-    const { assert!(SCHEMA_VERSION == 2) };
+    if found < 3 {
+        // A file from before M3 is not new: its engine already fetched.
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE meta ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0;
+             CREATE TABLE repairs (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               first INTEGER NOT NULL,
+               tip INTEGER NOT NULL
+             );
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )?;
+    }
+    const { assert!(SCHEMA_VERSION == 3) };
     Ok(())
 }
 
@@ -315,6 +331,71 @@ pub(crate) fn refused_cause(db: &Connection) -> Result<Option<String>, EngineErr
             |r| r.get(0),
         )
         .optional()?)
+}
+
+/// True if the state file is new since the last fetch that reached the
+/// relay head with no hold ([LOG-14]).
+pub(crate) fn fresh(db: &Connection) -> Result<bool, EngineError> {
+    Ok(db.query_row("SELECT fresh FROM meta", [], |r| r.get::<_, i64>(0))? != 0)
+}
+
+pub(crate) fn clear_fresh(db: &Connection) -> Result<(), EngineError> {
+    db.execute("UPDATE meta SET fresh = 0", [])?;
+    Ok(())
+}
+
+/// The verified entries from `first` to `last`, as stored envelope text.
+pub(crate) fn log_range(
+    db: &Connection,
+    first: u64,
+    last: u64,
+) -> Result<Vec<(u64, String)>, EngineError> {
+    let mut st = db.prepare(
+        "SELECT position, envelope FROM log WHERE position BETWEEN ?1 AND ?2 ORDER BY position",
+    )?;
+    let rows = st.query_map([to_i64(first)?, to_i64(last)?], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    rows.map(|r| {
+        let (p, e) = r?;
+        Ok((to_u64(p)?, e))
+    })
+    .collect()
+}
+
+/// The verified digest at a position, outside a transaction.
+pub(crate) fn verified_digest(
+    db: &Connection,
+    log_id: &[u8; 16],
+    position: u64,
+) -> Result<Option<Hash32>, EngineError> {
+    digest_at(db, log_id, position)
+}
+
+/// Record a finished repair for the app (S6).
+pub(crate) fn add_repair(db: &Connection, first: u64, tip: u64) -> Result<(), EngineError> {
+    db.execute(
+        "INSERT INTO repairs (first, tip) VALUES (?1, ?2)",
+        [to_i64(first)?, to_i64(tip)?],
+    )?;
+    Ok(())
+}
+
+/// Take the recorded repairs, oldest first, in one transaction.
+pub(crate) fn take_repairs(db: &Connection) -> Result<Vec<(u64, u64)>, EngineError> {
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let out = {
+        let mut st = tx.prepare("SELECT first, tip FROM repairs ORDER BY id")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        rows.map(|r| {
+            let (a, b) = r?;
+            Ok((to_u64(a)?, to_u64(b)?))
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?
+    };
+    tx.execute("DELETE FROM repairs", [])?;
+    tx.commit()?;
+    Ok(out)
 }
 
 pub(crate) fn set_caught_up(db: &Connection, v: bool) -> Result<(), EngineError> {

@@ -228,6 +228,24 @@ final class VectorTests: XCTestCase {
         _ = try again.nextRequest()
         try again.handleResponse(status: 503, headers: [], body: Data())
         XCTAssertEqual(try engine.status(), .relayUnavailable)
+        XCTAssertEqual(try engine.takeRepairs(), [])
+
+        // PROTOCOL.md 10.7: a fetch with a hold gives `paused: restore hold`.
+        let held = try engine.startSync()
+        _ = try held.nextRequest()
+        try held.handleResponse(
+            status: 200, headers: [],
+            body: Data(#"{"levels":[1],"limits":{"max_request_bytes":4194304,"max_change_bytes":65536,"max_snapshot_bytes":16777216,"max_append_envelopes":100,"max_fetch_entries":500},"time":1767225600}"#.utf8))
+        let put = try XCTUnwrap(try held.nextRequest())
+        XCTAssertEqual(put.method, "PUT")
+        try held.handleResponse(status: 201, headers: [], body: Data(#"{"position":1,"digest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#.utf8))
+        let fetch = try XCTUnwrap(try held.nextRequest())
+        XCTAssertTrue(fetch.url.contains("/entries?after=0"))
+        let d0 = try digest0(logId: setup.logId).base64EncodedString()
+        try held.handleResponse(
+            status: 200, headers: [],
+            body: Data((#"{"entries":[],"head":{"position":0,"digest":""# + d0 + #""},"has_more":false,"hold":true}"#).utf8))
+        XCTAssertEqual(try engine.status(), .restoreHold)
         XCTAssertThrowsError(try deviceId(signPk: Data(count: 32), sealPk: Data(count: 1215)))
     }
 }
