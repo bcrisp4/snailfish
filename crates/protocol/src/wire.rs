@@ -964,7 +964,10 @@ mod tests {
             Ok((sid, 7))
         );
         assert_eq!(parse_repair_next(&repair_next_body(8)), Ok(8));
-        assert_eq!(parse_repair_finished(&repair_finished_body(&head)), Ok(head));
+        assert_eq!(
+            parse_repair_finished(&repair_finished_body(&head)),
+            Ok(head)
+        );
     }
 
     #[test]

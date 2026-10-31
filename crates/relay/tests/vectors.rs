@@ -207,7 +207,9 @@ fn status_cases_return_the_vector_results() {
             s(&c["body"]).as_bytes(),
             s(&c["signer"]),
         );
-        if let Some(code) = c["error"].as_str() { assert_eq!(error_code(&r), code, "{name}") } else {
+        if let Some(code) = c["error"].as_str() {
+            assert_eq!(error_code(&r), code, "{name}")
+        } else {
             assert_eq!(
                 r.status,
                 200,

@@ -25,6 +25,9 @@ fuzz_target!(|data: &[u8]| {
         check_entries(&c.entries);
     }
     if let Ok(f) = wire::parse_repair_finish(data) {
-        assert_eq!(wire::parse_repair_finish(&wire::repair_finish_body(&f)), Ok(f));
+        assert_eq!(
+            wire::parse_repair_finish(&wire::repair_finish_body(&f)),
+            Ok(f)
+        );
     }
 });
