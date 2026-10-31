@@ -261,3 +261,11 @@ def test_drift_allows_a_base_without_design_md(tmp_path: Path) -> None:
     (root / "DESIGN.md").write_text(DESIGN)
     errors = rules.drift(root, "main")
     assert errors and "DLV-1" in errors[0]
+
+
+def test_partial_gap_needs_a_citation(tmp_path: Path) -> None:
+    ok = '[not_modelled]\n"ENR-1" = "later"\n[partial]\n"DLV-1" = "part"\n'
+    assert rules.check(make_repo(tmp_path / "ok", coverage=ok)) == []
+    uncited = '[not_modelled]\n"ENR-1" = "later"\n"DLV-2" = "not yet"\n[partial]\n"DLV-2" = "part"\n'
+    errors = rules.check(make_repo(tmp_path / "bad", model="// [DLV-1]\n", coverage=uncited))
+    assert errors == ["specs/coverage.toml: partial [DLV-2] is not cited in a model"]

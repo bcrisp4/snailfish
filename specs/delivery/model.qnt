@@ -19,6 +19,13 @@
 //    interleaving of actions models a crash at each step.
 //  - The applied position (position, digest) is the log prefix that the app
 //    handled. Prefix equality stands for digest equality.
+//  - A grant is a log entry GRANT + d. It makes a device of LATE active
+//    ([LOG-8]). Devices outside LATE are active from the genesis record. A
+//    device that is not active in the relay log cannot fetch, push or report
+//    (PROTOCOL.md 8.6 step 5). Grants carry no change and the app skips them.
+//  - A repair session stages chunks of the verified log of its device. A
+//    session ends by its finish, by expiry (24 hours without a chunk) or by a
+//    replacement from the same device.
 //
 // The const BUG selects one deliberate violation of the design. "none" is the
 // design. specs/delivery/checks.toml binds the consts for each config and each
@@ -36,6 +43,7 @@ module delivery {
     | EvFetch | EvPull | EvPullOwn | EvAppRestore | EvRelayRestore | EvRelayFault
     | EvRepair | EvHoldReleased | EvEarlyRelease | EvForkDetected | EvReverted
     | EvSplit | EvPushConflict | EvEngineLoss | EvResetRequired | EvLimitLowered | EvResetAhead | EvWarnedRelease
+    | EvGrant | EvRepairStart | EvRepairChunk | EvRepairExpired | EvLateRepair
 
   // The durable part of the app DB that a backup copies.
   type AppImage = { applied: Set[Id], outbox: Set[Id], appliedLog: List[Rcd] }
@@ -58,15 +66,21 @@ module delivery {
     log: List[Rcd],        // verified log
     gen: int,              // ghost: engine state losses so far. It makes the record hash new.
     stop: Stop,
-    fresh: bool,           // a new state file since the last hold ended. The status
-                           // report carries it until a hold ends (F3).
+    fresh: bool,           // a new state file since the last fetch that reached the
+                           // relay head with no hold. The status report carries it (F3).
   }
+
+  // A repair session. `base` is the relay log at the start, `staged` the
+  // entries in the staging table ([LOG-11]).
+  type Session = { live: bool, owner: Dev, base: List[Rcd], staged: List[Rcd] }
 
   type Relay = {
     log: List[Rcd],
     hold: bool,            // restore hold: appends are refused
-    reported: Set[Dev],    // devices that reported a tip at or below the head since the restore
+    tips: Dev -> List[Rcd],// the last reported verified log of each device since the restore
+    marked: Set[Dev],      // devices that reported a new engine state file since the restore
     limitLow: bool,        // the relay operator lowered the change size limit
+    session: Session,
   }
 
   type Change = { author: Dev, big: bool }
@@ -80,6 +94,7 @@ module delivery {
     reverted: Set[Id],     // changes that an app reverted after a refusal
     lostAtRelease: Set[Id],// changes that only app DBs held when a hold ended
     silentLoss: bool,      // a hold ended with no warning and lost a change
+    granted: Set[Dev],     // LATE devices that got a grant at some time
     faults: int,
     events: Set[Event],
   }
@@ -87,6 +102,7 @@ module delivery {
   // ---------------------------------------------------------------- consts
 
   const DEVS: Set[Dev]
+  const LATE: Set[Dev]     // devices that become active only through a grant entry
   const MAX_IDS: int
   const MAX_FAULTS: int    // bound on app restores, engine losses and relay rollbacks
   const FAULTS: Set[str]   // the fault classes that this config enables
@@ -119,13 +135,29 @@ module delivery {
     "noAheadReset",         // no ResetRequired if the applied position is past the log end (F2)
     "releaseIgnoresFresh",  // the user page does not mark a new engine state file (F3)
     "freshClearsOnFetch",   // the "not repaired" mark ends at the first fetch, not at the hold end (F3)
+    "repairMultiSession",   // a repair start replaces the live session of another device [LOG-11]
+    "repairMovesEarly",     // the relay puts each chunk into the log at once, not after the finish [LOG-11]
+    "repairNoExpiry",       // a repair session never expires [LOG-11]
+    "repairNeedsLogGrant",  // a repair signer must be active in the relay log, not in the entries [LOG-12]
   )
+
+  // A grant record. It is larger than every change record, because gen is at most MAX_FAULTS.
+  pure val GRANT: int = 1000
 
   // ---------------------------------------------------------------- pure logic
 
   pure def rid(r: Rcd): Id = r % MAX_IDS
 
-  pure def ids(l: List[Rcd]): Set[Id] = l.foldl(Set(), (s, x) => s.union(Set(rid(x))))
+  pure def isGrant(r: Rcd): bool = r >= GRANT
+
+  pure def ids(l: List[Rcd]): Set[Id] =
+    l.foldl(Set(), (s, x) => if (isGrant(x)) s else s.union(Set(rid(x))))
+
+  pure def grantsIn(l: List[Rcd]): Set[Dev] =
+    l.foldl(Set(), (s, x) => if (isGrant(x)) s.union(Set(x - GRANT)) else s)
+
+  // Rules: [LOG-8]
+  pure def activeIn(d: Dev, l: List[Rcd]): bool = not(LATE.contains(d)) or grantsIn(l).contains(d)
 
   pure def isPrefix(a: List[Rcd], b: List[Rcd]): bool =
     a.length() <= b.length() and b.slice(0, a.length()) == a
@@ -141,6 +173,7 @@ module delivery {
   pure val emptyImage: AppImage = { applied: Set(), outbox: Set(), appliedLog: List() }
   pure val freshApp: App = { applied: Set(), outbox: Set(), appliedLog: List(), dups: 0, backup: emptyImage }
   pure val freshEngine: Engine = { outbox: Map(), refused: Set(), log: List(), gen: 0, stop: Running, fresh: false }
+  pure val noSession: Session = { live: false, owner: 0, base: List(), staged: List() }
 
   // ---- app
 
@@ -162,7 +195,9 @@ module delivery {
   pure def applyPull(a: App, e: Engine, crash: bool, bug: str): App = {
     val id = rid(nextEntry(a, e))
     val moved = e.log.slice(0, a.appliedLog.length() + 1)
-    if (a.outbox.contains(id))
+    if (isGrant(nextEntry(a, e)))
+      { ...a, appliedLog: moved }
+    else if (a.outbox.contains(id))
       { ...a, outbox: a.outbox.exclude(Set(id)), appliedLog: moved }
     else {
       val dups = a.dups + (if (a.applied.contains(id)) 1 else 0)
@@ -201,9 +236,12 @@ module delivery {
   // An own envelope leaves the outbox only when the verified log holds it.
   // Rules: [DLV-8]
   // Partial: stubs are not modelled, so the replacement of a covered record is not encoded.
-  pure def applyFetch(e: Engine, newLog: List[Rcd], bug: str): Engine =
-    { ...e, log: newLog, outbox: without(e.outbox, ids(newLog)),
-      fresh: e.fresh and not(bug == "freshClearsOnFetch" and newLog.length() > 0) }
+  // The fresh flag ends at a fetch that reaches the relay head with no hold
+  // (PROTOCOL.md 10.8). A fetch during a hold keeps it (F3).
+  pure def applyFetch(e: Engine, newLog: List[Rcd], r: Relay, bug: str): Engine = {
+    val clears = (newLog == r.log and not(r.hold)) or (bug == "freshClearsOnFetch" and newLog.length() > 0)
+    { ...e, log: newLog, outbox: without(e.outbox, ids(newLog)), fresh: e.fresh and not(clears) }
+  }
 
   // ---- relay
 
@@ -249,6 +287,12 @@ module delivery {
   def eng(d: Dev): Engine = engines.get(d)
   def running(d: Dev): bool = eng(d).stop == Running
   def ev(e: Event): Env = { ...env, events: env.events.union(Set(e)) }
+  def active(d: Dev): bool = activeIn(d, relay.log)
+  // The devices of the space: each device outside LATE, and each LATE device that got a grant.
+  def members: Set[Dev] = DEVS.filter(d => not(LATE.contains(d)) or env.granted.contains(d))
+  // The relay reads a stored tip as reported if the log holds it now (PROTOCOL.md 10.8).
+  def reportedNow(d: Dev): bool = relay.tips.keys().contains(d) and isPrefix(relay.tips.get(d), relay.log)
+  def allReported: bool = members.forall(d => reportedNow(d))
   def canFault(f: str): bool = FAULTS.contains(f) and env.faults < MAX_FAULTS
   def fault(e: Event): Env = { ...ev(e), faults: env.faults + 1 }
 
@@ -259,9 +303,10 @@ module delivery {
     FAULTS.subseteq(FAULT_CLASSES),
     apps' = DEVS.mapBy(_ => freshApp),
     engines' = DEVS.mapBy(_ => freshEngine),
-    relay' = { log: List(), hold: false, reported: Set(), limitLow: false },
+    LATE.subseteq(DEVS),
+    relay' = { log: List(), hold: false, tips: Map(), marked: Set(), limitLow: false, session: noSession },
     env' = { nextId: 0, changes: Map(), stored: Set(), exposed: Set(), reverted: Set(),
-             lostAtRelease: Set(), silentLoss: false, faults: 0, events: Set() },
+             lostAtRelease: Set(), silentLoss: false, granted: Set(), faults: 0, events: Set() },
   }
 
   // The user edits on device d. The app works offline, and also when sync stops.
@@ -313,6 +358,7 @@ module delivery {
     all {
       eng(d).outbox.keys().contains(id),
       running(d),
+      active(d),
       not(relay.hold),
       relay' = if (v == Stored) { ...relay, log: relay.log.append(p.rec) } else relay,
       engines' =
@@ -328,11 +374,15 @@ module delivery {
   }
 
   // Fetch when the verified log is a prefix of the relay log: verify n entries.
+  // n equal to the verified length is a fetch that adds nothing: it can still
+  // reach the relay head and end the fresh flag.
   action fetchExtend(d: Dev, n: int): bool = all {
     running(d),
+    active(d),
     isPrefix(eng(d).log, relay.log),
-    eng(d).log.length() < n, n <= relay.log.length(),
-    engines' = engines.set(d, applyFetch(eng(d), relay.log.slice(0, n), BUG)),
+    eng(d).log.length() < n or (n == relay.log.length() and eng(d).fresh and not(relay.hold)),
+    n <= relay.log.length(),
+    engines' = engines.set(d, applyFetch(eng(d), relay.log.slice(0, n), relay, BUG)),
     apps' = apps,
     relay' = relay,
     env' = ev(EvFetch),
@@ -348,53 +398,148 @@ module delivery {
     val adopt = (forked and BUG == "adoptFork") or (shorter and BUG == "noRepair")
     all {
       running(d),
+      active(d),
       forked or (shorter and BUG == "noRepair"),
-      engines' = engines.set(d, if (adopt) applyFetch(e, relay.log, BUG) else { ...e, stop: Forked }),
+      engines' = engines.set(d, if (adopt) applyFetch(e, relay.log, relay, BUG) else { ...e, stop: Forked }),
       apps' = apps,
       relay' = relay,
       env' = ev(if (adopt) EvFetch else EvForkDetected),
     }
   }
 
-  // Repair session: the relay log ends before a verified position, so the device
-  // uploads the lost entries at the same positions. The relay commits the staged
-  // entries in one transaction. It accepts a repair during a restore hold.
-  // Rules: [LOG-10] [LOG-14]
-  // Partial: chunks, the staging table and the 24 hour expiry are not modelled.
-  action repair(d: Dev): bool = all {
-    BUG != "noRepair",
-    running(d),
-    isPrefix(relay.log, eng(d).log),
-    relay.log.length() < eng(d).log.length(),
-    relay' = { ...relay, log: eng(d).log },
-    engines' = engines,
-    apps' = apps,
-    env' = ev(EvRepair),
+  // A device needs a repair: the relay log is a proper prefix of its verified log.
+  // Rules: [LOG-10]
+  def needsRepair(d: Dev): bool =
+    running(d) and isPrefix(relay.log, eng(d).log) and relay.log.length() < eng(d).log.length()
+
+  // Start a repair session with the first chunk: the n verified entries after the
+  // relay head. The relay stages them and checks the chain. A space has one
+  // session. A start replaces a session of the same device. The signer must be
+  // active in the log or in the staged entries, so a device whose grant is only
+  // in the lost range can repair. The relay accepts a repair during a restore hold.
+  // Rules: [LOG-10] [LOG-11] [LOG-12] [LOG-14]
+  // Partial: the device learns the relay head from a fetch, which a device that
+  // is not active cannot do. PROTOCOL.md 10.9 needs the relay head as the base.
+  action startRepair(d: Dev, n: int): bool = {
+    val h = relay.log.length()
+    val chunk = eng(d).log.slice(h, h + n)
+    val signerOk = active(d) or (BUG != "repairNeedsLogGrant" and activeIn(d, relay.log.concat(chunk)))
+    val early = BUG == "repairMovesEarly"
+    all {
+      BUG != "noRepair",
+      needsRepair(d),
+      1 <= n, h + n <= eng(d).log.length(),
+      not(relay.session.live) or relay.session.owner == d or BUG == "repairMultiSession",
+      signerOk,
+      relay' = { ...relay,
+        log: if (early) relay.log.concat(chunk) else relay.log,
+        session: { live: true, owner: d,
+                   base: if (early) relay.log.concat(chunk) else relay.log,
+                   staged: if (early) List() else chunk } },
+      engines' = engines,
+      apps' = apps,
+      env' = { ...ev(EvRepairStart), events: env.events.union(
+                 if (active(d)) Set(EvRepairStart) else Set(EvRepairStart, EvLateRepair)) },
+    }
   }
 
-  // Status report during a restore hold. The user page shows each device that
-  // reported a verified tip at or below the log head since the restore.
+  // Add the next n entries to the session of d. The relay head must not have
+  // changed since the start.
+  // Rules: [LOG-11] [LOG-12]
+  action chunkRepair(d: Dev, n: int): bool = {
+    val ses = relay.session
+    val k = ses.base.length() + ses.staged.length()
+    val chunk = eng(d).log.slice(k, k + n)
+    val early = BUG == "repairMovesEarly"
+    all {
+      running(d),
+      ses.live, ses.owner == d,
+      relay.log == ses.base,
+      isPrefix(ses.base.concat(ses.staged), eng(d).log),
+      1 <= n, k + n <= eng(d).log.length(),
+      relay' = { ...relay,
+        log: if (early) relay.log.concat(chunk) else relay.log,
+        session: if (early) { ...ses, base: relay.log.concat(chunk) }
+                 else { ...ses, staged: ses.staged.concat(chunk) } },
+      engines' = engines,
+      apps' = apps,
+      env' = ev(EvRepairChunk),
+    }
+  }
+
+  // The finish names the verified head of d. The relay moves the staged entries
+  // into the log in one transaction and ends the session.
+  // Rules: [LOG-10] [LOG-11]
+  // Partial: no stubs, so the snapshot rule of [LOG-11] holds for every staged range.
+  action finishRepair(d: Dev): bool = {
+    val ses = relay.session
+    all {
+      running(d),
+      ses.live, ses.owner == d,
+      relay.log == ses.base,
+      ses.base.concat(ses.staged) == eng(d).log,
+      relay' = { ...relay, log: eng(d).log, session: noSession },
+      engines' = engines,
+      apps' = apps,
+      env' = ev(EvRepair),
+    }
+  }
+
+  // 24 hours pass without a chunk. The relay deletes the staged entries.
+  // Mutant repairNoExpiry keeps the session.
+  // Rules: [LOG-11]
+  action expireSession: bool = all {
+    relay.session.live,
+    relay' = if (BUG == "repairNoExpiry") relay else { ...relay, session: noSession },
+    engines' = engines,
+    apps' = apps,
+    env' = ev(EvRepairExpired),
+  }
+
+  // An active device g grants a LATE device d. A grant is a security record, so
+  // the relay accepts it during a hold. Its base is the verified log of g.
+  // Rules: [LOG-8] [LOG-14]
+  action grantDevice(g: Dev, d: Dev): bool = all {
+    running(g),
+    active(g),
+    isPrefix(eng(g).log, relay.log),
+    LATE.contains(d),
+    not(active(d)),
+    not(env.granted.contains(d)),
+    relay' = { ...relay, log: relay.log.append(GRANT + d) },
+    engines' = engines,
+    apps' = apps,
+    env' = { ...ev(EvGrant), granted: env.granted.union(Set(d)) },
+  }
+
+  // Status report during a restore hold: the verified log of the device and its
+  // fresh flag. A new report replaces the tip. The fresh mark stays until the
+  // hold ends (PROTOCOL.md 10.8).
   // Rules: [LOG-14]
-  action reportStatus(d: Dev): bool = all {
-    relay.hold,
-    running(d),
-    not(relay.reported.contains(d)),
-    isPrefix(eng(d).log, relay.log),
-    relay' = { ...relay, reported: relay.reported.union(Set(d)) },
-    engines' = engines,
-    apps' = apps,
-    env' = env,
+  action reportStatus(d: Dev): bool = {
+    val markNew = eng(d).fresh and not(relay.marked.contains(d))
+    all {
+      relay.hold,
+      running(d),
+      active(d),
+      not(relay.tips.keys().contains(d)) or relay.tips.get(d) != eng(d).log or markNew,
+      relay' = { ...relay, tips: relay.tips.put(d, eng(d).log),
+                           marked: if (eng(d).fresh) relay.marked.union(Set(d)) else relay.marked },
+      engines' = engines,
+      apps' = apps,
+      env' = env,
+    }
   }
 
-  // The end of a hold. Each device stops the "new engine state file" report. The
-  // ghost state records the changes that only app DBs hold at this point: the
-  // release loses them. A release with no warning that loses a change is silent.
+  // The end of a hold. The relay forgets the reports. The ghost state records
+  // the changes that only app DBs hold at this point: the release loses them. A
+  // release with no warning that loses a change is silent.
   // Rules: [LOG-14] [LOG-15]
   action endHold(e: Event, warned: bool): bool = {
     val newLoss = unheldApplied.exclude(env.lostAtRelease)
     all {
-      relay' = { ...relay, hold: false },
-      engines' = engines.keys().mapBy(d => { ...eng(d), fresh: false }),
+      relay' = { ...relay, hold: false, tips: Map(), marked: Set() },
+      engines' = engines,
       apps' = apps,
       env' = { ...ev(e), lostAtRelease: env.lostAtRelease.union(newLoss),
                silentLoss: env.silentLoss or (not(warned) and newLoss != Set()) },
@@ -402,14 +547,14 @@ module delivery {
   }
 
   // Only the user (user page) or the relay operator (snailfish-relay
-  // release-hold) ends a hold. This action is a release after the user page shows
-  // a report from every device and marks no device as "not repaired". The relay
-  // does not end a hold by itself.
+  // release-hold) ends a hold. This action is a release after the reports show
+  // a reported tip from every device and mark no device as "not repaired". The
+  // relay does not end a hold by itself.
   // Rules: [LOG-15]
   action releaseHold: bool = all {
     relay.hold,
-    relay.reported == DEVS,
-    BUG == "releaseIgnoresFresh" or DEVS.forall(d => not(eng(d).fresh)),
+    allReported,
+    BUG == "releaseIgnoresFresh" or relay.marked == Set(),
     endHold(EvHoldReleased, false),
   }
 
@@ -499,7 +644,8 @@ module delivery {
   action restoreRelay(k: int): bool = all {
     canFault("relayRestore"),
     0 <= k, k < relay.log.length(),
-    relay' = { ...relay, log: relay.log.slice(0, k), hold: BUG != "noHold", reported: Set() },
+    relay' = { ...relay, log: relay.log.slice(0, k), hold: BUG != "noHold", tips: Map(), marked: Set(),
+               session: noSession },
     engines' = engines,
     apps' = apps,
     env' = fault(EvRelayRestore),
@@ -509,7 +655,7 @@ module delivery {
   action rollBackRelay(k: int): bool = all {
     canFault("silentRollback"),
     0 <= k, k < relay.log.length(),
-    relay' = { ...relay, log: relay.log.slice(0, k) },
+    relay' = { ...relay, log: relay.log.slice(0, k), session: noSession },
     engines' = engines,
     apps' = apps,
     env' = fault(EvRelayFault),
@@ -520,8 +666,8 @@ module delivery {
   action releaseHoldWarned: bool = all {
     FAULTS.contains("warnedRelease"),
     relay.hold,
-    relay.reported == DEVS,
-    DEVS.exists(d => eng(d).fresh),
+    allReported,
+    relay.marked != Set(),
     endHold(EvWarnedRelease, true),
   }
 
@@ -529,7 +675,7 @@ module delivery {
   action releaseHoldEarly: bool = all {
     FAULTS.contains("earlyRelease"),
     relay.hold,
-    relay.reported != DEVS,
+    not(allReported),
     endHold(EvEarlyRelease, true),
   }
 
@@ -552,7 +698,11 @@ module delivery {
       { nondet id = eng(d).outbox.keys().oneOf() push(d, id, flag) },
       fetchExtend(d, k),
       fetchConflict(d),
-      repair(d),
+      startRepair(d, k),
+      chunkRepair(d, k),
+      finishRepair(d),
+      expireSession,
+      { nondet g = DEVS.oneOf() grantDevice(g, d) },
       reportStatus(d),
       pull(d, flag),
       handleReset(d),
@@ -670,6 +820,12 @@ module delivery {
     DEVS.forall(d => caughtUp(d) and app(d).outbox == Set() and eng(d).outbox == Map()) and
     DEVS.forall(d => ids(relay.log).exists(id => env.changes.get(id).author == d))
   // A repair after a restore, and then the hold ends.
+  val wGrant: bool = happened(EvGrant)
+  // A repair with at least one chunk after the start.
+  val wChunkedRepair: bool = happened(EvRepairChunk) and happened(EvRepair)
+  val wRepairExpired: bool = happened(EvRepairExpired)
+  // A device that is not active in the relay log started a repair [LOG-12].
+  val wLateRepair: bool = happened(EvLateRepair)
   val wRepairThenRelease: bool = happened(EvRepair) and (happened(EvHoldReleased) or happened(EvWarnedRelease))
   // Two faults lost a change that enqueue stored (expected: see noLostChangeWeak).
   val wDoubleFaultLoss: bool = not(env.stored.exclude(env.reverted).subseteq(held))

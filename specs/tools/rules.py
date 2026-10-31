@@ -153,11 +153,13 @@ def cited_ids(root: Path) -> dict[str, list[str]]:
     return found
 
 
-def load_not_modelled(root: Path) -> dict[str, str]:
-    """Read the not_modelled table of specs/coverage.toml.
+def load_coverage(root: Path, table_name: str) -> dict[str, str]:
+    """Read one table of specs/coverage.toml.
 
     Args:
         root: The repo root.
+        table_name: `not_modelled`, or `partial` for cited rules with a part
+            that no model encodes.
 
     Returns:
         A map from rule ID to the reason.
@@ -165,8 +167,13 @@ def load_not_modelled(root: Path) -> dict[str, str]:
     path = root / "specs" / "coverage.toml"
     if not path.exists():
         return {}
-    table = tomllib.loads(path.read_text()).get("not_modelled", {})
+    table = tomllib.loads(path.read_text()).get(table_name, {})
     return {str(k): str(v) for k, v in table.items()}
+
+
+def load_not_modelled(root: Path) -> dict[str, str]:
+    """Read the not_modelled table of specs/coverage.toml."""
+    return load_coverage(root, "not_modelled")
 
 
 def check(root: Path) -> list[str]:
@@ -200,6 +207,13 @@ def check(root: Path) -> list[str]:
             errors.append(f"specs/coverage.toml: unknown rule ID [{rule_id}]")
         if not reason.strip():
             errors.append(f"specs/coverage.toml: [{rule_id}] has an empty reason")
+    # A partial gap belongs to a cited rule. Without the citation, the rule
+    # belongs in not_modelled, and the gap entry would hide the missing model.
+    for rule_id, reason in load_coverage(root, "partial").items():
+        if rule_id not in cited:
+            errors.append(f"specs/coverage.toml: partial [{rule_id}] is not cited in a model")
+        if not reason.strip():
+            errors.append(f"specs/coverage.toml: partial [{rule_id}] has an empty reason")
     return errors
 
 

@@ -6,7 +6,7 @@ model = "model.qnt"
 module = "delivery"
 tests = "test.qnt"
 test_module = "deliveryTest"
-test_modules = ["deliveryTestHold"]
+test_modules = ["deliveryTestHold", "deliveryTestLate"]
 
 # Invariants that hold in every config unless a config lists it under `limits`.
 invariants = [
@@ -16,7 +16,7 @@ invariants = [
 
 # Configs that verify.py uses to count witnesses. Each witness (val w*) must be
 # reached in at least one of them.
-witness_configs = ["allFaults", "restoreEngine"]
+witness_configs = ["allFaults", "restoreEngine", "lateGrant"]
 witness_steps = 60
 
 # The config that the fast tier samples.
@@ -30,6 +30,7 @@ max_steps = 8
 
 [defaults]
 DEVS = "Set(1, 2)"
+LATE = "Set()"
 MAX_IDS = "4"
 MAX_FAULTS = "2"
 BUG = '"none"'
@@ -88,6 +89,13 @@ why = "Limit 2: an engine state loss and a relay restore lose a change (checked 
 
 [configs.engineOnly]
 FAULTS = 'Set("engineLoss")'
+
+# Device 2 becomes active through a grant entry, so a restore can lose its grant ([LOG-12]).
+[configs.lateGrant]
+LATE = "Set(2)"
+FAULTS = 'Set("relayRestore", "engineLoss", "warnedRelease")'
+skip = ["noLostChange"]
+why = "Limit 2: an engine state loss and a relay restore lose a change (checked in allFaults)."
 
 # Small configs for TLC (make verify-deep). TLC checks every reachable state.
 [configs.tinyCrash]
@@ -214,6 +222,30 @@ caught_by = "noSilentLoss"
 base = "restoreEngine"
 caught_by = "tests"
 test = "notRepairedMarkTest"
+
+# The repair session rules protect availability and the staging area. In this
+# model a partial or concurrent repair still writes a prefix of a verified log,
+# so no safety invariant fails. Each scripted test fails on each run.
+[mutants.repairMultiSession]
+base = "restoreBase"
+caught_by = "tests"
+test = "oneRepairSessionTest"
+
+[mutants.repairMovesEarly]
+base = "restoreBase"
+caught_by = "tests"
+test = "repairStagesUntilFinishTest"
+
+[mutants.repairNoExpiry]
+base = "restoreEngine"
+caught_by = "tests"
+test = "repairExpiryTest"
+
+[mutants.repairNeedsLogGrant]
+base = "lateGrant"
+caught_by = "tests"
+test_module = "deliveryTestLate"
+test = "lateDeviceRepairTest"
 
 # ---------------------------------------------------------------- exhaustive (TLC)
 # TLC checks every reachable state of a small config, at any depth. Each listed

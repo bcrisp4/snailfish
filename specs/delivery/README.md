@@ -20,8 +20,10 @@
 | `ResetRequired`: delete synced data, apply outbox rows again | `handleReset`, mutant `resetDropsOutbox` |
 | Engine state loss with the keys kept (T14) | `loseEngine` |
 | Signed base refused if not in the relay log | `verdict` (`BadBase`) |
-| Repair session after a rollback | `repair`, mutant `noRepair` |
-| Restore hold. Only the user or the relay operator ends it. | `restoreRelay`, `reportStatus`, `releaseHold` (after every device reports), `releaseHoldEarly` (before), mutant `noHold` |
+| Repair session after a rollback [LOG-10] | `startRepair`, `chunkRepair`, `finishRepair`, mutant `noRepair` |
+| One session per space, staging until the finish, 24 hour expiry [LOG-11] | `startRepair`, `expireSession`, mutants `repairMultiSession`, `repairMovesEarly`, `repairNoExpiry`, tests `oneRepairSessionTest`, `repairStagesUntilFinishTest`, `repairExpiryTest` |
+| A device whose grant is only in the lost range repairs the log [LOG-12] | `grantDevice`, `startRepair` (signer active in the log or the chunk), mutant `repairNeedsLogGrant`, test `lateDeviceRepairTest` in module `deliveryTestLate` |
+| Restore hold. Only the user or the relay operator ends it. | `restoreRelay`, `reportStatus` (each report replaces the tip, the fresh mark stays), `releaseHold` (after each device of the space has a reported tip in the log), `releaseHoldEarly` (before), mutant `noHold` |
 | Fork detection stops sync | `fetchConflict`, mutant `adoptFork` |
 
 ## Invariants
@@ -75,17 +77,25 @@ A log entry is a record hash: an int that holds the change ID and a counter `gen
 | --- | --- | --- |
 | F1 | No design change. The restore hold prevents it after a restore, if the release comes after every device reports. The text of T7 names the case. A silent rollback or an earlier release remains a limit. | `refusedNotStored`, configs `faultyRelay`, `earlyReleaseOnly`, `silentOnly` |
 | F2 | `changes_after` raises `ResetRequired` if the applied position is after the end of a log that the engine fetched to the relay head, with no hold. After two faults, the reset deletes the changes that only the app DB holds. DESIGN.md states this. | `resetRequired`, `noStuckDevice`, mutant `noAheadReset`, test `aheadOfLogResetTest` |
-| F3 | A device with a new engine state file reports it until the hold ends, also after a fetch. The user page marks it "not repaired" and warns before a release. The warning does not prevent the loss. It makes the loss visible. | `noSilentLoss`, mutants `releaseIgnoresFresh` and `freshClearsOnFetch`, test `notRepairedMarkTest` |
+| F3 | A device with a new engine state file reports it until a fetch reaches the relay head with no hold. A fetch during a hold does not end it, and the relay keeps the mark until the hold ends. The user page marks the device "not repaired" and warns before a release. The warning does not prevent the loss. It makes the loss visible. | `noSilentLoss`, mutants `releaseIgnoresFresh` and `freshClearsOnFetch`, test `notRepairedMarkTest` |
 | F4 | `enqueue_many` does not check the size limit. The relay checks the known `change_id` first. | `enqueue`, `refusedNotStored`, mutant `enqueueChecksSize` |
 | F5 | The Delivery row says "if no second fault occurs". | `noLostChange` limit 2 |
 
 Mutant `freshClearsOnFetch` needs a restore, an engine state loss and a fetch, in that order, during one hold. Random sampling seldom finds this path. `checks.toml` sets `caught_by = "tests"` for it, so `verify.py` runs the scenario tests with its `BUG`, and `notRepairedMarkTest` catches this one.
 
+The four repair-session mutants (`repairMultiSession`, `repairMovesEarly`, `repairNoExpiry`, `repairNeedsLogGrant`) break availability, not a safety invariant. In this model a partial or concurrent repair still writes a prefix of a verified log, and a device that cannot repair keeps its verified log. Each mutant has `caught_by = "tests"`, and its scripted test fails on each run.
+
+The engine starts with `fresh` false. A Rust engine marks each new state file, also on a first install. That reports more devices as "not repaired" than the model, which only adds warnings.
+
 Mutant `noHold` breaks `refusedNotStored`. Sampling of `restoreBase` at 5,000 traces found the violation in 5 of 6 local runs, and CI run 41115310784 missed it. `restoreSetsHoldTest` in module `deliveryTestHold` catches it on each run. The test lives in its own module, because the mutant also breaks the hold in each `deliveryTest` scenario that calls `reportStatus`.
 
 ## Not covered
 
-- Security records, epochs, the base rule for security records, enrollment and removal.
+- The device learns the relay head from a fetch. A device whose grant is only in the lost range cannot fetch (403), so the M3 engine cannot find the base of a repair. The model lets it start at the relay head. The relay part of [LOG-12] is in Rust (`crates/relay/tests`). The engine part is open for M4.
+- A repair session in a restored or rolled back space file. Both faults end the session in the model.
+- Stubs in a repair session, and the snapshot rule of [LOG-11] (`specs/coverage.toml` `partial`).
+
+- Security records other than grants, epochs, the base rule for security records ([LOG-7], in `specs/spacelog`), enrollment and removal. A grant here only makes a device active.
 - Log compaction: snapshots, stubs, accept records and `is_covered`.
 - Fork repair (export, import, enroll again).
 - A malicious relay. The relay in this model is honest, but it can lose data.

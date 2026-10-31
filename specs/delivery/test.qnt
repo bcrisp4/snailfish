@@ -1,7 +1,7 @@
 // Scenario tests for model.qnt. specs/tools/verify.py runs them, also with the
 // BUG of each mutant that sampling does not catch.
 module deliveryTest {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 3,
+  import delivery(DEVS = Set(1, 2), LATE = Set(), MAX_IDS = 4, MAX_FAULTS = 3,
                   FAULTS = Set("appRestore", "engineLoss", "relayRestore", "silentRollback", "earlyRelease", "warnedRelease"),
                   BUG = "none").* from "./model"
 
@@ -66,7 +66,9 @@ module deliveryTest {
       .expect(app(2).applied == Set(0, 1) and app(2).dups == 0)
 
   // S6: snailfish-relay restore. The hold refuses changes, a device repairs the
-  // log, and the hold stays on after every device reports until a release.
+  // log in a repair session with two chunks, and the hold stays on after every
+  // device reports until a release.
+  // Rules: [LOG-10] [LOG-11] [LOG-14] [LOG-15]
   run relayRestoreRepairTest =
     init
       .then(editAndPush(1, 0))
@@ -75,12 +77,15 @@ module deliveryTest {
       .then(restoreRelay(0))
       .expect(relay.hold and relay.log == [])
       .then(edit(1, false, false)).then(enqueue(1, 2))
-      // push is disabled by the hold. reportStatus is disabled: the tip is above the head.
-      .expect(relay.hold and not(isPrefix(eng(1).log, relay.log)))
-      .then(repair(1))
-      .expect(relay.log == [0, 1])
-      .then(reportStatus(1)).then(reportStatus(2))
-      .expect(relay.hold and relay.reported == DEVS)
+      // push is disabled by the hold. A report now would not count: the tip is above the head.
+      .then(reportStatus(2))
+      .expect(relay.hold and not(reportedNow(2)) and needsRepair(1))
+      .then(startRepair(1, 1)).then(chunkRepair(1, 1))
+      .expect(relay.session.live and relay.session.owner == 1)
+      .then(finishRepair(1))
+      .expect(relay.log == [0, 1] and not(relay.session.live) and reportedNow(2))
+      .then(reportStatus(1))
+      .expect(relay.hold and allReported)
       .then(releaseHold)
       .then(push(1, 2, false))
       .expect(relay.log == [0, 1, 2])
@@ -155,6 +160,7 @@ module deliveryTest {
       .then(fetchExtend(1, 1))
       .expect(eng(1).fresh)
       .then(reportStatus(1)).then(reportStatus(2))
+      .expect(allReported and relay.marked == Set(1))
       .then(releaseHoldWarned)
       .expect(not(relay.hold) and noSilentLoss and env.lostAtRelease == Set(1))
 
@@ -240,12 +246,83 @@ module deliveryTest {
       .expect(eng(1).outbox == Map() and eng(1).log == [0])
       .then(pull(1, false))
       .expect(app(1).applied == Set(0) and app(1).outbox == Set() and app(1).dups == 0 and caughtUp(1))
+
+  // [LOG-11] The relay keeps the chunks in the staging table. The log does not
+  // change before the finish, and the finish moves every staged entry at once.
+  run repairStagesUntilFinishTest =
+    init
+      .then(editAndPush(1, 0)).then(editAndPush(1, 1)).then(editAndPush(1, 2))
+      .then(fetchExtend(1, 3))
+      .then(restoreRelay(0))
+      .then(startRepair(1, 1))
+      .expect(relay.log == [] and relay.session.staged == [0])
+      .then(chunkRepair(1, 2))
+      .expect(relay.log == [] and relay.session.staged == [0, 1, 2])
+      .then(finishRepair(1))
+      .expect(relay.log == [0, 1, 2] and not(relay.session.live))
+
+  // [LOG-11] A space has at most one repair session. A second device cannot
+  // start one while the first session is live.
+  run oneRepairSessionTest =
+    init
+      .then(editAndPush(1, 0)).then(editAndPush(1, 1))
+      .then(fetchExtend(1, 2)).then(fetchExtend(2, 2))
+      .then(restoreRelay(0))
+      .then(startRepair(1, 1))
+      .expect(needsRepair(2) and relay.session.owner == 1)
+      .then(startRepair(2, 1).fail())
+
+  // [LOG-11] The device of a session loses its engine state. The session
+  // expires, and the other device repairs the log.
+  run repairExpiryTest =
+    init
+      .then(editAndPush(1, 0)).then(editAndPush(1, 1))
+      .then(fetchExtend(1, 2)).then(fetchExtend(2, 2))
+      .then(restoreRelay(0))
+      .then(startRepair(1, 1))
+      .then(loseEngine(1))
+      .expect(relay.session.live and relay.session.owner == 1 and not(needsRepair(1)))
+      .then(expireSession)
+      .expect(not(relay.session.live))
+      // One chunk with every lost entry, so the test does not depend on how
+      // the first session staged its chunk.
+      .then(startRepair(2, eng(2).log.length() - relay.log.length())).then(finishRepair(2))
+      .expect(relay.log == [0, 1] and not(relay.session.live))
+}
+
+// A device with a grant entry (LATE). Its grant is only in the lost range after
+// a restore, so it is not active in the relay log.
+module deliveryTestLate {
+  import delivery(DEVS = Set(1, 2), LATE = Set(2), MAX_IDS = 4, MAX_FAULTS = 2,
+                  FAULTS = Set("relayRestore"),
+                  BUG = "none").* from "./model"
+
+  action editAndPush(d: Dev, id: Id): bool =
+    edit(d, false, false).then(enqueue(d, id)).then(push(d, id, false))
+
+  // [LOG-12] Device 2 repairs the log with a first chunk that holds its own
+  // grant. It cannot fetch or push before the repair.
+  run lateDeviceRepairTest =
+    init
+      .then(editAndPush(1, 0))
+      .then(fetchExtend(1, 1))
+      .then(grantDevice(1, 2))
+      .then(fetchExtend(2, 2))
+      .then(editAndPush(2, 1))
+      .then(fetchExtend(2, 3))
+      .expect(eng(2).log == [0, GRANT + 2, 1])
+      .then(restoreRelay(1))
+      .expect(relay.log == [0] and not(active(2)) and needsRepair(2))
+      .then(startRepair(2, 2))
+      .expect(wLateRepair and relay.log == [0])
+      .then(finishRepair(2))
+      .expect(relay.log == [0, GRANT + 2, 1] and active(2))
 }
 
 // The mutant noHold (restoreRelay sets no hold) breaks the hold in each test
 // above that uses reportStatus, so its scripted test lives alone here.
 module deliveryTestHold {
-  import delivery(DEVS = Set(1, 2), MAX_IDS = 4, MAX_FAULTS = 3,
+  import delivery(DEVS = Set(1, 2), LATE = Set(), MAX_IDS = 4, MAX_FAULTS = 3,
                   FAULTS = Set("appRestore", "relayRestore"),
                   BUG = "none").* from "./model"
 

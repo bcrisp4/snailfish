@@ -1,6 +1,10 @@
 # Rules of DESIGN.md that no Quint model encodes yet.
 # A rule that a model encodes carries a `// [ID]` comment in model.qnt or test.qnt instead.
 # `specs/tools/rules.py check` fails if a rule is in neither place.
+# `partial` lists cited rules with a part that no model encodes yet.
+
+[partial]
+"LOG-11" = "snapshot rule: the relay moves staged entries only if the usable snapshot covers every staged stub. M3 has no stubs, and the relay refuses each staged stub (crates/relay/tests). Model it with compaction (M8)"
 
 [not_modelled]
 "DLV-1" = "durable commit settings are an implementation rule, not a protocol state"
@@ -15,8 +19,6 @@
 "MRG-6" = "app merge rules are outside the delivery model, the app owns them"
 "LOG-3" = "byte-level hash, not modelled. Rust: crates/protocol/tests/vectors.rs log_entries and envelopes, against the Go vectors"
 "LOG-4" = "byte-level hash, not modelled. Rust: crates/protocol/tests/vectors.rs log_entries, hash::tests"
-"LOG-11" = "security records, hashes and the signed log structure are not modelled"
-"LOG-12" = "security records, hashes and the signed log structure are not modelled"
 "LOG-13" = "security records, hashes and the signed log structure are not modelled"
 "CMP-1" = "compaction model not written yet"
 "CMP-2" = "compaction model not written yet"
