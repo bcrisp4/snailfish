@@ -211,6 +211,7 @@ class Device:
         self.db.execute("PRAGMA fullfsync=ON")
         self.db.executescript(SCHEMA)
         self.refused: list[bytes] = []
+        self.repairs: list[sf.Repair] = []
         self.flush_outbox()
 
     def close(self) -> None:
@@ -311,11 +312,16 @@ class Device:
                 self.refused.append(bytes(cid))
 
     def sync(self, send: Transport) -> sf.Status:
-        """Exchange with the relay, then pull. Returns the engine status."""
+        """Exchange with the relay, then pull. Returns the engine status.
+
+        After the exchange, `repairs` holds each repair of the relay log
+        that this device made (S6), for the app to show.
+        """
         exchange = self.engine.start_sync()
         while (req := exchange.next_request()) is not None:
             status, headers, body = send(req)
             exchange.handle_response(status, headers, body)
+        self.repairs = self.engine.take_repairs()
         self.pull()
         self.flush_outbox()
         return self.engine.status()

@@ -109,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "sync":
             with httpx.Client(timeout=30) as client:
                 status = dev.sync(http_transport(client, crasher))
+            for r in dev.repairs:
+                print(
+                    f"repair: the relay lost positions {r.first} to {r.tip}, "
+                    "and this device uploaded them again"
+                )
             print(f"status: {status}")
             return 0 if status.is_ok() else 1
         elif args.cmd == "list":
@@ -124,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
                         "engine_outbox": dev.engine.outbox_len(),
                         "applied": dev.applied_position().position,
                         "status": str(dev.engine.status()),
+                        "log_id": dev.space.log_id,
                     },
                     sort_keys=True,
                 )

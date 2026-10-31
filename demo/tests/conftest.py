@@ -82,6 +82,30 @@ class Relay:
             self.proc.wait(timeout=10)
             self.proc = None
 
+    def admin(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """Run a `snailfish-relay` operator command on the data directory."""
+        return subprocess.run(
+            [str(RELAY), "--data", str(self.data), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    def backup(self, out: Path) -> None:
+        """Take a backup while the relay runs."""
+        r = self.admin("backup", str(out))
+        assert r.returncode == 0, r.stderr
+
+    def restore(self, backup: Path) -> None:
+        """Stop the relay, restore the backup over the data, start again."""
+        running = self.admin("restore", "--replace", str(backup))
+        assert running.returncode != 0, "restore must refuse while the relay runs"
+        self.stop()
+        r = self.admin("restore", "--replace", str(backup))
+        assert r.returncode == 0, r.stderr
+        self.start()
+
 
 @pytest.fixture
 def relay(tmp_path: Path) -> Iterator[Relay]:
