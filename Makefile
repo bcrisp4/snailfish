@@ -200,9 +200,11 @@ test-python: bindings-python
 	  sh -c 'cd bindings/python && mise exec -- uv run --locked pytest'
 
 
-## The M2 acceptance tests: the demo app on the Python binding against a relay
-## process. Sync between two devices, a plaintext scan of the relay files,
-## merge order, and a client crash at each step of push and pull.
+## The M2 and M3 acceptance tests: the demo app on the Python binding against a
+## relay process. Sync between two devices, a plaintext scan of the relay files,
+## merge order, a client crash at each step of push and pull, and the M3 log
+## integrity cases: S6 backup, restore, repair and release, a change during the
+## hold, the "not repaired" refusal, and a fork through the record base.
 test-demo: bindings-python
 	$(CARGO) build -p snailfish-relay
 	cd demo && mise exec -- uv run --locked ruff check . && mise exec -- uv run --locked ruff format --check . \
