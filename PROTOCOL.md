@@ -1,6 +1,6 @@
 # Snailfish protocol
 
-Status: draft for M2. This file gives the exact bytes of the protocol (DESIGN.md "Wire format", [WIR-1] to [WIR-9]). DESIGN.md gives the rules and the reasons. If the two differ, change the Quint model first, then DESIGN.md, then this file, then `tools/vectorgen`, then the Rust code.
+Status: draft for M3. This file gives the exact bytes of the protocol (DESIGN.md "Wire format", [WIR-1] to [WIR-9]). DESIGN.md gives the rules and the reasons. If the two differ, change the Quint model first, then DESIGN.md, then this file, then `tools/vectorgen`, then the Rust code.
 
 Before the first public release, formats can change without notice, and the vectors are regenerated (DESIGN.md "Versioning").
 
@@ -15,7 +15,7 @@ Before the first public release, formats can change without notice, and the vect
 | 7. Signatures and keys | Done | `snailfish_protocol::sig`, `snailfish_protocol::keys` | `vectors/third_party/`, `vectors/protocol.json` |
 | 8. Request signatures | Done | `snailfish_protocol::request` | `vectors/http.json` |
 | 9. Recovery key encoding | Done | `snailfish_protocol::recovery` | `vectors/protocol.json`, `vectors/recovery-key.json` |
-| 10. HTTP API | Done (M2 routes) | `snailfish_protocol::wire`, `snailfish-relay` | `vectors/http.json` |
+| 10. HTTP API | Done (M3 routes) | `snailfish_protocol::wire`, `snailfish-relay` | `vectors/http.json` |
 
 `vectors/README.md` describes each vector file and the programs that make and check them.
 
@@ -350,6 +350,7 @@ The relay checks a signed request in this order. It returns the first error (sec
 - The relay stores a nonce only after the signature verifies, so a party without the key cannot use up nonces.
 - Steps 3 to 5 run before the signature check. The errors of steps 3 and 4 tell an unauthenticated caller only facts that the request itself holds. Step 5 tells a caller who knows the tenant handle and the log ID whether a device ID is active in the space. The tenant handle has 128 random bits ([STO-10]), so only a party that already holds it can ask.
 - For `PUT /v1/t/{tenant}/s/{log}`, step 5 takes the device key from the genesis record in the body. The relay therefore runs steps 1 to 4 before it parses the body (10.5).
+- For the repair routes, step 5 also accepts a device that the staged entries or the request entries make active (10.9, [LOG-12]). The relay therefore runs steps 1 to 4, parses the body and runs the chain check before step 5.
 - A request that fails a check changes no stored state, except the nonce of step 7.
 
 ## 9. Recovery key encoding
@@ -385,7 +386,7 @@ seal_seed = HKDF-Expand(prk, "snailfish.recovery.seal.v1", 32)
 
 ## 10. HTTP API
 
-This section gives the sync surface routes of M2. Later milestones add routes under the same prefix ([VER-12]). Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
+This section gives the sync surface routes of M3. Later milestones add routes under the same prefix ([VER-12]). Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
 
 ### 10.1 Routes
 
@@ -396,15 +397,21 @@ This section gives the sync surface routes of M2. Later milestones add routes un
 | `PUT` | `/v1/t/{tenant}/s/{log}` | Yes, by the device of the genesis record | Create the space with its genesis record (10.5) |
 | `POST` | `/v1/t/{tenant}/s/{log}/append` | Yes, by an active device | Append records (10.6) |
 | `GET` | `/v1/t/{tenant}/s/{log}/entries?after={n}&limit={m}` | Yes, by an active device | Fetch entries after position `n` (10.7) |
+| `POST` | `/v1/t/{tenant}/s/{log}/status` | Yes, by an active device | Report the verified tip during a restore hold (10.8) |
+| `POST` | `/v1/t/{tenant}/s/{log}/repair` | Yes, by a device that is active in the log or in the request entries | Start a repair session with the first chunk (10.9) |
+| `POST` | `/v1/t/{tenant}/s/{log}/repair/chunk` | Yes, by the device of the session | Add a chunk to the repair session (10.9) |
+| `POST` | `/v1/t/{tenant}/s/{log}/repair/finish` | Yes, by the device of the session | Move the staged entries into the log (10.9) |
 
 - `{tenant}` is the tenant handle: `t_` and 32 lowercase hex digits (128 bits, [STO-10]).
 - `{log}` is the log ID text (section 2.2).
 - The relay finds the tenant only through the handle, and the space only through the space index of the tenant file ([STO-3]).
-- M2 creates a space with a device signature only. M5 adds the setup token of the setup surface.
+- M3 creates a space with a device signature only. M5 adds the setup token of the setup surface.
 
 ### 10.2 Active devices
 
-A device is active in a space if the genesis record or a grant at a position in the log names it ([LOG-8]). M2 has no removal, so a device stays active. The device of a genesis record signs the `PUT` request that creates the space.
+A device is active in a space if the genesis record or a grant at a position in the log names it ([LOG-8]). M3 has no removal, so a device stays active. The device of a genesis record signs the `PUT` request that creates the space.
+
+A security record is a record of a type outside the `snailfish.change`, `snailfish.snapshot` and `snailfish.accept` families ([VER-5]). The genesis record and each grant are security records.
 
 ### 10.3 Errors
 
@@ -429,12 +436,18 @@ Each error response has an HTTP status and this body:
 | `unknown_space` | 404 | The tenant has no space with the log ID | `paused: relay unavailable` |
 | `not_found` | 404 | No route has the path | `paused: relay unavailable` |
 | `space_exists` | 409 | `PUT` with another genesis record for an existing log ID | `stopped: fork` |
-| `invalid_record` | 422 | The genesis record of a `PUT` breaks 10.5 | `stopped: fork` |
-| `too_large` | 413 | The body is larger than `max_request_bytes` | `degraded` |
+| `repair_busy` | 409 | Another device holds a repair session of the space that has not expired (10.9) | `paused: relay unavailable` |
+| `bad_repair` | 409 | The repair request does not continue the session: see 10.9 | `paused: relay unavailable`. The engine starts a new session at the next sync. |
+| `invalid_record` | 422 | The genesis record of a `PUT` breaks 10.5, or a repair entry fails the chain check of 10.9 | `stopped: fork` |
+| `uncovered_stub` | 422 | A repair entry is a stub that no usable snapshot of the staged range covers ([LOG-11]) | `stopped: fork` |
+| `too_large` | 413 | The body is larger than `max_request_bytes`, or a repair body is larger than `max_request_bytes` + 1,024 bytes (10.9) | `degraded` |
 | `wrong_authority` | 421 | `snailfish-authority` differs from the relay configuration (8.6 step 1) | `paused: relay authority` |
 | `internal` | 500 | A relay failure | `paused: relay unavailable` |
+| `backup_running` | 503 | `PUT` while `snailfish-relay backup` runs ([STO-8]) | `paused: relay unavailable` |
 
 A response that is not JSON, or JSON without a string `error`, is a fault outside the relay, for example a proxy page. The engine reports `paused: relay unavailable`.
+
+The append refusals of 10.6 are results inside a `200` response, not error responses.
 
 ### 10.4 `GET /v1/info`
 
@@ -445,10 +458,10 @@ A response that is not JSON, or JSON without a string `error`, is a fault outsid
 | Field | Content |
 | --- | --- |
 | `levels` | The protocol levels that the relay accepts ([VER-6], [VER-11]) |
-| `limits.max_request_bytes` | The largest request body |
+| `limits.max_request_bytes` | The largest request body, except for the repair allowance of 10.9 |
 | `limits.max_change_bytes` | The largest decoded payload of a change record |
 | `limits.max_snapshot_bytes` | The largest decoded payload of a snapshot record ([CMP-3]) |
-| `limits.max_append_envelopes` | The most envelopes in one append request |
+| `limits.max_append_envelopes` | The most envelopes in one append request, and the most entries in one repair request |
 | `limits.max_fetch_entries` | The most entries in one fetch response |
 | `time` | The relay time, as in `snailfish-time` |
 
@@ -466,6 +479,7 @@ The device that made the space holds its genesis record from the setup. If posit
 | The space exists with the same genesis record hash | 200 | `{"position":1,"digest":"<base64>"}`. This is an exact retry. |
 | The space exists with another genesis record | 409 | Error `space_exists` |
 | The record is not valid | 422 | `{"error":"invalid_record","message":"..."}` |
+| `snailfish-relay backup` runs | 503 | Error `backup_running`. The relay creates no space file. |
 
 ### 10.6 `POST /v1/t/{tenant}/s/{log}/append`
 
@@ -481,20 +495,25 @@ The relay checks each envelope in this order:
 
 1. If the envelope or the payload breaks section 4 or 6, the result is `refused` with `invalid_record`.
 2. If the log holds a change with the same `change_id` and the same record hash, the result is `known` with its position. If the record hash differs, the result is `conflict` with the position of the stored change ([WIR-6]). The relay checks this before every other refusal, so a stored change is never refused ([DLV-5], [DLV-7]).
-3. If the decoded payload of a change is larger than `max_change_bytes`, the result is `refused` with `too_large`.
-4. If `log` differs from `{log}`, the result is `refused` with `invalid_record`.
-5. If `author` differs from the request `keyid`, the result is `refused` with `not_author`.
-6. If `author` is not an active device, the result is `refused` with `not_active`. Step 5 and 8.6 step 5 make this step unreachable on the relay. The engine applies steps 4 and 6 to 11 to each fetched record.
-7. If the signature does not verify with the signing key of `author` (section 7.1), the result is `refused` with `invalid_record`.
-8. If the base is not position 1 or later, or not before the new position, or its digest differs from the log digest at that position, the result is `refused` with `bad_base` ([LOG-6]).
-9. If the record type is not `snailfish.change.v1` or `snailfish.grant.v1`, the result is `refused` with `unsupported`. M2 accepts only these two types.
-10. If a change names an epoch other than the current epoch (1 in M2), the result is `refused` with `wrong_epoch`.
-11. If a grant names a device that is already active, or a level below the space write level, the result is `refused` with `invalid_record`.
-12. Otherwise the relay appends the record at the next position. Positions are dense ([LOG-1]). The relay stores the log digest of the new entry (section 5). The result is `stored` with the position.
+3. If the space is on restore hold and the record is not a security record (10.2), the result is `refused` with `on_hold` ([LOG-14]).
+4. If the decoded payload of a change is larger than `max_change_bytes`, the result is `refused` with `too_large`.
+5. If `log` differs from `{log}`, the result is `refused` with `invalid_record`.
+6. If `author` differs from the request `keyid`, the result is `refused` with `not_author`.
+7. If `author` is not an active device, the result is `refused` with `not_active`. Step 6 and 8.6 step 5 make this step unreachable on the relay.
+8. If the signature does not verify with the signing key of `author` (section 7.1), the result is `refused` with `invalid_record`.
+9. If the base is not position 1 or later, or not before the new position, or its digest differs from the log digest at that position, the result is `refused` with `bad_base` ([LOG-6]).
+10. If the record is a security record and the log holds a security record after its base, the result is `refused` with `stale_base` ([LOG-7]). Changes after the base do not cause this refusal.
+11. If the record type is not `snailfish.change.v1` or `snailfish.grant.v1`, the result is `refused` with `unsupported`. M3 accepts only these two types.
+12. If a change names an epoch other than the current epoch (1 in M3), the result is `refused` with `wrong_epoch`.
+13. If a grant names a device that is already active, or a level below the space write level, the result is `refused` with `invalid_record`.
+14. Otherwise the relay appends the record at the next position. Positions are dense ([LOG-1]). The relay stores the log digest of the new entry (section 5). The result is `stored` with the position.
 
 - `head` is the last position and its log digest after the transaction.
 - A known envelope earlier in the same request counts: a second copy in one request is `known`.
-- `bad_base` is transient. Each other refusal is permanent for that envelope ([DLV-9]).
+- `bad_base`, `stale_base` and `on_hold` are transient. Each other refusal is permanent for that envelope ([DLV-9]).
+- After `on_hold`, the engine keeps the envelope in its outbox and reports `paused: restore hold`. It sends the envelope again after the hold ends.
+- After `stale_base`, the engine fetches, checks the space state again and signs the record again with a new base ([LOG-7]).
+- The engine applies steps 5 and 7 to 13 to each fetched record. A fetched record that fails one of them stops the engine with `stopped: fork` ([FRK-1]). The engine verifies the signature (step 8) before it changes any state for the record ([WIR-2]).
 - The engine splits its envelopes into requests that fit `max_append_envelopes` and `max_request_bytes`. A change whose append body alone is larger than `max_request_bytes` is refused for ever with `too_large`, and the engine does not send it ([DLV-9]).
 
 ### 10.7 `GET /v1/t/{tenant}/s/{log}/entries`
@@ -502,11 +521,103 @@ The relay checks each envelope in this order:
 Query: `after` (integer from 0) and `limit` (integer from 1 to `max_fetch_entries`). Both are required, in this order, as decimal integers with no leading zero.
 
 ```json
-{"entries":[{"position":1,"envelope":{"payloadType":"...","payload":"...","signatures":[{"keyid":"...","sig":"..."}]}},{"position":12,"stub":{"type":"snailfish.change.v1","change_id":"c_...","hash":"<base64>"}}],"head":{"position":12,"digest":"<base64>"},"has_more":false}
+{"entries":[{"position":1,"envelope":{"payloadType":"...","payload":"...","signatures":[{"keyid":"...","sig":"..."}]}},{"position":12,"stub":{"type":"snailfish.change.v1","change_id":"c_...","hash":"<base64>"}}],"head":{"position":12,"digest":"<base64>"},"has_more":false,"hold":false}
 ```
 
 - `entries` holds the entries from position `after + 1`, in position order, with no gap, at most `limit` entries.
-- An entry holds the stored envelope in full, or a stub. M2 has no compaction, so the M2 relay sends no stubs. A stub has `type`, `change_id` (only for a change) and `hash`, the record hash ([CMP-1]).
+- An entry holds the stored envelope in full, or a stub. M3 has no compaction, so the M3 relay sends no stubs. A stub has `type`, `change_id` (only for a change) and `hash`, the record hash ([CMP-1]).
 - The relay sends each envelope object as it stored it. The record hash does not depend on the layout ([WIR-3]).
 - `head` is the last position of the log and its log digest. `has_more` is true if the log holds entries after the last entry of the response.
-- If `after` is the head position or later, `entries` is empty. The engine compares `head` with its verified log.
+- `hold` is true while the space is on restore hold ([LOG-14]). The relay always sends `hold`. A reader treats a missing `hold` as false.
+- If `after` is the head position or later, `entries` is empty. The engine compares `head` with its verified log:
+
+| Relay `head` | Engine action |
+| --- | --- |
+| After the verified head | Fetch the next page |
+| Equal to the verified head, same digest | Caught up |
+| Before the verified head, and the digest equals the verified digest at that position | Repair session (10.9, [LOG-10]) |
+| Any other digest | `stopped: fork` ([FRK-1]) |
+
+### 10.8 `POST /v1/t/{tenant}/s/{log}/status`
+
+Request body:
+
+```json
+{"tip":{"position":12,"digest":"<base64>"},"fresh":true}
+```
+
+| Field | Content |
+| --- | --- |
+| `tip` | The verified head of the device: position (integer from 0) and log digest. Position 0 has `digest(0)`. |
+| `fresh` | True if the engine state file of the device is new since the last fetch that reached the relay head with no hold ([LOG-14], F3 in `specs/delivery/README.md`) |
+
+The response is `200` with `{"hold":true}` or `{"hold":false}`.
+
+- During a restore hold, the engine sends a status report in each sync, after the repair session and before the append requests.
+- During a hold, the relay stores the report for the device and the relay time. A new report replaces the tip of the device. The `fresh` mark of a device stays until the hold ends, also if a later report has `fresh` false.
+- When the relay reads the reports, for example for `snailfish-relay hold-status`, it reads a stored tip as "reported" if the log holds the tip position with the same digest at that time. A tip at position 0 with `digest(0)` is reported. A tip after the head means that the device did not repair yet. A later repair by another device can make a stored tip "reported".
+- Without a hold, the relay stores nothing and answers `{"hold":false}`. A body that breaks this section gets `bad_request` also without a hold.
+- A fetch does not end the `fresh` mark. The engine clears its `fresh` flag only after a fetch that reaches the relay head with `hold` false.
+
+### 10.9 Repair session
+
+A device repairs the log if the relay log ends before its verified head and the relay head digest equals the verified digest at that position ([LOG-10]). The device uploads its copies of the lost entries, in position order, in chunks. The relay keeps them in a staging table in the space file, outside the space quota, and moves them into the log after the last chunk ([LOG-11]).
+
+An entry has the form of a fetch entry (10.7): `{"position":n,"envelope":<envelope>}` or `{"position":n,"stub":<stub>}`.
+
+Start: `POST /v1/t/{tenant}/s/{log}/repair`
+
+```json
+{"base":{"position":4,"digest":"<base64>"},"entries":[{"position":5,"envelope":{...}},{"position":6,"envelope":{...}}]}
+```
+
+Chunk: `POST /v1/t/{tenant}/s/{log}/repair/chunk`
+
+```json
+{"session":"00112233445566778899aabbccddeeff","entries":[{"position":7,"envelope":{...}}]}
+```
+
+Finish: `POST /v1/t/{tenant}/s/{log}/repair/finish`
+
+```json
+{"session":"00112233445566778899aabbccddeeff","tip":{"position":7,"digest":"<base64>"}}
+```
+
+| Route | Result | Body |
+| --- | --- | --- |
+| Start | 201 | `{"session":"<32 hex digits>","next":7}` |
+| Chunk | 200 | `{"next":8}` |
+| Finish | 200 | `{"head":{"position":7,"digest":"<base64>"}}` |
+
+- `entries` holds 1 to `max_append_envelopes` entries.
+- A repair body is at most `max_request_bytes` + 1,024 bytes. The engine fills a chunk up to `max_request_bytes`, and sends an entry that does not fit alone. The allowance covers the wrapper of one entry, because each envelope fit in an append body before.
+- `session` is 16 random bytes from the relay, as 32 lowercase hex digits. `next` is the position after the last staged entry.
+- A space has at most one repair session. A start replaces a session of the same device, and a session that expired. The relay deletes the staged entries of a replaced session.
+- A session expires 86,400 seconds after its start or its last chunk: at a relay time of that time + 86,400 or later.
+
+The relay checks the body size first, as for every route (10.3 `too_large`). Then it checks a start request in this order:
+
+1. 8.6 steps 1 to 4.
+2. If the body breaks this section, return `bad_request`.
+3. If the base equals the relay head (position and digest), run the chain check, entry by entry, until the first failure. Otherwise no entry passes. Each entry must have the next position after the base or after the entry before it. An envelope must pass steps 1, 2, 5 and 7 to 13 of 10.6 against the log and the entries before it, with step 2 as for a fetched record: a known `change_id` fails the check. The size limit of step 4 and the hold of step 3 do not apply, because the record was in the log before. A stub fails the check with `uncovered_stub`, because M3 has no snapshot ([LOG-11]).
+4. 8.6 steps 5 to 7. Step 5 accepts a device that is active in the log or in the entries that passed step 3 ([LOG-12]).
+5. If the base differs from the relay head (position or digest), return `bad_repair`.
+6. If another device holds a session that has not expired, return `repair_busy`.
+7. If an entry failed step 3, return the error of that entry: `invalid_record`, `uncovered_stub`, or `bad_repair` for a wrong position.
+8. Otherwise create the session and stage the entries.
+
+A chunk request uses the same order. In step 3, the chain continues the staged entries of the named session if the relay holds that session and the relay head did not change since its start. Otherwise no entry passes. Step 4 also accepts a device that the staged entries of the named session make active, also if the session expired or belongs to another device. Step 5 is: if the session is unknown or expired, if the request signer is not the device of the session, or if the relay head changed since the start, return `bad_repair`. Step 6 does not apply. The first entry must have the position `next`.
+
+A finish request runs 8.6 steps 1 to 4, returns `bad_request` for a body that breaks this section, and runs 8.6 steps 5 to 7 with the keys of the log and the staged entries of the named session. Then:
+
+1. If the session is unknown or expired, if the request signer is not the device of the session, or if the relay head changed since the start, return `bad_repair`.
+2. If `tip` differs from the last staged entry (position or digest), return `bad_repair`.
+3. If a staged stub is not covered by the usable snapshot of the staged range, return `uncovered_stub`. M3 stages no stub, so this step finds none.
+4. Move the staged entries into the log in one transaction, end the session and delete its staged entries. The response holds the new head.
+
+- A request that fails a check changes no stored state, except the nonce of 8.6 step 7.
+- The chain check runs before the request signature check, so a caller that knows the tenant handle and the log ID can make the relay verify up to `max_append_envelopes` record signatures for one request. The tenant handle has 128 random bits ([STO-10]).
+- A security record that a device appends during a hold moves the head and ends each repair session with `bad_repair`. The next fetch of the repairing device then finds an entry that conflicts with its verified log, and the engine stops with `stopped: fork` (DESIGN.md T7 limit, `specs/epochs/test.qnt::removalDuringHoldCanForkTest`).
+- The relay accepts repair sessions during a restore hold ([LOG-14]).
+- The finish request names the tip, so the relay moves the entries only if they end at the verified head of the device ([LOG-10]).
+- If a chunk response is lost, the next chunk gets `bad_repair`, and the engine starts a new session.

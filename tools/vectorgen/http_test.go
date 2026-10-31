@@ -134,9 +134,44 @@ func TestHTTPFetchHasMore(t *testing.T) {
 		n            int
 		more         bool
 	}{{0, 2, 2, true}, {0, 4, 4, false}, {2, 500, 2, false}, {4, 5, 0, false}} {
-		pos, head, more := rs.space.fetch(tc.after, tc.limit)
+		pos, head, more, _ := rs.space.fetch(tc.after, tc.limit)
 		if len(pos) != tc.n || more != tc.more || head != 4 {
 			t.Errorf("after %d limit %d: %v %d %v", tc.after, tc.limit, pos, head, more)
+		}
+	}
+}
+
+// Each relay fault of the M3 rules must change the result of a named case, so
+// a relay with the fault cannot pass the vectors.
+func TestHTTPVectorsDetectRelayFaults(t *testing.T) {
+	h, w := testHTTP(t)
+	if err := checkHTTPWith(h, w, ""); err != nil {
+		t.Fatalf("baseline: %v", err)
+	}
+	for _, tc := range []struct{ mut, firstCase string }{
+		{"no-hold", "append_hold change-on-hold"},
+		{"hold-before-known", "append_hold exact-retry-on-hold"},
+		{"no-stale-base", "append grant-stale-base"},
+		{"stale-counts-changes", "append grant-base-before-change"},
+		{"fetch-no-hold", "fetch hold-after-0-limit-2"},
+		{"status-without-hold", "status no-hold"},
+		{"reported-ignores-digest", "status hold-tip-other-digest"},
+		{"chain-not-author", "repair one-start"},
+		{"no-log12", "repair signer-granted-in-entries"},
+		{"chain-allows-known", "repair known-change-id-in-entries"},
+		{"stub-invalid-record", "repair stub"},
+		{"no-tip-check", "repair wrong-tip"},
+		{"no-busy", "repair second-device-busy"},
+		{"no-expiry", "repair session-after-expiry"},
+		{"expiry-from-start", "repair chunk-extends-session"},
+		{"chunk-any-signer", "repair chunk-from-other-device"},
+		{"no-allowance", "repair body-at-allowance"},
+	} {
+		err := checkHTTPWith(h, w, tc.mut)
+		if err == nil {
+			t.Errorf("%s: the vectors pass", tc.mut)
+		} else if !strings.HasPrefix(err.Error(), tc.firstCase+":") {
+			t.Errorf("%s: first failure is %q, want case %q", tc.mut, err, tc.firstCase)
 		}
 	}
 }

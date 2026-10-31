@@ -7,9 +7,9 @@ import (
 )
 
 // This file builds vectors/http.json (vectors/README.md "Format of http.json").
-// The expected value of each append and fetch case is written by hand here and
-// asserted against the reference implementation of PROTOCOL.md 10.6 and 10.7
-// (httpref.go), so a mistake in either one stops the generator.
+// The expected value of each append, fetch, status and repair case is written
+// by hand here and asserted against the reference implementation of PROTOCOL.md
+// 10.6 to 10.9 (httpref.go), so a mistake in either one stops the generator.
 
 const (
 	httpNow       = 1767225600
@@ -97,6 +97,7 @@ type fetchJ struct {
 	Name      string `json:"name"`
 	After     int    `json:"after"`
 	Limit     int    `json:"limit"`
+	Hold      bool   `json:"hold"`
 	Positions []int  `json:"positions"`
 	Head      int    `json:"head"`
 	HasMore   bool   `json:"has_more"`
@@ -115,7 +116,43 @@ type httpJ struct {
 	Invalid    []invalidJ    `json:"invalid"`
 	Space      spaceJ        `json:"space"`
 	Append     []appendJ     `json:"append"`
+	AppendHold []appendJ     `json:"append_hold"`
 	Fetch      []fetchJ      `json:"fetch"`
+	Status     []statusJ     `json:"status"`
+	Repair     []repairJ     `json:"repair"`
+}
+
+type statusRespJ struct {
+	Hold bool `json:"hold"`
+}
+
+type statusJ struct {
+	Name     string       `json:"name"`
+	Signer   string       `json:"signer"`
+	Hold     bool         `json:"hold"`
+	Body     string       `json:"body"`
+	Response *statusRespJ `json:"response"`
+	Error    *string      `json:"error"`
+	TipInLog *bool        `json:"tip_in_log"`
+}
+
+type repairStepJ struct {
+	Route  string  `json:"route"`
+	Signer string  `json:"signer"`
+	At     int64   `json:"at"`
+	Body   string  `json:"body"`
+	Status int     `json:"status"`
+	Next   *int    `json:"next"`
+	Head   *headJ  `json:"head"`
+	Error  *string `json:"error"`
+}
+
+type repairJ struct {
+	Name      string        `json:"name"`
+	LogPrefix int           `json:"log_prefix"`
+	Hold      bool          `json:"hold"`
+	Steps     []repairStepJ `json:"steps"`
+	Log       []string      `json:"log"`
 }
 
 func httpLimits() limitsJ {
@@ -367,6 +404,9 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		{"grant-of-new-device", w.A, []string{grant(w.A, w.C, 2, 100, base4)}, []string{"stored:5"}, 0, nil},
 		{"bad-record-signature", w.A, []string{badSigEnv}, []string{"refused:invalid_record"}, 0, nil},
 		{"malformed-envelope", w.A, []string{`{"payloadType":"snailfish.change.v1","payload":"AA==","signatures":[]}`}, []string{"refused:invalid_record"}, 0, nil},
+		// [LOG-7]: the last security record is the grant to B at position 3.
+		{"grant-stale-base", w.A, []string{grant(w.A, w.C, 2, 100, b.baseRaw(2))}, []string{"refused:stale_base"}, 0, nil},
+		{"grant-base-before-change", w.A, []string{grant(w.A, w.C, 2, 100, b.baseRaw(3))}, []string{"stored:5"}, 0, nil},
 		{"mixed-results", w.A, []string{
 			newA21, e2,
 			mustChange(w.A, 2, base4, 1, logText, `{"op":"rename","task":1,"title":"Other"}`),
@@ -378,47 +418,115 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, c := range cases {
-		body := `{"envelopes":[` + strings.Join(c.envs, ",") + `]}`
-		st := sp.clone()
-		res, e := st.appendBatch(c.signer.idText, body, h.Limits)
-		if e != nil {
-			return nil, fmt.Errorf("append %s: %w", c.name, e)
+	runAppend := func(cases []ac, hold bool) ([]appendJ, error) {
+		var out []appendJ
+		for _, c := range cases {
+			body := `{"envelopes":[` + strings.Join(c.envs, ",") + `]}`
+			st := sp.clone()
+			st.hold = hold
+			res, e := st.appendBatch(c.signer.idText, body, h.Limits)
+			if e != nil {
+				return nil, fmt.Errorf("append %s: %w", c.name, e)
+			}
+			var got []string
+			var rj []resultJ
+			for _, r := range res {
+				got = append(got, resultFrom(r))
+				rj = append(rj, resultJOf(r))
+			}
+			if strings.Join(got, " ") != strings.Join(c.want, " ") {
+				return nil, fmt.Errorf("append %s: reference gives %v, expected %v", c.name, got, c.want)
+			}
+			n := len(st.entries)
+			out = append(out, appendJ{c.name, c.signer.name, body, rj, headJ{n, hx(st.digestAt(n))}})
 		}
-		var got []string
-		var rj []resultJ
-		for _, r := range res {
-			got = append(got, resultFrom(r))
-			rj = append(rj, resultJOf(r))
-		}
-		if strings.Join(got, " ") != strings.Join(c.want, " ") {
-			return nil, fmt.Errorf("append %s: reference gives %v, expected %v", c.name, got, c.want)
-		}
-		n := len(st.entries)
-		h.Append = append(h.Append, appendJ{c.name, c.signer.name, body, rj, headJ{n, hx(st.digestAt(n))}})
+		return out, nil
+	}
+	if h.Append, err = runAppend(cases, false); err != nil {
+		return nil, err
+	}
+
+	// ---- append cases during a restore hold ([LOG-14]) ----
+	holdCases := []ac{
+		{"change-on-hold", w.B, []string{newB}, []string{"refused:on_hold"}, 0, nil},
+		{"exact-retry-on-hold", w.A, []string{e2}, []string{"known:2"}, 0, nil},
+		{"grant-on-hold", w.A, []string{grant(w.A, w.C, 2, 100, base4)}, []string{"stored:5"}, 0, nil},
+		{"grant-stale-base-on-hold", w.A, []string{grant(w.A, w.C, 2, 100, b.baseRaw(2))}, []string{"refused:stale_base"}, 0, nil},
+	}
+	if err != nil {
+		return nil, err
+	}
+	if h.AppendHold, err = runAppend(holdCases, true); err != nil {
+		return nil, err
 	}
 
 	// ---- fetch cases ----
 	type fc struct {
 		name         string
 		after, limit int
+		hold         bool
 		pos          []int
 		more         bool
 	}
 	for _, c := range []fc{
-		{"after-0-limit-2", 0, 2, []int{1, 2}, true},
-		{"after-0-limit-3", 0, 3, []int{1, 2, 3}, true},
-		{"after-0-limit-4", 0, 4, []int{1, 2, 3, 4}, false},
-		{"after-2", 2, 500, []int{3, 4}, false},
-		{"after-3-limit-1", 3, 1, []int{4}, false},
-		{"after-head", 4, 500, []int{}, false},
-		{"after-beyond-head", 9, 10, []int{}, false},
+		{"after-0-limit-2", 0, 2, false, []int{1, 2}, true},
+		{"after-0-limit-3", 0, 3, false, []int{1, 2, 3}, true},
+		{"after-0-limit-4", 0, 4, false, []int{1, 2, 3, 4}, false},
+		{"after-2", 2, 500, false, []int{3, 4}, false},
+		{"after-3-limit-1", 3, 1, false, []int{4}, false},
+		{"after-head", 4, 500, false, []int{}, false},
+		{"after-beyond-head", 9, 10, false, []int{}, false},
+		{"hold-after-0-limit-2", 0, 2, true, []int{1, 2}, true},
+		{"hold-after-head", 4, 500, true, []int{}, false},
 	} {
-		pos, head, more := sp.fetch(c.after, c.limit)
-		if fmt.Sprint(pos) != fmt.Sprint(c.pos) || more != c.more || head != 4 {
-			return nil, fmt.Errorf("fetch %s: reference gives %v head %d more %v", c.name, pos, head, more)
+		st := sp.clone()
+		st.hold = c.hold
+		pos, head, more, hold := st.fetch(c.after, c.limit)
+		if fmt.Sprint(pos) != fmt.Sprint(c.pos) || more != c.more || head != 4 || hold != c.hold {
+			return nil, fmt.Errorf("fetch %s: reference gives %v head %d more %v hold %v", c.name, pos, head, more, hold)
 		}
-		h.Fetch = append(h.Fetch, fetchJ{c.name, c.after, c.limit, c.pos, head, more})
+		h.Fetch = append(h.Fetch, fetchJ{c.name, c.after, c.limit, hold, c.pos, head, more})
+	}
+
+	keys := map[string]*party{}
+	for _, d := range []*party{w.A, w.B, w.C} {
+		keys[d.name] = d
+	}
+
+	// ---- status reports (10.8) ----
+	tip := func(n int, d []byte, fresh bool) string {
+		return `{"tip":` + posRaw(n, d) + `,"fresh":` + fmt.Sprint(fresh) + `}`
+	}
+	type sc struct {
+		name   string
+		signer *party
+		hold   bool
+		body   string
+		want   string // "hold:<bool> reported:<bool|null>" or "error:<code>"
+	}
+	for _, c := range []sc{
+		{"hold-tip-in-log", w.A, true, tip(2, b.digests[2], false), "hold:true reported:true"},
+		{"hold-tip-at-head-fresh", w.B, true, tip(4, b.digests[4], true), "hold:true reported:true"},
+		{"hold-tip-after-head", w.A, true, tip(6, zeros, false), "hold:true reported:false"},
+		{"hold-tip-other-digest", w.A, true, tip(3, b.digests[2], false), "hold:true reported:false"},
+		{"no-hold", w.A, false, tip(4, b.digests[4], false), "hold:false reported:null"},
+		{"malformed-missing-fresh", w.A, true, `{"tip":` + posRaw(2, b.digests[2]) + `}`, "error:bad_request"},
+		{"malformed-fresh-not-boolean", w.A, true, `{"tip":` + posRaw(2, b.digests[2]) + `,"fresh":1}`, "error:bad_request"},
+		{"malformed-negative-position", w.A, true, tip(-1, b.digests[2], false), "error:bad_request"},
+		{"malformed-short-digest", w.A, true, tip(2, b.digests[2][:31], false), "error:bad_request"},
+		{"malformed-unknown-field", w.A, true, `{"tip":` + posRaw(2, b.digests[2]) + `,"fresh":false,"x":1}`, "error:bad_request"},
+		{"malformed-not-json", w.A, true, `{"tip":`, "error:bad_request"},
+	} {
+		got := replayStatus(sp, statusJ{Name: c.name, Signer: c.signer.name, Hold: c.hold, Body: c.body}, c.signer.idText, h.Now)
+		if g := statusWant(got); g != c.want {
+			return nil, fmt.Errorf("status %s: reference gives %q, expected %q", c.name, g, c.want)
+		}
+		h.Status = append(h.Status, got)
+	}
+
+	// ---- repair sessions (10.9) ----
+	if err := buildRepair(h, b, w, envs, keys); err != nil {
+		return nil, err
 	}
 
 	// ---- signed cases ----
@@ -531,4 +639,167 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		return nil, fmt.Errorf("self-check: %w", err)
 	}
 	return h, nil
+}
+
+// buildRepair writes the repair cases of http.json. Each case starts from the
+// first log_prefix entries of space.log, and the device uploads the others.
+func buildRepair(h *httpJ, b *logBuilder, w *world, envs []string, keys map[string]*party) error {
+	const day = sessionTTL
+	now := int64(httpNow)
+	d := b.digests
+	A, B, C := w.A, w.B, w.C
+	at := func(n int, env string) string { return fmt.Sprintf(`{"position":%d,"envelope":%s}`, n, env) }
+	ent := func(n int) string { return at(n, b.entries[n-1].Envelope) }
+	start := func(baseN int, baseD []byte, es ...string) string {
+		return `{"base":` + posRaw(baseN, baseD) + `,"entries":[` + strings.Join(es, ",") + `]}`
+	}
+	chunk := func(es ...string) string {
+		return `{"session":"{{session}}","entries":[` + strings.Join(es, ",") + `]}`
+	}
+	finish := func(n int, dg []byte) string { return `{"session":"{{session}}","tip":` + posRaw(n, dg) + `}` }
+	badSig := append([]byte{}, b.sigs[3]...)
+	badSig[0] ^= 1
+	badGrant := envelopeJSON("snailfish.grant.v1", b.payload[3], badSig, A.idText)
+	stubChange := fmt.Sprintf(`{"position":2,"stub":{"type":"snailfish.change.v1","change_id":"c_%s","hash":"%s"}}`, hx(changeIDFor(2)), b64(b.rhs[2]))
+	stubGrant := fmt.Sprintf(`{"position":3,"stub":{"type":"snailfish.grant.v1","hash":"%s"}}`, b64(b.rhs[3]))
+	const fixedSession = "00112233445566778899aabbccddeeff"
+	// padded fills a body with trailing JSON white space up to n bytes.
+	padded := func(body string, n int) string { return body + strings.Repeat(" ", n-len(body)) }
+	maxRepair := h.Limits.MaxRequestBytes + repairAllowance
+
+	type st struct {
+		route  string
+		signer *party
+		at     int64
+		body   string
+		want   string // "<status> next <n>", "<status> head <n>" or "<status> <code>"
+	}
+	type rc struct {
+		name   string
+		prefix int
+		hold   bool
+		steps  []st
+		logLen int
+	}
+	oneStart := []st{
+		{"start", A, now, start(2, d[2], ent(3), ent(4)), "201 next 5"},
+		{"finish", A, now, finish(4, d[4]), "200 head 4"},
+	}
+	cases := []rc{
+		{"one-start", 2, false, oneStart, 4},
+		{"start-and-chunks", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2)), "201 next 3"},
+			{"chunk", A, now + 10, chunk(ent(3)), "200 next 4"},
+			{"chunk", A, now + 20, chunk(ent(4)), "200 next 5"},
+			{"finish", A, now + 30, finish(4, d[4]), "200 head 4"},
+		}, 4},
+		{"during-hold", 2, true, oneStart, 4},
+		// [LOG-12]: the grant to B is position 3, which the relay lost.
+		{"signer-granted-in-entries", 2, false, []st{
+			{"start", B, now, start(2, d[2], ent(3), ent(4)), "201 next 5"},
+			{"finish", B, now, finish(4, d[4]), "200 head 4"},
+		}, 4},
+		{"signer-active-nowhere", 1, false, []st{
+			{"start", C, now, start(1, d[1], ent(2), ent(3)), "403 unknown_device"},
+		}, 1},
+		{"wrong-base-position", 2, false, []st{
+			{"start", A, now, start(1, d[1], ent(3), ent(4)), "409 bad_repair"},
+		}, 2},
+		{"wrong-base-digest", 2, false, []st{
+			{"start", A, now, start(2, d[1], ent(3), ent(4)), "409 bad_repair"},
+		}, 2},
+		// With a wrong base no entry passes the chain check, so B is not active (step 4 before step 5).
+		{"wrong-base-signer-granted-in-entries", 2, false, []st{
+			{"start", B, now, start(1, d[1], ent(3), ent(4)), "403 unknown_device"},
+		}, 2},
+		{"gap-in-positions", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2), ent(4)), "409 bad_repair"},
+			{"start", A, now, start(1, d[1], ent(3)), "409 bad_repair"},
+		}, 1},
+		{"entry-bad-signature", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2), at(3, badGrant)), "422 invalid_record"},
+		}, 1},
+		{"known-change-id-in-entries", 2, false, []st{
+			{"start", A, now, start(2, d[2], ent(3), ent(4), at(5, b.entries[3].Envelope)), "422 invalid_record"},
+		}, 2},
+		{"stub", 1, false, []st{
+			{"start", A, now, start(1, d[1], stubChange), "422 uncovered_stub"},
+			{"start", A, now, start(1, d[1], ent(2), stubGrant), "422 uncovered_stub"},
+		}, 1},
+		{"wrong-tip", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2), ent(3), ent(4)), "201 next 5"},
+			{"finish", A, now + 10, finish(4, d[3]), "409 bad_repair"},
+			{"finish", A, now + 20, finish(3, d[3]), "409 bad_repair"},
+			{"finish", A, now + 30, finish(4, d[4]), "200 head 4"},
+		}, 4},
+		{"second-device-busy", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2)), "201 next 3"},
+			{"start", B, now + 10, start(1, d[1], ent(2), ent(3)), "409 repair_busy"},
+			{"chunk", A, now + 20, chunk(ent(3), ent(4)), "200 next 5"},
+			{"finish", A, now + 30, finish(4, d[4]), "200 head 4"},
+		}, 4},
+		{"restart-same-device", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2)), "201 next 3"},
+			{"start", A, now + 10, start(1, d[1], ent(2), ent(3)), "201 next 4"},
+			{"chunk", A, now + 20, chunk(ent(4)), "200 next 5"},
+			{"finish", A, now + 30, finish(4, d[4]), "200 head 4"},
+		}, 4},
+		// B is active only through the staged grant in its chunk and finish ([LOG-12]).
+		{"session-after-expiry", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2)), "201 next 3"},
+			{"chunk", A, now + day + 1, chunk(ent(3)), "409 bad_repair"},
+			{"start", B, now + day + 2, start(1, d[1], ent(2), ent(3)), "201 next 4"},
+			{"chunk", B, now + day + 3, chunk(ent(4)), "200 next 5"},
+			{"finish", B, now + day + 4, finish(4, d[4]), "200 head 4"},
+		}, 4},
+		{"finish-after-expiry", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2), ent(3), ent(4)), "201 next 5"},
+			{"finish", A, now + day + 1, finish(4, d[4]), "409 bad_repair"},
+		}, 1},
+		{"chunk-extends-session", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2)), "201 next 3"},
+			{"chunk", A, now + day - 1, chunk(ent(3)), "200 next 4"},
+			{"chunk", A, now + 2*day - 2, chunk(ent(4)), "200 next 5"},
+			{"finish", A, now + 2*day - 2, finish(4, d[4]), "200 head 4"},
+		}, 4},
+		{"chunk-from-other-device", 1, false, []st{
+			{"start", A, now, start(1, d[1], ent(2)), "201 next 3"},
+			{"chunk", B, now + 10, chunk(ent(3)), "409 bad_repair"},
+			{"chunk", A, now + 20, chunk(ent(3)), "200 next 4"},
+			{"finish", A, now + 30, finish(3, d[3]), "200 head 3"},
+		}, 3},
+		{"unknown-session", 1, false, []st{
+			{"chunk", A, now, `{"session":"` + fixedSession + `","entries":[` + ent(2) + `]}`, "409 bad_repair"},
+			{"finish", A, now, `{"session":"` + fixedSession + `","tip":` + posRaw(1, d[1]) + `}`, "409 bad_repair"},
+		}, 1},
+		{"body-at-allowance", 1, false, []st{
+			{"start", A, now, padded(start(1, d[1], ent(2)), maxRepair), "201 next 3"},
+		}, 1},
+		{"body-over-allowance", 1, false, []st{
+			{"start", A, now, padded(start(1, d[1], ent(2)), maxRepair+1), "413 too_large"},
+		}, 1},
+		{"malformed-start", 1, false, []st{
+			{"start", A, now, start(1, d[1]), "400 bad_request"},
+		}, 1},
+	}
+	for _, c := range cases {
+		in := repairJ{Name: c.name, LogPrefix: c.prefix, Hold: c.hold}
+		for _, s := range c.steps {
+			in.Steps = append(in.Steps, repairStepJ{Route: s.route, Signer: s.signer.name, At: s.at, Body: s.body})
+		}
+		got, err := replayRepair(envs, h.LogID, in, keys, h.Limits, "")
+		if err != nil {
+			return fmt.Errorf("repair %s: %w", c.name, err)
+		}
+		for i, s := range got.Steps {
+			if g := stepWant(s); g != c.steps[i].want {
+				return fmt.Errorf("repair %s step %d: reference gives %q, expected %q", c.name, i+1, g, c.steps[i].want)
+			}
+		}
+		if len(got.Log) != c.logLen {
+			return fmt.Errorf("repair %s: reference log has %d entries, expected %d", c.name, len(got.Log), c.logLen)
+		}
+		h.Repair = append(h.Repair, got)
+	}
+	return nil
 }

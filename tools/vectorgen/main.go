@@ -278,8 +278,8 @@ func runCheck(dir string) error {
 	if err := checkRecovery(&rk); err != nil {
 		return err
 	}
-	fmt.Printf("OK: %d entries, %d statements, %d key sets opened, %d ciphertexts, %d envelopes, %d strict cases, %d+%d recovery texts, http: %d signed, %d invalid, %d append, %d fetch\n",
-		len(p.Log.Entries), len(p.Statements), len(p.KeySets), len(p.Ciphertexts), len(p.Envelopes), len(st.Cases), len(rk.Valid), len(rk.Invalid), len(hf.Signed), len(hf.Invalid), len(hf.Append), len(hf.Fetch))
+	fmt.Printf("OK: %d entries, %d statements, %d key sets opened, %d ciphertexts, %d envelopes, %d strict cases, %d+%d recovery texts, http: %d signed, %d invalid, %d append, %d append_hold, %d fetch, %d status, %d repair\n",
+		len(p.Log.Entries), len(p.Statements), len(p.KeySets), len(p.Ciphertexts), len(p.Envelopes), len(st.Cases), len(rk.Valid), len(rk.Invalid), len(hf.Signed), len(hf.Invalid), len(hf.Append), len(hf.AppendHold), len(hf.Fetch), len(hf.Status), len(hf.Repair))
 	return nil
 }
 

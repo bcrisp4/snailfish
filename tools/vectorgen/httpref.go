@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +14,8 @@ import (
 )
 
 // This file is a small reference relay: PROTOCOL.md 8.6 (request checks),
-// 10.5 (genesis), 10.6 (append) and 10.7 (fetch). It keeps the space in memory.
+// 10.5 (genesis), 10.6 (append), 10.7 (fetch), 10.8 (status reports) and 10.9
+// (repair sessions). It keeps the space in memory.
 
 type result struct {
 	status string // stored, known, conflict, refused
@@ -36,6 +39,23 @@ type space struct {
 	active     map[string]ed25519.PublicKey // device ID text to signing key
 	writeLevel int64
 	changes    map[string]chgRef // change ID text to the stored change
+	lastSec    int               // position of the last security record (10.6 step 10)
+	hold       bool              // restore hold ([LOG-14])
+	reports    map[string]report // device ID text to its last status report (10.8)
+	sess       *repairSession    // at most one repair session (10.9)
+	// mut names a deliberate fault. Only the tests of http_test.go set it, to
+	// show that the vectors detect the fault. The generator keeps it "".
+	mut string
+}
+
+// isSecurity is the security record rule of PROTOCOL.md 10.2 ([VER-5]).
+func isSecurity(ptype string) bool {
+	for _, f := range []string{"snailfish.change.", "snailfish.snapshot.", "snailfish.accept."} {
+		if strings.HasPrefix(ptype, f) {
+			return false
+		}
+	}
+	return true
 }
 
 func (sp *space) clone() *space {
@@ -48,6 +68,15 @@ func (sp *space) clone() *space {
 	c.changes = map[string]chgRef{}
 	for k, v := range sp.changes {
 		c.changes[k] = v
+	}
+	c.reports = map[string]report{}
+	for k, v := range sp.reports {
+		c.reports[k] = v
+	}
+	if sp.sess != nil {
+		ss := *sp.sess
+		ss.staged = append([]*record{}, sp.sess.staged...)
+		c.sess = &ss
 	}
 	return &c
 }
@@ -113,6 +142,9 @@ func (sp *space) push(r *record) int {
 	}
 	eh := entryHash(r.ptype, cid, r.rh)
 	sp.entries = append(sp.entries, spEntry{r.rh, digestN(sp.digestAt(n-1), n, eh)})
+	if isSecurity(r.ptype) {
+		sp.lastSec = n
+	}
 	switch r.ptype {
 	case "snailfish.genesis.v1":
 		id, sg, _ := r.device()
@@ -132,7 +164,7 @@ func newSpaceFromEnvelopes(logText string, envs []string) (*space, error) {
 	if err != nil {
 		return nil, err
 	}
-	sp := &space{logText: logText, logID: logID, active: map[string]ed25519.PublicKey{}, changes: map[string]chgRef{}}
+	sp := &space{logText: logText, logID: logID, active: map[string]ed25519.PublicKey{}, changes: map[string]chgRef{}, reports: map[string]report{}}
 	for i, env := range envs {
 		n := i + 1
 		r, err := parseRecord(env)
@@ -198,6 +230,10 @@ func (sp *space) appendOne(keyid, env string, lim limitsJ) result {
 	if err != nil {
 		return refuse("invalid_record")
 	}
+	onHold := sp.hold && !isSecurity(r.ptype)
+	if onHold && sp.mut == "hold-before-known" {
+		return refuse("on_hold")
+	}
 	// 2
 	if id := r.changeID(); id != "" {
 		if c, ok := sp.changes[id]; ok {
@@ -208,55 +244,78 @@ func (sp *space) appendOne(keyid, env string, lim limitsJ) result {
 		}
 	}
 	// 3
+	if onHold && sp.mut != "no-hold" {
+		return refuse("on_hold")
+	}
+	// 4
 	if r.ptype == "snailfish.change.v1" && len(r.payload) > lim.MaxChangeBytes {
 		return refuse("too_large")
 	}
-	// 4
-	if r.str("log") != sp.logText {
-		return refuse("invalid_record")
+	// 5 to 13
+	if code := sp.checkRules(r, keyid); code != "" {
+		return refuse(code)
 	}
-	author := r.str("author")
-	// 5
-	if author != keyid {
-		return refuse("not_author")
-	}
-	// 6
-	key := sp.active[author]
-	if key == nil {
-		return refuse("not_active")
-	}
-	// 7
-	if !ed25519.Verify(key, pae(r.ptype, r.payload), r.sig) {
-		return refuse("invalid_record")
-	}
-	// 8
-	next := len(sp.entries) + 1
-	if bn, bd := r.base(); bn < 1 || bn >= next || !bytes.Equal(bd, sp.digestAt(bn)) {
-		return refuse("bad_base")
-	}
-	// 9
-	if r.ptype != "snailfish.change.v1" && r.ptype != "snailfish.grant.v1" {
-		return refuse("unsupported")
-	}
-	// 10
-	if r.ptype == "snailfish.change.v1" {
-		if e, _ := r.m["epoch"].(int64); e != 1 {
-			return refuse("wrong_epoch")
-		}
-	}
-	// 11
-	if r.ptype == "snailfish.grant.v1" {
-		id, _, level := r.device()
-		if sp.active[id] != nil || level < sp.writeLevel {
-			return refuse("invalid_record")
-		}
-	}
-	// 12
+	// 14
 	return result{status: "stored", pos: sp.push(r)}
 }
 
+// checkRules is PROTOCOL.md 10.6 steps 5 to 13 against the state of sp. If
+// keyid is "", it skips step 6, as for a fetched record or a repair entry.
+func (sp *space) checkRules(r *record, keyid string) string {
+	// 5
+	if r.str("log") != sp.logText {
+		return "invalid_record"
+	}
+	author := r.str("author")
+	// 6
+	if keyid != "" && author != keyid {
+		return "not_author"
+	}
+	// 7
+	key := sp.active[author]
+	if key == nil {
+		return "not_active"
+	}
+	// 8
+	if !ed25519.Verify(key, pae(r.ptype, r.payload), r.sig) {
+		return "invalid_record"
+	}
+	// 9
+	next := len(sp.entries) + 1
+	bn, bd := r.base()
+	if bn < 1 || bn >= next || !bytes.Equal(bd, sp.digestAt(bn)) {
+		return "bad_base"
+	}
+	// 10
+	last := sp.lastSec
+	if sp.mut == "stale-counts-changes" {
+		last = len(sp.entries)
+	}
+	if isSecurity(r.ptype) && last > bn && sp.mut != "no-stale-base" {
+		return "stale_base"
+	}
+	// 11
+	if r.ptype != "snailfish.change.v1" && r.ptype != "snailfish.grant.v1" {
+		return "unsupported"
+	}
+	// 12
+	if r.ptype == "snailfish.change.v1" {
+		if e, _ := r.m["epoch"].(int64); e != 1 {
+			return "wrong_epoch"
+		}
+	}
+	// 13
+	if r.ptype == "snailfish.grant.v1" {
+		id, _, level := r.device()
+		if sp.active[id] != nil || level < sp.writeLevel {
+			return "invalid_record"
+		}
+	}
+	return ""
+}
+
 // fetch is PROTOCOL.md 10.7: positions after+1 .. at most limit entries.
-func (sp *space) fetch(after, limit int) (positions []int, head int, hasMore bool) {
+func (sp *space) fetch(after, limit int) (positions []int, head int, hasMore, hold bool) {
 	head = len(sp.entries)
 	positions = []int{}
 	for p := after + 1; p <= head && len(positions) < limit; p++ {
@@ -266,7 +325,392 @@ func (sp *space) fetch(after, limit int) (positions []int, head int, hasMore boo
 	if len(positions) > 0 {
 		last = positions[len(positions)-1]
 	}
-	return positions, head, head > last && head > after
+	return positions, head, head > last && head > after, sp.hold && sp.mut != "fetch-no-hold"
+}
+
+// ---- status reports (PROTOCOL.md 10.8) ----
+
+type report struct {
+	pos    int
+	digest []byte
+	fresh  bool // stays true until the hold ends
+	at     int64
+}
+
+// status is PROTOCOL.md 10.8 for the request signer keyid at relay time at.
+// It returns the `hold` value of the response, or an error code.
+func (sp *space) status(keyid string, at int64, body string) (bool, string) {
+	v, err := parseStrict([]byte(body))
+	if err != nil {
+		return false, "bad_request"
+	}
+	r := newReader(v, "tip", "fresh")
+	tip := r.pos("tip", 0)
+	fresh, ok := r.m["fresh"].(bool)
+	if !ok {
+		r.fail("fresh is not a boolean")
+	}
+	if r.err != nil {
+		return false, "bad_request"
+	}
+	if !sp.hold && sp.mut != "status-without-hold" {
+		return false, ""
+	}
+	old := sp.reports[keyid]
+	sp.reports[keyid] = report{int(tip.n), tip.d, fresh || old.fresh, at}
+	return sp.hold, ""
+}
+
+// reported is the "reported" reading of 10.8: the log holds the stored tip
+// position with the same digest now. ok is false if no report is stored.
+func (sp *space) reported(keyid string) (reported, ok bool) {
+	rp, ok := sp.reports[keyid]
+	if !ok {
+		return false, false
+	}
+	if rp.pos > len(sp.entries) {
+		return false, true
+	}
+	return sp.mut == "reported-ignores-digest" || bytes.Equal(rp.digest, sp.digestAt(rp.pos)), true
+}
+
+// ---- repair sessions (PROTOCOL.md 10.9) ----
+
+const (
+	sessionTTL      = 86400 // seconds after the start or the last chunk
+	repairAllowance = 1024  // bytes above max_request_bytes for a repair body
+)
+
+// errStatus is the HTTP status of each error code of 10.3 that the repair
+// routes and the status route return.
+var errStatus = map[string]int{
+	"bad_request": 400, "unknown_device": 403, "repair_busy": 409, "bad_repair": 409,
+	"invalid_record": 422, "uncovered_stub": 422, "too_large": 413,
+}
+
+type repairSession struct {
+	id, device  string
+	base        int // relay head position at the start
+	baseDigest  []byte
+	staged      []*record
+	start, last int64 // time of the start, and of the start or the last chunk
+}
+
+func (sp *space) expired(ss *repairSession, at int64) bool {
+	switch sp.mut {
+	case "no-expiry":
+		return false
+	case "expiry-from-start":
+		return at >= ss.start+sessionTTL
+	}
+	return at >= ss.last+sessionTTL
+}
+
+func (sp *space) headChanged(ss *repairSession) bool {
+	n := len(sp.entries)
+	return n != ss.base || !bytes.Equal(sp.digestAt(n), ss.baseDigest)
+}
+
+// repairEntry is one entry of a start or chunk body. env is the raw envelope
+// text, or "" for a stub.
+type repairEntry struct {
+	pos  int
+	env  string
+	stub bool
+}
+
+var sessionRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// parseRepairBody reads the form of a start body (first is "base") or a chunk
+// body (first is "session").
+func parseRepairBody(body, first string, lim limitsJ) (*reader, []repairEntry, error) {
+	v, err := parseStrict([]byte(body))
+	if err != nil {
+		return nil, nil, err
+	}
+	r := newReader(v, first, "entries")
+	items := r.list("entries")
+	if r.err == nil && (len(items) < 1 || len(items) > lim.MaxAppendEnvelopes) {
+		r.fail("%d entries", len(items))
+	}
+	var raw struct {
+		Entries []struct {
+			Envelope json.RawMessage `json:"envelope"`
+		} `json:"entries"`
+	}
+	if r.err == nil {
+		if err := json.Unmarshal([]byte(body), &raw); err != nil || len(raw.Entries) != len(items) {
+			r.fail("entries: %v", err)
+		}
+	}
+	var out []repairEntry
+	for i, it := range items {
+		if r.err != nil {
+			break
+		}
+		m, _ := it.(map[string]any)
+		var e *reader
+		ent := repairEntry{}
+		if _, isStub := m["stub"]; isStub {
+			e = newReader(it, "position", "stub")
+			sm, _ := m["stub"].(map[string]any)
+			typ, _ := sm["type"].(string)
+			isChange := strings.HasPrefix(typ, "snailfish.change.")
+			names := []string{"type", "hash"}
+			if isChange {
+				names = []string{"type", "change_id", "hash"}
+			}
+			st := e.sub("stub", names...)
+			st.str("type")
+			if isChange {
+				st.id("change_id", "c_", 16)
+			}
+			st.bin("hash", 32, 0)
+			if st.err != nil {
+				e.fail("stub: %v", st.err)
+			}
+			ent.stub = true
+		} else {
+			e = newReader(it, "position", "envelope")
+			if _, ok := e.m["envelope"].(map[string]any); !ok {
+				e.fail("envelope is not an object")
+			}
+			ent.env = string(raw.Entries[i].Envelope)
+		}
+		ent.pos = int(e.num("position", 1, maxInt))
+		if e.err != nil {
+			r.fail("entry %d: %v", i, e.err)
+		}
+		out = append(out, ent)
+	}
+	return r, out, r.err
+}
+
+// overlay returns the state of the log after the staged entries of ss. If the
+// relay head changed since the start, the staged entries no longer follow the
+// log, and only their grants count (for 8.6 step 5).
+func (sp *space) overlay(ss *repairSession) *space {
+	o := sp.clone()
+	o.sess = nil
+	if ss == nil {
+		return o
+	}
+	for _, r := range ss.staged {
+		if !sp.headChanged(ss) {
+			o.push(r)
+		} else if r.ptype == "snailfish.grant.v1" {
+			id, sg, _ := r.device()
+			o.active[id] = sg
+		}
+	}
+	return o
+}
+
+// chain is the chain check of 10.9 step 3 on o, the state after the base or
+// the staged entries. It pushes each entry that passes onto o, and returns
+// the passed records and the error of the first entry that fails, or "".
+func (o *space) chain(entries []repairEntry, signer string) ([]*record, string) {
+	var out []*record
+	for _, e := range entries {
+		if e.pos != len(o.entries)+1 {
+			return out, "bad_repair"
+		}
+		if e.stub {
+			if o.mut == "stub-invalid-record" {
+				return out, "invalid_record"
+			}
+			return out, "uncovered_stub"
+		}
+		r, err := parseRecord(e.env)
+		if err != nil {
+			return out, "invalid_record"
+		}
+		if id := r.changeID(); id != "" && o.mut != "chain-allows-known" {
+			if _, ok := o.changes[id]; ok {
+				return out, "invalid_record"
+			}
+		}
+		keyid := ""
+		if o.mut == "chain-not-author" {
+			keyid = signer
+		}
+		if code := o.checkRules(r, keyid); code != "" {
+			return out, "invalid_record"
+		}
+		o.push(r)
+		out = append(out, r)
+	}
+	return out, ""
+}
+
+// repairReply is the result of a repair request. next is for start and chunk,
+// head for finish.
+type repairReply struct {
+	status     int
+	session    string
+	next, head int
+	code       string
+}
+
+func repairErr(code string) repairReply { return repairReply{status: errStatus[code], code: code} }
+
+// isActive is 8.6 step 5 for the repair routes: o holds the log and the
+// staged or request entries ([LOG-12]).
+func (sp *space) isActive(o *space, keyid string) bool {
+	if sp.mut == "no-log12" {
+		return sp.active[keyid] != nil
+	}
+	return o.active[keyid] != nil
+}
+
+// repairTooLarge is the body limit of the repair routes (10.9).
+func (sp *space) repairTooLarge(body string, lim limitsJ) bool {
+	allow := repairAllowance
+	if sp.mut == "no-allowance" {
+		allow = 0
+	}
+	return len(body) > lim.MaxRequestBytes+allow
+}
+
+// repairStart is the start route of 10.9 after 8.6 steps 1 to 4.
+func (sp *space) repairStart(keyid string, at int64, body string, lim limitsJ) repairReply {
+	if sp.repairTooLarge(body, lim) {
+		return repairErr("too_large")
+	}
+	// 2
+	r, entries, err := parseRepairBody(body, "base", lim)
+	if err != nil {
+		return repairErr("bad_request")
+	}
+	base := r.pos("base", 0)
+	if r.err != nil {
+		return repairErr("bad_request")
+	}
+	// 3
+	n := len(sp.entries)
+	atHead := int(base.n) == n && bytes.Equal(base.d, sp.digestAt(n))
+	o := sp.overlay(nil)
+	var passed []*record
+	code := ""
+	if atHead {
+		passed, code = o.chain(entries, keyid)
+	}
+	// 4
+	if !sp.isActive(o, keyid) {
+		return repairErr("unknown_device")
+	}
+	// 5
+	if !atHead {
+		return repairErr("bad_repair")
+	}
+	// 6
+	if ss := sp.sess; ss != nil && ss.device != keyid && !sp.expired(ss, at) && sp.mut != "no-busy" {
+		return repairErr("repair_busy")
+	}
+	// 7
+	if code != "" {
+		return repairErr(code)
+	}
+	// 8
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return repairErr("internal")
+	}
+	sp.sess = &repairSession{id: hex.EncodeToString(id[:]), device: keyid, base: n, baseDigest: sp.digestAt(n),
+		staged: passed, start: at, last: at}
+	return repairReply{status: 201, session: sp.sess.id, next: len(o.entries) + 1}
+}
+
+// session returns the repair session that sid names, or nil.
+func (sp *space) session(sid string) *repairSession {
+	if sp.sess != nil && sp.sess.id == sid {
+		return sp.sess
+	}
+	return nil
+}
+
+// continues is the session condition of the chunk step 5 and the finish
+// step 1 of 10.9.
+func (sp *space) continues(ss *repairSession, keyid string, at int64) bool {
+	return ss != nil && !sp.expired(ss, at) && (ss.device == keyid || sp.mut == "chunk-any-signer") && !sp.headChanged(ss)
+}
+
+// repairChunk is the chunk route of 10.9 after 8.6 steps 1 to 4.
+func (sp *space) repairChunk(keyid string, at int64, body string, lim limitsJ) repairReply {
+	if sp.repairTooLarge(body, lim) {
+		return repairErr("too_large")
+	}
+	// 2
+	r, entries, err := parseRepairBody(body, "session", lim)
+	if err != nil {
+		return repairErr("bad_request")
+	}
+	sid := r.str("session")
+	if r.err != nil || !sessionRe.MatchString(sid) {
+		return repairErr("bad_request")
+	}
+	// 3: the chain continues the staged entries of the session.
+	ss := sp.session(sid)
+	o := sp.overlay(ss)
+	var passed []*record
+	code := ""
+	if ss != nil && !sp.headChanged(ss) {
+		passed, code = o.chain(entries, keyid)
+	}
+	// 4
+	if !sp.isActive(o, keyid) {
+		return repairErr("unknown_device")
+	}
+	// 5
+	if !sp.continues(ss, keyid, at) {
+		return repairErr("bad_repair")
+	}
+	// 7
+	if code != "" {
+		return repairErr(code)
+	}
+	// 8
+	ss.staged = append(ss.staged, passed...)
+	ss.last = at
+	return repairReply{status: 200, next: len(o.entries) + 1}
+}
+
+// repairFinish is the finish route of 10.9 after 8.6 steps 1 to 4.
+func (sp *space) repairFinish(keyid string, at int64, body string, lim limitsJ) repairReply {
+	if sp.repairTooLarge(body, lim) {
+		return repairErr("too_large")
+	}
+	v, err := parseStrict([]byte(body))
+	if err != nil {
+		return repairErr("bad_request")
+	}
+	r := newReader(v, "session", "tip")
+	sid := r.str("session")
+	tip := r.pos("tip", 0)
+	if r.err != nil || !sessionRe.MatchString(sid) {
+		return repairErr("bad_request")
+	}
+	ss := sp.session(sid)
+	o := sp.overlay(ss)
+	// 8.6 step 5 with the keys of the log and the staged entries
+	if !sp.isActive(o, keyid) {
+		return repairErr("unknown_device")
+	}
+	// 1
+	if !sp.continues(ss, keyid, at) {
+		return repairErr("bad_repair")
+	}
+	// 2
+	last := len(o.entries)
+	if (int(tip.n) != last || !bytes.Equal(tip.d, o.digestAt(last))) && sp.mut != "no-tip-check" {
+		return repairErr("bad_repair")
+	}
+	// 3: M3 stages no stub. 4
+	for _, rec := range ss.staged {
+		sp.push(rec)
+	}
+	sp.sess = nil
+	return repairReply{status: 200, head: len(sp.entries)}
 }
 
 // ---- request checks (PROTOCOL.md 8.6) ----

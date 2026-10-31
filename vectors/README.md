@@ -111,7 +111,32 @@ All times are Unix seconds. Byte strings are lowercase hex, unless the field is 
       "results": [ { "status", "position": n or null, "error": code or null } ],
       "head": { "position", "digest": hex }
   } ],
-  "fetch": [ { "name", "after", "limit", "positions": [n], "head": n, "has_more": bool } ]
+  "append_hold": [ same form as "append" ],         each case starts from space.log with the space on restore hold
+  "fetch": [ {
+      "name", "after", "limit",
+      "hold": bool,                                   the relay state, and the `hold` value that the response must hold. The response must hold the field.
+      "positions": [n], "head": n, "has_more": bool
+  } ],
+  "status": [ {
+      "name", "signer": device name, "hold": bool,    hold: the relay state before the case
+      "body": str,                                    the status report body of section 10.8
+      "response": { "hold": bool } or null,           null if the relay returns an error
+      "error": code or null,
+      "tip_in_log": bool or null                      the relay reads the tip as "reported" (10.8). null if no report is stored.
+  } ],
+  "repair": [ {
+      "name", "log_prefix": n, "hold": bool,          the relay log is positions 1..log_prefix of space.log
+      "steps": [ {
+          "route": "start" or "chunk" or "finish",
+          "signer": device name,
+          "at": n,                                    the relay time and the request created time of this step
+          "body": str,                                "{{session}}" stands for the session of the last start that returned 201 in this case
+          "status": n,                                the HTTP status
+          "next": n or null, "head": { "position", "digest": hex } or null,
+          "error": code or null
+      } ],
+      "log": [ record_hash hex ]                     the record hashes of the relay log after the last step, from position 1
+  } ]
 }
 ```
 
@@ -119,4 +144,8 @@ All times are Unix seconds. Byte strings are lowercase hex, unless the field is 
 - Each `invalid` case breaks one check of `PROTOCOL.md` 8.6. The relay returns `error` for it. The space has the devices of `space.log` as active devices.
 - `space.log` is the log of the space before each `append` case: genesis (recovery key R1, first device A), a change by A, a grant to B by A, and a change by B. Each `append` case starts from this log, so the cases are independent.
 - `append` covers a new change, an exact retry (`known`), the same `change_id` with another record hash (`conflict`), a second copy in one request, a bad base, a base at or after the new position, an author that differs from the request signer (a record by C that A sends), another log ID, an unsupported type, a wrong epoch, a too large change, a grant of an active device, and one request with mixed results.
-- `fetch` lists the positions that a fetch returns from `space.log`.
+- `append` also covers the base rule for security records ([LOG-7]): a grant whose base is before the last security record is `stale_base`, and a grant whose base is after the last security record but before a change is `stored`.
+- `append_hold` covers a change (`on_hold`), an exact retry of a stored change (`known`), a grant (`stored`) and a grant with a stale base (`stale_base`) during a hold ([LOG-14]).
+- `fetch` lists the positions that a fetch returns from `space.log`, and the `hold` field of the response.
+- `status` covers a report during a hold with a tip in the log, a tip after the head, a tip with another digest, a report without a hold, and malformed bodies.
+- `repair` covers a repair in one start, in a start and chunks, a repair during a hold, a signer whose grant is only in the request entries ([LOG-12]), a signer that is active nowhere, a wrong base, a gap in the positions, an entry with a bad signature, a stub ([LOG-11]), a wrong tip, a second device during a session (`repair_busy`), a restart by the same device, a session after expiry, a finish after expiry, a chunk from another device, an unknown session, a known `change_id` in the entries, a wrong base with a signer whose grant is in the entries, a body at and over the repair allowance, and a malformed start.
