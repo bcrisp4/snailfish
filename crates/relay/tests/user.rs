@@ -1149,8 +1149,20 @@ fn send_loop_delivers_messages_and_alerts() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let relay = fx.relay.clone();
     rt.spawn(snailfish_relay::webhook::run(relay));
-    l.set_nonblocking(false).unwrap();
-    let (mut s, _) = l.accept().unwrap();
+    // A loop that sends nothing fails here within 15 seconds.
+    l.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut s = loop {
+        match l.accept() {
+            Ok((s, _)) => break s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < deadline, "no webhook message");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    s.set_nonblocking(false).unwrap();
     s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .unwrap();
     let mut got = Vec::new();

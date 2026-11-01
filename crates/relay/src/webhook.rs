@@ -60,13 +60,13 @@ pub fn restricted(ip: IpAddr) -> bool {
 /// The IPv4 address inside an IPv6 address of 12.5: mapped (`::ffff:0:0/96`),
 /// compatible (`::/96`), NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`). The
 /// gateway of each form forwards to that IPv4 address, so it must pass the
-/// IPv4 rule. `::` and `::1` are not compatible addresses.
+/// IPv4 rule. `::` and `::1` fall in `::/96` and map into `0.0.0.0/8`,
+/// which is restricted, as they are.
 fn embedded_v4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     let o = v6.octets();
     let low = std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]);
     match v6.segments() {
-        [0, 0, 0, 0, 0, 0xffff, _, _] | [0x64, 0xff9b, 0, 0, 0, 0, _, _] => Some(low),
-        [0, 0, 0, 0, 0, 0, _, _] if !v6.is_loopback() && !v6.is_unspecified() => Some(low),
+        [0, 0, 0, 0, 0, 0xffff | 0, _, _] | [0x64, 0xff9b, 0, 0, 0, 0, _, _] => Some(low),
         [0x2002, ..] => Some(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5])),
         _ => None,
     }
