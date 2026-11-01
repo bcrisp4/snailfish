@@ -349,6 +349,15 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// The app shows the cause of a refused confirmation.
+    #[test]
+    fn confirm_error_names_the_cause() {
+        assert_eq!(
+            ConfirmError("another session".into()).to_string(),
+            "the confirmation is not valid: another session"
+        );
+    }
+
     /// The app shows this text to a user who typed the code.
     #[test]
     fn check_error_tells_the_user_about_a_typing_error() {

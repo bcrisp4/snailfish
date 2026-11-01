@@ -174,8 +174,17 @@ impl World {
         );
     }
 
-    /// Send one request to the relay core.
+    /// Send one request to the relay core. Each enrollment request asks for
+    /// JSON, and a request with a body says that the body is JSON
+    /// (`PROTOCOL.md` section 10).
     fn send(&self, req: &Request) -> (u16, Vec<Header>, Vec<u8>) {
+        let has = |name: &str| {
+            req.headers
+                .iter()
+                .any(|h| h.name == name && h.value == "application/json")
+        };
+        assert!(has("accept"), "{}", req.url);
+        assert_eq!(has("content-type"), !req.body.is_empty(), "{}", req.url);
         let url = req.url.strip_prefix(URL).unwrap();
         let (path, query) = url.split_once('?').unwrap_or((url, ""));
         let resp = self.relay.handle(&RelayRequest {
@@ -2693,4 +2702,162 @@ fn grant_step_retries_after_a_failed_sync() {
         (te.state(), ne.state()),
         (EnrollState::Done, EnrollState::Done)
     );
+}
+
+/// [LOG-7]: a grant that the relay refused with `stale_base`, when no grant
+/// or removal arrived, is signed again on the new tip with no question to
+/// the user. In M4 only a later record type (a device or level record)
+/// leaves the device list unchanged, so the test marks the grant stale.
+#[test]
+fn stale_grant_with_the_same_device_list_is_signed_again() {
+    let (mut w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    queue_grant(&ea, "C");
+    let id = state::grants(&ea.db).unwrap()[0].device_id;
+    state::set_grant_state(&ea.db, &id, state::GRANT_STALE).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.grants_to_confirm().unwrap(), Vec::<String>::new());
+    assert_eq!(state::grants(&ea.db).unwrap(), vec![]);
+    assert_eq!(relay_log(&w, &ea).len(), 3, "the grant of C is in the log");
+}
+
+/// Enroll B with a checkpoint that `edit` changes, sync B once, and return
+/// B's status and the methods of its requests.
+fn enroll_with_changed_checkpoint(
+    edit: impl Fn(&mut crate::enroll::Joined, &World),
+) -> (Status, Vec<String>) {
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    let mut j = ne.joined().unwrap();
+    edit(&mut j, &w);
+    install_enrollment(
+        &w.root.join("b"),
+        crate::enroll::space_of(&j, URL, APP),
+        &w.keys[1],
+        &j,
+    )
+    .unwrap();
+    let mut eb = w.engine(&w.dev("b"));
+    let mut s = eb.start_sync();
+    let mut methods = Vec::new();
+    while let Some(req) = s.next_request(&mut eb).unwrap() {
+        methods.push(req.method.clone());
+        let resp = w.relay.handle(&to_relay(&req));
+        s.handle_response(&mut eb, resp.status, &time(&resp), &resp.body)
+            .unwrap();
+    }
+    (eb.status(), methods)
+}
+
+/// [ENR-9], `PROTOCOL.md` 11.2: the checkpoint check needs a grant for the
+/// device object of `new.hello` up to the checkpoint, and the trusted device
+/// active at the checkpoint. A trusted device that became active exactly at
+/// the checkpoint position passes.
+#[test]
+fn checkpoint_check_needs_the_hello_device_and_an_active_trusted_device() {
+    let (st, m) = enroll_with_changed_checkpoint(|j, _| {
+        j.device = j.device.replace("\"name\":\"B\"", "\"name\":\"X\"");
+    });
+    assert!(
+        matches!(st, Status::Fork { ref cause } if cause.contains("no grant")),
+        "{st:?}"
+    );
+    assert!(m.iter().all(|x| x == "GET"));
+    // A trusted device that the log does not name.
+    let (st, _) = enroll_with_changed_checkpoint(|j, _| {
+        j.trusted = encode_id("d_", &[7; 32]);
+    });
+    assert!(
+        matches!(st, Status::Fork { ref cause } if cause.contains("trusted")),
+        "{st:?}"
+    );
+    // B itself became active at the checkpoint position: active there.
+    let (st, _) = enroll_with_changed_checkpoint(|j, w| {
+        let b = keys::device_id(
+            &snailfish_protocol::sig::SecretKey::from_seed(&w.keys[1].sign_seed).public(),
+            &keys::seal_public(&w.keys[1].seal_seed),
+        );
+        j.trusted = encode_id("d_", &b);
+    });
+    assert_eq!(st, Status::Ok);
+}
+
+/// [ENR-9]: a new device whose verified log is longer than the relay log
+/// before its checkpoint check sends no repair (`PROTOCOL.md` 11.2).
+#[test]
+fn enrolling_device_does_not_repair_a_shorter_relay_log() {
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    let backup = w.backup("b2");
+    let mut a = w.dev("a");
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    let mut j = ne.joined().unwrap();
+    j.position += 2;
+    install_enrollment(
+        &w.root.join("b"),
+        crate::enroll::space_of(&j, URL, APP),
+        &w.keys[1],
+        &j,
+    )
+    .unwrap();
+    let mut eb = w.engine(&w.dev("b"));
+    w.exchange(&mut eb);
+    assert_eq!(eb.verified_head().unwrap().position, 3);
+    w.restore(&backup);
+    let mut s = eb.start_sync();
+    let mut posts = 0;
+    while let Some(req) = s.next_request(&mut eb).unwrap() {
+        posts += usize::from(req.method == "POST");
+        let resp = w.relay.handle(&to_relay(&req));
+        s.handle_response(&mut eb, resp.status, &time(&resp), &resp.body)
+            .unwrap();
+    }
+    assert_eq!(posts, 0);
+    assert_eq!(eb.take_repairs().unwrap(), []);
+}
+
+/// `PROTOCOL.md` 10.3: only `expired` makes the trusted device send a
+/// request again. Each other error ends the enrollment at once.
+#[test]
+fn trusted_enrollment_fails_at_once_on_another_error() {
+    let (w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let req = te.next_request(&mut ea).unwrap().unwrap();
+    assert_eq!(req.method, "GET");
+    let body = snailfish_protocol::wire::error_body("unknown_session", "");
+    te.handle_response(&mut ea, 404, &[], &body).unwrap();
+    assert!(matches!(te.state(), EnrollState::Failed { ref cause } if cause.contains("expired")));
+    assert_eq!(te.next_request(&mut ea).unwrap(), None);
+}
+
+/// The engine state of an enrollment binds the space of `trusted.done`: a
+/// space with another tenant or log ID is refused.
+#[test]
+fn install_enrollment_refuses_another_space() {
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    let j = ne.joined().unwrap();
+    for (tenant, log) in [
+        (encode_id("t_", &[1; 16]), j.log_id.clone()),
+        (j.tenant.clone(), encode_id("l_", &[1; 16])),
+    ] {
+        let mut space = crate::enroll::space_of(&j, URL, APP);
+        space.tenant = tenant;
+        space.log_id = log;
+        let r = install_enrollment(&w.root.join("b"), space, &w.keys[1], &j);
+        assert!(matches!(r, Err(EngineError::Invalid(_))), "{r:?}");
+    }
 }

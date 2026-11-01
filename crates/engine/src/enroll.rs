@@ -718,7 +718,6 @@ impl TrustedEnrollment {
                 "unknown_session" => "the session expired".to_owned(),
                 other => format!("the relay refused the enrollment: {other}"),
             });
-            self.abandon_grant(engine)?;
             return Ok(());
         }
         match sent {
@@ -814,19 +813,6 @@ impl TrustedEnrollment {
                 self.state = EnrollState::Busy;
             }
             _ => {}
-        }
-        Ok(())
-    }
-
-    /// After a failure, take back a grant that the relay does not hold yet,
-    /// so a later sync does not make a device active whose enrollment
-    /// ended. A grant that the relay stored stays: the verified log holds
-    /// it, and the device stays active.
-    fn abandon_grant(&self, engine: &Engine) -> Result<(), EngineError> {
-        if let Some(d) = &self.new_device
-            && !state::is_active(&engine.db, &d.id)?
-        {
-            state::drop_grant(&engine.db, &d.id)?;
         }
         Ok(())
     }

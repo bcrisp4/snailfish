@@ -10,7 +10,7 @@ use snailfish_protocol::encoding::decode_id;
 use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::sig::SecretKey;
 use snailfish_protocol::space::{
-    Accepted, MemorySpace, Mode, Refusal, Verdict, check_append, check_genesis,
+    Accepted, MemorySpace, Mode, Refusal, SpaceView, Verdict, check_append, check_genesis,
 };
 
 fn vectors() -> Value {
@@ -514,5 +514,27 @@ fn current_recovery_key_signs_a_grant() {
     assert!(matches!(
         check_append(&g, &recovery_grant_b(&v, r1, &k2), Mode::Verify),
         Verdict::Refused(Refusal::InvalidRecord(_))
+    ));
+}
+
+/// [LOG-12], `PROTOCOL.md` 10.9: a repair chain reads the recovery key of
+/// the log through the overlay, so a staged grant by the current recovery
+/// key passes the chain check.
+#[test]
+fn overlay_reads_the_recovery_key_of_the_log() {
+    let v = vectors();
+    let log = decode_id::<16>(v["log"]["log_id"].as_str().unwrap(), "l_").unwrap();
+    let (a, _) = device(&v, "A");
+    let (r1, k1) = recovery(&v, "R1");
+    let (r2, _) = recovery(&v, "R2");
+    let mut g = MemorySpace::new(log);
+    g.apply(&check_genesis(&env(&v, 1), &log, Some(&a)).unwrap());
+    let overlay = snailfish_protocol::space::Overlay::new(&g);
+    assert_eq!(SpaceView::recovery_key(&overlay, &r1), Some(k1.public()));
+    assert_eq!(SpaceView::recovery_key(&overlay, &r2), None);
+    let grant = recovery_grant_b(&v, r1, &k1);
+    assert!(matches!(
+        check_append(&overlay, &grant, Mode::Verify),
+        Verdict::Store(_)
     ));
 }

@@ -161,13 +161,14 @@ fn exact<'a>(
     what: &str,
     names: &[&str],
 ) -> Result<Vec<&'a RawValue>, WireError> {
-    if m.len() != names.len() || !m.keys().all(|k| names.contains(&k.as_str())) {
-        return Err(bad(format!(
-            "{what} must hold exactly {}",
-            names.join(", ")
-        )));
+    let err = || bad(format!("{what} must hold exactly {}", names.join(", ")));
+    if m.len() != names.len() {
+        return Err(err());
     }
-    Ok(names.iter().filter_map(|n| m.get(*n).copied()).collect())
+    names
+        .iter()
+        .map(|n| m.get(*n).copied().ok_or_else(err))
+        .collect()
 }
 
 fn check_new_hello(raw: &RawValue) -> Result<Device, WireError> {
@@ -558,6 +559,11 @@ mod tests {
         let dup = format!(r#"{{"nonce":"{n}","nonce":"{n}"}}"#);
         assert!(parse_write(dup.as_bytes(), Role::New, None).is_err());
         assert!(parse_session(br#"{"expires":1,"state":"open","state":"done"}"#).is_err());
+        let cancelled =
+            parse_session(br#"{"expires":1,"state":"cancelled","new":{},"trusted":{}}"#);
+        assert_eq!(cancelled.map(|s| s.state), Ok(State::Cancelled));
+        // A wrong field name with the right field count.
+        assert!(parse_write(br#"{"hello":{"devices":{}}}"#, Role::New, None).is_err());
         let mut d = device(1);
         d.id = device(2).id;
         assert!(

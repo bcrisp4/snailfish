@@ -47,6 +47,13 @@ exclude_re = [
   # and leaks nothing, so no test can tell it from the original.
   "impl std::fmt::Debug for TrustedEnrollment>::fmt",
   "impl std::fmt::Debug for NewEnrollment>::fmt",
+  # Equivalent mutants in M4: protocol level 1 is the only level, so the
+  # write level of each space and the level of each device are 1. A write
+  # level of 0 or 1 gives the same verdict for every M4 device. M7 adds
+  # levels, and its tests must cover this check.
+  "replace write_level -> u64 with 0",
+  "replace write_level -> u64 with 1",
+  "replace < with > in TrustedEnrollment::on_session",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`
