@@ -8,14 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 )
 
 // This file is a small reference relay: PROTOCOL.md 8.6 (request checks),
-// 10.5 (genesis), 10.6 (append), 10.7 (fetch), 10.8 (status reports) and 10.9
-// (repair sessions). It keeps the space in memory.
+// 10.5 (genesis), 10.6 (append), 10.7 (fetch), 10.8 (status reports), 10.9
+// (repair sessions) and 10.10 (enrollment sessions). It keeps the space in
+// memory.
 
 type result struct {
 	status string // stored, known, conflict, refused
@@ -37,6 +39,7 @@ type space struct {
 	logID      []byte
 	entries    []spEntry
 	active     map[string]ed25519.PublicKey // device ID text to signing key
+	recovery   map[string]ed25519.PublicKey // the current recovery ID text to its signing key (10.2)
 	writeLevel int64
 	changes    map[string]chgRef // change ID text to the stored change
 	lastSec    int               // position of the last security record (10.6 step 10)
@@ -64,6 +67,10 @@ func (sp *space) clone() *space {
 	c.active = map[string]ed25519.PublicKey{}
 	for k, v := range sp.active {
 		c.active[k] = v
+	}
+	c.recovery = map[string]ed25519.PublicKey{}
+	for k, v := range sp.recovery {
+		c.recovery[k] = v
 	}
 	c.changes = map[string]chgRef{}
 	for k, v := range sp.changes {
@@ -150,6 +157,9 @@ func (sp *space) push(r *record) int {
 		id, sg, _ := r.device()
 		sp.active[id] = sg
 		sp.writeLevel, _ = r.m["level"].(int64)
+		rec, _ := r.m["recovery"].(map[string]any)
+		rk, _ := decodeB64(fmt.Sprint(rec["sign"]))
+		sp.recovery = map[string]ed25519.PublicKey{r.str("author"): rk}
 	case "snailfish.grant.v1":
 		id, sg, _ := r.device()
 		sp.active[id] = sg
@@ -164,7 +174,8 @@ func newSpaceFromEnvelopes(logText string, envs []string) (*space, error) {
 	if err != nil {
 		return nil, err
 	}
-	sp := &space{logText: logText, logID: logID, active: map[string]ed25519.PublicKey{}, changes: map[string]chgRef{}, reports: map[string]report{}}
+	sp := &space{logText: logText, logID: logID, active: map[string]ed25519.PublicKey{}, recovery: map[string]ed25519.PublicKey{},
+		changes: map[string]chgRef{}, reports: map[string]report{}}
 	for i, env := range envs {
 		n := i + 1
 		r, err := parseRecord(env)
@@ -190,7 +201,7 @@ func newSpaceFromEnvelopes(logText string, envs []string) (*space, error) {
 			if bn < 1 || bn >= n || !bytes.Equal(bd, sp.digestAt(bn)) {
 				return nil, fmt.Errorf("position %d: bad base", n)
 			}
-			if key = sp.active[author]; key == nil {
+			if key = sp.authorKey(author); key == nil {
 				return nil, fmt.Errorf("position %d: author is not active", n)
 			}
 		}
@@ -267,17 +278,18 @@ func (sp *space) checkRules(r *record, keyid string) string {
 		return "invalid_record"
 	}
 	author := r.str("author")
+	isRec := strings.HasPrefix(author, "r_")
 	// 6
-	if keyid != "" && author != keyid {
+	if keyid != "" && author != keyid && (!isRec || sp.mut == "recovery-not-author") {
 		return "not_author"
 	}
 	// 7
-	key := sp.active[author]
-	if key == nil {
+	key := sp.authorKey(author)
+	if key == nil && !(isRec && sp.mut == "recovery-skip-active") {
 		return "not_active"
 	}
 	// 8
-	if !ed25519.Verify(key, pae(r.ptype, r.payload), r.sig) {
+	if len(key) != ed25519.PublicKeySize || !ed25519.Verify(key, pae(r.ptype, r.payload), r.sig) {
 		return "invalid_record"
 	}
 	// 9
@@ -312,6 +324,16 @@ func (sp *space) checkRules(r *record, keyid string) string {
 		}
 	}
 	return ""
+}
+
+// authorKey is the signing key of an author of 10.6 steps 7 and 8: an active
+// device, or the current recovery ID of the space (10.2). It is nil for each
+// other author.
+func (sp *space) authorKey(author string) ed25519.PublicKey {
+	if strings.HasPrefix(author, "r_") {
+		return sp.recovery[author]
+	}
+	return sp.active[author]
 }
 
 // fetch is PROTOCOL.md 10.7: positions after+1 .. at most limit entries.
@@ -384,8 +406,9 @@ const (
 // errStatus is the HTTP status of each error code of 10.3 that the repair
 // routes and the status route return.
 var errStatus = map[string]int{
-	"bad_request": 400, "unknown_device": 403, "repair_busy": 409, "bad_repair": 409,
+	"bad_request": 400, "bad_digest": 400, "unknown_device": 403, "repair_busy": 409, "bad_repair": 409,
 	"invalid_record": 422, "uncovered_stub": 422, "too_large": 413,
+	"unknown_session": 404, "session_exists": 409, "bad_step": 409, "session_closed": 409,
 }
 
 type repairSession struct {
@@ -711,6 +734,324 @@ func (sp *space) repairFinish(keyid string, at int64, body string, lim limitsJ) 
 	}
 	sp.sess = nil
 	return repairReply{status: 200, head: len(sp.entries)}
+}
+
+// ---- enrollment sessions (PROTOCOL.md 10.10) ----
+
+const enrollTTL = 600 // seconds after the open
+
+// enrollSlots is the slot order of 10.10.
+var enrollSlots = []string{"new.hello", "trusted.hello", "new.nonce", "trusted.nonce", "new.confirm", "trusted.done"}
+
+type enrollSession struct {
+	device  string // the device ID text of the device that opened it
+	expires int64
+	state   string         // open, done or cancelled
+	slots   map[string]any // slot to the stored message value
+	raw     map[string]string
+}
+
+// enrollRelay holds the enrollment sessions of one space of one tenant.
+type enrollRelay struct {
+	sp       *space
+	tenant   string
+	sessions map[string]*enrollSession // session ID text
+	mut      string
+}
+
+// enrollReq is one request. keyid is "" for the unsigned routes. digestOK is
+// false if content-digest differs from the body (8.6 step 4).
+type enrollReq struct {
+	route, keyid, session, body string
+	at                          int64
+	digestOK                    bool
+}
+
+type enrollReply struct {
+	status int
+	body   any
+	code   string
+}
+
+func enrollErr(code string) enrollReply { return enrollReply{status: errStatus[code], code: code} }
+
+// lookup returns the session sid if it has not expired. The relay deletes an
+// expired session.
+func (er *enrollRelay) lookup(sid string, at int64) *enrollSession {
+	ss := er.sessions[sid]
+	if ss != nil && at >= ss.expires && er.mut != "enroll-no-expiry" {
+		delete(er.sessions, sid)
+		return nil
+	}
+	return ss
+}
+
+func (ss *enrollSession) object(sid string) map[string]any {
+	nw, tr := map[string]any{}, map[string]any{}
+	for slot, v := range ss.slots {
+		writer, name, _ := strings.Cut(slot, ".")
+		if writer == "new" {
+			nw[name] = v
+		} else {
+			tr[name] = v
+		}
+	}
+	return map[string]any{"session": sid, "expires": ss.expires, "state": ss.state, "new": nw, "trusted": tr}
+}
+
+// decodeValue is the JSON value of a message as the relay stores it.
+func decodeValue(body, key string) any {
+	dec := json.NewDecoder(strings.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil
+	}
+	return m[key]
+}
+
+// rawField returns the raw JSON text of m[key][sub], or of m[key] if sub is "".
+func rawField(body, key, sub string) (string, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		return "", err
+	}
+	if sub == "" {
+		return string(m[key]), nil
+	}
+	var n map[string]json.RawMessage
+	if err := json.Unmarshal(m[key], &n); err != nil {
+		return "", err
+	}
+	return string(n[sub]), nil
+}
+
+// parseMessage is step 2 of a write: the body rules of 10.10 for the writer
+// "new" or "trusted". It returns the slot of the message, or "cancel".
+func (er *enrollRelay) parseMessage(writer, body string) (string, error) {
+	lv, err := parseLenient([]byte(body))
+	if err != nil {
+		return "", err
+	}
+	top, ok := lv.(map[string]any)
+	if !ok || len(top) != 1 {
+		return "", errors.New("body must hold exactly one message")
+	}
+	var key string
+	for k := range top {
+		key = k
+	}
+	strict := func() *reader {
+		v, err := parseStrict([]byte(body))
+		if err != nil {
+			return &reader{m: map[string]any{}, err: err}
+		}
+		return newReader(v, key)
+	}
+	switch {
+	case key == "cancel":
+		r := strict()
+		if r.err == nil && r.m["cancel"] != true {
+			return "", errors.New("cancel is not true")
+		}
+		return "cancel", r.err
+	case key == "nonce":
+		r := strict()
+		r.bin("nonce", 32, 0)
+		return writer + ".nonce", r.err
+	case key == "hello" && writer == "new":
+		r := strict()
+		x := r.sub("hello", "device")
+		if x.err == nil {
+			deviceObj(x, "device")
+			if x.err != nil {
+				r.fail("hello: %v", x.err)
+			}
+		}
+		return "new.hello", r.err
+	case key == "hello" && writer == "trusted":
+		r := strict()
+		x := r.sub("hello", "keys", "commitment")
+		if x.err == nil {
+			keysObj(x, "keys")
+			x.bin("commitment", 32, 0)
+			if x.err != nil {
+				r.fail("hello: %v", x.err)
+			}
+		}
+		return "trusted.hello", r.err
+	case key == "confirm" && writer == "new":
+		env, err := rawField(body, "confirm", "")
+		if err == nil {
+			_, err = parseEnvelope(env)
+		}
+		return "new.confirm", err
+	case key == "done" && writer == "trusted":
+		r := newReader(top, "done")
+		x := r.sub("done", "tenant", "checkpoint")
+		tenant := x.str("tenant")
+		if x.err != nil {
+			return "", x.err
+		}
+		if tenant != er.tenant && er.mut != "enroll-no-tenant-check" {
+			return "", errors.New("tenant differs from the path")
+		}
+		env, err := rawField(body, "done", "checkpoint")
+		if err == nil {
+			_, err = parseEnvelope(env)
+		}
+		return "trusted.done", err
+	}
+	return "", fmt.Errorf("the %s route takes no %q message", writer, key)
+}
+
+func (er *enrollRelay) handle(rq enrollReq) enrollReply {
+	switch rq.route {
+	case "open":
+		return er.open(rq)
+	case "trusted_write", "new_write":
+		return er.write(rq)
+	case "trusted_read", "new_read":
+		return er.read(rq)
+	}
+	panic("route " + rq.route)
+}
+
+// open is the open route of 10.10.
+func (er *enrollRelay) open(rq enrollReq) enrollReply {
+	parse := func() (string, bool) {
+		v, err := parseStrict([]byte(rq.body))
+		if err != nil {
+			return "", false
+		}
+		r := newReader(v, "session")
+		sid, _ := r.id("session", "e_", 16)
+		return sid, r.err == nil
+	}
+	var sid string
+	var ok bool
+	if er.mut == "enroll-body-before-digest" {
+		if sid, ok = parse(); !ok {
+			return enrollErr("bad_request")
+		}
+	}
+	// 8.6 steps 1 to 4
+	if !rq.digestOK {
+		return enrollErr("bad_digest")
+	}
+	if sid, ok = parse(); !ok {
+		return enrollErr("bad_request")
+	}
+	// 8.6 steps 5 to 7
+	if er.sp.active[rq.keyid] == nil {
+		return enrollErr("unknown_device")
+	}
+	if ss := er.lookup(sid, rq.at); ss != nil {
+		if ss.device != rq.keyid {
+			return enrollErr("session_exists")
+		}
+		exp := ss.expires
+		if er.mut == "enroll-open-retry-new-expires" {
+			exp = rq.at + enrollTTL
+		}
+		return enrollReply{status: 200, body: map[string]any{"expires": exp}}
+	}
+	ss := &enrollSession{device: rq.keyid, expires: rq.at + enrollTTL, state: "open", slots: map[string]any{}, raw: map[string]string{}}
+	er.sessions[sid] = ss
+	return enrollReply{status: 201, body: map[string]any{"expires": ss.expires}}
+}
+
+// write is the write check order of 10.10, steps 1 to 8.
+func (er *enrollRelay) write(rq enrollReq) enrollReply {
+	trusted := rq.route == "trusted_write"
+	writer := "new"
+	if trusted {
+		writer = "trusted"
+	}
+	// 1
+	if trusted && !rq.digestOK {
+		return enrollErr("bad_digest")
+	}
+	// 2
+	slot, err := er.parseMessage(writer, rq.body)
+	if err != nil {
+		return enrollErr("bad_request")
+	}
+	// 3
+	if trusted && er.sp.active[rq.keyid] == nil {
+		return enrollErr("unknown_device")
+	}
+	// 4
+	ss := er.lookup(rq.session, rq.at)
+	if ss == nil || (trusted && ss.device != rq.keyid && er.mut != "enroll-trusted-any-device") {
+		return enrollErr("unknown_session")
+	}
+	ok := enrollReply{status: 200}
+	var val any
+	retry := slot == "cancel" && ss.state == "cancelled"
+	if slot != "cancel" {
+		_, key, _ := strings.Cut(slot, ".")
+		val = decodeValue(rq.body, key)
+		if old, full := ss.slots[slot]; full {
+			retry = reflect.DeepEqual(old, val)
+			if er.mut == "enroll-retry-bytes" {
+				retry = ss.raw[slot] == rq.body
+			}
+		}
+	}
+	closed := ss.state != "open"
+	if er.mut == "enroll-closed-before-retry" && closed {
+		return enrollErr("session_closed")
+	}
+	// 5
+	if retry {
+		ok.body = ss.object(rq.session)
+		return ok
+	}
+	// 6
+	if closed {
+		return enrollErr("session_closed")
+	}
+	// 7
+	if slot == "cancel" {
+		ss.state = "cancelled"
+		ok.body = ss.object(rq.session)
+		return ok
+	}
+	next := ""
+	for _, x := range enrollSlots {
+		if _, full := ss.slots[x]; !full {
+			next = x
+			break
+		}
+	}
+	_, full := ss.slots[slot]
+	if slot != next && (er.mut != "enroll-any-order" || full) {
+		return enrollErr("bad_step")
+	}
+	// 8
+	ss.slots[slot], ss.raw[slot] = val, rq.body
+	if slot == "trusted.done" {
+		ss.state = "done"
+	}
+	ok.body = ss.object(rq.session)
+	return ok
+}
+
+// read is the read route of 10.10: write steps 1, 3 and 4.
+func (er *enrollRelay) read(rq enrollReq) enrollReply {
+	trusted := rq.route == "trusted_read"
+	if trusted && !rq.digestOK {
+		return enrollErr("bad_digest")
+	}
+	if trusted && er.sp.active[rq.keyid] == nil {
+		return enrollErr("unknown_device")
+	}
+	ss := er.lookup(rq.session, rq.at)
+	if ss == nil || (trusted && ss.device != rq.keyid && er.mut != "enroll-trusted-any-device") {
+		return enrollErr("unknown_session")
+	}
+	return enrollReply{status: 200, body: ss.object(rq.session)}
 }
 
 // ---- request checks (PROTOCOL.md 8.6) ----

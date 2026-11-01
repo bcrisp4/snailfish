@@ -639,11 +639,22 @@ func validatePayload(ptype string, raw []byte) error {
 		names = []string{"log", "author", "position", "digest"}
 	case "snailfish.delete.v1":
 		names = []string{"log", "author", "head", "expires"}
+	case "snailfish.confirm.v1":
+		names = []string{"session", "trusted", "device", "trusted_nonce", "new_nonce"}
 	default:
 		return fmt.Errorf("unknown payload type %q", ptype)
 	}
 	r := newReader(v, names...)
 	if r.err != nil {
+		return r.err
+	}
+	// 6.3: a confirmation has no log and no author. device.sign signs it.
+	if ptype == "snailfish.confirm.v1" {
+		r.id("session", "e_", 16)
+		r.id("trusted", "d_", 32)
+		deviceObj(r, "device")
+		r.bin("trusted_nonce", 32, 0)
+		r.bin("new_nonce", 32, 0)
 		return r.err
 	}
 	_, logID := r.id("log", "l_", 16)

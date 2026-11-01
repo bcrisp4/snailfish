@@ -145,6 +145,9 @@ impl SpaceView for Shifted {
     fn device_key(&self, id: &[u8; 32]) -> Option<[u8; 32]> {
         self.0.device_key(id)
     }
+    fn recovery_key(&self, id: &[u8; 32]) -> Option<[u8; 32]> {
+        self.0.recovery_key(id)
+    }
     fn change(&self, c: &[u8; 16]) -> Option<(u64, [u8; 32])> {
         self.0.change(c)
     }

@@ -141,7 +141,7 @@ func TestHTTPFetchHasMore(t *testing.T) {
 	}
 }
 
-// Each relay fault of the M3 rules must change the result of a named case, so
+// Each relay fault of the M3 and M4 rules must change the result of a named case, so
 // a relay with the fault cannot pass the vectors.
 func TestHTTPVectorsDetectRelayFaults(t *testing.T) {
 	h, w := testHTTP(t)
@@ -166,6 +166,16 @@ func TestHTTPVectorsDetectRelayFaults(t *testing.T) {
 		{"expiry-from-start", "repair chunk-extends-session"},
 		{"chunk-any-signer", "repair chunk-from-other-device"},
 		{"no-allowance", "repair body-at-allowance"},
+		{"recovery-not-author", "append recovery-grant"},
+		{"recovery-skip-active", "append recovery-grant-not-current"},
+		{"enroll-no-expiry", "enroll expiry"},
+		{"enroll-retry-bytes", "enroll slot-exact-retry"},
+		{"enroll-any-order", "enroll wrong-order"},
+		{"enroll-trusted-any-device", "enroll trusted-route-other-device"},
+		{"enroll-closed-before-retry", "enroll write-after-done"},
+		{"enroll-open-retry-new-expires", "enroll open-exact-retry"},
+		{"enroll-no-tenant-check", "enroll done-other-tenant"},
+		{"enroll-body-before-digest", "enroll check-order"},
 	} {
 		err := checkHTTPWith(h, w, tc.mut)
 		if err == nil {

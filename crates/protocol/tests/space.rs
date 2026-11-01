@@ -443,3 +443,76 @@ fn hold_refuses_changes_but_not_security_records() {
     let s = setup(&v);
     assert_eq!(check_append(&s, &env(&v, 3), hold), Verdict::Known(3));
 }
+
+/// The seeds of a recovery key of `protocol.json`.
+fn recovery(v: &Value, name: &str) -> ([u8; 32], SecretKey) {
+    let r = v["recovery"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == name)
+        .unwrap();
+    let id = decode_id::<32>(r["id"].as_str().unwrap(), "r_").unwrap();
+    let seed: [u8; 32] = hex::decode(r["sign_seed"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    (id, SecretKey::from_seed(&seed))
+}
+
+/// The grant of B at position 2, signed again by the key `key` as the
+/// recovery ID `rid`, with its base at the genesis record.
+fn recovery_grant_b(v: &Value, rid: [u8; 32], key: &SecretKey) -> Envelope {
+    use snailfish_protocol::records::{Author, Body, Position, parse_payload};
+    use snailfish_protocol::write;
+    let e = env(v, 2);
+    let r = parse_payload(&e.payload_type, &e.payload).unwrap();
+    let Body::Grant { device: dev, keys } = &r.body else {
+        panic!("entry 2 is a grant record");
+    };
+    let payload = write::grant(
+        &r.log,
+        &Author::Recovery(rid),
+        &Position {
+            position: 1,
+            digest: digest(v, 1),
+        },
+        dev,
+        &keys[0],
+    );
+    Envelope {
+        sig: key.sign_record(&e.payload_type, &payload),
+        payload_type: e.payload_type,
+        payload,
+    }
+}
+
+/// M4 decision 1 ([LOG-8], `PROTOCOL.md` 10.6 steps 6 to 8): the current
+/// recovery key signs a grant, and any active device sends it. The relay
+/// and the engine store it and make B active. A grant by another recovery
+/// key is `not_active`, and a grant whose signature is not by the named
+/// recovery key is `invalid_record`.
+#[test]
+fn current_recovery_key_signs_a_grant() {
+    let v = vectors();
+    let log = decode_id::<16>(v["log"]["log_id"].as_str().unwrap(), "l_").unwrap();
+    let (a, _) = device(&v, "A");
+    let (b, _) = device(&v, "B");
+    let (r1, k1) = recovery(&v, "R1");
+    let (r2, k2) = recovery(&v, "R2");
+    let mut g = MemorySpace::new(log);
+    g.apply(&check_genesis(&env(&v, 1), &log, Some(&a)).unwrap());
+    let grant = recovery_grant_b(&v, r1, &k1);
+    for mode in [relay(a), Mode::Verify] {
+        let acc = stored(check_append(&g, &grant, mode));
+        assert_eq!(acc.new_device.map(|(id, _)| id), Some(b));
+    }
+    assert_eq!(
+        check_append(&g, &recovery_grant_b(&v, r2, &k2), relay(a)),
+        Verdict::Refused(Refusal::NotActive)
+    );
+    assert!(matches!(
+        check_append(&g, &recovery_grant_b(&v, r1, &k2), Mode::Verify),
+        Verdict::Refused(Refusal::InvalidRecord(_))
+    ));
+}

@@ -86,8 +86,10 @@ func recoverySymbols(secret []byte) string {
 	return crockfordEncode(append(append([]byte{}, secret...), recoveryCheck(secret)...))
 }
 
-func recoveryDisplay(secret []byte) string {
-	sym := recoverySymbols(secret)
+func recoveryDisplay(secret []byte) string { return groups(recoverySymbols(secret)) }
+
+// groups writes 32 symbols in 8 groups of 4, joined with "-" (sections 9 and 11.1).
+func groups(sym string) string {
 	var g []string
 	for i := 0; i < len(sym); i += 4 {
 		g = append(g, sym[i:i+4])
@@ -96,7 +98,12 @@ func recoveryDisplay(secret []byte) string {
 }
 
 // parseRecoveryKey is the reader of PROTOCOL.md section 9.
-func parseRecoveryKey(text string) ([]byte, error) {
+func parseRecoveryKey(text string) ([]byte, error) { return parseCode(text, recoveryCheck) }
+
+// parseCode is the five reader steps of PROTOCOL.md section 9 for a 16-byte
+// value and its 4-byte check. Section 11.1 uses the same steps with another
+// check label.
+func parseCode(text string, check func([]byte) []byte) ([]byte, error) {
 	t := strings.NewReplacer("-", "", " ", "").Replace(text)
 	t = strings.ToUpper(t)
 	t = strings.NewReplacer("O", "0", "I", "1", "L", "1").Replace(t)
@@ -112,9 +119,9 @@ func parseRecoveryKey(text string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	secret, check := raw[:16], raw[16:]
-	if hex.EncodeToString(check) != hex.EncodeToString(recoveryCheck(secret)) {
+	value, c := raw[:16], raw[16:]
+	if hex.EncodeToString(c) != hex.EncodeToString(check(value)) {
 		return nil, errors.New("check mismatch")
 	}
-	return secret, nil
+	return value, nil
 }

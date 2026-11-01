@@ -4,8 +4,8 @@
 //! signature, the strict parse, dense positions, the digest chain, the base
 //! rule ([LOG-6]), the base rule for security records ([LOG-7]) and the
 //! active devices from the genesis record and the grants ([LOG-8]). The
-//! relay also refuses changes during a restore hold ([LOG-14]). Removal
-//! comes in M7.
+//! relay also refuses changes during a restore hold ([LOG-14]). The current
+//! recovery key can sign a grant (M4). Removal comes in M7.
 //!
 //! The functions do no I/O. The caller gives the log state through
 //! [`SpaceView`], for example from SQLite.
@@ -29,6 +29,10 @@ pub trait SpaceView {
     fn digest_at(&self, position: u64) -> Option<Hash32>;
     /// The Ed25519 public key of an active device ([LOG-8]).
     fn device_key(&self, id: &Hash32) -> Option<[u8; 32]>;
+    /// The Ed25519 public key of the recovery ID `id`, if `id` is the
+    /// current recovery ID of the space (`PROTOCOL.md` 10.2). M4 has no
+    /// recovery record, so it is the recovery key of the genesis record.
+    fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]>;
     /// The position and record hash of a change with this `change_id`.
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)>;
     /// The space write level ([VER-9]).
@@ -244,21 +248,19 @@ fn judge(
     if record.log != view.log_id() {
         return Err(invalid("log: the record names another log"));
     }
-    let author = match record.author {
-        Author::Device(id) => id,
-        Author::Recovery(_) => {
-            if let Mode::Relay { .. } = mode {
+    // PROTOCOL.md 10.6 steps 6 and 7. A record by the recovery key has no
+    // request signer to match: any active device can send it.
+    let key = match record.author {
+        Author::Device(id) => {
+            if let Mode::Relay { signer, .. } = mode
+                && signer != id
+            {
                 return Err(Refusal::NotAuthor);
             }
-            return Err(Refusal::NotActive);
+            view.device_key(&id).ok_or(Refusal::NotActive)?
         }
+        Author::Recovery(rid) => view.recovery_key(&rid).ok_or(Refusal::NotActive)?,
     };
-    if let Mode::Relay { signer, .. } = mode
-        && signer != author
-    {
-        return Err(Refusal::NotAuthor);
-    }
-    let key = view.device_key(&author).ok_or(Refusal::NotActive)?;
     PublicKey::from_bytes(&key)
         .and_then(|k| k.verify_record(&env.payload_type, &env.payload, &env.sig))
         .map_err(invalid)?;
@@ -372,6 +374,28 @@ pub fn genesis_level(record: &Record) -> Option<u64> {
     }
 }
 
+/// The recovery ID and the Ed25519 key of a genesis record.
+#[must_use]
+pub fn genesis_recovery(record: &Record) -> Option<(Hash32, [u8; 32])> {
+    match &record.body {
+        Body::Genesis { recovery, .. } => Some((
+            crate::keys::recovery_id(&recovery.sign, &recovery.seal),
+            recovery.sign,
+        )),
+        _ => None,
+    }
+}
+
+/// The recovery ID and the Ed25519 key of a stored genesis envelope, for
+/// a [`SpaceView`] that keeps the envelope text. `None` if the text is not a
+/// genesis record.
+#[must_use]
+pub fn genesis_recovery_of(envelope_json: &str) -> Option<(Hash32, [u8; 32])> {
+    let env = Envelope::parse(envelope_json.as_bytes()).ok()?;
+    let record = records::parse_payload(&env.payload_type, &env.payload).ok()?;
+    genesis_recovery(&record)
+}
+
 /// An in-memory [`SpaceView`]: the engine and tests use it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemorySpace {
@@ -387,6 +411,8 @@ pub struct MemorySpace {
     pub level: u64,
     /// The position of the last security record.
     pub last_security: u64,
+    /// The current recovery ID and its Ed25519 key.
+    pub recovery: Option<(Hash32, [u8; 32])>,
 }
 
 impl MemorySpace {
@@ -416,6 +442,9 @@ impl MemorySpace {
         if let Some(level) = genesis_level(&a.record) {
             self.level = level;
         }
+        if let Some(r) = genesis_recovery(&a.record) {
+            self.recovery = Some(r);
+        }
         if a.record.is_security() {
             self.last_security = a.position;
         }
@@ -437,6 +466,9 @@ impl SpaceView for MemorySpace {
     }
     fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
         self.devices.get(id).copied()
+    }
+    fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.recovery.filter(|(r, _)| r == id).map(|(_, k)| k)
     }
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
         self.changes.get(change_id).copied()
@@ -502,6 +534,9 @@ impl<V: SpaceView> SpaceView for Overlay<'_, V> {
             .iter()
             .find_map(|a| a.new_device.filter(|(d, _)| d == id).map(|(_, k)| k))
             .or_else(|| self.inner.device_key(id))
+    }
+    fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.inner.recovery_key(id)
     }
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
         self.added

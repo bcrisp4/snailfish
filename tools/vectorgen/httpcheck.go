@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -174,6 +175,15 @@ func checkHTTPWith(h *httpJ, w *world, mut string) error {
 			return err
 		}
 	}
+	for _, c := range h.Enroll {
+		got, err := replayEnroll(envs, h.LogID, h.Tenant, c, keys, mut)
+		if err != nil {
+			return fmt.Errorf("enroll %s: %w", c.Name, err)
+		}
+		if err := compare("enroll "+c.Name, c, got); err != nil {
+			return err
+		}
+	}
 	if err := checkHTTPCoverage(h); err != nil {
 		return err
 	}
@@ -233,7 +243,24 @@ func checkHTTPCoverage(h *httpJ) error {
 			}
 		}
 	}
+	for _, c := range h.Enroll {
+		for _, s := range c.Steps {
+			if s.Error != nil {
+				have["enroll "+*s.Error] = true
+				continue
+			}
+			have[fmt.Sprintf("enroll %s %d", s.Route, s.Status)] = true
+			if m, ok := s.Response.(map[string]any); ok && m["state"] != nil {
+				have[fmt.Sprint("enroll state ", m["state"])] = true
+			}
+		}
+	}
 	for _, need := range []string{
+		"append not_active", "append unsupported",
+		"enroll open 201", "enroll open 200", "enroll new_read 200", "enroll new_write 200", "enroll trusted_read 200", "enroll trusted_write 200",
+		"enroll state open", "enroll state done", "enroll state cancelled",
+		"enroll bad_request", "enroll bad_digest", "enroll unknown_device",
+		"enroll unknown_session", "enroll session_exists", "enroll bad_step", "enroll session_closed",
 		"append stale_base",
 		"append_hold on_hold", "append_hold known", "append_hold stored", "append_hold stale_base",
 		"fetch hold true", "fetch hold false",
@@ -345,6 +372,108 @@ func replayRepair(envs []string, logID string, c repairJ, keys map[string]*party
 	}
 	for _, e := range sp.entries {
 		out.Log = append(out.Log, hx(e.rh))
+	}
+	return out, nil
+}
+
+// enrollWant is the short form of an enroll step result.
+func enrollWant(s enrollStepJ) string {
+	if s.Error != nil {
+		return fmt.Sprintf("%d %s", s.Status, *s.Error)
+	}
+	m, _ := s.Response.(map[string]any)
+	if _, ok := m["state"]; !ok {
+		return fmt.Sprintf("%d expires %v", s.Status, m["expires"])
+	}
+	slots := func(w string) string {
+		o, _ := m[w].(map[string]any)
+		var names []string
+		for _, x := range enrollSlots {
+			writer, name, _ := strings.Cut(x, ".")
+			if _, ok := o[name]; ok && writer == w {
+				names = append(names, name)
+			}
+		}
+		return strings.Join(names, ",")
+	}
+	return fmt.Sprintf("%d %v n:%s t:%s", s.Status, m["state"], slots("new"), slots("trusted"))
+}
+
+var (
+	openPathRe    = regexp.MustCompile(`^/v1/t/(t_[0-9a-f]{32})/s/(l_[0-9a-f]{32})/enroll$`)
+	trustedPathRe = regexp.MustCompile(`^/v1/t/(t_[0-9a-f]{32})/s/(l_[0-9a-f]{32})/enroll/(e_[0-9a-f]{32})$`)
+	newPathRe     = regexp.MustCompile(`^/v1/e/(e_[0-9a-f]{32})$`)
+)
+
+// replayEnroll runs the steps of an enroll case on the reference relay, from
+// the whole space log envs with no session. It keeps route, signer, at,
+// method, path, body and digest_body, and takes every other field from the
+// reference relay.
+func replayEnroll(envs []string, logID, tenant string, c enrollCaseJ, keys map[string]*party, mut string) (enrollCaseJ, error) {
+	out := enrollCaseJ{Name: c.Name}
+	if len(c.Steps) == 0 {
+		return out, fmt.Errorf("no steps")
+	}
+	sp, err := newSpaceFromEnvelopes(logID, envs)
+	if err != nil {
+		return out, err
+	}
+	er := &enrollRelay{sp: sp, tenant: tenant, sessions: map[string]*enrollSession{}, mut: mut}
+	var last int64
+	for i, s := range c.Steps {
+		fail := func(f string, a ...any) (enrollCaseJ, error) {
+			return out, fmt.Errorf("step %d: %s", i+1, fmt.Sprintf(f, a...))
+		}
+		if s.At < last {
+			return fail("relay time goes back")
+		}
+		last = s.At
+		signed := s.Route == "open" || strings.HasPrefix(s.Route, "trusted_")
+		method := "POST"
+		if strings.HasSuffix(s.Route, "_read") {
+			method = "GET"
+		}
+		if s.Method != method || (method == "GET" && s.Body != "") {
+			return fail("method %s or body does not fit route %s", s.Method, s.Route)
+		}
+		var m []string
+		switch s.Route {
+		case "open":
+			m = openPathRe.FindStringSubmatch(s.Path)
+		case "trusted_read", "trusted_write":
+			m = trustedPathRe.FindStringSubmatch(s.Path)
+		case "new_read", "new_write":
+			m = newPathRe.FindStringSubmatch(s.Path)
+		default:
+			return fail("route %q", s.Route)
+		}
+		if m == nil || (signed && (m[1] != tenant || m[2] != logID)) {
+			return fail("path %q does not fit route %s", s.Path, s.Route)
+		}
+		rq := enrollReq{route: s.Route, session: m[len(m)-1], body: s.Body, at: s.At, digestOK: s.DigestBody == nil}
+		if s.Route == "open" {
+			rq.session = ""
+		}
+		if signed {
+			sg := keys[s.Signer]
+			if sg == nil {
+				return fail("unknown signer %q", s.Signer)
+			}
+			rq.keyid = sg.idText
+			if s.DigestBody != nil && *s.DigestBody == s.Body {
+				return fail("digest_body equals body")
+			}
+		} else if s.Signer != "" || s.DigestBody != nil {
+			return fail("unsigned route with a signer or digest_body")
+		}
+		rp := er.handle(rq)
+		ns := enrollStepJ{Route: s.Route, Signer: s.Signer, At: s.At, Method: s.Method, Path: s.Path, Body: s.Body, DigestBody: s.DigestBody, Status: rp.status}
+		if rp.code != "" {
+			ns.Error = ptr(rp.code)
+		} else {
+			ns.Response = rp.body
+		}
+		out.Steps = append(out.Steps, ns)
 	}
 	return out, nil
 }

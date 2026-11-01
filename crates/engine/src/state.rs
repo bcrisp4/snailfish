@@ -429,6 +429,18 @@ impl SpaceView for DbSpace<'_> {
             .flatten()
             .and_then(|b| b.try_into().ok())
     }
+    fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.tx
+            .query_row("SELECT envelope FROM log WHERE position = 1", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|g| snailfish_protocol::space::genesis_recovery_of(&g))
+            .filter(|(r, _)| r == id)
+            .map(|(_, k)| k)
+    }
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
         self.tx
             .query_row(

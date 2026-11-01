@@ -7,9 +7,10 @@ import (
 )
 
 // This file builds vectors/http.json (vectors/README.md "Format of http.json").
-// The expected value of each append, fetch, status and repair case is written
-// by hand here and asserted against the reference implementation of PROTOCOL.md
-// 10.6 to 10.9 (httpref.go), so a mistake in either one stops the generator.
+// The expected value of each append, fetch, status, repair and enroll case is
+// written by hand here and asserted against the reference implementation of
+// PROTOCOL.md 10.6 to 10.10 (httpref.go), so a mistake in either one stops the
+// generator.
 
 const (
 	httpNow       = 1767225600
@@ -120,6 +121,7 @@ type httpJ struct {
 	Fetch      []fetchJ      `json:"fetch"`
 	Status     []statusJ     `json:"status"`
 	Repair     []repairJ     `json:"repair"`
+	Enroll     []enrollCaseJ `json:"enroll"`
 }
 
 type statusRespJ struct {
@@ -155,6 +157,24 @@ type repairJ struct {
 	Log       []string      `json:"log"`
 }
 
+type enrollStepJ struct {
+	Route      string  `json:"route"`
+	Signer     string  `json:"signer"`
+	At         int64   `json:"at"`
+	Method     string  `json:"method"`
+	Path       string  `json:"path"`
+	Body       string  `json:"body"`
+	DigestBody *string `json:"digest_body"`
+	Status     int     `json:"status"`
+	Response   any     `json:"response"`
+	Error      *string `json:"error"`
+}
+
+type enrollCaseJ struct {
+	Name  string        `json:"name"`
+	Steps []enrollStepJ `json:"steps"`
+}
+
 func httpLimits() limitsJ {
 	return limitsJ{MaxRequestBytes: 16384, MaxChangeBytes: 512, MaxSnapshotBytes: 4096, MaxAppendEnvelopes: 8, MaxFetchEntries: 500}
 }
@@ -164,9 +184,10 @@ func httpTenant() string { return "t_" + hx(testSeed("tenant", "handle")[:16]) }
 // httpSealer reuses the sealed key sets of protocol.json: the http log holds
 // the same recipients, epoch and log ID, so the HPKE info is the same.
 // http entry 1 is genesis (protocol entry 1), 3 is the grant to B (protocol
-// entry 2), 100 is a grant to C (protocol entry 8).
+// entry 2), 100 is a grant to C (protocol entry 8), 101 is an epoch 2 record
+// with key sets to A, B and R1 (protocol entry 9).
 func httpSealer(p *protocolJ) sealer {
-	m := map[int]int{1: 1, 3: 2, 100: 8}
+	m := map[int]int{1: 1, 3: 2, 100: 8, 101: 9}
 	return func(entry, index int, pk, info, plaintext []byte) ([]byte, error) {
 		pe, ok := m[entry]
 		if !ok {
@@ -378,6 +399,17 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 	}()
 	level2, _, _ := signEnv(w.A, "snailfish.level.v1", obj(
 		"log", q(logText), "author", q(w.A.idText), "base", base4, "level", "2"))
+	// A recovery-signed epoch record parses (6.2). 10.6 step 11 refuses it
+	// because M4 accepts only changes and grants.
+	epochKeys, err := b.keySets(101, []int{2}, w.A, w.B, w.R1)
+	if err != nil {
+		return nil, err
+	}
+	stay := sortParties([]*party{w.A, w.B})
+	recEpoch, _, _ := signEnv(w.R1, "snailfish.epoch.v1", obj(
+		"log", q(logText), "author", q(w.R1.idText), "base", base4,
+		"epoch", "2", "removed", "[]", "stay", list(q(stay[0].idText), q(stay[1].idText)),
+		"commitment", q(b64(commitment(w.logID, 2, w.appKeys[2]))), "keys", epochKeys))
 	type ac struct {
 		name   string
 		signer *party
@@ -414,6 +446,13 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 			grant(w.A, w.B, 1, 3, base4),
 			mustChange(w.A, 27, posRaw(5, d5), 1, logText, `{"op":"after-stored"}`),
 		}, []string{"stored:5", "known:2", "conflict:2", "refused:bad_base", "refused:invalid_record", "stored:6"}, 0, nil},
+		// 10.6 steps 6 to 8 and 11: the current recovery ID can author a grant.
+		// The request signer is then any active device.
+		{"recovery-grant", w.B, []string{grant(w.R1, w.C, 2, 100, base4)}, []string{"stored:5"}, 0, nil},
+		{"recovery-grant-not-current", w.B, []string{grant(w.R2, w.C, 2, 100, base4)}, []string{"refused:not_active"}, 0, nil},
+		{"recovery-epoch", w.B, []string{recEpoch}, []string{"refused:unsupported"}, 0, nil},
+		// 6.2 allows only a device ID as the author of a change.
+		{"recovery-change", w.B, []string{mustChange(w.R1, 28, base4, 1, logText, `{"op":"x"}`)}, []string{"refused:invalid_record"}, 0, nil},
 	}
 	if err != nil {
 		return nil, err
@@ -526,6 +565,11 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 
 	// ---- repair sessions (10.9) ----
 	if err := buildRepair(h, b, w, envs, keys); err != nil {
+		return nil, err
+	}
+
+	// ---- enrollment sessions (10.10) ----
+	if err := buildEnrollHTTP(h, b, w, envs, keys); err != nil {
 		return nil, err
 	}
 
@@ -800,6 +844,275 @@ func buildRepair(h *httpJ, b *logBuilder, w *world, envs []string, keys map[stri
 			return fmt.Errorf("repair %s: reference log has %d entries, expected %d", c.name, len(got.Log), c.logLen)
 		}
 		h.Repair = append(h.Repair, got)
+	}
+	return nil
+}
+
+// buildEnrollHTTP writes the enroll cases of http.json (PROTOCOL.md 10.10).
+// Each case starts from space.log with no session. A opens each session, and
+// the messages are those of the main transcript of enroll.json (C enrolls).
+func buildEnrollHTTP(h *httpJ, b *logBuilder, w *world, envs []string, keys map[string]*party) error {
+	now := int64(httpNow)
+	A, B, C := w.A, w.B, w.C
+	tr := mainTranscript(w)
+	sid := tr.Session
+	other := sessionText(enrollSeed("session-unknown")[:16])
+	spacePath := "/v1/t/" + h.Tenant + "/s/" + h.LogID
+	exp := now + enrollTTL
+
+	openBody := func(x string) string { return `{"session":"` + x + `"}` }
+	newHello := `{"hello":{"device":` + tr.NewDevice + `}}`
+	rev := fields{}
+	df := splitFields(tr.NewDevice)
+	for i := len(df) - 1; i >= 0; i-- {
+		rev = append(rev, df[i])
+	}
+	newHelloOtherOrder := "{ \"hello\" : {\n \"device\" : " + rev.render() + " } }"
+	newHelloOther := `{"hello":{"device":` + helloDevice(B) + `}}`
+	trustedHello := `{"hello":{"keys":` + keysRaw(A) + `,"commitment":"` + b64(unhex(tr.Commitment)) + `"}}`
+	nonce := func(x []byte) string { return `{"nonce":"` + b64(x) + `"}` }
+	newNonce, trustedNonce := nonce(unhex(tr.NNonce)), nonce(unhex(tr.TNonce))
+	confirmEnv, _, _ := signEnv(C, "snailfish.confirm.v1", confirmOf(tr))
+	confirm := `{"confirm":` + confirmEnv + `}`
+	cpEnv, _, _ := signEnv(A, "snailfish.checkpoint.v1", obj(
+		"log", q(h.LogID), "author", q(A.idText), "position", "4", "digest", q(b64(b.digests[4]))))
+	doneFor := func(tenant string) string {
+		return `{"done":{"tenant":"` + tenant + `","checkpoint":` + cpEnv + `}}`
+	}
+	done := doneFor(h.Tenant)
+	otherTenant := "t_" + hx(testSeed("tenant", "other")[:16])
+	cancel := `{"cancel":true}`
+	malformed := `{"nonce":`
+	wrongDigest := `{"other":"body"}`
+
+	type st struct {
+		route  string
+		signer *party
+		at     int64
+		sess   string // the session ID in the path. Ignored for open.
+		body   string
+		digest string // the text whose digest the request carries, "" for the body
+		want   string // "<status> expires <n>", "<status> <state> n:<slots> t:<slots>" or "<status> <code>"
+	}
+	open := func(sg *party, at int64, x string, want string) st {
+		return st{"open", sg, at, "", openBody(x), "", want}
+	}
+	nw := func(at int64, body, want string) st { return st{"new_write", nil, at, sid, body, "", want} }
+	tw := func(sg *party, at int64, body, want string) st {
+		return st{"trusted_write", sg, at, sid, body, "", want}
+	}
+	nr := func(at int64, want string) st { return st{"new_read", nil, at, sid, "", "", want} }
+	trd := func(sg *party, at int64, want string) st { return st{"trusted_read", sg, at, sid, "", "", want} }
+	opened := fmt.Sprintf("201 expires %d", exp)
+	// honest is the honest run up to and including slot n of the order.
+	honest := func(n int) []st {
+		all := []st{
+			open(A, now, sid, opened),
+			nw(now+2, newHello, "200 open n:hello t:"),
+			tw(A, now+4, trustedHello, "200 open n:hello t:hello"),
+			nw(now+6, newNonce, "200 open n:hello,nonce t:hello"),
+			tw(A, now+7, trustedNonce, "200 open n:hello,nonce t:hello,nonce"),
+			nw(now+8, confirm, "200 open n:hello,nonce,confirm t:hello,nonce"),
+			tw(A, now+9, done, "200 done n:hello,nonce,confirm t:hello,nonce,done"),
+		}
+		return append([]st{}, all[:n+1]...)
+	}
+	cat := func(parts ...[]st) []st {
+		var out []st
+		for _, p := range parts {
+			out = append(out, p...)
+		}
+		return out
+	}
+	full := "n:hello,nonce,confirm t:hello,nonce,done"
+
+	cases := []struct {
+		name  string
+		steps []st
+	}{
+		{"honest-run", []st{
+			open(A, now, sid, opened),
+			nr(now+1, "200 open n: t:"),
+			nw(now+2, newHello, "200 open n:hello t:"),
+			trd(A, now+3, "200 open n:hello t:"),
+			tw(A, now+4, trustedHello, "200 open n:hello t:hello"),
+			nr(now+5, "200 open n:hello t:hello"),
+			nw(now+6, newNonce, "200 open n:hello,nonce t:hello"),
+			tw(A, now+7, trustedNonce, "200 open n:hello,nonce t:hello,nonce"),
+			nw(now+8, confirm, "200 open n:hello,nonce,confirm t:hello,nonce"),
+			tw(A, now+9, done, "200 done "+full),
+			nr(now+10, "200 done "+full),
+			trd(A, now+11, "200 done "+full),
+		}},
+		{"open-exact-retry", []st{
+			open(A, now, sid, opened),
+			open(A, now+5, sid, fmt.Sprintf("200 expires %d", exp)),
+		}},
+		{"open-by-other-device", []st{
+			open(A, now, sid, opened),
+			open(B, now+1, sid, "409 session_exists"),
+			open(A, now+2, sid, fmt.Sprintf("200 expires %d", exp)),
+		}},
+		{"trusted-route-other-device", []st{
+			open(A, now, sid, opened),
+			trd(B, now+1, "404 unknown_session"),
+			nw(now+2, newHello, "200 open n:hello t:"),
+			tw(B, now+3, trustedHello, "404 unknown_session"),
+			trd(A, now+4, "200 open n:hello t:"),
+		}},
+		{"slot-exact-retry", []st{
+			open(A, now, sid, opened),
+			nw(now+1, newHello, "200 open n:hello t:"),
+			nw(now+2, newHello, "200 open n:hello t:"),
+			nw(now+3, newHelloOtherOrder, "200 open n:hello t:"),
+			nw(now+4, newHelloOther, "409 bad_step"),
+			tw(A, now+5, trustedHello, "200 open n:hello t:hello"),
+			tw(A, now+6, trustedHello, "200 open n:hello t:hello"),
+			nr(now+7, "200 open n:hello t:hello"),
+		}},
+		{"wrong-order", []st{
+			open(A, now, sid, opened),
+			tw(A, now+1, trustedHello, "409 bad_step"),
+			nw(now+2, newNonce, "409 bad_step"),
+			nw(now+3, confirm, "409 bad_step"),
+			nw(now+4, newHello, "200 open n:hello t:"),
+			nw(now+5, newNonce, "409 bad_step"),
+			tw(A, now+6, trustedNonce, "409 bad_step"),
+			tw(A, now+7, done, "409 bad_step"),
+			nr(now+8, "200 open n:hello t:"),
+		}},
+		{"done-on-new-route", []st{
+			open(A, now, sid, opened),
+			nw(now+1, done, "400 bad_request"),
+			nw(now+2, trustedHello, "400 bad_request"),
+			nr(now+3, "200 open n: t:"),
+		}},
+		{"confirm-on-trusted-route", cat(honest(4), []st{
+			tw(A, now+20, confirm, "400 bad_request"),
+			tw(A, now+21, newHello, "400 bad_request"),
+			nr(now+22, "200 open n:hello,nonce t:hello,nonce"),
+		})},
+		{"done-other-tenant", cat(honest(5), []st{
+			tw(A, now+20, doneFor(otherTenant), "400 bad_request"),
+			tw(A, now+21, done, "200 done "+full),
+		})},
+		{"write-after-done", cat(honest(6), []st{
+			tw(A, now+20, done, "200 done "+full),
+			nw(now+21, confirm, "200 done "+full),
+			nw(now+22, cancel, "409 session_closed"),
+			tw(A, now+23, cancel, "409 session_closed"),
+			tw(A, now+24, nonce(enrollSeed("other-nonce")), "409 session_closed"),
+			nr(now+25, "200 done "+full),
+		})},
+		{"cancel-by-new", []st{
+			open(A, now, sid, opened),
+			nw(now+1, newHello, "200 open n:hello t:"),
+			nw(now+2, cancel, "200 cancelled n:hello t:"),
+			tw(A, now+3, trustedHello, "409 session_closed"),
+			nw(now+4, cancel, "200 cancelled n:hello t:"),
+			tw(A, now+5, cancel, "200 cancelled n:hello t:"),
+			nw(now+6, newHello, "200 cancelled n:hello t:"),
+			nr(now+7, "200 cancelled n:hello t:"),
+			trd(A, now+8, "200 cancelled n:hello t:"),
+		}},
+		{"cancel-by-trusted", []st{
+			open(A, now, sid, opened),
+			nw(now+1, newHello, "200 open n:hello t:"),
+			tw(A, now+2, trustedHello, "200 open n:hello t:hello"),
+			tw(A, now+3, cancel, "200 cancelled n:hello t:hello"),
+			nw(now+4, newNonce, "409 session_closed"),
+			tw(A, now+5, cancel, "200 cancelled n:hello t:hello"),
+			nr(now+6, "200 cancelled n:hello t:hello"),
+		}},
+		{"expiry", []st{
+			open(A, now, sid, opened),
+			nr(exp-1, "200 open n: t:"),
+			nw(exp-1, newHello, "200 open n:hello t:"),
+			nr(exp, "404 unknown_session"),
+			trd(A, exp, "404 unknown_session"),
+			tw(A, exp, trustedHello, "404 unknown_session"),
+			nw(exp+1, newNonce, "404 unknown_session"),
+			tw(A, exp+1, cancel, "404 unknown_session"),
+			open(A, exp+2, sid, fmt.Sprintf("201 expires %d", exp+2+enrollTTL)),
+			nr(exp+3, "200 open n: t:"),
+		}},
+		{"unknown-session", []st{
+			open(A, now, sid, opened),
+			{"new_read", nil, now + 1, other, "", "", "404 unknown_session"},
+			{"new_write", nil, now + 2, other, newHello, "", "404 unknown_session"},
+			{"trusted_read", A, now + 3, other, "", "", "404 unknown_session"},
+			{"trusted_write", A, now + 4, other, cancel, "", "404 unknown_session"},
+		}},
+		{"unknown-field", []st{
+			{"open", A, now, "", `{"session":"` + sid + `","x":1}`, "", "400 bad_request"},
+			open(A, now+1, sid, fmt.Sprintf("201 expires %d", exp+1)),
+			nw(now+2, `{"nonce":"`+b64(unhex(tr.NNonce))+`","x":1}`, "400 bad_request"),
+			nw(now+3, `{"hello":{"device":`+tr.NewDevice+`,"x":1}}`, "400 bad_request"),
+			nw(now+4, `{"hello":{"device":`+tr.NewDevice[:len(tr.NewDevice)-1]+`,"x":1}}}`, "400 bad_request"),
+			tw(A, now+5, `{"done":{"tenant":"`+h.Tenant+`","checkpoint":`+cpEnv+`,"x":1}}`, "400 bad_request"),
+			nr(now+6, "200 open n: t:"),
+		}},
+		{"malformed", []st{
+			{"open", A, now, "", openBody("e_" + strings.ToUpper(sid[2:])), "", "400 bad_request"},
+			open(A, now+1, sid, fmt.Sprintf("201 expires %d", exp+1)),
+			nw(now+2, `{"nonce":"`+b64(unhex(tr.NNonce))+`","cancel":true}`, "400 bad_request"),
+			nw(now+3, `{"cancel":false}`, "400 bad_request"),
+			nw(now+4, nonce(unhex(tr.NNonce)[:31]), "400 bad_request"),
+			nw(now+5, `{"hello":{"device":`+strings.Replace(tr.NewDevice, C.idText, A.idText, 1)+`}}`, "400 bad_request"),
+			nw(now+6, `{"confirm":{"payloadType":"snailfish.confirm.v1"}}`, "400 bad_request"),
+			nw(now+7, malformed, "400 bad_request"),
+			nr(now+8, "200 open n: t:"),
+		}},
+		// 10.10: the signed routes run 8.6 steps 1 to 4, then the body rules,
+		// then 8.6 steps 5 to 7, then the session.
+		{"check-order", []st{
+			{"open", A, now, "", malformed, wrongDigest, "400 bad_digest"},
+			{"open", C, now, "", malformed, "", "400 bad_request"},
+			open(C, now, sid, "403 unknown_device"),
+			open(A, now, sid, opened),
+			{"trusted_write", A, now + 1, sid, malformed, wrongDigest, "400 bad_digest"},
+			{"trusted_write", C, now + 2, sid, malformed, "", "400 bad_request"},
+			tw(C, now+3, trustedNonce, "403 unknown_device"),
+			{"trusted_read", A, now + 4, sid, "", wrongDigest, "400 bad_digest"},
+			trd(C, now+5, "403 unknown_device"),
+			{"trusted_write", A, now + 6, other, malformed, "", "400 bad_request"},
+			{"new_write", nil, now + 7, other, malformed, "", "400 bad_request"},
+		}},
+	}
+	for _, c := range cases {
+		in := enrollCaseJ{Name: c.name}
+		for _, s := range c.steps {
+			method, path := "POST", spacePath+"/enroll/"+s.sess
+			switch s.route {
+			case "open":
+				path = spacePath + "/enroll"
+			case "new_write":
+				path = "/v1/e/" + s.sess
+			case "new_read":
+				method, path = "GET", "/v1/e/"+s.sess
+			case "trusted_read":
+				method = "GET"
+			}
+			signer := ""
+			if s.signer != nil {
+				signer = s.signer.name
+			}
+			var dg *string
+			if s.digest != "" {
+				dg = ptr(s.digest)
+			}
+			in.Steps = append(in.Steps, enrollStepJ{Route: s.route, Signer: signer, At: s.at, Method: method, Path: path, Body: s.body, DigestBody: dg})
+		}
+		got, err := replayEnroll(envs, h.LogID, h.Tenant, in, keys, "")
+		if err != nil {
+			return fmt.Errorf("enroll %s: %w", c.name, err)
+		}
+		for i, s := range got.Steps {
+			if g := enrollWant(s); g != c.steps[i].want {
+				return fmt.Errorf("enroll %s step %d: reference gives %q, expected %q", c.name, i+1, g, c.steps[i].want)
+			}
+		}
+		h.Enroll = append(h.Enroll, got)
 	}
 	return nil
 }

@@ -1403,6 +1403,22 @@ impl SpaceView for SqlView<'_> {
         })())
     }
 
+    fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.query((|| {
+            let g: Option<String> = self
+                .conn
+                .query_row("SELECT envelope FROM entries WHERE position = 1", [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            Ok(
+                g.and_then(|g| snailfish_protocol::space::genesis_recovery_of(&g))
+                    .filter(|(r, _)| r == id)
+                    .map(|(_, k)| k),
+            )
+        })())
+    }
+
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
         self.query((|| {
             let row: Option<(i64, Vec<u8>)> = self.first(

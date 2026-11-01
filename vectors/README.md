@@ -7,7 +7,8 @@ The `protocol` crate, the sync engine, the Python binding and the Swift binding 
 | `protocol.json` | `tools/vectorgen` (Go) | One valid space log with every record type of `PROTOCOL.md` section 6, envelope variants, frames, IDs, key sets, change ciphertexts and recovery keys |
 | `strict-json.json` | `tools/vectorgen` (Go) | Payloads that `PROTOCOL.md` section 3 accepts or refuses, one case for each rule, and the section 6 rules for `sign` keys, recovery proofs and epoch records |
 | `recovery-key.json` | `tools/vectorgen` (Go) | Valid and invalid recovery key text forms (`PROTOCOL.md` section 9) |
-| `http.json` | `tools/vectorgen` (Go) | Request signatures (`PROTOCOL.md` section 8) and append and fetch results of the HTTP API (section 10) |
+| `http.json` | `tools/vectorgen` (Go) | Request signatures (`PROTOCOL.md` section 8) and append, fetch, status, repair and enrollment session results of the HTTP API (section 10) |
+| `enroll.json` | `tools/vectorgen` (Go) | Session codes and payloads, transcripts and confirmations of enrollment (`PROTOCOL.md` sections 6.3 and 11) |
 | `third_party/cctv-ed25519.json` | C2SP CCTV, commit `50a8ecf2a220f4c8bdc4f085789b8e85c26829e7`, BSD-3-Clause (`third_party/CCTV-LICENSE`) | The 914 Ed25519 edge-case vectors |
 | `third_party/hpke-rfc9180.json` | `cfrg/draft-irtf-cfrg-hpke` commit `b1f7cb0cdeab6906c61b3d6574e8bdfdbe1cd3fb` | RFC 9180 vector for base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305 |
 | `third_party/hpke-pq.json` | `hpkewg/hpke-pq` commit `6433c8fce0b8b749dfc86c1095081a88698ccfab` | `draft-ietf-hpke-pq` vector for MLKEM768-X25519, HKDF-SHA256, ChaCha20Poly1305 |
@@ -17,6 +18,8 @@ The `protocol` crate, the sync engine, the Python binding and the Swift binding 
 The Go generator uses the Go standard library (`crypto/ed25519`, `crypto/sha256`, `crypto/hkdf` and `crypto/hpke`), `golang.org/x/crypto/chacha20poly1305` and `filippo.io/edwards25519`. The last one checks that a `sign` key is canonical and not of small order. It does not call Rust. The Rust code therefore checks its output against a second implementation of `PROTOCOL.md`.
 
 Go `crypto/hpke` takes no fixed ephemeral key, so each run makes new `sealed` bytes. The committed files are the reference. Run the generator only after a format change.
+
+`-out-http <dir>` writes only `http.json`, with the `sealed` values of `protocol.json` in that directory. `-out-enroll <dir>` writes only `enroll.json`. It holds no `sealed` values, so each run writes the same bytes.
 
 ## Regenerate and check
 
@@ -136,6 +139,20 @@ All times are Unix seconds. Byte strings are lowercase hex, unless the field is 
           "error": code or null
       } ],
       "log": [ record_hash hex ]                     the record hashes of the relay log after the last step, from position 1
+  } ],
+  "enroll": [ {
+      "name",                                         each case starts from space.log with no enrollment session
+      "steps": [ {
+          "route": "open" or "trusted_read" or "trusted_write" or "new_read" or "new_write",
+          "signer": device name, or "" for the unsigned routes (new_read, new_write),
+          "at": n,                                    the relay time and the request created time of this step
+          "method", "path",                           the request line of PROTOCOL.md 10.1. The path holds the session ID, except for open.
+          "body": str,                                the exact body bytes as UTF-8, "" for a GET
+          "digest_body": str or null,                 if not null, content-digest and the signature cover the digest of this text, not of body
+          "status": n,                                the HTTP status
+          "response": JSON value or null,             the response body: {"expires": n} for open, else the session object. null if the relay returns an error.
+          "error": code or null
+      } ]
   } ]
 }
 ```
@@ -149,3 +166,54 @@ All times are Unix seconds. Byte strings are lowercase hex, unless the field is 
 - `fetch` lists the positions that a fetch returns from `space.log`, and the `hold` field of the response.
 - `status` covers a report during a hold with a tip in the log, a tip after the head, a tip with another digest, a report without a hold, and malformed bodies.
 - `repair` covers a repair in one start, in a start and chunks, a repair during a hold, a signer whose grant is only in the request entries ([LOG-12]), a signer that is active nowhere, a wrong base, a gap in the positions, an entry with a bad signature, a stub ([LOG-11]), a wrong tip, a second device during a session (`repair_busy`), a restart by the same device, a session after expiry, a finish after expiry, a chunk from another device, an unknown session, a known `change_id` in the entries, a wrong base with a signer whose grant is in the entries, a body at and over the repair allowance, and a malformed start.
+- `append` also covers authors of `PROTOCOL.md` 10.6 steps 6 to 8 and 11: a grant by the current recovery ID R1 that B sends (`stored`), a grant by the recovery ID R2, which is not the current one (`not_active`), an epoch record by R1 (`unsupported`), and a change by R1 (`invalid_record`, because section 6.2 allows only a device ID).
+- `enroll` covers the enrollment session of `PROTOCOL.md` 10.10. A opens each session, and C is the new device. The messages are those of the `a-trusted-c-new` transcript of `enroll.json`.
+- `enroll` covers an honest run of the six slots with a read after each step, an exact retry of open (the stored `expires`), an open by another device (`session_exists`), the trusted route by another active device (`unknown_session`), and exact retries of a slot with the same value, another key order and other whitespace.
+- `enroll` also covers each message out of order (`bad_step`), a `done` body and a trusted `hello` body on the new-device route, a `confirm` body and a new-device `hello` body on the trusted route, a `done` body with another tenant (`bad_request`), and writes after done (`session_closed`, except exact retries).
+- `enroll` also covers a cancel by each side, writes and cancel retries after a cancel, a read and a write at and after `expires` (`unknown_session`), an open again after expiry, an unknown session on each route, unknown fields, malformed bodies, and the check order of the signed routes: `bad_digest`, then `bad_request`, then `unknown_device`, then the session.
+- A step `response` is a JSON value. A reader compares parsed JSON values, because the relay sends each stored message as it stored it, in any layout. A new-device or trusted object with no message is `{}`.
+- A reader signs each request of a signed step with the `sign_seed` of its signer, a `created` of `at` and a nonce that it did not use before.
+
+## Format of `enroll.json`
+
+Byte strings are lowercase hex, unless the field is a code, a payload or envelope string, or a device object string.
+
+```text
+{
+  "version": 1,
+  "relay_url": "https://sync.example.net",           the relay URL of the payloads (PROTOCOL.md 8.3)
+  "devices": [ { "name", "sign_seed", "seal_seed", "sign_pk", "seal_pk", "id" } ],   A, B and C of protocol.json
+  "codes": [ { "name", "session": "e_...", "symbols", "display", "payload_t", "payload_n" } ],
+  "typed": {
+      "valid":   [ { "name", "text", "session": "e_..." } ],
+      "invalid": [ { "name", "text" } ]
+  },
+  "payloads": {
+      "valid":   [ { "name", "text", "role": "t" or "n", "relay_url", "session": "e_..." } ],
+      "invalid": [ { "name", "text" } ]
+  },
+  "transcripts": [ {
+      "name", "session": "e_...",
+      "trusted": device name, "new": device name, "t_id", "n_id",
+      "new_device": str,                              the device object of new.hello, in the writer form of PROTOCOL.md section 3
+      "t_nonce": hex, "n_nonce": hex,
+      "commit_frame": hex, "commitment": hex,         the frame of the commitment of 11.2 and its SHA-256
+      "code_frame": hex, "digits": hex,               the frame of the code of 11.2 and its SHA-256
+      "code": str                                     6 decimal digits
+  } ],
+  "confirmations": [ {
+      "name", "transcript": name,
+      "rule": "" or "6.3" or "11.2",                  the section of the rule that the case breaks, "" for a valid case
+      "payload": str, "envelope": str,
+      "signer": device name,                          the key that signs the envelope
+      "valid": bool                                   the trusted device accepts it for the transcript (11.2)
+  } ]
+}
+```
+
+- `codes` holds five session IDs, also all zero and all `ff` bytes. `payload_t` and `payload_n` use `relay_url`.
+- `typed.valid` holds reader variants of section 9: lowercase, no dashes, spaces, spaces and dashes, and `O` for `0` and `I` or `L` for `1`.
+- `typed.invalid` breaks one reader rule each: a wrong check, a recovery key check (label `snailfish.recovery-check.v1`), `U`, 31 symbols, 33 symbols, and an empty text.
+- `payloads.invalid` breaks one rule each: another first part, another role (`x`, `T`), a relay URL with a path, with only a trailing `/` or with another scheme, three or five parts, two spaces, and a wrong check.
+- `transcripts` holds A and C, A and B, B and A, and a case whose code has three leading zeros.
+- `confirmations` holds two valid cases of the `a-trusted-c-new` transcript, one in another key order. A `6.3` case breaks one payload rule: a missing field, an extra field, an `author` field, a device ID that does not match the keys, a 31-byte nonce, and a session text with uppercase hex or another prefix. An `11.2` case has a valid payload but fails one check of the trusted device: the signature of another key, another payload type, another session, trusted device, device object, trusted nonce or new nonce.
