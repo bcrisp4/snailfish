@@ -80,6 +80,17 @@ fn json_headers(body: &[u8]) -> Vec<Header> {
     h
 }
 
+/// The relay URL form of a payload (`PROTOCOL.md` 11.1): the scheme and
+/// the authority of 8.3, in lowercase, with no default port. The engine
+/// accepts a configured URL in other forms (`relay_base`).
+fn payload_url(relay_url: &str) -> String {
+    let scheme = relay_url
+        .split_once("://")
+        .map_or("https", |(s, _)| s)
+        .to_ascii_lowercase();
+    format!("{scheme}://{}", authority(relay_url))
+}
+
 fn read_payload_or_code(text: &str, own: Role) -> Result<([u8; 16], Option<String>), EngineError> {
     if text.starts_with(enroll::PAYLOAD_VERSION) {
         let p = enroll::parse_payload(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
@@ -224,7 +235,7 @@ impl Engine {
     pub fn confirm_grant(
         &mut self,
         device_id: &str,
-        recovery_key: Option<&str>,
+        recovery_key: Option<String>,
     ) -> Result<(), EngineError> {
         let id = snailfish_protocol::encoding::decode_id::<32>(device_id, "d_")
             .map_err(|err| EngineError::Invalid(format!("device ID: {err}")))?;
@@ -234,7 +245,7 @@ impl Engine {
             .ok_or_else(|| EngineError::Invalid("no grant for this device waits".into()))?;
         let secret = match (g.by_recovery, recovery_key) {
             (true, Some(k)) => {
-                Some(recovery::parse(k).map_err(|err| EngineError::Invalid(err.to_string()))?)
+                Some(recovery::parse(&k).map_err(|err| EngineError::Invalid(err.to_string()))?)
             }
             (true, None) => {
                 return Err(EngineError::Invalid(
@@ -347,11 +358,23 @@ impl TrustedEnrollment {
     /// [`EngineError::Random`].
     pub fn new(
         engine: &Engine,
-        scanned: Option<&str>,
-        recovery_key: Option<&str>,
+        scanned: Option<String>,
+        recovery_key: Option<String>,
     ) -> Result<Self, EngineError> {
+        // A device can grant only with the app key and a checked log
+        // ([ENR-9]), so refuse before the users compare codes.
+        if engine.app_key.is_none() || state::checkpoint(&engine.db)?.is_some() {
+            return Err(EngineError::Invalid(
+                "this device has not finished its own enrollment: sync it first".into(),
+            ));
+        }
+        if matches!(engine.status, Status::Fork { .. }) {
+            return Err(EngineError::Invalid(
+                "sync is stopped on this device".into(),
+            ));
+        }
         let recovery = recovery_key
-            .map(|k| recovery::parse(k).map_err(|err| EngineError::Invalid(err.to_string())))
+            .map(|k| recovery::parse(&k).map_err(|err| EngineError::Invalid(err.to_string())))
             .transpose()?;
         if let Some(secret) = &recovery {
             let (sign, seal) = recovery::derive(secret);
@@ -365,9 +388,10 @@ impl TrustedEnrollment {
                 ));
             }
         }
+        let own = payload_url(&engine.space.relay_url);
         let (session, payload) = if let Some(text) = scanned {
-            let (session, relay) = read_payload_or_code(text, Role::Trusted)?;
-            if relay.is_some_and(|r| r != engine.space.relay_url) {
+            let (session, relay) = read_payload_or_code(&text, Role::Trusted)?;
+            if relay.is_some_and(|r| r != own) {
                 return Err(EngineError::Invalid(
                     "the payload names another relay".into(),
                 ));
@@ -377,7 +401,7 @@ impl TrustedEnrollment {
             let session = rand()?;
             let p = enroll::payload(&Payload {
                 role: Role::Trusted,
-                relay_url: engine.space.relay_url.clone(),
+                relay_url: own,
                 session,
             });
             (session, Some(p))
@@ -441,7 +465,7 @@ impl TrustedEnrollment {
             (EnrollState::ConfirmAgain, true) => {
                 let id = self.device()?.id;
                 let key = self.recovery.map(|s| recovery::display(&s));
-                engine.confirm_grant(&encode_id("d_", &id), key.as_deref())?;
+                engine.confirm_grant(&encode_id("d_", &id), key)?;
                 self.state = EnrollState::Busy;
             }
             (EnrollState::Compare { .. } | EnrollState::ConfirmAgain, false) => {
@@ -652,6 +676,7 @@ impl TrustedEnrollment {
             )),
             Some(g) if g.state == GRANT_CONFIRM => self.state = EnrollState::ConfirmAgain,
             Some(_) if self.syncs >= MAX_GRANT_SYNCS => {
+                state::drop_grant(&engine.db, &id)?;
                 self.fail("the grant did not reach the relay");
             }
             Some(_) => {}
@@ -693,6 +718,7 @@ impl TrustedEnrollment {
                 "unknown_session" => "the session expired".to_owned(),
                 other => format!("the relay refused the enrollment: {other}"),
             });
+            self.abandon_grant(engine)?;
             return Ok(());
         }
         match sent {
@@ -788,6 +814,19 @@ impl TrustedEnrollment {
                 self.state = EnrollState::Busy;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// After a failure, take back a grant that the relay does not hold yet,
+    /// so a later sync does not make a device active whose enrollment
+    /// ended. A grant that the relay stored stays: the verified log holds
+    /// it, and the device stays active.
+    fn abandon_grant(&self, engine: &Engine) -> Result<(), EngineError> {
+        if let Some(d) = &self.new_device
+            && !state::is_active(&engine.db, &d.id)?
+        {
+            state::drop_grant(&engine.db, &d.id)?;
         }
         Ok(())
     }
@@ -910,7 +949,7 @@ impl NewEnrollment {
         relay_url: &str,
         keys: &DeviceKeys,
         name: &str,
-        scanned: Option<&str>,
+        scanned: Option<String>,
     ) -> Result<Self, EngineError> {
         if !(1..=128).contains(&name.len()) {
             return Err(EngineError::Invalid(
@@ -929,8 +968,9 @@ impl NewEnrollment {
             name: name.to_owned(),
             level: MAX_LEVEL,
         };
+        let scanned_any = scanned.is_some();
         let (session, payload) = if let Some(text) = scanned {
-            let (session, relay) = read_payload_or_code(text, Role::New)?;
+            let (session, relay) = read_payload_or_code(&text, Role::New)?;
             if let Some(r) = relay {
                 relay_url = r;
             }
@@ -939,7 +979,7 @@ impl NewEnrollment {
             let session = rand()?;
             let p = enroll::payload(&Payload {
                 role: Role::New,
-                relay_url: relay_url.clone(),
+                relay_url: payload_url(&relay_url),
                 session,
             });
             (session, Some(p))
@@ -959,7 +999,7 @@ impl NewEnrollment {
             t_nonce: None,
             joined: None,
             cancel_cause: None,
-            scanned: scanned.is_some(),
+            scanned: scanned_any,
             clock: crate::system_time,
             deadline: None,
         })

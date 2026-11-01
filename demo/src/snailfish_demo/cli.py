@@ -28,11 +28,15 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 import snailfish as sf
 
 from snailfish_demo import app
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class Crasher:
@@ -97,6 +101,19 @@ def answer_for(mode: str) -> app.Answer:
             say(f"compare: {code}")
             return mode == "yes"
         reply = input(f"compare: {code}\nDoes the other device show the same code? [y/N] ")
+        return reply.strip().lower() in ("y", "yes")
+
+    return ask
+
+
+def again_for(mode: str) -> Callable[[], bool]:
+    """Return the question of [LOG-7]: a prompt, or a fixed answer for tests."""
+
+    def ask() -> bool:
+        if mode != "ask":
+            say("confirm again: another device joined or left first")
+            return mode == "yes"
+        reply = input("Another device joined or left first. Add the new device anyway? [y/N] ")
         return reply.strip().lower() in ("y", "yes")
 
     return ask
@@ -169,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
                     say,
                     args.scan,
                     args.recovery_key,
+                    again_for(args.confirm),
                 )
             return finish(cause)
         if args.cmd == "edit":

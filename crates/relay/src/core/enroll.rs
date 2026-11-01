@@ -54,18 +54,15 @@ fn state_of(s: &str) -> Result<State, StoreError> {
     }
 }
 
-/// Delete expired sessions, then read the session. A session at its
-/// `expires` time or later does not exist (10.10).
+/// Read the session. A session at its `expires` time or later does not
+/// exist (10.10). Writers delete expired sessions with [`purge`], so a read
+/// takes no write lock on `directory.db`.
 fn load(tx: &Transaction<'_>, session: &str, now: u64) -> ApiResult<Option<Row>> {
-    tx.execute(
-        "DELETE FROM enroll_sessions WHERE expires <= ?1",
-        params![to_i64(now)?],
-    )?;
     let row = tx
         .query_row(
             "SELECT tenant, log_id, device_id, expires, state, m0, m1, m2, m3, m4, m5
-             FROM enroll_sessions WHERE session = ?1",
-            params![session],
+             FROM enroll_sessions WHERE session = ?1 AND expires > ?2",
+            params![session, to_i64(now)?],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -96,6 +93,15 @@ fn load(tx: &Transaction<'_>, session: &str, now: u64) -> ApiResult<Option<Row>>
         })
     })
     .transpose()
+}
+
+/// Delete the expired sessions, inside a write transaction.
+fn purge(tx: &Transaction<'_>, now: u64) -> ApiResult<()> {
+    tx.execute(
+        "DELETE FROM enroll_sessions WHERE expires <= ?1",
+        params![to_i64(now)?],
+    )?;
+    Ok(())
 }
 
 /// Read the session for the route of `owner`: the trusted route sees only
@@ -140,8 +146,7 @@ impl Relay {
 
     /// 8.6 steps 5 to 7 with the active devices of the space. Returns the
     /// device ID text of the signer.
-    fn enroll_signer(&self, req: &Request, now: u64, tenant: &str, log: &str) -> ApiResult<String> {
-        let sp = self.open_space(tenant, log)?;
+    fn enroll_signer(&self, req: &Request, now: u64, sp: &super::OpenSpace) -> ApiResult<String> {
         let keys = super::load_devices(&sp.conn)?;
         let v = self.verify(req, now, |id| keys.get(id).copied())?;
         Self::claim_nonce(&sp.tenant, &v, now)?;
@@ -157,13 +162,14 @@ impl Relay {
         log: &str,
     ) -> ApiResult<(u16, Vec<u8>)> {
         self.guard(req)?;
-        self.open_space(tenant, log)?;
+        let sp = self.open_space(tenant, log)?;
         self.enroll_steps_1_to_4(req, now)?;
         let session = mailbox::parse_open(&req.body).map_err(|e| api(400, "bad_request", e.0))?;
-        let device = self.enroll_signer(req, now, tenant, log)?;
+        let device = self.enroll_signer(req, now, &sp)?;
         let session = encode_id("e_", &session);
         let mut d = self.directory()?;
         let tx = d.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        purge(&tx, now)?;
         if let Some(row) = load(&tx, &session, now)? {
             if row.tenant == tenant && row.log == log && row.device == device {
                 tx.commit()?;
@@ -197,9 +203,9 @@ impl Relay {
         self.guard(req)?;
         let device = match space {
             Some((tenant, log)) => {
-                self.open_space(tenant, log)?;
+                let sp = self.open_space(tenant, log)?;
                 self.enroll_steps_1_to_4(req, now)?;
-                Some(self.enroll_signer(req, now, tenant, log)?)
+                Some(self.enroll_signer(req, now, &sp)?)
             }
             None => None,
         };
@@ -210,9 +216,9 @@ impl Relay {
             device,
         });
         let mut d = self.directory()?;
-        let tx = d.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A deferred transaction: a read takes no write lock (10.10 read).
+        let tx = d.transaction()?;
         let row = load_for(&tx, session, now, owner.as_ref())?;
-        tx.commit()?;
         Ok((200, body_of(&id, &row)))
     }
 
@@ -231,23 +237,28 @@ impl Relay {
         } else {
             Role::New
         };
-        if let Some((tenant, log)) = space {
-            self.open_space(tenant, log)?;
-            self.enroll_steps_1_to_4(req, now)?;
-        }
+        let sp = match space {
+            Some((tenant, log)) => {
+                let sp = self.open_space(tenant, log)?;
+                self.enroll_steps_1_to_4(req, now)?;
+                Some(sp)
+            }
+            None => None,
+        };
         let write = mailbox::parse_write(&req.body, role, space.map(|(t, _)| t))
             .map_err(|e| api(400, "bad_request", e.0))?;
-        let owner = match space {
-            Some((tenant, log)) => Some(Owner {
+        let owner = match (space, &sp) {
+            (Some((tenant, log)), Some(sp)) => Some(Owner {
                 tenant,
                 log,
-                device: self.enroll_signer(req, now, tenant, log)?,
+                device: self.enroll_signer(req, now, sp)?,
             }),
-            None => None,
+            _ => None,
         };
         let id = session_id(session)?;
         let mut d = self.directory()?;
         let tx = d.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        purge(&tx, now)?;
         let mut row = load_for(&tx, session, now, owner.as_ref())?;
         let closed = || {
             api(

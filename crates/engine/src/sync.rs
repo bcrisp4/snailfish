@@ -886,6 +886,10 @@ pub(crate) fn authority(url: &str) -> String {
 /// the verified head. `None` if the verified log holds no own grant after
 /// position 1 (`PROTOCOL.md` 10.9).
 fn late_repair(engine: &Engine, limits: &Limits) -> Result<Option<RepairRun>, EngineError> {
+    // [ENR-9]: a new device uploads nothing before its checkpoint check.
+    if enrolling(engine)? {
+        return Ok(None);
+    }
     let Some((g, _)) = state::activation(&engine.db, &engine.device_id)? else {
         return Ok(None);
     };

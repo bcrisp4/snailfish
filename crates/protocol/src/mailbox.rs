@@ -109,7 +109,16 @@ pub enum Write {
     Cancel,
 }
 
+/// Refuse a body with a duplicate key at any depth: two readers could take
+/// different values of one key (`PROTOCOL.md` section 4 reader rule).
+fn no_duplicates(body: &[u8], what: &str) -> Result<(), WireError> {
+    crate::strict::parse_envelope_json(body)
+        .map(|_| ())
+        .map_err(|e| bad(format!("{what}: {e}")))
+}
+
 fn one_field(body: &[u8]) -> Result<(String, &RawValue), WireError> {
+    no_duplicates(body, "enrollment body")?;
     let m: BTreeMap<String, &RawValue> =
         serde_json::from_slice(body).map_err(|e| bad(format!("enrollment body: {e}")))?;
     let mut it = m.into_iter();
@@ -368,6 +377,7 @@ fn side_map<'a>(
 /// Refuses a body without `expires` and a known `state`, and a message
 /// that breaks 10.10.
 pub fn parse_session(body: &[u8]) -> Result<Session, WireError> {
+    no_duplicates(body, "session object")?;
     let m: BTreeMap<String, &RawValue> =
         serde_json::from_slice(body).map_err(|e| bad(format!("session object: {e}")))?;
     let expires = m
@@ -542,6 +552,12 @@ mod tests {
         assert!(parse_write(br#"{"cancel":false}"#, Role::New, None).is_err());
         assert!(parse_write(br#"{"nonce":"AAAA","cancel":true}"#, Role::New, None).is_err());
         assert!(parse_write(br#"{"extra":1}"#, Role::New, None).is_err());
+        // A duplicate key at any depth.
+        assert!(parse_write(br#"{"cancel":true,"cancel":true}"#, Role::New, None).is_err());
+        let n = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let dup = format!(r#"{{"nonce":"{n}","nonce":"{n}"}}"#);
+        assert!(parse_write(dup.as_bytes(), Role::New, None).is_err());
+        assert!(parse_session(br#"{"expires":1,"state":"open","state":"done"}"#).is_err());
         let mut d = device(1);
         d.id = device(2).id;
         assert!(

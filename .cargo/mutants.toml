@@ -42,6 +42,11 @@ exclude_re = [
   # remove_db that does nothing leaves only -wal and -shm files of a
   # closed database, which hold no frames. The result is the same.
   "replace remove_db -> Result<\\(\\), OpsError> with Ok\\(\\(\\)\\)",
+  # The enrollments hold keys and nonces, so their Debug output names the
+  # step and the state only. An empty Debug output changes no behaviour
+  # and leaks nothing, so no test can tell it from the original.
+  "impl std::fmt::Debug for TrustedEnrollment>::fmt",
+  "impl std::fmt::Debug for NewEnrollment>::fmt",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`

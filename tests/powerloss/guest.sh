@@ -38,7 +38,16 @@ for _ in $(seq 100); do "$relay" health --url http://127.0.0.1:8080/v1/health 2>
 if [ ! -e "$state/setup-done" ]; then
   # The host kills only after SF-WORK, so the setup completes once.
   tenant=$("$relay" --data "$state/relay" user add sam) || fail "user add"
-  python3 -m snailfish_demo.cli setup --relay http://127.0.0.1:8080 --tenant "$tenant" "$state/a" "$state/b" > /dev/null || fail "setup"
+  python3 -m snailfish_demo.cli setup --relay http://127.0.0.1:8080 --tenant "$tenant" "$state/a" > /dev/null || fail "setup"
+  demo a sync > /dev/null || fail "setup sync"
+  # B joins through an enrollment: A shows the payload, B reads it.
+  demo a invite --confirm yes > "$state/invite.out" 2>&1 &
+  invite=$!
+  for _ in $(seq 100); do grep -q '^payload: ' "$state/invite.out" && break; sleep 0.1; done
+  payload=$(sed -n 's/^payload: //p' "$state/invite.out")
+  [ -n "$payload" ] || fail "no payload"
+  python3 -m snailfish_demo.cli join --relay http://127.0.0.1:8080 --scan "$payload" --confirm yes --name B "$state/b" > /dev/null || fail "join"
+  wait "$invite" || fail "invite"
   sync
   touch "$state/setup-done" && sync "$state"
 fi

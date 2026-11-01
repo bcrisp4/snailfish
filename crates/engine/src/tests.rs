@@ -113,9 +113,9 @@ impl World {
         recovery: Option<&str>,
         answers: (bool, bool),
     ) -> (EnrollState, EnrollState) {
-        let mut te = TrustedEnrollment::new(t, None, recovery).unwrap();
+        let mut te = TrustedEnrollment::new(t, None, recovery.map(str::to_owned)).unwrap();
         self.open(t, &mut te);
-        let mut ne = NewEnrollment::new(URL, &self.keys[1], "B", te.payload().as_deref()).unwrap();
+        let mut ne = NewEnrollment::new(URL, &self.keys[1], "B", te.payload()).unwrap();
         self.drive(t, &mut te, &mut ne, answers);
         if let Some(j) = ne.joined() {
             let space = crate::enroll::space_of(&j, URL, APP);
@@ -2147,14 +2147,14 @@ fn enrollment_in_both_directions() {
             let ne = NewEnrollment::new(URL, &w.keys[1], "B", None).unwrap();
             let p = ne.payload().unwrap();
             assert!(p.starts_with("snailfish-enroll-v1 n https://sync.example.net "));
-            (TrustedEnrollment::new(&ea, Some(&p), None).unwrap(), ne)
+            (TrustedEnrollment::new(&ea, Some(p), None).unwrap(), ne)
         } else {
             let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
             assert_eq!(te.code(), None, "no code before the open");
             w.open(&mut ea, &mut te);
             // The typed code works as well as the payload.
             let code = te.code().unwrap();
-            let ne = NewEnrollment::new(URL, &w.keys[1], "B", Some(&code)).unwrap();
+            let ne = NewEnrollment::new(URL, &w.keys[1], "B", Some(code)).unwrap();
             (te, ne)
         };
         w.drive(&mut ea, &mut te, &mut ne, (true, true));
@@ -2196,7 +2196,7 @@ fn new_device_uploads_nothing_before_the_checkpoint_check() {
     let (mut w, mut ea) = world_with_new_b();
     let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
     w.open(&mut ea, &mut te);
-    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload().as_deref()).unwrap();
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
     w.drive(&mut ea, &mut te, &mut ne, (true, true));
     let mut j = ne.joined().unwrap();
     j.digest[0] ^= 1;
@@ -2260,7 +2260,7 @@ fn expired_session_and_active_device_fail() {
     let (mut w, mut ea) = world_with_new_b();
     let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
     w.open(&mut ea, &mut te);
-    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload().as_deref()).unwrap();
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
     RELAY_TIME.fetch_add(600, Ordering::SeqCst);
     w.drive(&mut ea, &mut te, &mut ne, (true, true));
     RELAY_TIME.fetch_sub(600, Ordering::SeqCst);
@@ -2308,7 +2308,7 @@ fn expired_session_and_active_device_fail() {
 fn recovery_key_signs_the_grant() {
     let (mut w, mut ea) = world_with_new_b();
     let wrong = snailfish_protocol::recovery::display(&[9; 16]);
-    assert!(TrustedEnrollment::new(&ea, None, Some(&wrong)).is_err());
+    assert!(TrustedEnrollment::new(&ea, None, Some(wrong)).is_err());
     let rk = w.recovery_key.clone();
     let (t, n) = w.enroll_b(&mut ea, Some(&rk), (true, true));
     assert_eq!((t, n), (EnrollState::Done, EnrollState::Done));
@@ -2454,7 +2454,7 @@ fn new_device_reaches_the_code_while_the_trusted_device_waits_for_the_user() {
     let (w, mut ea) = world_with_new_b();
     let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
     w.open(&mut ea, &mut te);
-    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload().as_deref()).unwrap();
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
     let compare = |s: &EnrollState| matches!(s, EnrollState::Compare { .. });
     for _ in 0..100 {
         if compare(&te.state()) {
@@ -2481,4 +2481,216 @@ fn new_device_reaches_the_code_while_the_trusted_device_waits_for_the_user() {
         }
     }
     assert_eq!(ne.state(), EnrollState::Compare { code });
+}
+
+/// A trusted enrollment that fails in its grant step takes back the grant
+/// that the relay does not hold, so no later sync makes active a device
+/// whose enrollment ended. Here the relay refuses each append with a
+/// transport fault until the enrollment gives up.
+#[test]
+fn failed_grant_step_takes_back_the_grant() {
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
+    let end = |s: &EnrollState| matches!(s, EnrollState::Done | EnrollState::Failed { .. });
+    for _ in 0..400 {
+        if end(&te.state()) {
+            break;
+        }
+        if matches!(te.state(), EnrollState::Compare { .. }) {
+            te.confirm(&mut ea, true).unwrap();
+        }
+        if matches!(ne.state(), EnrollState::Compare { .. }) {
+            ne.confirm(true).unwrap();
+        }
+        if let Some(req) = te.next_request(&mut ea).unwrap() {
+            let (st, h, b) = if req.url.ends_with("/append") {
+                (503, Vec::new(), Vec::new())
+            } else {
+                w.send(&req)
+            };
+            te.handle_response(&mut ea, st, &h, &b).unwrap();
+        }
+        if let Some(req) = ne.next_request() {
+            let (st, _, b) = w.send(&req);
+            ne.handle_response(st, &b).unwrap();
+        }
+    }
+    assert!(
+        matches!(te.state(), EnrollState::Failed { ref cause } if cause.contains("did not reach")),
+        "{:?}",
+        te.state()
+    );
+    assert_eq!(state::grants(&ea.db).unwrap(), vec![]);
+    w.exchange(&mut ea);
+    assert_eq!(relay_log(&w, &ea).len(), 1, "no grant later");
+}
+
+/// [ENR-9]: a new device that holds its own grant but has not reached its
+/// checkpoint uploads no repair after `unknown_device` ([LOG-12] waits
+/// for the checkpoint check).
+#[test]
+fn enrolling_device_sends_no_late_repair() {
+    let (mut w, mut ea) = world_with_new_b();
+    let backup = w.backup("b1");
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    let mut j = ne.joined().unwrap();
+    // A checkpoint after the head: the check cannot pass yet.
+    j.position += 1;
+    install_enrollment(
+        &w.root.join("b"),
+        crate::enroll::space_of(&j, URL, APP),
+        &w.keys[1],
+        &j,
+    )
+    .unwrap();
+    let mut eb = w.engine(&w.dev("b"));
+    w.exchange(&mut eb);
+    assert_eq!(
+        eb.verified_head().unwrap().position,
+        2,
+        "the own grant is verified"
+    );
+    w.restore(&backup);
+    let mut s = eb.start_sync();
+    let mut posts = 0;
+    while let Some(req) = s.next_request(&mut eb).unwrap() {
+        posts += usize::from(req.method == "POST");
+        let resp = w.relay.handle(&to_relay(&req));
+        s.handle_response(&mut eb, resp.status, &time(&resp), &resp.body)
+            .unwrap();
+    }
+    assert_eq!(posts, 0);
+    assert_eq!(eb.status(), Status::RelayUnavailable);
+    assert_eq!(eb.take_repairs().unwrap(), []);
+}
+
+/// `PROTOCOL.md` 11.1: a payload holds the relay URL in its normal form,
+/// so a device configured with uppercase letters or a default port still
+/// writes a payload that the other device reads and accepts. A device that
+/// has not finished its own enrollment cannot start a trusted one.
+#[test]
+fn payload_relay_url_is_normal_and_new_device_cannot_grant() {
+    let (w, ea) = world_with_new_b();
+    let ne = NewEnrollment::new("HTTPS://Sync.Example.NET:443/", &w.keys[1], "B", None).unwrap();
+    let p = ne.payload().unwrap();
+    assert!(
+        p.starts_with("snailfish-enroll-v1 n https://sync.example.net "),
+        "{p}"
+    );
+    assert!(TrustedEnrollment::new(&ea, Some(p), None).is_ok());
+
+    let (mut w, mut ea) = (w, ea);
+    assert_eq!(w.enroll_b(&mut ea, None, (true, true)).0, EnrollState::Done);
+    let eb = w.engine(&w.dev("b"));
+    let err = TrustedEnrollment::new(&eb, None, None).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Invalid(ref m) if m.contains("own enrollment")),
+        "{err:?}"
+    );
+}
+
+/// Run an enrollment until the trusted side sends its first append, and
+/// return that request unsent.
+fn drive_until_append(
+    w: &World,
+    t: &mut Engine,
+    te: &mut TrustedEnrollment,
+    ne: &mut NewEnrollment,
+) -> Request {
+    for _ in 0..400 {
+        if matches!(te.state(), EnrollState::Compare { .. }) {
+            te.confirm(t, true).unwrap();
+        }
+        if matches!(ne.state(), EnrollState::Compare { .. }) {
+            ne.confirm(true).unwrap();
+        }
+        if let Some(req) = te.next_request(t).unwrap() {
+            if req.url.ends_with("/append") {
+                return req;
+            }
+            let (st, h, b) = w.send(&req);
+            te.handle_response(t, st, &h, &b).unwrap();
+        }
+        if let Some(req) = ne.next_request() {
+            let (st, _, b) = w.send(&req);
+            ne.handle_response(st, &b).unwrap();
+        }
+    }
+    panic!("no append: {:?}", te.state());
+}
+
+/// `specs/spacelog/test.qnt::resignReconfirmTest` through the enrollment
+/// API, [LOG-7]: A enrolls C while B enrolls D on the same base. The grant
+/// of D reaches the relay first, so the grant of C gets `stale_base`. The
+/// enrollment on A asks the user again (`ConfirmAgain`), and after the
+/// confirmation it appends the grant and sends the checkpoint. A grant that
+/// does not wait cannot be confirmed again.
+#[test]
+fn concurrent_enrollments_ask_the_user_again() {
+    let (mut w, dev_a, dev_b) = World::new();
+    let mut ea = w.engine(&dev_a);
+    let mut eb = w.engine(&dev_b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    let kc = new_device_keys().unwrap();
+    let kd = new_device_keys().unwrap();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut nc = NewEnrollment::new(URL, &kc, "C", te.payload()).unwrap();
+    let held = drive_until_append(&w, &mut ea, &mut te, &mut nc);
+    let c_id = encode_id("d_", &state::grants(&ea.db).unwrap()[0].device_id);
+    assert!(
+        matches!(ea.confirm_grant(&c_id, None), Err(EngineError::Invalid(_))),
+        "the grant of C does not wait for a confirmation"
+    );
+
+    let mut tb = TrustedEnrollment::new(&eb, None, None).unwrap();
+    w.open(&mut eb, &mut tb);
+    let mut nd = NewEnrollment::new(URL, &kd, "D", tb.payload()).unwrap();
+    w.drive(&mut eb, &mut tb, &mut nd, (true, true));
+    assert_eq!(tb.state(), EnrollState::Done);
+
+    let (st, h, b) = w.send(&held);
+    te.handle_response(&mut ea, st, &h, &b).unwrap();
+    for _ in 0..50 {
+        if te.state() == EnrollState::ConfirmAgain {
+            break;
+        }
+        if let Some(req) = te.next_request(&mut ea).unwrap() {
+            let (st, h, b) = w.send(&req);
+            te.handle_response(&mut ea, st, &h, &b).unwrap();
+        }
+    }
+    assert_eq!(te.state(), EnrollState::ConfirmAgain);
+    assert_eq!(ea.grants_to_confirm().unwrap(), vec![c_id]);
+    te.confirm(&mut ea, true).unwrap();
+    w.drive(&mut ea, &mut te, &mut nc, (true, true));
+    assert_eq!(
+        (te.state(), nc.state()),
+        (EnrollState::Done, EnrollState::Done)
+    );
+    assert_eq!(relay_log(&w, &ea).len(), 4, "genesis, B, D and C");
+}
+
+/// The grant step syncs again after a sync that did not reach the relay,
+/// and the enrollment ends with Done when a later sync appends the grant.
+#[test]
+fn grant_step_retries_after_a_failed_sync() {
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
+    // The append request is lost in transport: the app gets a 503.
+    drive_until_append(&w, &mut ea, &mut te, &mut ne);
+    te.handle_response(&mut ea, 503, &[], &[]).unwrap();
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    assert_eq!(
+        (te.state(), ne.state()),
+        (EnrollState::Done, EnrollState::Done)
+    );
 }

@@ -576,3 +576,128 @@ fn engine_object_reports_a_repair() {
         vec![snailfish::Repair { first: 2, tip: 2 }]
     );
 }
+
+/// [LOG-7] through the binding: A enrolls C while B enrolls D on the same
+/// base. The grant of D reaches the relay first, so the enrollment on A
+/// reaches `ConfirmAgain`, and `grants_to_confirm` names C until the user
+/// confirms again.
+#[test]
+fn confirm_again_crosses_the_binding() {
+    use snailfish::EnrollState as S;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = snailfish_relay::core::Relay::open(snailfish_relay::core::Config::new(
+        dir.path().join("relay"),
+        "sync.example.net",
+    ))
+    .unwrap();
+    let tenant = relay.add_user("sam").unwrap();
+    let mut ka = snailfish::new_device_keys().unwrap();
+    let setup = snailfish::create_space(
+        "com.example.tasks",
+        &snailfish::NewDevice {
+            keys: ka.clone(),
+            name: "A".into(),
+        },
+    )
+    .unwrap();
+    ka.app_key.clone_from(&setup.app_key);
+    let sp = space(&setup.log_id, &tenant);
+    let pa = dir.path().join("a");
+    let pa = pa.to_str().unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), &ka).unwrap());
+    exchange(&relay, &a);
+    let open = |t: &snailfish::TrustedEnrollment| {
+        let (st, h, b) = send(&relay, t.next_request().unwrap().unwrap());
+        t.handle_response(st, &h, &b).unwrap();
+    };
+    // B joins, then syncs once, so it can grant.
+    let kb = snailfish::new_device_keys().unwrap();
+    let tb = snailfish::TrustedEnrollment::new(a.clone(), None, None).unwrap();
+    open(&tb);
+    let nb =
+        snailfish::NewEnrollment::new("https://sync.example.net", &kb, "B", tb.payload().unwrap())
+            .unwrap();
+    drive(&relay, &tb, &nb, (true, true));
+    let pb = dir.path().join("b");
+    let pb = pb.to_str().unwrap();
+    snailfish::install_enrollment(pb, sp.clone(), &kb, &nb.joined().unwrap().unwrap()).unwrap();
+    let b = std::sync::Arc::new(snailfish::Engine::open(pb, sp, &kb).unwrap());
+    exchange(&relay, &b);
+    exchange(&relay, &a);
+
+    // A runs until its grant of C is about to go, and holds that request.
+    let tc = snailfish::TrustedEnrollment::new(a.clone(), None, None).unwrap();
+    open(&tc);
+    let nc = snailfish::NewEnrollment::new(
+        "https://sync.example.net",
+        &snailfish::new_device_keys().unwrap(),
+        "C",
+        tc.payload().unwrap(),
+    )
+    .unwrap();
+    let held = drive_until_append(&relay, &tc, &nc);
+    // B enrolls D to the end.
+    let td = snailfish::TrustedEnrollment::new(b.clone(), None, None).unwrap();
+    open(&td);
+    let nd = snailfish::NewEnrollment::new(
+        "https://sync.example.net",
+        &snailfish::new_device_keys().unwrap(),
+        "D",
+        td.payload().unwrap(),
+    )
+    .unwrap();
+    drive(&relay, &td, &nd, (true, true));
+    assert_eq!(td.state().unwrap(), S::Done);
+
+    let (st, h, bd) = send(&relay, held);
+    tc.handle_response(st, &h, &bd).unwrap();
+    for _ in 0..50 {
+        if tc.state().unwrap() == S::ConfirmAgain {
+            break;
+        }
+        if let Some(req) = tc.next_request().unwrap() {
+            let (st, h, bd) = send(&relay, req);
+            tc.handle_response(st, &h, &bd).unwrap();
+        }
+    }
+    assert_eq!(tc.state().unwrap(), S::ConfirmAgain);
+    assert_eq!(a.grants_to_confirm().unwrap().len(), 1);
+    tc.confirm(true).unwrap();
+    drive(&relay, &tc, &nc, (true, true));
+    assert_eq!(
+        (tc.state().unwrap(), nc.state().unwrap()),
+        (S::Done, S::Done)
+    );
+    assert_eq!(a.grants_to_confirm().unwrap(), Vec::<String>::new());
+}
+
+/// Run an enrollment until the trusted side sends its first append, and
+/// return that request unsent.
+fn drive_until_append(
+    relay: &snailfish_relay::core::Relay,
+    t: &snailfish::TrustedEnrollment,
+    n: &snailfish::NewEnrollment,
+) -> snailfish::Request {
+    use snailfish::EnrollState as S;
+    for _ in 0..200 {
+        if matches!(t.state().unwrap(), S::Compare { .. }) {
+            t.confirm(true).unwrap();
+        }
+        if matches!(n.state().unwrap(), S::Compare { .. }) {
+            n.confirm(true).unwrap();
+        }
+        if let Some(req) = t.next_request().unwrap() {
+            if req.url.ends_with("/append") {
+                return req;
+            }
+            let (st, h, bd) = send(relay, req);
+            t.handle_response(st, &h, &bd).unwrap();
+        }
+        if let Some(req) = n.next_request().unwrap() {
+            let (st, _, bd) = send(relay, req);
+            n.handle_response(st, &bd).unwrap();
+        }
+    }
+    panic!("no append");
+}

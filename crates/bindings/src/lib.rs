@@ -904,13 +904,12 @@ impl Engine {
     /// # Errors
     ///
     /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
-    #[allow(clippy::needless_pass_by_value)] // UniFFI has no `Option<&str>` argument: it passes an optional string by value.
     pub fn confirm_grant(&self, device_id: &str, recovery_key: Option<String>) -> Result<()> {
         Ok(self
             .inner
             .lock()
             .map_err(|_| poisoned())?
-            .confirm_grant(device_id, recovery_key.as_deref())?)
+            .confirm_grant(device_id, recovery_key)?)
     }
 
     /// Start one exchange with the relay.
@@ -974,7 +973,6 @@ impl TrustedEnrollment {
     ///
     /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
     #[uniffi::constructor]
-    #[allow(clippy::needless_pass_by_value)] // UniFFI has no `Option<&str>` argument: it passes an optional string by value.
     pub fn new(
         engine: std::sync::Arc<Engine>,
         scanned: Option<String>,
@@ -982,11 +980,7 @@ impl TrustedEnrollment {
     ) -> Result<Self> {
         let inner = {
             let e = engine.inner.lock().map_err(|_| poisoned())?;
-            snailfish_engine::enroll::TrustedEnrollment::new(
-                &e,
-                scanned.as_deref(),
-                recovery_key.as_deref(),
-            )?
+            snailfish_engine::enroll::TrustedEnrollment::new(&e, scanned, recovery_key)?
         };
         Ok(Self {
             engine,
@@ -1074,7 +1068,6 @@ impl NewEnrollment {
     ///
     /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
     #[uniffi::constructor]
-    #[allow(clippy::needless_pass_by_value)] // UniFFI has no `Option<&str>` argument: it passes an optional string by value.
     pub fn new(
         relay_url: &str,
         keys: &DeviceKeys,
@@ -1085,7 +1078,7 @@ impl NewEnrollment {
             relay_url,
             &keys.to_engine()?,
             name,
-            scanned.as_deref(),
+            scanned,
         )?;
         Ok(Self {
             inner: Mutex::new(inner),

@@ -680,6 +680,7 @@ Messages. Each session has six message slots. They take a message in this order:
 - Either writer can also send `{"cancel":true}`.
 - The new-device route accepts only `hello`, `nonce`, `confirm` and `cancel` bodies of the new device. The trusted route accepts only `hello`, `nonce`, `done` and `cancel` bodies of the trusted device. Each other body breaks this section.
 - The device and keys objects are the objects of section 6.1, with the same rules. `commitment` and each nonce are 32-byte binary values.
+- A body with a duplicate key at any depth breaks this section, as for an envelope (section 4). A device refuses such a session object too.
 - `confirm` holds a `snailfish.confirm.v1` envelope, and `checkpoint` a `snailfish.checkpoint.v1` envelope (section 6.3). The relay checks only the envelope form of section 4, not the `payloadType` or the payload. The devices check the content (section 11).
 - `tenant` must equal `{tenant}` of the request path. Otherwise the body breaks this section. The session belongs to the space of the path (step 4), so the check needs no session.
 

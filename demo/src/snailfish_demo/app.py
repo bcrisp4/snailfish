@@ -203,13 +203,16 @@ def invite(
     say: Say,
     scanned: str | None = None,
     recovery_key: str | None = None,
+    again: Callable[[], bool] | None = None,
 ) -> str:
     """Enroll a new device from this trusted device ([ENR-1] to [ENR-8]).
 
     If `scanned` is None, this device shows the session: `say` gets the QR
     payload and the typed code. Otherwise `scanned` is the payload or the
     typed code that the new device shows. If the user gives the recovery
-    key, it signs the grant.
+    key, it signs the grant. `again` asks the user to confirm the grant
+    again after another device joined or left first ([LOG-7]). Without it,
+    the enrollment stops at that question.
 
     Returns:
         An empty string on success, or the cause of the failure.
@@ -226,7 +229,7 @@ def invite(
             t.confirm(answer(state.code))
             continue
         if isinstance(state, sf.EnrollState.CONFIRM_AGAIN):
-            t.confirm(answer("the device list changed: confirm the new device again"))
+            t.confirm(again is not None and again())
             continue
         req = t.next_request()
         if req is None:
