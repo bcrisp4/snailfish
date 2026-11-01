@@ -52,7 +52,7 @@ ifneq ($(MUTANTS_TMPDIR),)
 $(MUTANTS_TARGETS): export TMPDIR := $(MUTANTS_TMPDIR)
 endif
 
-.PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-powerloss \
+.PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-browser test-powerloss \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
         rust-nightly-check rust-nightly-components mutants-ramdisk mutants-tmpdir verify-crypto
@@ -245,9 +245,18 @@ test-python: bindings-python
 ## hold, the "not repaired" refusal, and a fork through the record base.
 test-demo: bindings-python
 	$(CARGO) build -p snailfish-relay
+	cd demo && mise exec -- uv run --locked playwright install chromium
 	cd demo && mise exec -- uv run --locked ruff check . && mise exec -- uv run --locked ruff format --check . \
 	  && mise exec -- uv run --locked pyright \
 	  && SNAILFISH_RELAY_BIN=$(CURDIR)/target/debug/snailfish-relay mise exec -- uv run --locked pytest
+
+## The user page in Chromium with a virtual passkey (demo/tests/test_browser.py).
+## A quick check after a change to app.js, the page HTML or its headers.
+## make test-demo runs it too. The first run downloads the pinned Chromium.
+test-browser: bindings-python
+	$(CARGO) build -p snailfish-relay
+	cd demo && mise exec -- uv run --locked playwright install chromium
+	cd demo && SNAILFISH_RELAY_BIN=$(CURDIR)/target/debug/snailfish-relay mise exec -- uv run --locked pytest tests/test_browser.py
 
 ## The power-loss test: SIGKILL a QEMU VM during push and pull, KILLS times.
 ## About 5 minutes for 20 kills on an M5 with HVF, after the first boot.

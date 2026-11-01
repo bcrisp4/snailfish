@@ -295,9 +295,26 @@ fn page(title: &str, body: &str) -> Reply {
                     .into(),
             ),
             ("cache-control".into(), "no-store".into()),
-            ("referrer-policy".into(), "no-referrer".into()),
+            // Under `no-referrer`, a browser sends `Origin: null` with a form
+            // POST, and write rule 2 refuses it (12.4). `same-origin` sends no
+            // referrer to another site.
+            ("referrer-policy".into(), "same-origin".into()),
         ],
     }
+}
+
+/// The CSP source of a redirect URI of 12.2: `http://127.0.0.1:<port>`,
+/// `http://[::1]:<port>`, or `<scheme>:` for a private-use scheme. The URI
+/// passed `redirect_uri_ok`, so the source holds no space, `;` or `,`.
+fn redirect_source(uri: &str) -> String {
+    for prefix in ["http://127.0.0.1:", "http://[::1]:"] {
+        if let Some(rest) = uri.strip_prefix(prefix) {
+            let port = rest.split('/').next().unwrap_or_default();
+            return format!("{prefix}{port}");
+        }
+    }
+    let scheme = uri.split(':').next().unwrap_or_default();
+    format!("{scheme}:")
 }
 
 fn redirect(to: &str) -> Reply {
@@ -960,7 +977,16 @@ impl Relay {
             esc(&a.state),
             self.auth.csrf(&s.id)
         );
-        page("Allow the app", &b)
+        let mut r = page("Allow the app", &b);
+        // A browser checks `form-action` also on the redirect after the form
+        // POST, so the page must allow the redirect target of the app (12.4).
+        let src = redirect_source(&a.redirect_uri);
+        for (n, v) in &mut r.headers {
+            if n == "content-security-policy" {
+                *v = v.replace("form-action 'self'", &format!("form-action 'self' {src}"));
+            }
+        }
+        r
     }
 
     fn home(&self, session: &Session, now: u64) -> ApiResult<Reply> {

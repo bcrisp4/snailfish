@@ -14,7 +14,7 @@ requires = ["uv_build>=0.10,<0.11"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]
+dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414", "playwright==1.55.0"]
 
 [tool.pytest.ini_options]
 addopts = ["--strict-markers", "-q"]

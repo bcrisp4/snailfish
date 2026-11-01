@@ -918,7 +918,11 @@ fn user_page_serves_its_pages_and_script() {
     let fx = Fx::new();
     let mut b = Browser::new(&fx);
     let text = |r: Response| String::from_utf8(r.body).unwrap();
-    assert!(text(b.send("GET", "/u/signin", "", b"", &[])).contains("Sign in with a passkey"));
+    let signin = b.send("GET", "/u/signin", "", b"", &[]);
+    // Under `no-referrer`, Chrome sends `Origin: null` with each form POST,
+    // so every form of the page gets `bad_origin` (12.4).
+    assert_eq!(signin.header("referrer-policy"), Some("same-origin"));
+    assert!(text(signin).contains("Sign in with a passkey"));
     assert!(text(b.send("GET", "/u/invite", "", b"", &[])).contains("Register a passkey"));
     let js = b.send("GET", "/u/app.js", "", b"", &[]);
     assert_eq!(js.content_type, "text/javascript; charset=utf-8");
@@ -932,8 +936,33 @@ fn user_page_serves_its_pages_and_script() {
         text(b.send("GET", "/u/authorize", &q, b"", &[])).contains("An app asks to set up sync")
     );
     let (mut b, _) = signed_in(&fx);
-    let page = text(b.send("GET", "/u/authorize", &q, b"", &[]));
+    let r = b.send("GET", "/u/authorize", &q, b"", &[]);
+    // Chrome checks `form-action` on the redirect after the Allow POST, so
+    // without the app scheme here the approval never reaches the app.
+    let csp = r.header("content-security-policy").unwrap().to_owned();
+    assert!(
+        csp.contains("form-action 'self' com.example.tasks:;"),
+        "{csp}"
+    );
+    let page = text(r);
     assert!(page.contains("Allow") && page.contains(REDIRECT), "{page}");
+    let loopback = setup::authorize_query(&setup::Authorize {
+        challenge: setup::challenge(VERIFIER),
+        redirect_uri: "http://127.0.0.1:49152/cb".into(),
+        state: "s1".into(),
+    });
+    let r = b.send("GET", "/u/authorize", &loopback, b"", &[]);
+    let csp = r.header("content-security-policy").unwrap();
+    assert!(
+        csp.contains("form-action 'self' http://127.0.0.1:49152;"),
+        "{csp}"
+    );
+    let home = b.send("GET", "/u/", "", b"", &[]);
+    assert!(
+        home.header("content-security-policy")
+            .unwrap()
+            .contains("form-action 'self';")
+    );
 }
 
 /// 12.4: a signed-in user adds a passkey. The options exclude the passkeys

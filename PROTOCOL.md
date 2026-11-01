@@ -939,6 +939,8 @@ Sessions:
 
 - A session ID is 16 random bytes. The cookie is `sf_session=<32 hex digits>.<64 hex digits>`: the ID, then HMAC-SHA256 with `session.key` over `frame("snailfish.session.v1", id)`.
 - The cookie has the attributes `Path=/u; HttpOnly; SameSite=Strict; Max-Age=43200`, and `Secure` if the origin is `https`.
+- Each page has `Referrer-Policy: same-origin`. Under `no-referrer`, a browser sends `Origin: null` with a form `POST`, and write rule 2 refuses each form of the page.
+- The `Content-Security-Policy` of each page has `form-action 'self'`. A browser checks that directive also on the redirect after a form `POST`, so the approval page of 12.2 adds the source of its redirect URI: `http://127.0.0.1:<port>`, `http://[::1]:<port>`, or `<scheme>:`.
 - The relay stores SHA-256 of the session ID with the user ID and the expiry time, the relay time of the sign-in plus 43,200 seconds. The session selects the user, and the user selects the tenant ([USR-3]).
 - The anti-CSRF token of a session is the lowercase hex of HMAC-SHA256 with `session.key` over `frame("snailfish.csrf.v1", id)`.
 
