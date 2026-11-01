@@ -1044,6 +1044,13 @@ fn user_page_shows_names_and_deletes_groups() {
     let page = b.home();
     let li = page.split("<li>").nth(1).unwrap();
     assert!(li.starts_with("Phone "), "the member shows no name: {li}");
+    let mut member = |op: &str| {
+        let f = [("group", "1"), ("device", device_b.as_str()), ("op", op)];
+        b.form("/u/groups/members", &f).status
+    };
+    assert_eq!(member("swap"), 400);
+    assert_eq!(member("remove"), 303);
+    assert!(!b.home().contains("<li>Phone "), "the member stays");
     assert_eq!(b.form("/u/groups/delete", &[("group", "1")]).status, 303);
     assert!(!b.home().contains("<h3>phone"));
     fx.set_hold(fx.tenant(), true);
