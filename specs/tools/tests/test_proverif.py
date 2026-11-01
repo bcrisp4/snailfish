@@ -74,6 +74,20 @@ def test_reachable_means_a_false_not_event_query() -> None:
     assert any("got true, expected reachable" in line for line in fails(lines))
 
 
+def test_reachable_accepts_a_false_conjunction_query() -> None:
+    out = "RESULT not (event(TokenIssued(u_6,d_3)) && event(HonestUser(u_6))) is false.\n"
+    lines = proverif.compare("f.pv", proverif.parse_output(out), {"not (event(TokenIssued": "reachable"})
+    assert fails(lines) == []
+
+
+def test_model_dirs_finds_each_directory_with_an_expectation(tmp_path: Path) -> None:
+    for name in ("b", "a", "c"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "a" / "expect.toml").write_text("")
+    (tmp_path / "b" / "expect.toml").write_text("")
+    assert proverif.model_dirs(tmp_path) == [tmp_path / "a", tmp_path / "b"]
+
+
 def test_reachable_does_not_accept_a_false_security_query() -> None:
     out = "RESULT not attacker(appk[]) is false.\n"
     lines = proverif.compare("f.pv", proverif.parse_output(out), {"not attacker(appk": "reachable"})

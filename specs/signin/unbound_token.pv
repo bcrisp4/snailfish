@@ -1,0 +1,2 @@
+(* Variant vUnboundToken. Run: proverif -lib lib.pvl unbound_token.pv *)
+process System(vUnboundToken)

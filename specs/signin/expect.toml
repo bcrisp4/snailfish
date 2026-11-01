@@ -1,0 +1,43 @@
+# Expected ProVerif results. One table for each .pv file in this directory.
+# Keys and values follow specs/enrollment/expect.toml. The variable names u_6, d_3 and
+# ch_3 are the names that ProVerif prints for the query variables.
+
+["signin.pv"]
+"HonestUser(u_6)) ==> event(Approves" = "true"
+"ten(u_6))) ==> event(Approves" = "true"
+"==> event(UserRegisters" = "true"
+"not (event(TokenIssued" = "reachable"
+"not (event(SpaceCreated" = "reachable"
+"not (event(PasskeyRegistered" = "reachable"
+
+["no_pkce.pv"]
+"HonestUser(u_6)) ==> event(Approves" = "false"
+"ten(u_6))) ==> event(Approves" = "false"
+"==> event(UserRegisters" = "true"
+"not (event(TokenIssued" = "reachable"
+"not (event(SpaceCreated" = "reachable"
+"not (event(PasskeyRegistered" = "reachable"
+
+["unbound_token.pv"]
+"HonestUser(u_6)) ==> event(Approves" = "false"
+"ten(u_6))) ==> event(Approves" = "true"
+"==> event(UserRegisters" = "true"
+"not (event(TokenIssued" = "reachable"
+"not (event(SpaceCreated" = "reachable"
+"not (event(PasskeyRegistered" = "reachable"
+
+["no_tenant_check.pv"]
+"HonestUser(u_6)) ==> event(Approves" = "false"
+"ten(u_6))) ==> event(Approves" = "true"
+"==> event(UserRegisters" = "true"
+"not (event(TokenIssued" = "reachable"
+"not (event(SpaceCreated" = "reachable"
+"not (event(PasskeyRegistered" = "reachable"
+
+["plain_invite.pv"]
+"HonestUser(u_6)) ==> event(Approves" = "false"
+"ten(u_6))) ==> event(Approves" = "true"
+"==> event(UserRegisters" = "false"
+"not (event(TokenIssued" = "reachable"
+"not (event(SpaceCreated" = "reachable"
+"not (event(PasskeyRegistered" = "reachable"

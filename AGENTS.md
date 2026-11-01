@@ -15,6 +15,7 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | Protocol, engine, or relay Rust logic | `specs/conformance.md`, the relevant model actions and named scenarios | Add a real-path Rust test of the same scenario, with model path, scenario name, and rule IDs. Model results do not verify Rust behaviour. |
 | A function in `crates/protocol` | The model rule and `PROTOCOL.md` section | Add a property test and bounded Kani harness. Cite the rule ID. These checks address different input domains. |
 | Enrollment, removal, or key sealing | `specs/enrollment/README.md`, `lib.pvl`, and `expect.toml` | Update the security model and a broken variant. A symbolic security result depends on its attacker assumptions. |
+| Sign-in, invite links, the setup token, or tenant selection | `specs/signin/README.md`, `lib.pvl`, and `expect.toml` | Update the security model and a broken variant. Tenant isolation depends on these rules. |
 | A wire format or untrusted parser | `PROTOCOL.md`, `vectors/README.md`, existing vectors and fuzz seeds | Write the format, then change `tools/vectorgen` (Go), then the Rust. Add a seeded fuzz target for each parser. Two implementations from one spec catch misreadings that one cannot. Models omit byte-level faults. |
 | The binding API (`crates/bindings`) | `crates/engine/src/codec.rs`, `bindings/python/tests`, `bindings/swift/Tests` | Put logic in `snailfish-engine`, not in the binding. Run the shared vectors in each binding, because a marshalling fault passes the Rust tests. |
 | Verification tools or CI | `specs/README.md`, the runner tests, and `.github/workflows/verify.yml` | Reject tool errors and incomplete runs. An expected counterexample must identify the intended property. |
@@ -28,7 +29,7 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | Before a merge with model or protocol changes | `make verify MODEL=<model>` and `make verify-deep MODEL=<model>` for each affected model | Sampling and exhaustive finite configurations provide different evidence. |
 | Before a merge with a tagged design-rule change | `make verify-drift BASE=<base>` | A changed rule requires a model, scenario, manifest, or coverage change. |
 | Before a merge with shared-tool or CI changes | `make verify` and `make verify-deep` | Shared tools can invalidate results for every model and backend. |
-| Before a merge with enrollment model changes | `make verify-crypto` | Every design and broken-variant query must match its expectation. |
+| Before a merge with enrollment or sign-in model changes | `make verify-crypto` | Every design and broken-variant query must match its expectation. |
 | Before each push with Rust changes | `make rust-mutants-diff BASE=@{push}` (`BASE=main` for a branch with no push) | This tests only the new commits, in minutes. A survivor found in CI costs a 30 to 60 minute round. |
 | Before a merge with Rust changes | `make rust-kani` and the CI `mutants` job | Bounded harnesses and fault-sensitive tests check the implementation. The CI job tests every mutant in the branch diff, so a local branch-wide run repeats it. |
 | Before a merge with parser changes | `make rust-fuzz` | Arbitrary bytes exercise parser failure paths. |

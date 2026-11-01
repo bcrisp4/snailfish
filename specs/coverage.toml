@@ -4,6 +4,9 @@
 # `partial` lists cited rules with a part that no model encodes yet.
 
 [partial]
+"USR-1" = "specs/signin checks the hash and that only the holder of the token registers a passkey. It does not check one use or the 7 day expiry, because ProVerif has no time and a table row cannot be removed. Rust: crates/relay/tests/user.rs invite tests"
+"USR-4" = "specs/signin checks the PKCE binding. It does not check one use, the 60 second expiry or the redirect URI binding. Rust: crates/relay/tests/user.rs handoff tests"
+"USR-5" = "specs/signin checks the device binding. It does not check the 10 minute expiry. Rust: crates/relay/tests/user.rs handoff tests"
 "ENR-9" = "ProVerif checks the grant, the checkpoint signature and that the new device uploads nothing before both checks. It does not check the log from the genesis record. specs/spacelog checks the log up to the checkpoint (fetchOne). Rust: crates/engine enrollment tests"
 "LOG-11" = "snapshot rule: the relay moves staged entries only if the usable snapshot covers every staged stub. M3 has no stubs, and the relay refuses each staged stub (crates/relay/tests). Model it with compaction (M8)"
 
@@ -89,3 +92,7 @@
 "STO-13" = "relay storage is not modelled"
 "STO-14" = "relay storage is not modelled"
 "STO-15" = "relay storage is not modelled"
+"USR-2" = "a new invite link removes passkeys and sessions: a storage rule, not a protocol state. Rust: crates/relay/tests/user.rs. specs/README.md lists the exclusion"
+"USR-7" = "Origin, anti-CSRF and cookie rules of the browser surface: specs/README.md lists the exclusion. Rust: crates/relay/tests/user.rs, demo/tests/test_users.py"
+"USR-8" = "webhook host allowlist and address checks: specs/README.md lists the exclusion. Rust: crates/relay/src/webhook.rs tests, demo/tests/test_users.py"
+"QTA-5" = "the space count limit is one check in space creation with no interleaving. Rust: crates/relay/tests/user.rs"

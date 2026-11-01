@@ -274,6 +274,6 @@ test-swift: bindings-swift
 
 ## ---------------------------------------------------------------- ProVerif
 
-## ProVerif models of enrollment. Needs `opam install proverif`. About 30 seconds.
+## ProVerif models of enrollment and sign-in. Needs `opam install proverif`. About 30 seconds.
 verify-crypto:
 	eval $$(opam env 2>/dev/null); mise exec -- uv run --script specs/tools/proverif.py

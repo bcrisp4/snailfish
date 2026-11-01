@@ -1,0 +1,2 @@
+(* The design in DESIGN.md, "User sign-in". Run: proverif -lib lib.pvl signin.pv *)
+process System(vNone)

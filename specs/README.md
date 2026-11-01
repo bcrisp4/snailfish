@@ -4,7 +4,7 @@ These models check parts of `DESIGN.md`. Each model README states its assumption
 
 The fast and full Quint tiers sample traces. Apalache checks every trace up to a step bound. TLC checks every reachable state of selected finite configurations.
 
-ProVerif checks enrollment queries for unbounded sessions under its symbolic attacker assumptions. None of these results establishes Rust conformance.
+ProVerif checks enrollment and sign-in queries for unbounded sessions under its symbolic attacker assumptions. None of these results establishes Rust conformance.
 
 ## Layout
 
@@ -17,7 +17,7 @@ ProVerif checks enrollment queries for unbounded sessions under its symbolic att
 | `<model>/_gen/` | Generated config modules and traces. Not committed. |
 | `tools/verify.py` | Runs the checks of each tier for each model. One `quint run` checks all invariants of a config and counts its witnesses. |
 | `tools/trace.py` | Finds and prints a counterexample with only the changed fields. |
-| `tools/proverif.py` | Runs the ProVerif files of `enrollment/` and compares each query with `enrollment/expect.toml`. |
+| `tools/proverif.py` | Runs the ProVerif files of each directory with an `expect.toml` (`enrollment/`, `signin/`) and compares each query with it. |
 | `tools/rules.py` | Checks the rule IDs of `DESIGN.md` against the model citations (`.qnt`, `.pv` and `.pvl` files) and `coverage.toml`. Finds rule changes with no change in `specs/`. |
 | `coverage.toml` | The rules that no model encodes yet, each with a reason. |
 | [conformance.md](conformance.md) | Required model-to-Rust scenario tests, observable results, and persistence tests. |
@@ -42,6 +42,21 @@ The rule check verifies references, not semantics. The drift check requires a re
 | [spacelog](spacelog/README.md) | Genesis, grants, removal, key rotation, malicious relay behaviour, and bounded invalid records from compromised keys. |
 | [epochs](epochs/README.md) | Epoch retries, deduplication, removal during a hold, and security-record repair after relay restore. |
 | [enrollment](enrollment/README.md) | ProVerif (symbolic, Dolev-Yao): numeric comparison, commit before reveal, signed confirmation, grant and checkpoint, app key sealing. Run with `make verify-crypto`. |
+| [signin](signin/README.md) | ProVerif (symbolic, Dolev-Yao): invite links, passkey sign-in, the PKCE code, the setup token bound to the device key, and tenant isolation. Run with `make verify-crypto`. |
+| [quota](quota/README.md) | Space quota refusal, the outbox after a refusal, fetches and security records at a full quota. |
+
+## Exclusions
+
+These rules have no model. Real-path tests check them instead. `coverage.toml` lists each one.
+
+| Rule | Reason | Tests |
+| --- | --- | --- |
+| The WebAuthn ceremony (DESIGN.md "Interfaces") | The `webauthn-rs` crate does the registration and the assertion checks. A model of the ceremony would check that crate, not this design. `specs/signin` treats a passkey as an ideal signature. | `crates/relay/tests/user.rs` passkey tests with a software authenticator |
+| [USR-2] A new invite link removes the old passkeys and sessions | One storage transaction with no protocol state. | `crates/relay/tests/user.rs` |
+| [USR-7] Origin, anti-CSRF token and cookie rules | Browser rules of the user page. The HTML and the browser are outside every model. | `crates/relay/tests/user.rs`, `demo/tests/test_users.py` |
+| [USR-8] Webhook host allowlist and address checks | A DNS and socket rule of the relay, with no shared state. | `crates/relay/src/webhook.rs` tests, `demo/tests/test_users.py` |
+| [QTA-5] The space count limit | One check in space creation. | `crates/relay/tests/user.rs` |
+| The user page HTML | Presentation only. Each write goes through a route that the tests above check. | `demo/tests/test_users.py` |
 
 ## Run the checks
 

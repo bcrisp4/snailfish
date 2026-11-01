@@ -1,0 +1,2 @@
+(* Variant vNoTenantCheck. Run: proverif -lib lib.pvl no_tenant_check.pv *)
+process System(vNoTenantCheck)

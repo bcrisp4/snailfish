@@ -1,0 +1,53 @@
+model = "model.qnt"
+module = "quota"
+tests = "test.qnt"
+test_module = "quotaTest"
+invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported"]
+fast_config = "bounded"
+witness_configs = ["bounded"]
+witness_steps = 20
+
+[deep]
+config = "tiny"
+invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported"]
+# TLC checks the complete tiny state graph. This is a bounded cross-check.
+max_steps = 6
+
+[defaults]
+QUOTA = "2"
+MAX_QUOTA = "3"
+MAX_RECORDS = "4"
+BUG = '"none"'
+
+[configs.bounded]
+
+[configs.tiny]
+QUOTA = "1"
+MAX_QUOTA = "2"
+MAX_RECORDS = "3"
+
+[mutants.noQuota]
+base = "bounded"
+caught_by = "withinQuota"
+
+[mutants.quotaDrops]
+base = "bounded"
+caught_by = "noLostChange"
+
+[mutants.quotaBlocksFetch]
+base = "bounded"
+caught_by = "servesStored"
+
+[mutants.quotaBlocksSecurity]
+base = "bounded"
+caught_by = "securityNotBlocked"
+
+[mutants.quotaNoPause]
+base = "bounded"
+caught_by = "quotaReported"
+
+[[exhaustive]]
+config = "tiny"
+invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported"]
+mutants = ["noQuota", "quotaDrops", "quotaBlocksFetch", "quotaBlocksSecurity", "quotaNoPause"]
+why = "Two devices, at most three records of size 1 or 2, a quota of 1 that the operator can raise to 2."
