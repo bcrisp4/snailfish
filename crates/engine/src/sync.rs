@@ -130,6 +130,15 @@ impl Sync {
                     if engine.verified_head()?.position == 0
                         && state::setup_genesis(&engine.db)?.is_some()
                     {
+                        // [USR-6]: space creation needs a setup token, so an
+                        // engine without one asks for a sign-in.
+                        if state::setup_token(&engine.db)?.is_none() {
+                            engine.status = Status::SetupFailed {
+                                cause: "no setup token".into(),
+                            };
+                            self.phase = Phase::Done;
+                            continue;
+                        }
                         Some(Sent::Create)
                     } else {
                         self.phase = Phase::FirstFetch;
@@ -244,9 +253,8 @@ impl Sync {
             ),
             Sent::Create => {
                 let g = state::setup_genesis(&engine.db)?.ok_or(EngineError::UnexpectedResponse)?;
-                // An engine without a token sends none of its own: the
-                // relay answers `bad_request`, and the status names it.
-                let token = state::setup_token(&engine.db)?.unwrap_or([0; 32]);
+                let token =
+                    state::setup_token(&engine.db)?.ok_or(EngineError::UnexpectedResponse)?;
                 (
                     "PUT",
                     space_path,

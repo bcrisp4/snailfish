@@ -124,8 +124,8 @@ impl World {
         let req = si
             .token_request(&redirect, keys, RELAY_TIME.load(Ordering::SeqCst))
             .unwrap();
-        let (status, _, body) = self.send(&req);
-        si.read_token(status, &body).unwrap()
+        let (status, headers, body) = self.send(&req);
+        si.read_token(status, &headers, &body).unwrap()
     }
 
     /// Enroll B (keys[1]) with the trusted engine `t`: A shows the session.
@@ -1581,6 +1581,67 @@ fn device_status_report_holds_the_applied_position() {
     w.exchange(&mut ea);
     assert_eq!(a.applied.position, 3);
     assert_eq!(w.device_applied(&ea), Some(3));
+}
+
+/// `PROTOCOL.md` 8.5 and 12.3: an app clock 10 minutes ahead gets
+/// `expired`, which leaves the code unused. The second request signs with
+/// the relay time of the answer and gets the token.
+#[test]
+fn sign_in_corrects_the_clock_after_expired() {
+    let w = World::with_a();
+    let si = crate::signin::SignIn::new(URL, "com.example.tasks:/cb").unwrap();
+    let code = w
+        .relay
+        .issue_code("sam", si.challenge(), "com.example.tasks:/cb")
+        .unwrap();
+    let state = si
+        .authorize_url()
+        .rsplit_once("state=")
+        .unwrap()
+        .1
+        .to_owned();
+    let redirect = format!("com.example.tasks:/cb?code={code}&state={state}");
+    let fast = RELAY_TIME.load(Ordering::SeqCst) + 600;
+    let req = si.token_request(&redirect, &w.keys[0], fast).unwrap();
+    let (status, headers, body) = w.send(&req);
+    let err = si.read_token(status, &headers, &body).unwrap_err();
+    assert!(err.to_string().contains("expired"), "{err}");
+    let req = si.token_request(&redirect, &w.keys[0], fast).unwrap();
+    let (status, headers, body) = w.send(&req);
+    let t = si.read_token(status, &headers, &body).unwrap();
+    assert_eq!(t.tenant, w.tenant);
+}
+
+/// [USR-6]: an engine with the setup records and no setup token sends no
+/// create request, and reports `stopped: setup failed`. After a new
+/// sign-in, the next sync creates the space.
+#[test]
+fn engine_without_a_setup_token_asks_for_a_sign_in() {
+    let mut w = World::with_a();
+    let mut ea = w.engine(&w.dev("a"));
+    ea.db.execute("DELETE FROM setup_token", []).unwrap();
+    let mut sync = ea.start_sync();
+    let req = sync.next_request(&mut ea).unwrap().unwrap();
+    assert!(req.url.ends_with("/v1/info"));
+    let (status, headers, body) = w.send(&req);
+    sync.handle_response(&mut ea, status, &headers, &body)
+        .unwrap();
+    assert_eq!(
+        sync.next_request(&mut ea).unwrap(),
+        None,
+        "no create request"
+    );
+    assert_eq!(
+        ea.status(),
+        Status::SetupFailed {
+            cause: "no setup token".into()
+        }
+    );
+    let token = w.sign_in(&w.keys[0]).token;
+    ea.set_setup_token(&token).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Ok);
+    assert_eq!(ea.verified_head().unwrap().position, 1);
 }
 
 /// [VER-15]: a version 1 state file (M1) migrates forward to the current

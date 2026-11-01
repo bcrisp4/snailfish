@@ -394,8 +394,8 @@ impl SignIn {
     /// # Errors
     ///
     /// [`SnailfishError::Engine`] with the relay error code.
-    pub fn read_token(&self, status: u16, body: &[u8]) -> Result<SetupToken> {
-        Ok(self.inner.read_token(status, body)?)
+    pub fn read_token(&self, status: u16, headers: &[Header], body: &[u8]) -> Result<SetupToken> {
+        Ok(self.inner.read_token(status, headers, body)?)
     }
 }
 

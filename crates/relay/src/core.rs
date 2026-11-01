@@ -1295,6 +1295,13 @@ fn move_staged(tx: &Connection, session: &[u8; 16], tip: u64, now: u64) -> Resul
          SELECT device_id, sign_key, position FROM staging WHERE device_id IS NOT NULL",
         [],
     )?;
+    // [QTA-1]: the moved changes count against the quota. The usage comes
+    // from the log, so it is right also after a storage fault.
+    tx.execute(
+        "UPDATE usage SET bytes = (SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))), 0)
+         FROM entries WHERE payload_type LIKE 'snailfish.change.%') WHERE id = 1",
+        [],
+    )?;
     tx.execute("DELETE FROM staging", [])?;
     tx.execute("DELETE FROM repair", [])?;
     tx.execute(

@@ -46,8 +46,8 @@ class Relay:
         si = sf.SignIn(self.url, "com.example.tasks:/callback")
         redirect = self.browser.approve(si.authorize_url(), "sam")
         req = si.token_request(redirect, keys, int(time.time()))
-        status, _, body = self.send(req.method, req.url, req.headers, req.body)
-        return si.read_token(status, body)
+        status, headers, body = self.send(req.method, req.url, req.headers, req.body)
+        return si.read_token(status, headers, body)
 
     def first_device(
         self, ka: sf.DeviceKeys, log_id: str, url: str = ""

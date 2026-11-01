@@ -951,6 +951,7 @@ Write rules ([USR-7]):
 - A form body is `application/x-www-form-urlencoded`. Each field of the route occurs once, and the relay refuses another field (`bad_request`). The JSON routes follow the strict body rule of section 10.
 - The JSON of the WebAuthn routes is the JSON of the `webauthn-rs` crate, version 0.5, which the browser API takes and returns. A start response also holds `ceremony`, 16 random bytes as 32 hex digits, which the finish request names. The relay keeps a ceremony in memory for 300 seconds.
 - A `GET` of a page without a valid session shows the sign-in page.
+- Limit: a sign-in start tells the caller whether a user name has a passkey, because the options name its credentials. The rate limit of 12.6 slows a search for names.
 - A device in a machine group is a device ID that is active in a space of the tenant. A group name is 1 to 64 UTF-8 bytes.
 
 | Code | HTTP status | Cause |

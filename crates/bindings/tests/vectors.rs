@@ -266,8 +266,8 @@ fn sign_in(relay: &snailfish_relay::core::Relay, keys: &snailfish::DeviceKeys) -
     let req = si
         .token_request(&back, keys, snailfish_relay::core::system_time())
         .unwrap();
-    let (status, _, body) = send(relay, req);
-    let t = si.read_token(status, &body).unwrap();
+    let (status, headers, body) = send(relay, req);
+    let t = si.read_token(status, &headers, &body).unwrap();
     assert!(t.token.starts_with("st_"));
     t.token
 }

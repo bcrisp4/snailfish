@@ -248,6 +248,32 @@ fn backup_and_restore_hold_each_space() {
     assert_eq!(error_code(&fx.fetch(fx.tenant(), 0, 10)), "unknown_space");
 }
 
+/// [QTA-1], [LOG-10]: a repair after a restore moves the lost change back,
+/// and the space usage counts it again. Without this, each repair would let
+/// a space grow past its quota by the repaired bytes.
+#[test]
+fn repair_counts_the_moved_changes_in_the_usage() {
+    let mut fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let out = tempfile::TempDir::new().unwrap();
+    let dst = out.path().join("b1");
+    ops::backup(fx.dir.path(), &dst).unwrap();
+    let before = fx.usage(fx.tenant());
+    let change = fx.change("A", 4, [0x53; 16], 40, 2);
+    let (_, _, head5) = fx.append(fx.tenant(), "A", std::slice::from_ref(&change));
+    let after = fx.usage(fx.tenant());
+    assert_eq!(after, before + change.len() as u64);
+    ops::restore(fx.dir.path(), &dst, true, 1).unwrap();
+    fx.restart(common::limits_of(&fx.h));
+    assert_eq!(fx.usage(fx.tenant()), before);
+    let body = wire::repair_start_body(&head_of(&fx, 4), &[(5, change)]).unwrap();
+    let r = fx.post(fx.tenant(), "repair", &body, "A");
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let (sid, _) = wire::parse_repair_started(&r.body).unwrap();
+    assert_eq!(finish(&fx, "A", sid, head5), 200);
+    assert_eq!(fx.usage(fx.tenant()), after);
+}
+
 /// [STO-8]: while a backup holds its lock, the relay refuses space creation
 /// and creates no space file.
 #[test]

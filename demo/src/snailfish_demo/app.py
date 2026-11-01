@@ -165,8 +165,15 @@ def sign_in(
     exchanges the code for a setup token and the tenant handle."""
     si = sf.SignIn(relay_url, redirect_uri)
     redirect = browser(si.authorize_url())
-    status, _, body = send(si.token_request(redirect, keys, int(time.time())))
-    return si.read_token(status, body)
+    status, headers, body = send(si.token_request(redirect, keys, int(time.time())))
+    try:
+        return si.read_token(status, headers, body)
+    except sf.SnailfishError.Invalid as e:
+        # PROTOCOL.md 8.5: after `expired`, send once more with the relay time.
+        if "expired" not in str(e):
+            raise
+    status, headers, body = send(si.token_request(redirect, keys, int(time.time())))
+    return si.read_token(status, headers, body)
 
 
 def create_space(

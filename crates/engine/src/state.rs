@@ -743,7 +743,11 @@ pub(crate) fn setup_token(db: &Connection) -> Result<Option<[u8; 32]>, EngineErr
 
 /// Keep the applied position of the last `changes_after` call (10.11).
 pub(crate) fn set_applied(db: &Connection, position: u64) -> Result<(), EngineError> {
-    db.execute("UPDATE meta SET applied = ?1", [to_i64(position)?])?;
+    // Most calls repeat the value, and an unchanged row needs no write.
+    db.execute(
+        "UPDATE meta SET applied = ?1 WHERE applied != ?1",
+        [to_i64(position)?],
+    )?;
     Ok(())
 }
 

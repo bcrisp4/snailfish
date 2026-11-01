@@ -38,6 +38,10 @@ impl Relay {
             "DELETE FROM setup_nonces WHERE expires < ?1",
             params![to_i64(now)?],
         )?;
+        tx.execute(
+            "DELETE FROM setup_tokens WHERE expires <= ?1",
+            params![to_i64(now)?],
+        )?;
         let fresh = tx.execute(
             "INSERT INTO setup_nonces (keyid, nonce, expires) VALUES (?1, ?2, ?3)
              ON CONFLICT DO NOTHING",

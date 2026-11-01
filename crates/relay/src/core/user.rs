@@ -479,7 +479,7 @@ impl Relay {
                 match &session {
                     Some(s) => Ok(self.authorize_page(s, &a)),
                     None => Ok(signin_page(
-                        "Sign in, then open the sign-in link of the app again.",
+                        "An app asks to set up sync. Sign in, and this page shows its request.",
                     )),
                 }
             }

@@ -6,7 +6,11 @@
 //! The engine does no network I/O. The app opens [`SignIn::authorize_url`]
 //! in the system browser, gives the redirect URL back, sends the request of
 //! [`SignIn::token_request`] and passes the response to
-//! [`SignIn::read_token`].
+//! [`SignIn::read_token`]. After an `expired` answer, the sign-in keeps the
+//! relay time of the answer, and one more [`SignIn::token_request`] signs
+//! with the corrected time (`PROTOCOL.md` 8.5).
+
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -37,6 +41,10 @@ pub struct SignIn {
     relay_url: String,
     authorize: Authorize,
     verifier: String,
+    // Seconds to add to the app clock: relay time - app time ([WIR-7]).
+    offset: AtomicI64,
+    // The app time of the last token request.
+    sent_at: AtomicU64,
 }
 
 impl std::fmt::Debug for SignIn {
@@ -75,6 +83,8 @@ impl SignIn {
                 state: encode_id("", &s),
             },
             verifier,
+            offset: AtomicI64::new(0),
+            sent_at: AtomicU64::new(0),
         })
     }
 
@@ -95,7 +105,8 @@ impl SignIn {
     }
 
     /// The setup token request for the URL that the browser redirected to.
-    /// The device key signs it, with `now` as the relay time of the app.
+    /// The device key signs it, with `now`, the app time, and the offset of
+    /// an earlier `expired` answer.
     ///
     /// # Errors
     ///
@@ -131,9 +142,13 @@ impl SignIn {
         });
         let auth = authority(&self.relay_url);
         let path = "/v1/setup/token";
+        self.sent_at.store(now, Ordering::Relaxed);
+        let created = now
+            .checked_add_signed(self.offset.load(Ordering::Relaxed))
+            .unwrap_or(now);
         let p = Params {
-            created: now,
-            expires: now.saturating_add(request::MAX_LIFETIME),
+            created,
+            expires: created.saturating_add(request::MAX_LIFETIME),
             nonce: keys::random_bytes().map_err(|_| EngineError::Random)?,
             keyid: keys::device_id(&sk.public(), &seal),
         };
@@ -171,9 +186,25 @@ impl SignIn {
     ///
     /// # Errors
     ///
-    /// [`EngineError::Invalid`] with the relay error code, for example
-    /// `bad_setup`: the app starts the sign-in again.
-    pub fn read_token(&self, status: u16, body: &[u8]) -> Result<SetupToken, EngineError> {
+    /// [`EngineError::Invalid`] with the relay error code. After `expired`
+    /// the app sends one more [`SignIn::token_request`]. After `bad_setup`
+    /// the app starts the sign-in again.
+    pub fn read_token(
+        &self,
+        status: u16,
+        headers: &[Header],
+        body: &[u8],
+    ) -> Result<SetupToken, EngineError> {
+        let relay = headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(request::TIME_HEADER))
+            .and_then(|h| request::parse_time(&h.value));
+        if let Some(t) = relay {
+            let sent = self.sent_at.load(Ordering::Relaxed);
+            let diff = i128::from(t).saturating_sub(i128::from(sent));
+            self.offset
+                .store(i64::try_from(diff).unwrap_or(0), Ordering::Relaxed);
+        }
         if status != 200 {
             let code = snailfish_protocol::wire::parse_error(body)
                 .unwrap_or_else(|| format!("HTTP {status}"));
