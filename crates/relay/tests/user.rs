@@ -731,6 +731,19 @@ fn session_key_is_random_private_and_kept() {
     fx.reopen_with(|c| c.secrets_dir = other);
     let mut b = Browser { fx: &fx, cookie };
     assert!(b.home().contains("Sign in with a passkey"));
+    // A key that the relay cannot read stops the open. A new key in its
+    // place would end every session without a word to the operator.
+    let file = secrets.join("session.key");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(
+        std::fs::read(&file).is_err(),
+        "this test needs a user that file modes apply to, not root"
+    );
+    let mut cfg = snailfish_relay::core::Config::new(fx.dir.path(), &fx.authority);
+    cfg.secrets_dir = secrets.clone();
+    assert!(snailfish_relay::core::Relay::open(cfg).is_err());
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), key);
 }
 
 /// 12.4: the origin is a scheme and a domain name with no path, query or
@@ -1057,6 +1070,25 @@ fn applied_position_behind_for_7_days_is_stalled() {
             "{applied}: {page}"
         );
     }
+    // A report at the head starts no behind time. After a new change, the
+    // time starts at the first report behind it, not at the report before.
+    let report = |applied: u64| {
+        let body =
+            format!(r#"{{"state":"ok","outbox":0,"oldest":null,"applied":{applied},"epoch":1}}"#);
+        let r = fx
+            .relay
+            .handle(&fx.signed("POST", &path, "", body.as_bytes(), "B"));
+        assert_eq!(r.status, 200);
+    };
+    report(head);
+    let c = fx.change("A", head, [8; 16], 60, 1);
+    let (_, results, _) = fx.append(fx.tenant(), "A", &[c]);
+    assert!(matches!(results[0], AppendResult::Stored(_)), "{results:?}");
+    fx.now.fetch_add(7 * 86_400, Ordering::SeqCst);
+    report(head);
+    let (mut b, _) = signed_in(&fx);
+    let page = b.home();
+    assert!(!page.contains("stalled"), "{page}");
 }
 
 /// 8.6: a refused token exchange keeps its nonce, so a replay of the same
@@ -1126,8 +1158,10 @@ fn alerts_queue_once_per_case() {
         200
     );
     assert_eq!(fx.relay.queue_alerts(&t, now + 7 * 86_400).unwrap(), 1);
-    // Without allowed hosts, the relay queues nothing.
+    // Without allowed hosts, the relay queues nothing. First end both
+    // cases, so a new case could queue.
     fx.relay.set_quotas("sam", None, None).unwrap();
+    assert_eq!(fx.relay.queue_alerts(&t, now).unwrap(), 0);
     fx.reopen_with(|_| {});
     fx.relay.set_quotas("sam", None, Some(used)).unwrap();
     assert_eq!(fx.relay.queue_alerts(&t, now).unwrap(), 0);

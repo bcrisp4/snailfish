@@ -680,7 +680,9 @@ impl Relay {
                 webauthn_uuid(user_id)?,
                 &name,
                 &name,
-                (!exclude.is_empty() && invite.is_none()).then_some(exclude),
+                // The invite route has no passkey to exclude: a new invite
+                // removed them.
+                (!exclude.is_empty()).then_some(exclude),
             )
             .map_err(|_| internal())?;
         let id = self.auth.keep(
