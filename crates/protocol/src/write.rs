@@ -34,7 +34,15 @@ fn keys(k: &Keys) -> String {
     )
 }
 
-fn device(d: &Device) -> String {
+/// The writer form of a keys object (`PROTOCOL.md` 6.1).
+#[must_use]
+pub fn keys_object(k: &Keys) -> String {
+    format!("{{{}}}", keys(k))
+}
+
+/// The writer form of a device object (`PROTOCOL.md` 6.1).
+#[must_use]
+pub fn device(d: &Device) -> String {
     format!(
         r#"{{"id":"{}",{},"name":{},"level":{}}}"#,
         encode_id("d_", &d.id),
@@ -140,13 +148,46 @@ pub fn change(
     .into_bytes()
 }
 
+/// A `snailfish.checkpoint.v1` statement (`PROTOCOL.md` 6.3, [ENR-8]).
+#[must_use]
+pub fn checkpoint(log: &[u8; 16], author: &Hash32, at: &Position) -> Vec<u8> {
+    format!(
+        r#"{{"log":"{}","author":"{}","position":{},"digest":"{}"}}"#,
+        encode_id("l_", log),
+        encode_id("d_", author),
+        at.position,
+        encode_b64(&at.digest)
+    )
+    .into_bytes()
+}
+
+/// A `snailfish.confirm.v1` statement (`PROTOCOL.md` 6.3 and 11.2, [ENR-7]).
+#[must_use]
+pub fn confirm(
+    session: &[u8; 16],
+    trusted: &Hash32,
+    new_device: &Device,
+    trusted_nonce: &[u8; 32],
+    new_nonce: &[u8; 32],
+) -> Vec<u8> {
+    format!(
+        r#"{{"session":"{}","trusted":"{}","device":{},"trusted_nonce":"{}","new_nonce":"{}"}}"#,
+        encode_id("e_", session),
+        encode_id("d_", trusted),
+        device(new_device),
+        encode_b64(trusted_nonce),
+        encode_b64(new_nonce)
+    )
+    .into_bytes()
+}
+
 // No Kani harness: each function formats strings and base64, which CBMC
 // cannot finish with symbolic lengths. The vector test and the parser
 // round trip below cover the writers.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::{Body, parse_payload};
+    use crate::records::{Body, Statement, parse_payload, parse_statement};
     use proptest::prelude::*;
 
     proptest! {
@@ -168,6 +209,45 @@ mod tests {
             prop_assert_eq!(r.author, Author::Device(author));
             prop_assert_eq!(r.base, base);
             prop_assert_eq!(r.body, Body::Change { epoch, change_id: cid, ciphertext: ct });
+        }
+
+        /// [ENR-8]: a written checkpoint parses back to the same fields.
+        #[test]
+        fn checkpoint_round_trip(
+            log in any::<[u8; 16]>(),
+            author in any::<[u8; 32]>(),
+            pos in 1u64..(1 << 53),
+            digest in any::<[u8; 32]>(),
+        ) {
+            let at = Position { position: pos, digest };
+            let p = checkpoint(&log, &author, &at);
+            prop_assert_eq!(
+                parse_statement("snailfish.checkpoint.v1", &p).unwrap(),
+                Statement::Checkpoint { log, author, at }
+            );
+        }
+
+        /// [ENR-7]: a written confirmation parses back to the same fields,
+        /// and a confirmation with an `author` field is refused (6.3).
+        #[test]
+        fn confirm_round_trip(
+            session in any::<[u8; 16]>(),
+            trusted in any::<[u8; 32]>(),
+            seed in any::<[u8; 32]>(),
+            tn in any::<[u8; 32]>(),
+            nn in any::<[u8; 32]>(),
+        ) {
+            let sign = crate::sig::SecretKey::from_seed(&seed).public();
+            let seal = Box::new(crate::keys::seal_public(&seed));
+            let d = Device { id: crate::keys::device_id(&sign, &seal), keys: Keys { sign, seal }, name: "Phone".into(), level: 1 };
+            let p = confirm(&session, &trusted, &d, &tn, &nn);
+            prop_assert_eq!(
+                parse_statement("snailfish.confirm.v1", &p).unwrap(),
+                Statement::Confirm { session, trusted, device: d, trusted_nonce: tn, new_nonce: nn }
+            );
+            let text = String::from_utf8(p).unwrap();
+            let with_author = text.replacen('{', r#"{"author":"d_00","#, 1);
+            prop_assert!(parse_statement("snailfish.confirm.v1", with_author.as_bytes()).is_err());
         }
     }
 }

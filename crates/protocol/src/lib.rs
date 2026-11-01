@@ -7,9 +7,11 @@
 //! gives the exact bytes.
 
 pub mod encoding;
+pub mod enroll;
 pub mod envelope;
 pub mod hash;
 pub mod keys;
+pub mod mailbox;
 pub mod pae;
 pub mod records;
 pub mod recovery;

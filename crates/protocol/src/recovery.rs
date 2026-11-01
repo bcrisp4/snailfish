@@ -45,12 +45,18 @@ pub fn display(secret: &[u8; 16]) -> String {
     let mut raw = [0u8; 20];
     raw[..16].copy_from_slice(secret);
     raw[16..].copy_from_slice(&check(secret));
+    symbols_display(&raw)
+}
+
+/// 20 bytes as 32 Crockford symbols in 8 groups of 4, joined with `-`
+/// (`PROTOCOL.md` sections 9 and 11.1).
+pub(crate) fn symbols_display(raw: &[u8; 20]) -> String {
     // 20 bytes are 160 bits, exactly 32 symbols of 5 bits.
     let mut bits: u64 = 0;
     let mut n: u32 = 0;
     let mut out = String::with_capacity(39);
     let mut count = 0usize;
-    for byte in raw {
+    for &byte in raw {
         bits = (bits << 8) | u64::from(byte);
         n = n.saturating_add(8);
         while n >= 5 {
@@ -87,6 +93,18 @@ fn symbol_value(c: u8) -> Option<u8> {
 /// [`RecoveryKeyError`] for a symbol outside the alphabet, a wrong number of
 /// symbols, or a check mismatch.
 pub fn parse(text: &str) -> Result<[u8; 16], RecoveryKeyError> {
+    let raw = symbols_read(text)?;
+    let mut secret = [0u8; 16];
+    secret.copy_from_slice(&raw[..16]);
+    if raw[16..] != check(&secret) {
+        return Err(RecoveryKeyError::BadCheck);
+    }
+    Ok(secret)
+}
+
+/// Read 32 Crockford symbols into 20 bytes with the reader steps 1 to 5 of
+/// `PROTOCOL.md` section 9, except the check.
+pub(crate) fn symbols_read(text: &str) -> Result<[u8; 20], RecoveryKeyError> {
     let mut values = Vec::with_capacity(SYMBOLS);
     for c in text.bytes() {
         if c == b'-' || c == b' ' {
@@ -113,12 +131,7 @@ pub fn parse(text: &str) -> Result<[u8; 16], RecoveryKeyError> {
             bits &= (1u64 << n).saturating_sub(1);
         }
     }
-    let mut secret = [0u8; 16];
-    secret.copy_from_slice(&raw[..16]);
-    if raw[16..] != check(&secret) {
-        return Err(RecoveryKeyError::BadCheck);
-    }
-    Ok(secret)
+    Ok(raw)
 }
 
 /// The Ed25519 seed and the X-Wing seed of a recovery secret.

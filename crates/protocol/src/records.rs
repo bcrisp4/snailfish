@@ -174,7 +174,23 @@ pub enum Statement {
         head: Position,
         expires: u64,
     },
+    /// The signed confirmation of a new device ([ENR-7], `PROTOCOL.md`
+    /// 11.2). `device.keys.sign` is the signing key.
+    Confirm {
+        session: [u8; 16],
+        trusted: Hash32,
+        device: Device,
+        trusted_nonce: [u8; 32],
+        new_nonce: [u8; 32],
+    },
 }
+
+/// The statement types of `PROTOCOL.md` 6.3.
+pub const STATEMENT_TYPES: [&str; 3] = [
+    "snailfish.checkpoint.v1",
+    "snailfish.delete.v1",
+    "snailfish.confirm.v1",
+];
 
 /// The class of a payload type (`PROTOCOL.md` 6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,10 +225,7 @@ pub const RECORD_TYPES: [&str; 9] = [
 pub fn classify(payload_type: &str) -> TypeClass {
     if RECORD_TYPES.contains(&payload_type) {
         TypeClass::Record
-    } else if matches!(
-        payload_type,
-        "snailfish.checkpoint.v1" | "snailfish.delete.v1"
-    ) {
+    } else if STATEMENT_TYPES.contains(&payload_type) {
         TypeClass::Statement
     } else if is_family(payload_type, "snailfish.change")
         || is_family(payload_type, "snailfish.snapshot")
@@ -356,6 +369,22 @@ pub fn parse_statement(payload_type: &str, payload: &[u8]) -> Result<Statement, 
                 author: parse_author(f.str("author")?)?,
                 head: position(f.get("head")?, "head")?,
                 expires: f.int("expires", 0, MAX_INT)?,
+            })
+        }
+        "snailfish.confirm.v1" => {
+            let f = Fields::exact(
+                &map,
+                "confirm",
+                &["session", "trusted", "device", "trusted_nonce", "new_nonce"],
+            )?;
+            Ok(Statement::Confirm {
+                session: decode_id::<16>(f.str("session")?, "e_")
+                    .map_err(|e| bad(format!("session: rule 7: {e}")))?,
+                trusted: decode_id::<32>(f.str("trusted")?, "d_")
+                    .map_err(|e| bad(format!("trusted: rule 7: {e}")))?,
+                device: device(f.get("device")?)?,
+                trusted_nonce: bin32(&f, "trusted_nonce")?,
+                new_nonce: bin32(&f, "new_nonce")?,
             })
         }
         _ => Err(bad(format!("unknown statement type `{payload_type}`"))),
@@ -507,6 +536,25 @@ fn require_recovery(author: &Author) -> Result<(), ParseError> {
 
 fn log_id(f: &Fields<'_>, name: &str) -> Result<[u8; 16], ParseError> {
     decode_id::<16>(f.str(name)?, "l_").map_err(|e| bad(format!("{name}: rule 7: {e}")))
+}
+
+/// Parse a device object (`PROTOCOL.md` 6.1) with the strict rules of
+/// section 3, for the enrollment messages of 10.10.
+///
+/// # Errors
+///
+/// Refuses each object that breaks section 3 or 6.1.
+pub fn parse_device_json(bytes: &[u8]) -> Result<Device, ParseError> {
+    device(&strict::parse(bytes)?)
+}
+
+/// Parse a keys object (`PROTOCOL.md` 6.1), as [`parse_device_json`].
+///
+/// # Errors
+///
+/// Refuses each object that breaks section 3 or 6.1.
+pub fn parse_keys_json(bytes: &[u8]) -> Result<Keys, ParseError> {
+    keys_obj(&strict::parse(bytes)?, "keys")
 }
 
 /// Parse an author or recipient ID text: a device ID or a recovery ID.
@@ -821,13 +869,13 @@ mod tests {
         /// payload type.
         #[test]
         fn parsers_never_panic_on_random_bytes(
-            idx in 0usize..11,
+            idx in 0usize..12,
             bytes in proptest::collection::vec(any::<u8>(), 0..256),
         ) {
             let types: Vec<&str> = RECORD_TYPES
                 .iter()
                 .copied()
-                .chain(["snailfish.checkpoint.v1", "snailfish.delete.v1"])
+                .chain(STATEMENT_TYPES)
                 .collect();
             let _ = parse_payload(types[idx], &bytes);
             let _ = parse_statement(types[idx], &bytes);
@@ -858,11 +906,11 @@ mod tests {
         }
 
         /// [VER-5]: `classify` returns `Record` only for the 9 record types
-        /// and `Statement` only for the 2 statement types.
+        /// and `Statement` only for the 3 statement types.
         #[test]
         fn classify_matches_the_type_tables(t in "snailfish\\.[a-z]{0,10}(\\.v[0-9]{0,2})?") {
             let record = RECORD_TYPES.contains(&t.as_str());
-            let statement = t == "snailfish.checkpoint.v1" || t == "snailfish.delete.v1";
+            let statement = STATEMENT_TYPES.contains(&t.as_str());
             prop_assert_eq!(classify(&t) == TypeClass::Record, record);
             prop_assert_eq!(classify(&t) == TypeClass::Statement, statement);
         }
