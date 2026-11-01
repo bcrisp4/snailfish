@@ -1,14 +1,13 @@
-//! The M2 space setup: the genesis record and the grants of a new space,
-//! made from key files on one machine (M2 decision 2).
-//!
-//! M4 replaces the second half with enrollment. The records are real: the
-//! relay and each engine check them with the same space-state check.
+//! The space setup of the first device: the genesis record of a new space.
+//! Each other device joins through enrollment ([`crate::enroll`]). The
+//! records are real: the relay and each engine check them with the same
+//! space-state check.
 
 use std::path::Path;
 
-use snailfish_protocol::encoding::{Hash32, encode_id};
+use snailfish_protocol::encoding::encode_id;
 use snailfish_protocol::envelope;
-use snailfish_protocol::hash::{digest_next, digest0, entry_hash};
+use snailfish_protocol::hash::digest0;
 use snailfish_protocol::keys::{self, SEAL_PK_LEN};
 use snailfish_protocol::records::{Author, Device, KeySet, Keys, Position};
 use snailfish_protocol::recovery;
@@ -36,7 +35,7 @@ pub struct SpaceSetup {
     pub recovery_key: String,
     /// The app key of epoch 1.
     pub app_key: [u8; 32],
-    /// The genesis envelope, then one grant envelope for each other device.
+    /// The genesis envelope.
     pub envelopes: Vec<String>,
 }
 
@@ -78,8 +77,7 @@ fn seal_to(
 }
 
 /// Make a new space: a random log ID, a recovery key, the app key of epoch
-/// 1, the genesis record with the first device, and a grant to each other
-/// device signed by the first device.
+/// 1, and the genesis record with the first device.
 ///
 /// The `app_key` of each [`DeviceKeys`] is ignored: the setup makes the app
 /// key and returns it.
@@ -87,12 +85,8 @@ fn seal_to(
 /// # Errors
 ///
 /// [`EngineError::Random`] and [`EngineError::Invalid`].
-pub fn create_space(
-    app_id: &str,
-    first: &NewDevice,
-    others: &[NewDevice],
-) -> Result<SpaceSetup, EngineError> {
-    make_space(rand()?, app_id, first, others)
+pub fn create_space(app_id: &str, first: &NewDevice) -> Result<SpaceSetup, EngineError> {
+    make_space(rand()?, app_id, first)
 }
 
 /// [`create_space`] with a chosen log ID. Tests use it to make a second
@@ -101,7 +95,6 @@ pub(crate) fn make_space(
     log: [u8; 16],
     app_id: &str,
     first: &NewDevice,
-    others: &[NewDevice],
 ) -> Result<SpaceSetup, EngineError> {
     let secret: [u8; 16] = rand()?;
     let app_key: [u8; 32] = rand()?;
@@ -140,30 +133,7 @@ pub(crate) fn make_space(
     let t = "snailfish.genesis.v1";
     let sig = r_sign.sign_record(t, &payload);
     let genesis = envelope::write_json(t, &payload, &sig, &encode_id("r_", &rid));
-    let rh = snailfish_protocol::hash::record_hash(t, &payload, &sig);
-    let mut digest: Hash32 = digest_next(&base0.digest, 1, &entry_hash(t, None, &rh));
-    let mut envelopes = vec![genesis];
-    let a_sign = SecretKey::from_seed(&first.keys.sign_seed);
-    for (i, other) in others.iter().enumerate() {
-        let (d, seal) = device_of(&other.keys, &other.name);
-        let set = seal_to(&seal, &log, Author::Device(d.id), &app_key)?;
-        let pos = u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1);
-        let base = Position {
-            position: pos,
-            digest,
-        };
-        let payload = write::grant(&log, &Author::Device(dev.id), &base, &d, &set);
-        let t = "snailfish.grant.v1";
-        let sig = a_sign.sign_record(t, &payload);
-        envelopes.push(envelope::write_json(
-            t,
-            &payload,
-            &sig,
-            &encode_id("d_", &dev.id),
-        ));
-        let rh = snailfish_protocol::hash::record_hash(t, &payload, &sig);
-        digest = digest_next(&digest, pos.saturating_add(1), &entry_hash(t, None, &rh));
-    }
+    let envelopes = vec![genesis];
     Ok(SpaceSetup {
         log_id: encode_id("l_", &log),
         recovery_key: recovery::display(&secret),
@@ -187,8 +157,7 @@ pub fn new_device_keys() -> Result<DeviceKeys, EngineError> {
 }
 
 /// Give the setup records to the engine of the first device in `data_dir`,
-/// so that its next sync creates the space on the relay and appends the
-/// grants.
+/// so that its next sync creates the space on the relay.
 ///
 /// # Errors
 ///
@@ -202,4 +171,38 @@ pub fn install_setup(
 ) -> Result<(), EngineError> {
     let e = crate::Engine::open(data_dir, space, keys)?;
     crate::state::add_setup(&e.db, envelopes)
+}
+
+/// Create the engine state of a new device after its enrollment
+/// ([`crate::enroll::NewEnrollment`]). The engine keeps the checkpoint, and
+/// its syncs upload nothing until the verified log passes the checkpoint
+/// check ([ENR-9]).
+///
+/// # Errors
+///
+/// As [`crate::Engine::open`], and [`EngineError::Invalid`] if the space
+/// does not match `joined`.
+pub fn install_enrollment(
+    data_dir: &Path,
+    space: SpaceRef,
+    keys: &DeviceKeys,
+    joined: &crate::enroll::Joined,
+) -> Result<(), EngineError> {
+    if space.tenant != joined.tenant || space.log_id != joined.log_id {
+        return Err(EngineError::Invalid(
+            "the space is not the space of the enrollment".into(),
+        ));
+    }
+    let trusted = snailfish_protocol::encoding::decode_id::<32>(&joined.trusted, "d_")
+        .map_err(|e| EngineError::Invalid(format!("trusted device: {e}")))?;
+    let e = crate::Engine::open(data_dir, space, keys)?;
+    crate::state::set_checkpoint(
+        &e.db,
+        &crate::state::PendingCheckpoint {
+            position: joined.position,
+            digest: joined.digest,
+            trusted,
+            device: joined.device.clone(),
+        },
+    )
 }

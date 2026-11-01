@@ -13,7 +13,8 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 use snailfish_relay::core::{Config, Relay, Request as RelayRequest};
 
 use super::*;
-use crate::setup::{NewDevice, create_space, install_setup, new_device_keys};
+use crate::enroll::{EnrollState, NewEnrollment, TrustedEnrollment};
+use crate::setup::{NewDevice, create_space, install_enrollment, install_setup, new_device_keys};
 
 const AUTHORITY: &str = "sync.example.net";
 const URL: &str = "https://sync.example.net";
@@ -31,6 +32,7 @@ struct World {
     keys: Vec<DeviceKeys>,
     // A relay fault for the next request: drop the response.
     lose_next: bool,
+    recovery_key: String,
 }
 
 /// One device: its engine directory and its app state (a real app keeps
@@ -50,41 +52,148 @@ fn relay_config(root: &Path) -> Config {
 }
 
 impl World {
-    /// A space with devices A and B: A holds the setup records.
+    /// A space with devices A and B. A creates the space, and B joins
+    /// through an enrollment with A, so the relay log holds the genesis
+    /// record and the grant of B. Neither app has pulled.
     fn new() -> (Self, Dev, Dev) {
+        let mut w = Self::with_a();
+        let mut ea = w.engine(&w.dev("a"));
+        w.exchange(&mut ea);
+        let kb = new_device_keys().unwrap();
+        w.keys.push(kb);
+        w.enroll_b(&mut ea, None, (true, true));
+        drop(ea);
+        // The app of B keeps the app key in its key store after the first
+        // sync of B. These tests start from that point, so B can edit before
+        // its first sync. `enrolled_device_opens_the_app_key_from_its_grant`
+        // checks the path without the key.
+        w.keys[1].app_key = w.keys[0].app_key;
+        let a = w.dev("a");
+        let b = w.dev("b");
+        (w, a, b)
+    }
+
+    /// A space with device A only, before its first sync.
+    fn with_a() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_owned();
         let relay = Relay::open(relay_config(&root)).unwrap();
         let tenant = relay.add_user("sam").unwrap();
         let mut ka = new_device_keys().unwrap();
-        let mut kb = new_device_keys().unwrap();
         let s = create_space(
             APP,
             &NewDevice {
                 keys: ka.clone(),
                 name: "A".into(),
             },
-            &[NewDevice {
-                keys: kb.clone(),
-                name: "B".into(),
-            }],
         )
         .unwrap();
         ka.app_key = s.app_key;
-        kb.app_key = s.app_key;
         let w = Self {
             _dir: dir,
             root: root.clone(),
             relay,
             tenant,
             log_id: s.log_id.clone(),
-            keys: vec![ka, kb],
+            keys: vec![ka],
             lose_next: false,
+            recovery_key: s.recovery_key.clone(),
         };
         install_setup(&root.join("a"), w.space(), &w.keys[0], &s.envelopes).unwrap();
-        let a = w.dev("a");
-        let b = w.dev("b");
-        (w, a, b)
+        w
+    }
+
+    /// Enroll B (keys[1]) with the trusted engine `t`: A shows the session.
+    /// `answers` are the code answers of A and B. Installs the engine state
+    /// of B if the enrollment ends with Done on both devices. Returns the
+    /// final states.
+    fn enroll_b(
+        &mut self,
+        t: &mut Engine,
+        recovery: Option<&str>,
+        answers: (bool, bool),
+    ) -> (EnrollState, EnrollState) {
+        let mut te = TrustedEnrollment::new(t, None, recovery).unwrap();
+        self.open(t, &mut te);
+        let mut ne = NewEnrollment::new(URL, &self.keys[1], "B", te.payload().as_deref()).unwrap();
+        self.drive(t, &mut te, &mut ne, answers);
+        if let Some(j) = ne.joined() {
+            let space = crate::enroll::space_of(&j, URL, APP);
+            install_enrollment(&self.root.join("b"), space, &self.keys[1], &j).unwrap();
+        }
+        (te.state(), ne.state())
+    }
+
+    /// Send the open request of a trusted enrollment that shows the session.
+    /// An `expired` answer is sent again once with the corrected clock.
+    fn open(&self, t: &mut Engine, te: &mut TrustedEnrollment) {
+        assert_eq!(te.payload(), None, "no payload before the open");
+        for _ in 0..2 {
+            let req = te.next_request(t).unwrap().unwrap();
+            let (status, headers, body) = self.send(&req);
+            te.handle_response(t, status, &headers, &body).unwrap();
+            if te.payload().is_some() {
+                return;
+            }
+        }
+        panic!("the session did not open: {:?}", te.state());
+    }
+
+    /// Run both sides of an enrollment through the relay until each ends.
+    fn drive(
+        &mut self,
+        t: &mut Engine,
+        te: &mut TrustedEnrollment,
+        ne: &mut NewEnrollment,
+        answers: (bool, bool),
+    ) {
+        let end = |s: &EnrollState| matches!(s, EnrollState::Done | EnrollState::Failed { .. });
+        for _ in 0..400 {
+            if end(&te.state()) && end(&ne.state()) {
+                return;
+            }
+            if matches!(te.state(), EnrollState::Compare { .. }) {
+                te.confirm(t, answers.0).unwrap();
+            }
+            if matches!(ne.state(), EnrollState::Compare { .. }) {
+                ne.confirm(answers.1).unwrap();
+            }
+            if let Some(req) = te.next_request(t).unwrap() {
+                let (status, headers, body) = self.send(&req);
+                te.handle_response(t, status, &headers, &body).unwrap();
+            }
+            if let Some(req) = ne.next_request() {
+                let (status, _, body) = self.send(&req);
+                ne.handle_response(status, &body).unwrap();
+            }
+        }
+        panic!(
+            "the enrollment does not end: {:?} {:?}",
+            te.state(),
+            ne.state()
+        );
+    }
+
+    /// Send one request to the relay core.
+    fn send(&self, req: &Request) -> (u16, Vec<Header>, Vec<u8>) {
+        let url = req.url.strip_prefix(URL).unwrap();
+        let (path, query) = url.split_once('?').unwrap_or((url, ""));
+        let resp = self.relay.handle(&RelayRequest {
+            method: req.method.clone(),
+            path: path.into(),
+            query: query.into(),
+            headers: req
+                .headers
+                .iter()
+                .map(|h| (h.name.clone(), h.value.clone()))
+                .collect(),
+            body: req.body.clone(),
+        });
+        let headers = vec![Header {
+            name: "snailfish-time".into(),
+            value: resp.time.to_string(),
+        }];
+        (resp.status, headers, resp.body)
     }
 
     fn space(&self) -> SpaceRef {
@@ -949,15 +1058,17 @@ fn edit_before_the_first_sync_is_signed_after_the_fetch() {
     assert_eq!(eb.verified_head().unwrap().position, 4);
 }
 
-/// The first sync appends the grant to B before any change of A, so a
-/// change of A never names a base before the grant. The grant has its own
-/// append request.
+/// A sync appends the grants of the grant outbox before the changes of
+/// the app outbox, in their own append request, so a grant is never
+/// behind a change of the same sync in one request ([LOG-7]).
 #[test]
-fn first_sync_appends_the_grant_before_the_changes() {
-    let (w, mut a, _) = World::new();
+fn sync_appends_the_grants_before_the_changes() {
+    let (mut w, mut a, _) = World::new();
     let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
     a.edit(&ea, b"x");
     a.enqueue(&mut ea);
+    queue_grant(&ea, "C");
     let mut s = ea.start_sync();
     let mut appends = Vec::new();
     while let Some(req) = s.next_request(&mut ea).unwrap() {
@@ -979,6 +1090,10 @@ fn first_sync_appends_the_grant_before_the_changes() {
             vec!["snailfish.grant.v1".to_owned()],
             vec!["snailfish.change.v1".to_owned()]
         ]
+    );
+    assert!(
+        state::grants(&ea.db).unwrap().is_empty(),
+        "the verified log holds the grant"
     );
 }
 
@@ -1052,28 +1167,67 @@ fn relay_head_with_another_digest_stops() {
     }
 }
 
-/// A relay that refuses a setup record for ever stops sync with
-/// `stopped: fork`: the space cannot reach the state that the setup signed.
-/// A `bad_base` answer for a setup record is transient.
+/// Put a grant of new keys, signed by A on its verified head, into the
+/// grant outbox of A, as an enrollment does after the confirmation.
+fn queue_grant(ea: &Engine, name: &str) -> DeviceKeys {
+    let k = new_device_keys().unwrap();
+    let sign = snailfish_protocol::sig::SecretKey::from_seed(&k.sign_seed).public();
+    let seal = Box::new(keys::seal_public(&k.seal_seed));
+    let d = snailfish_protocol::records::Device {
+        id: keys::device_id(&sign, &seal),
+        keys: snailfish_protocol::records::Keys { sign, seal },
+        name: name.into(),
+        level: MAX_LEVEL,
+    };
+    let env = crate::enroll::sign_grant(ea, &d, &crate::enroll::Signer::Device).unwrap();
+    state::put_grant(
+        &ea.db,
+        &state::GrantRow {
+            device_id: d.id,
+            device: snailfish_protocol::write::device(&d),
+            confirmed: state::device_list(&ea.db).unwrap(),
+            by_recovery: false,
+            envelope: Some(env),
+            state: state::GRANT_SEND.into(),
+        },
+    )
+    .unwrap();
+    k
+}
+
+/// `PROTOCOL.md` 10.6: a grant that the relay refuses for ever leaves the
+/// grant outbox and the engine reports `degraded` with the code. A
+/// `bad_base` answer is transient: the grant stays to be sent again.
 #[test]
-fn refused_setup_record_stops_and_bad_base_does_not() {
-    for (code, stops) in [("not_active", true), ("bad_base", false)] {
-        let (w, a, _) = World::new();
+fn refused_grant_degrades_and_bad_base_keeps_it() {
+    for (code, kept) in [("invalid_record", false), ("bad_base", true)] {
+        let (mut w, a, _) = World::new();
         let mut ea = w.engine(&a);
+        w.exchange(&mut ea);
+        queue_grant(&ea, "C");
         let mut s = ea.start_sync();
-        // info, create, fetch
-        steps(&w, &mut ea, &mut s, 3);
+        // info, fetch
+        steps(&w, &mut ea, &mut s, 2);
         let req = s.next_request(&mut ea).unwrap().unwrap();
-        assert_eq!(req.method, "POST", "the grant to B");
+        assert!(req.url.ends_with("/append"), "the grant to C");
         let body = snailfish_protocol::wire::append_response(
             &[snailfish_protocol::wire::AppendResult::Refused(code.into())],
             &snailfish_protocol::wire::Head {
-                position: 1,
+                position: 2,
                 digest: [0; 32],
             },
         );
         s.handle_response(&mut ea, 200, &[], &body).unwrap();
-        assert_eq!(matches!(ea.status(), Status::Fork { .. }), stops, "{code}");
+        assert_eq!(
+            state::grants(&ea.db).unwrap().len(),
+            usize::from(kept),
+            "{code}"
+        );
+        assert_eq!(
+            matches!(ea.status(), Status::Degraded { ref cause } if cause == &format!("grant refused: {code}")),
+            !kept,
+            "{code}"
+        );
     }
 }
 
@@ -1169,7 +1323,8 @@ fn expired_is_retried_once_then_clock_skew() {
 /// holds another genesis record for this log ID: `stopped: fork`.
 #[test]
 fn space_exists_is_a_fork() {
-    let (w, a, _) = World::new();
+    let w = World::with_a();
+    let a = w.dev("a");
     let mut ea = w.engine(&a);
     let mut s = ea.start_sync();
     steps(&w, &mut ea, &mut s, 1);
@@ -1272,10 +1427,6 @@ fn fetched_grant_below_the_write_level_stops() {
             keys: ka.clone(),
             name: "A".into(),
         },
-        &[NewDevice {
-            keys: kb,
-            name: "B".into(),
-        }],
     )
     .unwrap();
     // Raise the genesis write level to 2 by hand: the engine writes level 1
@@ -1305,8 +1456,12 @@ fn fetched_grant_below_the_write_level_stops() {
     view.apply(&snailfish_protocol::space::check_genesis(&genv, &log, None).unwrap());
     // The grant's base digest is for the old genesis, so build the fetch
     // from the protocol view and check the engine refuses the record.
-    let grant =
-        snailfish_protocol::envelope::Envelope::parse(setup.envelopes[1].as_bytes()).unwrap();
+    let head = snailfish_protocol::records::Position {
+        position: 1,
+        digest: view.digests[1],
+    };
+    let grant = grant_envelope(&log, &ka, &head, &kb, "B");
+    let grant = snailfish_protocol::envelope::Envelope::parse(grant.as_bytes()).unwrap();
     let v = snailfish_protocol::space::check_append(
         &view,
         &grant,
@@ -1499,9 +1654,13 @@ fn batch_limits_are_exact() {
     // The count limit.
     let (b, _) = batch((0..5).map(|i| change(i, 1)).collect(), &limits(1_000, 2));
     assert_eq!(shape(&b), vec![2, 2, 1]);
-    // A setup record that does not fit goes alone: the relay answer decides.
+    // A grant that does not fit goes alone: the relay answer decides.
     let (b, big) = batch(
-        vec![change(1, 5), (Item::Setup(2), "x".repeat(40)), change(3, 5)],
+        vec![
+            change(1, 5),
+            (Item::Grant([2; 32]), "x".repeat(40)),
+            change(3, 5),
+        ],
         &limits(37, 100),
     );
     assert_eq!((shape(&b), big), (vec![1, 1, 1], vec![]));
@@ -1511,7 +1670,8 @@ fn batch_limits_are_exact() {
 /// `invalid_record` answer to the create request is `stopped: fork`.
 #[test]
 fn too_large_degrades_and_refused_genesis_stops() {
-    let (w, a, _) = World::new();
+    let w = World::with_a();
+    let a = w.dev("a");
     let mut ea = w.engine(&a);
     let mut s = ea.start_sync();
     steps(&w, &mut ea, &mut s, 1);
@@ -1521,7 +1681,8 @@ fn too_large_degrades_and_refused_genesis_stops() {
     s.handle_response(&mut ea, 422, &[], &body).unwrap();
     assert!(matches!(ea.status(), Status::Fork { .. }));
 
-    let (w, a, _) = World::new();
+    let w = World::with_a();
+    let a = w.dev("a");
     let mut ea = w.engine(&a);
     let mut s = ea.start_sync();
     steps(&w, &mut ea, &mut s, 1);
@@ -1537,7 +1698,8 @@ fn too_large_degrades_and_refused_genesis_stops() {
 /// for the same log, with the same app and a valid signature, stops sync.
 #[test]
 fn relay_with_another_genesis_record_stops() {
-    let (w, a, _) = World::new();
+    let w = World::with_a();
+    let a = w.dev("a");
     let log = decode_id::<16>(&w.log_id, "l_").unwrap();
     let other = crate::setup::make_space(
         log,
@@ -1546,7 +1708,6 @@ fn relay_with_another_genesis_record_stops() {
             keys: new_device_keys().unwrap(),
             name: "X".into(),
         },
-        &[],
     )
     .unwrap();
     let genesis = &other.envelopes[0];
@@ -1874,8 +2035,8 @@ fn refused_repair_entry_stops_with_fork() {
             other => panic!("{code}: expected fork, got {other:?}"),
         }
     }
-    let (w2, b2, _) = World::new();
-    let mut eb = w2.engine(&b2);
+    let w2 = World::with_a();
+    let mut eb = w2.engine(&w2.dev("a"));
     let mut s = eb.start_sync();
     while let Some(req) = s.next_request(&mut eb).unwrap() {
         if req.method == "PUT" {
@@ -1891,4 +2052,433 @@ fn refused_repair_entry_stops_with_fork() {
         Status::Fork { cause } => assert!(cause.contains("genesis"), "{cause}"),
         other => panic!("expected fork, got {other:?}"),
     }
+}
+
+/// A grant of `new` signed by the device `by` on `base`, with a key set of
+/// a random app key: the space check reads only the epochs of the key set.
+fn grant_envelope(
+    log: &[u8; 16],
+    by: &DeviceKeys,
+    base: &snailfish_protocol::records::Position,
+    new: &DeviceKeys,
+    name: &str,
+) -> String {
+    use snailfish_protocol::records::{Author, Device, KeySet, Keys};
+    let sk = snailfish_protocol::sig::SecretKey::from_seed(&by.sign_seed);
+    let by_id = keys::device_id(&sk.public(), &keys::seal_public(&by.seal_seed));
+    let nk = snailfish_protocol::sig::SecretKey::from_seed(&new.sign_seed).public();
+    let seal = Box::new(keys::seal_public(&new.seal_seed));
+    let id = keys::device_id(&nk, &seal);
+    let sealed = keys::seal_key_set(&seal[..], log, &id, &[1], &[[7; 32]]).unwrap();
+    let device = Device {
+        id,
+        keys: Keys { sign: nk, seal },
+        name: name.into(),
+        level: MAX_LEVEL,
+    };
+    let set = KeySet {
+        to: Author::Device(id),
+        epochs: vec![1],
+        sealed,
+    };
+    let payload =
+        snailfish_protocol::write::grant(log, &Author::Device(by_id), base, &device, &set);
+    let sig = sk.sign_record("snailfish.grant.v1", &payload);
+    snailfish_protocol::envelope::write_json("snailfish.grant.v1", &payload, &sig, "d_")
+}
+
+// ---------------------------------------------------------------- M4
+
+/// A space with A synced once, and B keys with no app key: the real state
+/// of a new device before its enrollment.
+fn world_with_new_b() -> (World, Engine) {
+    let mut w = World::with_a();
+    let mut ea = w.engine(&w.dev("a"));
+    w.exchange(&mut ea);
+    w.keys.push(new_device_keys().unwrap());
+    (w, ea)
+}
+
+/// The record types and authors of the relay log, from position 1.
+fn relay_log(w: &World, e: &Engine) -> Vec<(String, String)> {
+    let _ = e;
+    let mut out = Vec::new();
+    for (_, json) in fetch_all(w) {
+        let env = snailfish_protocol::envelope::Envelope::parse(json.as_bytes()).unwrap();
+        let r =
+            snailfish_protocol::records::parse_payload(&env.payload_type, &env.payload).unwrap();
+        let author = match r.author {
+            snailfish_protocol::records::Author::Device(id) => encode_id("d_", &id),
+            snailfish_protocol::records::Author::Recovery(id) => encode_id("r_", &id),
+        };
+        out.push((env.payload_type, author));
+    }
+    out
+}
+
+/// The relay log as (position, envelope), read with the key of A.
+fn fetch_all(w: &World) -> Vec<(u64, String)> {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut e = Engine::open(tmp.path(), w.space(), &w.keys[0]).unwrap();
+    let mut s = e.start_sync();
+    while let Some(req) = s.next_request(&mut e).unwrap() {
+        let resp = w.relay.handle(&to_relay(&req));
+        s.handle_response(&mut e, resp.status, &time(&resp), &resp.body)
+            .unwrap();
+    }
+    let head = e.verified_head().unwrap().position;
+    state::log_range(&e.db, 1, head).unwrap()
+}
+
+/// [ENR-1] to [ENR-9], `specs/spacelog/test.qnt::grantWithCheckpointTest`:
+/// enrollment in both directions. The device that shows the session can be
+/// the trusted device or the new device. The new device verifies the log to
+/// the checkpoint, opens the app key from its grant (the same key as A),
+/// reads the change of A, and can then write.
+#[test]
+fn enrollment_in_both_directions() {
+    for new_shows in [false, true] {
+        let (mut w, mut ea) = world_with_new_b();
+        let mut a = w.dev("a");
+        a.edit(&ea, b"a1");
+        a.enqueue(&mut ea);
+        w.exchange(&mut ea);
+        let (mut te, mut ne) = if new_shows {
+            let ne = NewEnrollment::new(URL, &w.keys[1], "B", None).unwrap();
+            let p = ne.payload().unwrap();
+            assert!(p.starts_with("snailfish-enroll-v1 n https://sync.example.net "));
+            (TrustedEnrollment::new(&ea, Some(&p), None).unwrap(), ne)
+        } else {
+            let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+            assert_eq!(te.code(), None, "no code before the open");
+            w.open(&mut ea, &mut te);
+            // The typed code works as well as the payload.
+            let code = te.code().unwrap();
+            let ne = NewEnrollment::new(URL, &w.keys[1], "B", Some(&code)).unwrap();
+            (te, ne)
+        };
+        w.drive(&mut ea, &mut te, &mut ne, (true, true));
+        assert_eq!(
+            (te.state(), ne.state()),
+            (EnrollState::Done, EnrollState::Done)
+        );
+        let j = ne.joined().unwrap();
+        assert_eq!((j.tenant.as_str(), j.position), (w.tenant.as_str(), 3));
+        install_enrollment(
+            &w.root.join("b"),
+            crate::enroll::space_of(&j, URL, APP),
+            &w.keys[1],
+            &j,
+        )
+        .unwrap();
+        let mut b = w.dev("b");
+        let mut eb = w.engine(&b);
+        assert_eq!(eb.app_key(), None, "no key before the checkpoint check");
+        w.exchange(&mut eb);
+        assert_eq!(eb.status(), Status::Ok);
+        assert_eq!(eb.app_key(), Some(w.keys[0].app_key));
+        b.pull(&eb).unwrap();
+        assert_eq!(b.state, vec![b"a1".to_vec()]);
+        b.edit(&eb, b"b1");
+        b.enqueue(&mut eb);
+        w.exchange(&mut eb);
+        w.exchange(&mut ea);
+        a.pull(&ea).unwrap();
+        assert_eq!(a.state, vec![b"a1".to_vec(), b"b1".to_vec()]);
+    }
+}
+
+/// [ENR-9], T6, `specs/enrollment/early_upload.pv`: a new device whose log
+/// differs from the checkpoint stops with fork and sends no request that
+/// uploads anything: no append, no status report and no repair.
+#[test]
+fn new_device_uploads_nothing_before_the_checkpoint_check() {
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload().as_deref()).unwrap();
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    let mut j = ne.joined().unwrap();
+    j.digest[0] ^= 1;
+    install_enrollment(
+        &w.root.join("b"),
+        crate::enroll::space_of(&j, URL, APP),
+        &w.keys[1],
+        &j,
+    )
+    .unwrap();
+    let mut eb = w.engine(&w.dev("b"));
+    let mut s = eb.start_sync();
+    let mut methods = Vec::new();
+    while let Some(req) = s.next_request(&mut eb).unwrap() {
+        methods.push((req.method.clone(), req.url.clone()));
+        let resp = w.relay.handle(&to_relay(&req));
+        s.handle_response(&mut eb, resp.status, &time(&resp), &resp.body)
+            .unwrap();
+    }
+    assert!(
+        matches!(eb.status(), Status::Fork { ref cause } if cause.contains("checkpoint")),
+        "{:?}",
+        eb.status()
+    );
+    assert!(methods.iter().all(|(m, _)| m == "GET"), "{methods:?}");
+    assert_eq!(eb.app_key(), None);
+}
+
+/// [ENR-7], T6: if the user reports a code mismatch on either device, the
+/// session ends and the trusted device appends no grant.
+#[test]
+fn code_mismatch_appends_no_grant() {
+    for answers in [(false, true), (true, false)] {
+        let (mut w, mut ea) = world_with_new_b();
+        let (t, n) = w.enroll_b(&mut ea, None, answers);
+        assert!(
+            matches!(t, EnrollState::Failed { .. }),
+            "{answers:?}: {t:?}"
+        );
+        assert!(
+            matches!(n, EnrollState::Failed { .. }),
+            "{answers:?}: {n:?}"
+        );
+        assert_eq!(
+            relay_log(&w, &ea).len(),
+            1,
+            "{answers:?}: only the genesis record"
+        );
+        assert_eq!(state::grants(&ea.db).unwrap(), vec![]);
+    }
+}
+
+/// [ENR-1] 10.10: a session that expired fails on both devices. A new
+/// device that read the session from the trusted device fails at once on
+/// `unknown_session`. A new device that shows its own session waits for
+/// the trusted device until its own 10 minutes end, to the second. A
+/// device that is already active cannot enroll again.
+#[test]
+fn expired_session_and_active_device_fail() {
+    static NEW_TIME: AtomicU64 = AtomicU64::new(1_000);
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload().as_deref()).unwrap();
+    RELAY_TIME.fetch_add(600, Ordering::SeqCst);
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    RELAY_TIME.fetch_sub(600, Ordering::SeqCst);
+    for s in [te.state(), ne.state()] {
+        assert!(
+            matches!(s, EnrollState::Failed { ref cause } if cause.contains("expired")),
+            "{s:?}"
+        );
+    }
+
+    let mut shows = NewEnrollment::new(URL, &w.keys[1], "B", None).unwrap();
+    shows.set_clock(|| NEW_TIME.load(Ordering::SeqCst));
+    let mut step = |later: u64| {
+        NEW_TIME.store(1_000 + later, Ordering::SeqCst);
+        let req = shows.next_request()?;
+        let (st, _, body) = w.send(&req);
+        shows.handle_response(st, &body).unwrap();
+        Some(shows.state())
+    };
+    assert_eq!(step(0), Some(EnrollState::Waiting), "not opened yet");
+    assert_eq!(
+        step(599),
+        Some(EnrollState::Waiting),
+        "one second before the end"
+    );
+    assert_eq!(step(600), None);
+    assert!(
+        matches!(shows.state(), EnrollState::Failed { ref cause } if cause.contains("expired"))
+    );
+
+    let (t, n) = w.enroll_b(&mut ea, None, (true, true));
+    assert_eq!((t, n), (EnrollState::Done, EnrollState::Done));
+    let (t, _) = w.enroll_b(&mut ea, None, (true, true));
+    assert!(
+        matches!(t, EnrollState::Failed { ref cause } if cause.contains("already")),
+        "{t:?}"
+    );
+}
+
+/// `specs/spacelog/test.qnt::recoveryGrantTest`, M4 decision 1: the user
+/// types the recovery key on A, and the recovery key signs the grant. The
+/// new device verifies the log and joins. A wrong recovery key is refused
+/// before the session starts.
+#[test]
+fn recovery_key_signs_the_grant() {
+    let (mut w, mut ea) = world_with_new_b();
+    let wrong = snailfish_protocol::recovery::display(&[9; 16]);
+    assert!(TrustedEnrollment::new(&ea, None, Some(&wrong)).is_err());
+    let rk = w.recovery_key.clone();
+    let (t, n) = w.enroll_b(&mut ea, Some(&rk), (true, true));
+    assert_eq!((t, n), (EnrollState::Done, EnrollState::Done));
+    let log = relay_log(&w, &ea);
+    assert_eq!(log[1].0, "snailfish.grant.v1");
+    assert!(
+        log[1].1.starts_with("r_"),
+        "the recovery key signs: {log:?}"
+    );
+    let mut eb = w.engine(&w.dev("b"));
+    w.exchange(&mut eb);
+    assert_eq!(eb.status(), Status::Ok);
+    assert_eq!(eb.app_key(), Some(w.keys[0].app_key));
+}
+
+/// `specs/spacelog/test.qnt::resignReconfirmTest`, [LOG-7]: A and B each
+/// sign a grant on the same base. The relay stores the grant of B and
+/// refuses the grant of A with `stale_base`. A fetches: a grant arrived,
+/// so A does not sign again until the user confirms again, and the new
+/// grant names the new device list.
+#[test]
+fn stale_grant_after_another_grant_needs_a_new_confirmation() {
+    let (mut w, dev_a, dev_b) = World::new();
+    let mut ea = w.engine(&dev_a);
+    let mut eb = w.engine(&dev_b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    let keys_c = queue_grant(&ea, "C");
+    queue_grant(&eb, "D");
+    w.exchange(&mut eb);
+    w.exchange(&mut ea);
+    let c_id = keys::device_id(
+        &snailfish_protocol::sig::SecretKey::from_seed(&keys_c.sign_seed).public(),
+        &keys::seal_public(&keys_c.seal_seed),
+    );
+    let g = state::grants(&ea.db).unwrap();
+    assert_eq!(g.len(), 1);
+    assert_eq!(g[0].state, state::GRANT_STALE, "refused with stale_base");
+    w.exchange(&mut ea);
+    assert_eq!(
+        ea.grants_to_confirm().unwrap(),
+        vec![encode_id("d_", &c_id)]
+    );
+    assert_eq!(
+        relay_log(&w, &ea).len(),
+        3,
+        "no grant without a new confirmation"
+    );
+    ea.confirm_grant(&encode_id("d_", &c_id), None).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(state::grants(&ea.db).unwrap(), vec![]);
+    assert_eq!(relay_log(&w, &ea).len(), 4);
+    // The grant of C names the base at position 3, after the grant of D.
+    let (_, json) = fetch_all(&w).pop().unwrap();
+    let env = snailfish_protocol::envelope::Envelope::parse(json.as_bytes()).unwrap();
+    let r = snailfish_protocol::records::parse_payload(&env.payload_type, &env.payload).unwrap();
+    assert_eq!(r.base.position, 3);
+}
+
+/// `specs/spacelog/test.qnt::retryChecksStateTest`, [LOG-7]: the response
+/// to a grant is lost. The next sync fetches first, finds the device
+/// active, and drops the grant: it sends no second copy and asks the user
+/// nothing.
+#[test]
+fn grant_of_a_device_that_became_active_is_dropped() {
+    let (mut w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    queue_grant(&ea, "C");
+    let mut s = ea.start_sync();
+    steps(&w, &mut ea, &mut s, 2);
+    let req = s.next_request(&mut ea).unwrap().unwrap();
+    assert!(req.url.ends_with("/append"));
+    let _lost = w.relay.handle(&to_relay(&req));
+    drop(s);
+    let mut s = ea.start_sync();
+    let mut appends = 0;
+    while let Some(req) = s.next_request(&mut ea).unwrap() {
+        appends += usize::from(req.url.ends_with("/append"));
+        let resp = w.relay.handle(&to_relay(&req));
+        s.handle_response(&mut ea, resp.status, &time(&resp), &resp.body)
+            .unwrap();
+    }
+    assert_eq!(appends, 0);
+    assert_eq!(state::grants(&ea.db).unwrap(), vec![]);
+    assert_eq!(ea.grants_to_confirm().unwrap(), Vec::<String>::new());
+    assert_eq!(relay_log(&w, &ea).len(), 3);
+}
+
+/// `specs/delivery/test.qnt::lateDeviceRepairTest` and
+/// `lateRepairBlockedTest`, [LOG-12]: B joins after a relay backup. The
+/// operator restores the backup, so the grant of B is only in the lost
+/// range and the relay answers its fetch with `unknown_device`. B repairs
+/// from the position before its grant. If the relay also lost the entry
+/// before the grant, B reports `paused: repair needs another device`.
+#[test]
+fn device_with_a_lost_grant_repairs_from_the_position_before_it() {
+    for blocked in [false, true] {
+        let (mut w, mut ea) = world_with_new_b();
+        let backup = w.backup("b1");
+        if blocked {
+            let mut a = w.dev("a");
+            a.edit(&ea, b"a1");
+            a.enqueue(&mut ea);
+            w.exchange(&mut ea);
+        }
+        let (t, _) = w.enroll_b(&mut ea, None, (true, true));
+        assert_eq!(t, EnrollState::Done);
+        let mut b = w.dev("b");
+        let mut eb = w.engine(&b);
+        w.exchange(&mut eb);
+        b.edit(&eb, b"b1");
+        b.enqueue(&mut eb);
+        w.exchange(&mut eb);
+        let head = eb.verified_head().unwrap().position;
+        w.restore(&backup);
+        w.exchange(&mut eb);
+        if blocked {
+            assert_eq!(eb.status(), Status::RepairNeedsAnotherDevice);
+            assert_eq!(relay_log(&w, &ea).len(), 1);
+            // A is active in the relay log and repairs it.
+            w.exchange(&mut ea);
+            assert_eq!(ea.take_repairs().unwrap(), [Repair { first: 2, tip: 3 }]);
+        } else {
+            assert_eq!(
+                eb.take_repairs().unwrap(),
+                [Repair {
+                    first: 2,
+                    tip: head
+                }]
+            );
+            assert_eq!(relay_log(&w, &ea).len(), usize::try_from(head).unwrap());
+        }
+    }
+}
+
+/// [ENR-6] [ENR-7]: the trusted device shows its code only after the relay
+/// holds its nonce, so the new device can compute its code while the user
+/// looks at the trusted device. An app that waits for the user at once
+/// must not block the new device.
+#[test]
+fn new_device_reaches_the_code_while_the_trusted_device_waits_for_the_user() {
+    let (w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload().as_deref()).unwrap();
+    let compare = |s: &EnrollState| matches!(s, EnrollState::Compare { .. });
+    for _ in 0..100 {
+        if compare(&te.state()) {
+            break;
+        }
+        if let Some(req) = te.next_request(&mut ea).unwrap() {
+            let (st, h, b) = w.send(&req);
+            te.handle_response(&mut ea, st, &h, &b).unwrap();
+        }
+        if let Some(req) = ne.next_request() {
+            let (st, _, b) = w.send(&req);
+            ne.handle_response(st, &b).unwrap();
+        }
+    }
+    let EnrollState::Compare { code } = te.state() else {
+        panic!("{:?}", te.state());
+    };
+    // The trusted device waits for its user and sends nothing more.
+    assert_eq!(te.next_request(&mut ea).unwrap(), None);
+    for _ in 0..10 {
+        if let Some(req) = ne.next_request() {
+            let (st, _, b) = w.send(&req);
+            ne.handle_response(st, &b).unwrap();
+        }
+    }
+    assert_eq!(ne.state(), EnrollState::Compare { code });
 }

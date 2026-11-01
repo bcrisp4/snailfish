@@ -124,7 +124,31 @@ fn migrate(db: &Connection) -> Result<(), EngineError> {
              COMMIT;",
         )?;
     }
-    const { assert!(SCHEMA_VERSION == 3) };
+    if found < 4 {
+        // M4: the grants of an enrollment, and the checkpoint that a new
+        // device checks before it uploads anything ([ENR-9]).
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE grants (
+               device_id BLOB PRIMARY KEY,
+               device TEXT NOT NULL,
+               confirmed TEXT NOT NULL,
+               by_recovery INTEGER NOT NULL,
+               envelope TEXT,
+               state TEXT NOT NULL
+             );
+             CREATE TABLE enrollment (
+               id INTEGER PRIMARY KEY CHECK (id = 1),
+               position INTEGER NOT NULL,
+               digest BLOB NOT NULL,
+               trusted BLOB NOT NULL,
+               device TEXT NOT NULL
+             );
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
+    const { assert!(SCHEMA_VERSION == 4) };
     Ok(())
 }
 
@@ -196,7 +220,11 @@ pub(crate) fn enqueue(e: &mut Engine, rows: &[OutboxRow]) -> Result<EnqueueResul
     let base = e.base()?;
     let log_id = e.log_id;
     let device = e.device_id;
-    let app_key = e.app_key;
+    let app_key = e.app_key.ok_or_else(|| {
+        EngineError::Invalid(
+            "the engine has no app key yet: the enrollment check has not passed".into(),
+        )
+    })?;
     // Encrypt and sign before the transaction: the CSPRNG and the
     // signature need no database state.
     let mut prepared = Vec::with_capacity(parsed.len());
@@ -636,12 +664,11 @@ pub(crate) fn decrypt_change(e: &Engine, env: &Envelope) -> Option<Vec<u8>> {
         return None;
     };
     let aad = keys::change_aad(&r.log, *epoch, change_id, r.author.id());
-    keys::decrypt(&e.app_key, &aad, ciphertext).ok()
+    keys::decrypt(e.app_key.as_ref()?, &aad, ciphertext).ok()
 }
 
-/// Store the setup records of a new space: the genesis record at seq 1 and
-/// the grants after it. Sync uploads them and deletes each one when the
-/// verified log holds it.
+/// Store the setup record of a new space: the genesis record at seq 1.
+/// Sync uploads it and deletes it when the verified log holds it.
 pub(crate) fn add_setup(db: &Connection, envelopes: &[String]) -> Result<(), EngineError> {
     let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
     for (i, json) in envelopes.iter().enumerate() {
@@ -682,15 +709,6 @@ pub(crate) fn setup_genesis_hash(db: &Connection) -> Result<Option<Hash32>, Engi
     .transpose()
 }
 
-/// The setup records after the genesis record.
-pub(crate) fn setup_appends(db: &Connection) -> Result<Vec<(i64, String)>, EngineError> {
-    let mut st = db.prepare("SELECT seq, envelope FROM setup WHERE seq > 1 ORDER BY seq")?;
-    let rows = st
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    Ok(rows)
-}
-
 /// Delete a setup record that the verified log now holds.
 pub(crate) fn drop_setup(tx: &Transaction<'_>, record_hash: &Hash32) -> Result<(), EngineError> {
     tx.execute(
@@ -698,4 +716,215 @@ pub(crate) fn drop_setup(tx: &Transaction<'_>, record_hash: &Hash32) -> Result<(
         [&record_hash[..]],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------- M4
+
+/// The send state of a grant in the grant outbox ([LOG-7]).
+pub(crate) const GRANT_SEND: &str = "send";
+/// The relay refused the grant with `stale_base`. The next sync checks the
+/// space state again before it signs again.
+pub(crate) const GRANT_STALE: &str = "stale";
+/// A grant or a removal arrived, or the recovery key signed the grant: the
+/// user must confirm again.
+pub(crate) const GRANT_CONFIRM: &str = "confirm";
+
+/// One grant of the grant outbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantRow {
+    pub device_id: Hash32,
+    pub device: String,
+    pub confirmed: String,
+    pub by_recovery: bool,
+    pub envelope: Option<String>,
+    pub state: String,
+}
+
+/// The active devices of the verified log as the sorted, comma-joined
+/// device ID texts: the list that the user confirms ([LOG-7]).
+pub(crate) fn device_list(db: &Connection) -> Result<String, EngineError> {
+    let mut st = db.prepare("SELECT id FROM devices ORDER BY id")?;
+    let ids: Vec<Vec<u8>> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(ids
+        .iter()
+        .map(|i| snailfish_protocol::encoding::encode_id("d_", i))
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+/// True if the device is active in the verified log.
+pub(crate) fn is_active(db: &Connection, id: &Hash32) -> Result<bool, EngineError> {
+    Ok(db
+        .query_row("SELECT 1 FROM devices WHERE id = ?1", [&id[..]], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+pub(crate) fn put_grant(db: &Connection, g: &GrantRow) -> Result<(), EngineError> {
+    db.execute(
+        "INSERT INTO grants (device_id, device, confirmed, by_recovery, envelope, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (device_id) DO UPDATE SET device = excluded.device,
+           confirmed = excluded.confirmed, by_recovery = excluded.by_recovery,
+           envelope = excluded.envelope, state = excluded.state",
+        params![
+            &g.device_id[..],
+            g.device,
+            g.confirmed,
+            i64::from(g.by_recovery),
+            g.envelope,
+            g.state
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn grants(db: &Connection) -> Result<Vec<GrantRow>, EngineError> {
+    let mut st = db.prepare(
+        "SELECT device_id, device, confirmed, by_recovery, envelope, state FROM grants ORDER BY device_id",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok((
+            r.get::<_, Vec<u8>>(0)?,
+            GrantRow {
+                device_id: [0; 32],
+                device: r.get(1)?,
+                confirmed: r.get(2)?,
+                by_recovery: r.get::<_, i64>(3)? != 0,
+                envelope: r.get(4)?,
+                state: r.get(5)?,
+            },
+        ))
+    })?;
+    rows.map(|r| {
+        let (id, mut g) = r?;
+        g.device_id = to_hash(&id)?;
+        Ok(g)
+    })
+    .collect()
+}
+
+pub(crate) fn set_grant_state(
+    db: &Connection,
+    id: &Hash32,
+    state: &str,
+) -> Result<(), EngineError> {
+    db.execute(
+        "UPDATE grants SET state = ?2 WHERE device_id = ?1",
+        params![&id[..], state],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn drop_grant(db: &Connection, id: &Hash32) -> Result<(), EngineError> {
+    db.execute("DELETE FROM grants WHERE device_id = ?1", [&id[..]])?;
+    Ok(())
+}
+
+/// The checkpoint of an enrollment that the new device has not checked yet
+/// ([ENR-9]): position, digest, the trusted device and the device object
+/// of `new.hello`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingCheckpoint {
+    pub position: u64,
+    pub digest: Hash32,
+    pub trusted: Hash32,
+    pub device: String,
+}
+
+pub(crate) fn set_checkpoint(db: &Connection, c: &PendingCheckpoint) -> Result<(), EngineError> {
+    db.execute(
+        "INSERT OR REPLACE INTO enrollment (id, position, digest, trusted, device)
+         VALUES (1, ?1, ?2, ?3, ?4)",
+        params![to_i64(c.position)?, &c.digest[..], &c.trusted[..], c.device],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn checkpoint(db: &Connection) -> Result<Option<PendingCheckpoint>, EngineError> {
+    let row: Option<(i64, Vec<u8>, Vec<u8>, String)> = db
+        .query_row(
+            "SELECT position, digest, trusted, device FROM enrollment WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    row.map(|(p, d, t, device)| {
+        Ok(PendingCheckpoint {
+            position: to_u64(p)?,
+            digest: to_hash(&d)?,
+            trusted: to_hash(&t)?,
+            device,
+        })
+    })
+    .transpose()
+}
+
+pub(crate) fn clear_checkpoint(db: &Connection) -> Result<(), EngineError> {
+    db.execute("DELETE FROM enrollment", [])?;
+    Ok(())
+}
+
+/// The position of the record that makes `id` active: the genesis record
+/// or a grant. `None` if the verified log does not name it.
+pub(crate) fn activation(
+    db: &Connection,
+    id: &Hash32,
+) -> Result<Option<(u64, String)>, EngineError> {
+    let mut st = db.prepare(
+        "SELECT position, envelope FROM log
+         WHERE payload_type IN ('snailfish.genesis.v1', 'snailfish.grant.v1') ORDER BY position",
+    )?;
+    let rows: Vec<(i64, String)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (p, json) in rows {
+        let Ok(env) = Envelope::parse(json.as_bytes()) else {
+            continue;
+        };
+        let Ok(r) = snailfish_protocol::records::parse_payload(&env.payload_type, &env.payload)
+        else {
+            continue;
+        };
+        let (Body::Genesis { device, .. } | Body::Grant { device, .. }) = &r.body else {
+            continue;
+        };
+        if &device.id == id {
+            return Ok(Some((to_u64(p)?, json)));
+        }
+    }
+    Ok(None)
+}
+
+/// Set the content hash of each change that the engine stored before it
+/// had the app key, for example during an enrollment ([DLV-13]). Returns
+/// the position of the first change that does not decrypt.
+pub(crate) fn fill_content(e: &Engine) -> Result<Option<u64>, EngineError> {
+    let tx = Transaction::new_unchecked(&e.db, TransactionBehavior::Immediate)?;
+    let rows: Vec<(i64, String)> = {
+        let mut st = tx.prepare(
+            "SELECT position, envelope FROM log
+             WHERE change_id IS NOT NULL AND content_hash IS NULL ORDER BY position",
+        )?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    let mut failed = None;
+    for (p, json) in rows {
+        let env = Envelope::parse(json.as_bytes())
+            .map_err(|err| EngineError::Storage(format!("stored envelope: {err}")))?;
+        match decrypt_change(e, &env) {
+            Some(b) => {
+                tx.execute(
+                    "UPDATE log SET content_hash = ?2 WHERE position = ?1",
+                    params![p, &content_hash(&b)[..]],
+                )?;
+            }
+            None => {
+                failed = failed.or(Some(to_u64(p)?));
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(failed)
 }

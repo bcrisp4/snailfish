@@ -31,7 +31,9 @@ def test_second_engine_on_one_directory_is_refused(tmp_path: Path) -> None:
 
 
 def test_enqueue_refuses_other_bytes_for_a_known_change_id(tmp_path: Path) -> None:
-    engine = sf.Engine.open(str(tmp_path), space("l_" + "1" * 32), sf.new_device_keys())
+    keys = sf.new_device_keys()
+    keys.app_key = bytes(range(32))
+    engine = sf.Engine.open(str(tmp_path), space("l_" + "1" * 32), keys)
     cid = engine.new_change_id()
     assert len(cid) == 16
     row = sf.OutboxRow(change_id=cid, change_bytes=b"x")
@@ -40,6 +42,16 @@ def test_enqueue_refuses_other_bytes_for_a_known_change_id(tmp_path: Path) -> No
     other = sf.OutboxRow(change_id=cid, change_bytes=b"y")
     assert engine.enqueue_many([other]).refused == [cid]
     assert engine.outbox_len() == 1
+
+
+def test_enqueue_without_an_app_key_is_invalid(tmp_path: Path) -> None:
+    """A new device has no app key until its enrollment check passes, so the
+    engine cannot encrypt a change yet."""
+    engine = sf.Engine.open(str(tmp_path), space("l_" + "1" * 32), sf.new_device_keys())
+    assert engine.app_key() is None
+    row = sf.OutboxRow(change_id=engine.new_change_id(), change_bytes=b"x")
+    with pytest.raises(sf.SnailfishError.Invalid):
+        engine.enqueue_many([row])
 
 
 def test_info_with_old_levels_is_relay_too_old(tmp_path: Path) -> None:

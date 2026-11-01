@@ -451,12 +451,12 @@ Each error response has an HTTP status and this body:
 | `unknown_space` | 404 | The tenant has no space with the log ID | `paused: relay unavailable` |
 | `not_found` | 404 | No route has the path | `paused: relay unavailable` |
 | `space_exists` | 409 | `PUT` with another genesis record for an existing log ID | `stopped: fork` |
-| `unknown_session` | 404 | The relay holds no session with the ID that has not expired, or the session belongs to another device or space (10.10) | Enrollment: the new device reads again until its own 10 minutes end. The trusted device fails the enrollment. |
+| `unknown_session` | 404 | The relay holds no session with the ID that has not expired, or the session belongs to another device or space (10.10) | Enrollment: a new device that shows the session writes `new.hello` again until its own 10 minutes end. Each other device fails the enrollment. |
 | `session_exists` | 409 | An open request names a session ID that the relay holds for another device or space (10.10) | The enrollment fails |
 | `bad_step` | 409 | An enrollment message that is not the next message of the session (10.10) | The enrollment fails |
 | `session_closed` | 409 | An enrollment message after the session ended (10.10) | The enrollment fails |
 | `repair_busy` | 409 | Another device holds a repair session of the space that has not expired (10.9) | `paused: relay unavailable` |
-| `bad_repair` | 409 | The repair request does not continue the session: see 10.9 | `paused: relay unavailable`. The engine starts a new session at the next sync. For a repair from the position before the own grant ([LOG-12]): `paused: repair needs another device`. |
+| `bad_repair` | 409 | The repair request does not continue the session: see 10.9 | `paused: relay unavailable`. The engine starts a new session at the next sync. For a repair from the position before the own grant ([LOG-12]), this code and `unknown_device`: `paused: repair needs another device`. |
 | `invalid_record` | 422 | The genesis record of a `PUT` breaks 10.5, or a repair entry fails the chain check of 10.9 | `stopped: fork` |
 | `uncovered_stub` | 422 | A repair entry is a stub that no usable snapshot of the staged range covers ([LOG-11]) | `stopped: fork` |
 | `too_large` | 413 | The body is larger than `max_request_bytes`, or a repair body is larger than `max_request_bytes` + 1,024 bytes (10.9) | `degraded` |
@@ -641,7 +641,7 @@ A finish request runs 8.6 steps 1 to 4, returns `bad_request` for a body that br
 - The finish request names the tip, so the relay moves the entries only if they end at the verified head of the device ([LOG-10]).
 - If a chunk response is lost, the next chunk gets `bad_repair`, and the engine starts a new session.
 
-A device whose grant is only in the lost range gets `unknown_device` on a fetch, so it cannot read the relay head ([LOG-12]). If its verified log holds its own grant at position g, the engine starts a repair with the base `g - 1` and its digest, and the entries from g to the verified head. If the relay answers `bad_repair`, the relay head is another position, and the engine reports `paused: repair needs another device`. A device that is active in the relay log must then repair it.
+A device whose grant is only in the lost range gets `unknown_device` on a fetch, so it cannot read the relay head ([LOG-12]). If its verified log holds its own grant at position g, the engine starts a repair with the base `g - 1` and its digest, and the entries from g to the verified head. If the relay head is another position, the chain check of start step 3 passes no entry, so the relay answers `unknown_device` (step 4) or `bad_repair` (step 5). The engine then reports `paused: repair needs another device`. A device that is active in the relay log must then repair it.
 
 If the verified log holds no grant of the device, for example after a relay restore before the first fetch of a new device, the engine reports `paused: relay unavailable`. The device must enroll again.
 
@@ -751,7 +751,7 @@ code       = n mod 1000000, as 6 decimal digits with leading zeros
 | Step | Device | Action |
 | --- | --- | --- |
 | 1 | Shows the code | Makes the session ID ([ENR-1]). |
-| 2 | Trusted | Opens the session on its signed route (10.10, [ENR-2]). |
+| 2 | Trusted | Opens the session on its signed route (10.10, [ENR-2]). A trusted device that shows the code shows it only after the open, so a new device that reads it finds the session. |
 | 3 | New | Writes `new.hello` with its device object: keys, name and highest protocol level ([ENR-3]). |
 | 4 | Trusted | Reads `new.hello`. If the level is below the space write level, cancels and asks the user to update the new device. If the device is active, cancels. Otherwise makes `t_nonce` and writes `trusted.hello` with its keys and the commitment ([ENR-3], [ENR-4]). |
 | 5 | New | Reads `trusted.hello`, makes `n_nonce` and writes `new.nonce` ([ENR-5]). |

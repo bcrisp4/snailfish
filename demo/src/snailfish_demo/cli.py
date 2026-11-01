@@ -1,10 +1,19 @@
 """The demo task app CLI.
 
 Usage:
-    snailfish-demo setup --relay URL --tenant T DIR_A DIR_B
+    snailfish-demo setup --relay URL --tenant T DIR_A
+    snailfish-demo --dir DIR invite [--scan TEXT] [--recovery-key KEY] [--confirm ask|yes|no]
+    snailfish-demo join --relay URL [--scan TEXT] [--name NAME] [--confirm ask|yes|no] DIR
     snailfish-demo --dir DIR edit TASK FIELD VALUE
     snailfish-demo --dir DIR sync
     snailfish-demo --dir DIR list
+
+`invite` runs on a device of the space and `join` on the new device. The
+device that shows the session prints its QR payload as a text line and
+its typed code. The other device takes either one with `--scan`. Both
+devices print the 6-digit code, and the user confirms the match on each
+device at a prompt. `--confirm yes` or `--confirm no` answers the prompt
+with no input, for tests.
 
 `SNAILFISH_DEMO_CRASH_AT=N` makes the process exit at the Nth crash point
 of the run, with no cleanup, as a kill does. The crash points are before
@@ -75,6 +84,33 @@ def http_transport(client: httpx.Client, crash_point: Crasher) -> app.Transport:
     return send
 
 
+def say(line: str) -> None:
+    """Print one line at once, so a test can read it while the process runs."""
+    print(line, flush=True)
+
+
+def answer_for(mode: str) -> app.Answer:
+    """Return the code comparison: a prompt, or a fixed answer for tests."""
+
+    def ask(code: str) -> bool:
+        if mode != "ask":
+            say(f"compare: {code}")
+            return mode == "yes"
+        reply = input(f"compare: {code}\nDoes the other device show the same code? [y/N] ")
+        return reply.strip().lower() in ("y", "yes")
+
+    return ask
+
+
+def finish(cause: str) -> int:
+    """Print the result of an enrollment and return the exit code."""
+    if cause:
+        say(f"failed: {cause}")
+        return 1
+    say("enrolled")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI."""
     p = argparse.ArgumentParser(prog="snailfish-demo")
@@ -84,7 +120,16 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--relay", required=True)
     s.add_argument("--tenant", required=True)
     s.add_argument("dir_a", type=Path)
-    s.add_argument("dir_b", type=Path)
+    i = sub.add_parser("invite")
+    i.add_argument("--scan")
+    i.add_argument("--recovery-key")
+    i.add_argument("--confirm", choices=("ask", "yes", "no"), default="ask")
+    j = sub.add_parser("join")
+    j.add_argument("--relay", required=True)
+    j.add_argument("--scan")
+    j.add_argument("--name", default="new device")
+    j.add_argument("--confirm", choices=("ask", "yes", "no"), default="ask")
+    j.add_argument("dir_new", type=Path)
     e = sub.add_parser("edit")
     e.add_argument("task")
     e.add_argument("field", choices=app.FIELDS)
@@ -95,14 +140,37 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "setup":
-        key = app.create_space(args.relay, args.tenant, args.dir_a, args.dir_b)
+        key = app.create_space(args.relay, args.tenant, args.dir_a)
         print(f"recovery key (write it down): {key}")
         return 0
+    if args.cmd == "join":
+        with httpx.Client(timeout=30) as client:
+            cause = app.join(
+                args.dir_new,
+                args.relay,
+                args.name,
+                http_transport(client, Crasher()),
+                answer_for(args.confirm),
+                say,
+                args.scan,
+            )
+        return finish(cause)
     if args.dir is None:
         p.error("--dir is required")
     crasher = Crasher()
     dev = app.Device(args.dir, crash_point=crasher)
     try:
+        if args.cmd == "invite":
+            with httpx.Client(timeout=30) as client:
+                cause = app.invite(
+                    dev,
+                    http_transport(client, crasher),
+                    answer_for(args.confirm),
+                    say,
+                    args.scan,
+                    args.recovery_key,
+                )
+            return finish(cause)
         if args.cmd == "edit":
             value: object = args.value == "true" if args.field == "done" else args.value
             dev.edit(args.task, args.field, value)
@@ -128,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
                         "handled": [c.hex() for c in dev.handled_ids()],
                         "engine_outbox": dev.engine.outbox_len(),
                         "applied": dev.applied_position().position,
+                        "head": dev.engine.verified_head().position,
                         "status": str(dev.engine.status()),
                         "log_id": dev.space.log_id,
                     },

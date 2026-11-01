@@ -26,7 +26,7 @@ enum Phase {
     FirstFetch,
     Repair,
     Report,
-    Setup,
+    Grants,
     Push,
     LastFetch,
     Done,
@@ -35,7 +35,8 @@ enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Item {
     Change([u8; 16]),
-    Setup(i64),
+    /// A grant of the grant outbox, by the device ID it grants.
+    Grant(snailfish_protocol::encoding::Hash32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,9 @@ struct RepairRun {
     tip: Head,
     session: Option<[u8; 16]>,
     chunks: VecDeque<Vec<(u64, String)>>,
+    /// A repair from the position before the own grant, after the relay
+    /// answered a fetch with `unknown_device` ([LOG-12]).
+    late: bool,
 }
 
 /// One exchange with the relay. The app calls [`Sync::next_request`], sends
@@ -141,13 +145,13 @@ impl Sync {
                     });
                     if next.is_none() {
                         self.repair = None;
-                        self.phase = self.after_first_fetch();
+                        self.phase = self.after_first_fetch(engine)?;
                         continue;
                     }
                     next
                 }
                 Phase::Report => Some(Sent::Status),
-                Phase::Setup | Phase::Push => {
+                Phase::Grants | Phase::Push => {
                     if !self.queued {
                         self.queue(engine)?;
                     }
@@ -155,7 +159,7 @@ impl Sync {
                         Some(Sent::Append(b))
                     } else {
                         self.queued = false;
-                        self.phase = if self.phase == Phase::Setup {
+                        self.phase = if self.phase == Phase::Grants {
                             Phase::Push
                         } else {
                             Phase::LastFetch
@@ -173,11 +177,8 @@ impl Sync {
     }
 
     fn queue(&mut self, engine: &mut Engine) -> Result<(), EngineError> {
-        let items: Vec<(Item, String)> = if self.phase == Phase::Setup {
-            state::setup_appends(&engine.db)?
-                .into_iter()
-                .map(|(seq, env)| (Item::Setup(seq), env))
-                .collect()
+        let items: Vec<(Item, String)> = if self.phase == Phase::Grants {
+            crate::enroll::grants_to_send(engine)?
         } else {
             state::pending(engine, usize::MAX)?
                 .into_iter()
@@ -362,18 +363,9 @@ impl Sync {
         body: &[u8],
     ) -> Result<(), EngineError> {
         let sent = self.sent.take().ok_or(EngineError::UnexpectedResponse)?;
-        if let Some(t) = headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case(request::TIME_HEADER))
-            .and_then(|h| request::parse_time(&h.value))
-        {
-            let local = (engine.clock)();
-            engine.clock_offset =
-                i64::try_from(i128::from(t).saturating_sub(i128::from(local))).unwrap_or(0);
-        }
+        read_time(engine, headers);
         if !(200..300).contains(&status) {
-            self.error(engine, sent, body);
-            return Ok(());
+            return self.error(engine, sent, body);
         }
         let result = match sent {
             Sent::Info => self.info(engine, body),
@@ -405,16 +397,32 @@ impl Sync {
         }
     }
 
-    fn error(&mut self, engine: &mut Engine, sent: Sent, body: &[u8]) {
+    fn error(&mut self, engine: &mut Engine, sent: Sent, body: &[u8]) -> Result<(), EngineError> {
         let code = wire::parse_error(body);
+        // [LOG-12]: the relay does not know this device, so its grant can be
+        // only in the range that the relay lost. Repair from the position
+        // before the own grant: the relay head must be that position.
+        if code.as_deref() == Some("unknown_device")
+            && matches!(sent, Sent::Fetch)
+            && self.phase == Phase::FirstFetch
+            && let Some(run) = late_repair(engine, &self.limits)?
+        {
+            self.repair = Some(run);
+            self.phase = Phase::Repair;
+            return Ok(());
+        }
+        let late = self.repair.as_ref().is_some_and(|r| r.late);
         engine.status = match code.as_deref() {
             Some("wrong_authority") => Status::RelayAuthority,
             Some("expired") if !self.retried => {
                 // The offset is now fresh from this answer. Send once more.
                 self.retried = true;
                 self.retry = Some(sent);
-                return;
+                return Ok(());
             }
+            // PROTOCOL.md 10.9: with another relay head, no entry passes
+            // the chain check, so the relay does not know the signer.
+            Some("bad_repair" | "unknown_device") if late => Status::RepairNeedsAnotherDevice,
             Some("expired") => Status::ClockSkew,
             Some("space_exists") => Status::Fork {
                 cause: "the relay holds another genesis record for this log".into(),
@@ -440,6 +448,7 @@ impl Sync {
             _ => Status::RelayUnavailable,
         };
         self.phase = Phase::Done;
+        Ok(())
     }
 
     fn info(&mut self, engine: &mut Engine, body: &[u8]) -> Result<(), Answer> {
@@ -508,6 +517,7 @@ impl Sync {
                 return Err(stop(format!("the relay head digest at {head} differs")));
             }
         }
+        let checked = check_checkpoint(engine, &tx)?;
         if at_head {
             state::set_caught_up(&tx, true).map_err(Answer::Engine)?;
             // PROTOCOL.md 10.8: the fresh flag ends at a fetch that reaches
@@ -517,6 +527,23 @@ impl Sync {
             }
         }
         tx.commit().map_err(|e| Answer::Engine(e.into()))?;
+        let enrolling = enrolling(engine).map_err(Answer::Engine)?;
+        if checked {
+            // [ENR-9]: the log up to the checkpoint verified, so open the
+            // key set of the grant, then decrypt the changes stored without
+            // the key.
+            engine.app_key = Some(
+                engine
+                    .open_app_key()
+                    .map_err(|e| stop(e.to_string()))?
+                    .ok_or_else(|| {
+                        stop("the verified log holds no key set to this device".into())
+                    })?,
+            );
+            if let Some(p) = state::fill_content(engine).map_err(Answer::Engine)? {
+                degraded = Some(format!("a change at position {p} does not decrypt"));
+            }
+        }
         self.hold = f.hold;
         if let Some(cause) = degraded {
             engine.status = Status::Degraded { cause };
@@ -525,7 +552,7 @@ impl Sync {
             engine.status = Status::RestoreHold;
         }
         if shorter {
-            if self.phase == Phase::FirstFetch {
+            if self.phase == Phase::FirstFetch && !enrolling {
                 let lost = state::log_range(&engine.db, f.head.position.saturating_add(1), head)
                     .map_err(Answer::Engine)?;
                 self.repair = Some(RepairRun {
@@ -536,6 +563,7 @@ impl Sync {
                     },
                     session: None,
                     chunks: repair_chunks(lost, &f.head, &self.limits),
+                    late: false,
                 });
                 self.phase = Phase::Repair;
             } else {
@@ -558,7 +586,7 @@ impl Sync {
             return Ok(());
         }
         self.phase = match self.phase {
-            Phase::FirstFetch => self.after_first_fetch(),
+            Phase::FirstFetch => self.after_first_fetch(engine).map_err(Answer::Engine)?,
             _ => Phase::Done,
         };
         Ok(())
@@ -569,18 +597,22 @@ impl Sync {
         if wire::parse_status_response(body).map_err(|_| Answer::Unreadable)? {
             engine.status = Status::RestoreHold;
         }
-        self.phase = Phase::Setup;
+        self.phase = Phase::Grants;
         Ok(())
     }
 
     /// The phase after the first fetch and the repair: a status report
-    /// during a hold ([LOG-14]), then the append requests.
-    fn after_first_fetch(&self) -> Phase {
-        if self.hold {
+    /// during a hold ([LOG-14]), then the append requests. A new device
+    /// that has not checked its enrollment checkpoint uploads nothing
+    /// ([ENR-9]).
+    fn after_first_fetch(&self, engine: &Engine) -> Result<Phase, EngineError> {
+        Ok(if enrolling(engine)? {
+            Phase::Done
+        } else if self.hold {
             Phase::Report
         } else {
-            Phase::Setup
-        }
+            Phase::Grants
+        })
     }
 
     /// The answer to a repair start or chunk: the relay staged the chunk.
@@ -622,7 +654,7 @@ impl Sync {
             r.tip.position,
         )
         .map_err(Answer::Engine)?;
-        self.phase = self.after_first_fetch();
+        self.phase = self.after_first_fetch(engine).map_err(Answer::Engine)?;
         Ok(())
     }
 
@@ -632,15 +664,12 @@ impl Sync {
             return Err(Answer::Unreadable);
         }
         for ((item, _), r) in items.iter().zip(results) {
-            let Item::Change(cid) = item else {
-                // A setup record leaves its table when the verified log
-                // holds it. A refusal is a fault of the setup.
-                if let AppendResult::Refused(code) = r
-                    && code != "bad_base"
-                {
-                    return Err(stop(format!("the relay refused a setup record: {code}")));
+            let cid = match item {
+                Item::Change(cid) => cid,
+                Item::Grant(id) => {
+                    crate::enroll::grant_answer(engine, id, &r).map_err(Answer::Engine)?;
+                    continue;
                 }
-                continue;
             };
             match r {
                 // [DLV-8]: the envelope stays until a fetch shows it.
@@ -718,8 +747,7 @@ fn entry_len(pos: u64, env: &str) -> usize {
 /// Split items into append requests of at most `max_append_envelopes`
 /// envelopes and `max_request_bytes` body bytes (`PROTOCOL.md` 10.4).
 /// Returns the batches and the changes that do not fit in any body alone.
-/// A setup record that does not fit goes alone, and the relay answer
-/// decides.
+/// A grant that does not fit goes alone, and the relay answer decides.
 pub(crate) fn batch(items: Vec<(Item, String)>, limits: &Limits) -> (Batches, Vec<[u8; 16]>) {
     let max_count = usize::try_from(limits.max_append_envelopes.max(1)).unwrap_or(usize::MAX);
     let max_bytes = usize::try_from(limits.max_request_bytes).unwrap_or(usize::MAX);
@@ -802,7 +830,9 @@ fn verify_entry(
     };
     let content = if accepted.record.change_id().is_some() {
         let c = state::decrypt_change(engine, &raw.envelope).map(|b| state::content_hash(&b));
-        if c.is_none() {
+        // A new device has no app key before its checkpoint check. It
+        // decrypts these changes after the check (`state::fill_content`).
+        if c.is_none() && engine.app_key.is_some() {
             // [DLV-13]: skip it, keep its position, report the author.
             degraded = Some(format!(
                 "a change at position {pos} by {} does not decrypt",
@@ -819,6 +849,11 @@ fn verify_entry(
         degraded = Some("refused: conflict".into());
     }
     state::drop_setup(tx, &accepted.record_hash).map_err(Answer::Engine)?;
+    if let Some((id, _)) = accepted.new_device {
+        // [LOG-7]: the verified log holds a grant for this device, so the
+        // grant outbox needs no grant for it.
+        state::drop_grant(tx, &id).map_err(Answer::Engine)?;
+    }
     Ok(degraded)
 }
 
@@ -845,4 +880,94 @@ pub(crate) fn authority(url: &str) -> String {
     };
     auth.strip_suffix(default)
         .map_or(auth.clone(), str::to_owned)
+}
+
+/// The repair run of [LOG-12]: from the position before the own grant to
+/// the verified head. `None` if the verified log holds no own grant after
+/// position 1 (`PROTOCOL.md` 10.9).
+fn late_repair(engine: &Engine, limits: &Limits) -> Result<Option<RepairRun>, EngineError> {
+    let Some((g, _)) = state::activation(&engine.db, &engine.device_id)? else {
+        return Ok(None);
+    };
+    let (head, digest) = state::head(&engine.db, &engine.log_id)?;
+    let Some(base_pos) = g.checked_sub(1).filter(|p| *p >= 1) else {
+        return Ok(None);
+    };
+    let Some(base_digest) = state::verified_digest(&engine.db, &engine.log_id, base_pos)? else {
+        return Ok(None);
+    };
+    let base = Head {
+        position: base_pos,
+        digest: base_digest,
+    };
+    let lost = state::log_range(&engine.db, g, head)?;
+    Ok(Some(RepairRun {
+        base,
+        tip: Head {
+            position: head,
+            digest,
+        },
+        session: None,
+        chunks: repair_chunks(lost, &base, limits),
+        late: true,
+    }))
+}
+
+/// [ENR-9]: check the enrollment checkpoint once the verified log reaches
+/// it, inside the fetch transaction. True if the check passed now.
+fn check_checkpoint(engine: &Engine, tx: &Transaction<'_>) -> Result<bool, Answer> {
+    let Some(cp) = state::checkpoint(tx).map_err(Answer::Engine)? else {
+        return Ok(false);
+    };
+    let (head, _) = state::head(tx, &engine.log_id).map_err(Answer::Engine)?;
+    if head < cp.position {
+        return Ok(false);
+    }
+    if state::verified_digest(tx, &engine.log_id, cp.position).map_err(Answer::Engine)?
+        != Some(cp.digest)
+    {
+        return Err(stop(format!(
+            "the log differs from the enrollment checkpoint at position {}",
+            cp.position
+        )));
+    }
+    let want = snailfish_protocol::records::parse_device_json(cp.device.as_bytes())
+        .map_err(|e| Answer::Engine(EngineError::Storage(e.to_string())))?;
+    let own = state::activation(tx, &engine.device_id).map_err(Answer::Engine)?;
+    let own_ok = own.is_some_and(|(p, json)| {
+        p <= cp.position && crate::enroll::grant_device(&json).is_some_and(|d| d == want)
+    });
+    if !own_ok {
+        return Err(stop(
+            "the log up to the enrollment checkpoint holds no grant for this device".into(),
+        ));
+    }
+    let trusted = state::activation(tx, &cp.trusted).map_err(Answer::Engine)?;
+    if trusted.is_none_or(|(p, _)| p > cp.position) {
+        return Err(stop(
+            "the trusted device is not active at the enrollment checkpoint".into(),
+        ));
+    }
+    state::clear_checkpoint(tx).map_err(Answer::Engine)?;
+    Ok(true)
+}
+
+/// Keep the clock offset of a response with a valid `snailfish-time`
+/// ([WIR-7]).
+pub(crate) fn read_time(engine: &mut Engine, headers: &[Header]) {
+    if let Some(t) = headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(request::TIME_HEADER))
+        .and_then(|h| request::parse_time(&h.value))
+    {
+        let local = (engine.clock)();
+        engine.clock_offset =
+            i64::try_from(i128::from(t).saturating_sub(i128::from(local))).unwrap_or(0);
+    }
+}
+
+/// True if the engine holds an enrollment checkpoint that it has not
+/// checked yet ([ENR-9]).
+fn enrolling(engine: &Engine) -> Result<bool, EngineError> {
+    Ok(state::checkpoint(&engine.db)?.is_some())
 }

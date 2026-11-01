@@ -148,30 +148,144 @@ def write_private(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
-def create_space(relay_url: str, tenant: str, dir_a: Path, dir_b: Path) -> str:
-    """Create a space with devices A and B from key files on one machine.
+def create_space(relay_url: str, tenant: str, dir_a: Path) -> str:
+    """Create a space with device A as its first device.
 
-    The engine makes the recovery key, the genesis record with a grant to A,
-    and a grant to B signed by A (M2 decision 2). The function writes A's
-    key file and engine setup, and copies B's keys and the app key into B's
-    directory. A's next sync creates the space on the relay.
+    The engine makes the recovery key and the genesis record. The function
+    writes A's key file and engine setup. A's next sync creates the space on
+    the relay. Each other device joins through an enrollment.
 
     Returns:
         The recovery key in its display form. Show it once.
     """
     ka = sf.new_device_keys()
-    kb = sf.new_device_keys()
-    setup = sf.create_space(
-        APP_ID, sf.NewDevice(keys=ka, name="A"), [sf.NewDevice(keys=kb, name="B")]
-    )
+    setup = sf.create_space(APP_ID, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
-    kb.app_key = setup.app_key
     space = {"relay_url": relay_url, "tenant": tenant, "log_id": setup.log_id, "app_id": APP_ID}
-    for d, k in ((dir_a, ka), (dir_b, kb)):
-        d.mkdir(parents=True, exist_ok=True)
-        write_private(d / "keys.json", json.dumps({"space": space, "keys": keys_to_json(k)}))
+    dir_a.mkdir(parents=True, exist_ok=True)
+    write_private(dir_a / "keys.json", json.dumps({"space": space, "keys": keys_to_json(ka)}))
     sf.install_setup(str(dir_a / "engine"), sf.SpaceRef(**space), ka, setup.envelopes)
     return setup.recovery_key
+
+
+# How long an enrollment waits between two reads of the session.
+POLL_SECONDS = 0.2
+
+
+class Answer(Protocol):
+    """Asks the user whether the code on the other device matches."""
+
+    def __call__(self, code: str) -> bool:
+        """Return True if the user confirms that `code` matches."""
+        ...
+
+
+class Say(Protocol):
+    """Shows one line to the user."""
+
+    def __call__(self, line: str) -> None:
+        """Show `line`."""
+        ...
+
+
+def _ended(state: sf.EnrollState) -> bool:
+    return isinstance(state, (sf.EnrollState.DONE, sf.EnrollState.FAILED))
+
+
+def _cause(state: sf.EnrollState) -> str:
+    return state.cause if isinstance(state, sf.EnrollState.FAILED) else ""
+
+
+def invite(
+    dev: Device,
+    send: Transport,
+    answer: Answer,
+    say: Say,
+    scanned: str | None = None,
+    recovery_key: str | None = None,
+) -> str:
+    """Enroll a new device from this trusted device ([ENR-1] to [ENR-8]).
+
+    If `scanned` is None, this device shows the session: `say` gets the QR
+    payload and the typed code. Otherwise `scanned` is the payload or the
+    typed code that the new device shows. If the user gives the recovery
+    key, it signs the grant.
+
+    Returns:
+        An empty string on success, or the cause of the failure.
+    """
+    t = sf.TrustedEnrollment(dev.engine, scanned, recovery_key)
+    shown = scanned is not None
+    while not _ended(state := t.state()):
+        # The payload exists once the relay opened the session.
+        if not shown and (payload := t.payload()) is not None:
+            say(f"payload: {payload}")
+            say(f"code: {t.code()}")
+            shown = True
+        if isinstance(state, sf.EnrollState.COMPARE):
+            t.confirm(answer(state.code))
+            continue
+        if isinstance(state, sf.EnrollState.CONFIRM_AGAIN):
+            t.confirm(answer("the device list changed: confirm the new device again"))
+            continue
+        req = t.next_request()
+        if req is None:
+            break
+        t.handle_response(*send(req))
+        if isinstance(t.state(), sf.EnrollState.WAITING):
+            time.sleep(POLL_SECONDS)
+    return _cause(t.state())
+
+
+def join(
+    data_dir: Path,
+    relay_url: str,
+    name: str,
+    send: Transport,
+    answer: Answer,
+    say: Say,
+    scanned: str | None = None,
+) -> str:
+    """Join a space as a new device ([ENR-1] to [ENR-9]).
+
+    The function makes the device keys. If `scanned` is None, this device
+    shows the session: `say` gets the QR payload and the typed code.
+    After the enrollment it writes the key file and the engine state, and
+    the first sync checks the log up to the checkpoint before it uploads
+    anything.
+
+    Returns:
+        An empty string on success, or the cause of the failure.
+    """
+    keys = sf.new_device_keys()
+    n = sf.NewEnrollment(relay_url, keys, name, scanned)
+    if (payload := n.payload()) is not None:
+        say(f"payload: {payload}")
+        say(f"code: {n.code()}")
+    while not _ended(state := n.state()):
+        if isinstance(state, sf.EnrollState.COMPARE):
+            n.confirm(answer(state.code))
+            continue
+        req = n.next_request()
+        if req is None:
+            break
+        status, _, body = send(req)
+        n.handle_response(status, body)
+        if isinstance(n.state(), sf.EnrollState.WAITING):
+            time.sleep(POLL_SECONDS)
+    joined = n.joined()
+    if joined is None:
+        return _cause(n.state()) or "the enrollment ended with no result"
+    space = {
+        "relay_url": n.relay_url(),
+        "tenant": joined.tenant,
+        "log_id": joined.log_id,
+        "app_id": APP_ID,
+    }
+    data_dir.mkdir(parents=True, exist_ok=True)
+    write_private(data_dir / "keys.json", json.dumps({"space": space, "keys": keys_to_json(keys)}))
+    sf.install_enrollment(str(data_dir / "engine"), sf.SpaceRef(**space), keys, joined)
+    return ""
 
 
 def _no_crash(_name: str) -> None:
@@ -322,9 +436,24 @@ class Device:
             status, headers, body = send(req)
             exchange.handle_response(status, headers, body)
         self.repairs = self.engine.take_repairs()
+        self.keep_app_key()
         self.pull()
         self.flush_outbox()
         return self.engine.status()
+
+    def keep_app_key(self) -> None:
+        """Write the app key to the key file once the engine has it.
+
+        A new device gets the app key from its grant after the first sync
+        checks the enrollment checkpoint ([ENR-9]). The app keeps it in its
+        key store, as DESIGN.md "App integration" requires.
+        """
+        path = self.dir / "keys.json"
+        cfg = json.loads(path.read_text())
+        key = self.engine.app_key()
+        if key is not None and bytes.fromhex(cfg["keys"]["app_key"]) != key:
+            cfg["keys"]["app_key"] = key.hex()
+            write_private(path, json.dumps(cfg))
 
     def pull(self) -> int:
         """Apply the changes after the applied position ([DLV-10], [DLV-11]).

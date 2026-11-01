@@ -69,24 +69,59 @@ def exchange(relay: Relay, engine: sf.Engine) -> None:
         sync.handle_response(status, headers, body)
 
 
+def enroll(
+    relay: Relay, a: sf.Engine, kb: sf.DeviceKeys, answers: tuple[bool, bool]
+) -> tuple[sf.TrustedEnrollment, sf.NewEnrollment]:
+    """Run an enrollment of new keys `kb` with A: A shows the session.
+
+    Each device answers the code comparison with its value of `answers`.
+    """
+    t = sf.TrustedEnrollment(a, None, None)
+    assert t.payload() is None  # shown only after the open
+    req = t.next_request()
+    assert req is not None
+    t.handle_response(*relay.send(req.method, req.url, req.headers, req.body))
+    n = sf.NewEnrollment(relay.url, kb, "B", t.payload())
+
+    def ended(s: sf.EnrollState) -> bool:
+        return isinstance(s, (sf.EnrollState.DONE, sf.EnrollState.FAILED))
+
+    for _ in range(400):
+        if ended(t.state()) and ended(n.state()):
+            return t, n
+        if isinstance(t.state(), sf.EnrollState.COMPARE):
+            t.confirm(answers[0])
+        if isinstance(n.state(), sf.EnrollState.COMPARE):
+            n.confirm(answers[1])
+        if (req := t.next_request()) is not None:
+            t.handle_response(*relay.send(req.method, req.url, req.headers, req.body))
+        if (req := n.next_request()) is not None:
+            status, _, body = relay.send(req.method, req.url, req.headers, req.body)
+            n.handle_response(status, body)
+    pytest.fail("the enrollment does not end")
+
+
 def test_change_from_a_reaches_b(relay: Relay, tmp_path: Path) -> None:
-    """A change by device A reaches device B once, and A does not get it back."""
+    """B joins through an enrollment with A ([ENR-1] to [ENR-9]). A change by
+    device A reaches device B once, and A does not get it back."""
     ka = sf.new_device_keys()
     kb = sf.new_device_keys()
-    setup = sf.create_space(
-        APP, sf.NewDevice(keys=ka, name="A"), [sf.NewDevice(keys=kb, name="B")]
-    )
+    setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
-    kb.app_key = setup.app_key
     space = sf.SpaceRef(
         relay_url=relay.url, tenant=relay.tenant, log_id=setup.log_id, app_id=APP
     )
     sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes)
     a = sf.Engine.open(str(tmp_path / "a"), space, ka)
-    b = sf.Engine.open(str(tmp_path / "b"), space, kb)
-
     exchange(relay, a)
     assert a.status() == sf.Status.OK()
+    t, n = enroll(relay, a, kb, (True, True))
+    assert (t.state(), n.state()) == (sf.EnrollState.DONE(), sf.EnrollState.DONE())
+    joined = n.joined()
+    assert joined is not None and joined.position == 2
+    sf.install_enrollment(str(tmp_path / "b"), space, kb, joined)
+    b = sf.Engine.open(str(tmp_path / "b"), space, kb)
+    assert b.app_key() is None
     cid = a.new_change_id()
     result = a.enqueue_many([sf.OutboxRow(change_id=cid, change_bytes=b"rename")])
     assert (result.stored, result.refused) == ([cid], [])
@@ -94,6 +129,7 @@ def test_change_from_a_reaches_b(relay: Relay, tmp_path: Path) -> None:
     assert a.outbox_len() == 0
     exchange(relay, b)
     assert b.status() == sf.Status.OK()
+    assert b.app_key() == setup.app_key
 
     got = b.changes_after(b.genesis_base(), 500)
     assert [(c.position, c.change_id, c.change_bytes) for c in got] == [
@@ -109,7 +145,7 @@ def test_change_from_a_reaches_b(relay: Relay, tmp_path: Path) -> None:
 def test_wrong_authority_is_paused(relay: Relay, tmp_path: Path) -> None:
     """An engine that signs another authority reports `paused: relay authority`."""
     ka = sf.new_device_keys()
-    setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"), [])
+    setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
     url = relay.url.replace("127.0.0.1", "localhost")
     space = sf.SpaceRef(
@@ -124,7 +160,7 @@ def test_wrong_authority_is_paused(relay: Relay, tmp_path: Path) -> None:
 def test_relay_down_is_unavailable(tmp_path: Path) -> None:
     """A connection failure is the app's error. A 503 is `relay unavailable`."""
     ka = sf.new_device_keys()
-    setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"), [])
+    setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
     space = sf.SpaceRef(
         relay_url="https://r.example",
@@ -146,16 +182,15 @@ def test_hold_and_repair_cross_the_binding(relay: Relay, tmp_path: Path) -> None
     ends before the verified head gives a repair session. The repair reaches
     the app through `take_repairs` (S6, [LOG-10], [LOG-14])."""
     ka = sf.new_device_keys()
-    kb = sf.new_device_keys()
-    setup = sf.create_space(
-        APP, sf.NewDevice(keys=ka, name="A"), [sf.NewDevice(keys=kb, name="B")]
-    )
+    setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
     space = sf.SpaceRef(
         relay_url=relay.url, tenant=relay.tenant, log_id=setup.log_id, app_id=APP
     )
     sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes)
     a = sf.Engine.open(str(tmp_path / "a"), space, ka)
+    exchange(relay, a)
+    a.enqueue_many([sf.OutboxRow(change_id=a.new_change_id(), change_bytes=b"x")])
     exchange(relay, a)
     assert a.verified_head().position == 2
     assert a.take_repairs() == []
@@ -195,3 +230,23 @@ def test_hold_and_repair_cross_the_binding(relay: Relay, tmp_path: Path) -> None
     assert req is not None and req.url.endswith("/status")
     sync.handle_response(200, [], b'{"hold":true}')
     assert a.status() == sf.Status.RESTORE_HOLD()
+
+
+def test_code_mismatch_appends_no_grant(relay: Relay, tmp_path: Path) -> None:
+    """A code mismatch on the new device ends both sides, and A appends no
+    grant ([ENR-7])."""
+    ka = sf.new_device_keys()
+    setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
+    ka.app_key = setup.app_key
+    space = sf.SpaceRef(
+        relay_url=relay.url, tenant=relay.tenant, log_id=setup.log_id, app_id=APP
+    )
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes)
+    a = sf.Engine.open(str(tmp_path / "a"), space, ka)
+    exchange(relay, a)
+    t, n = enroll(relay, a, sf.new_device_keys(), (True, False))
+    assert isinstance(t.state(), sf.EnrollState.FAILED)
+    assert isinstance(n.state(), sf.EnrollState.FAILED)
+    assert n.joined() is None
+    exchange(relay, a)
+    assert a.verified_head().position == 1

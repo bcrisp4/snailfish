@@ -172,19 +172,74 @@ final class VectorTests: XCTestCase {
         }
     }
 
+    func testEnrollmentVectors() throws {
+        let v = try dict(loadVector("enroll.json"))
+        for c in try list(v["codes"]) {
+            let session = try enrollParseCode(text: str(c["display"]))
+            XCTAssertEqual(try enrollDisplay(session: session), try str(c["display"]))
+            let p = try enrollParsePayload(text: str(c["payload_t"]))
+            XCTAssertEqual(p.role, "t")
+            XCTAssertEqual(p.session, session)
+        }
+        for c in try list(dict(v["typed"])["invalid"]) {
+            let name = try str(c["name"])
+            XCTAssertThrowsError(try enrollParseCode(text: str(c["text"])), name)
+        }
+        for c in try list(dict(v["payloads"])["invalid"]) {
+            let name = try str(c["name"])
+            XCTAssertThrowsError(try enrollParsePayload(text: str(c["text"])), name)
+        }
+        var transcripts: [String: [String: Any]] = [:]
+        for t in try list(v["transcripts"]) {
+            transcripts[try str(t["name"])] = t
+            let session = try hex(String(try str(t["session"]).dropFirst(2)))
+            let c = try enrollCommitment(
+                session: session, tId: str(t["t_id"]), nId: str(t["n_id"]), tNonce: hex(t["t_nonce"]))
+            XCTAssertEqual(toHex(c), try str(t["commitment"]))
+            XCTAssertEqual(
+                try enrollCode(
+                    session: session, tId: str(t["t_id"]), nId: str(t["n_id"]), tNonce: hex(t["t_nonce"]),
+                    nNonce: hex(t["n_nonce"])),
+                try str(t["code"]))
+        }
+        for c in try list(v["confirmations"]) {
+            let t = try XCTUnwrap(transcripts[try str(c["transcript"])])
+            let check = {
+                try enrollCheckConfirm(
+                    envelopeJson: Data(try str(c["envelope"]).utf8),
+                    session: try hex(String(try str(t["session"]).dropFirst(2))),
+                    tId: try str(t["t_id"]), newDevice: Data(try str(t["new_device"]).utf8),
+                    tNonce: try hex(t["t_nonce"]), nNonce: try hex(t["n_nonce"]))
+            }
+            let name = try str(c["name"])
+            if (c["valid"] as? Bool) == true {
+                XCTAssertNoThrow(try check(), name)
+            } else {
+                XCTAssertThrowsError(try check(), name)
+            }
+        }
+    }
+
     func testEngineThroughTheBinding() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }
         var ka = try newDeviceKeys()
         let kb = try newDeviceKeys()
         XCTAssertEqual([ka.signSeed.count, ka.sealSeed.count, ka.appKey.count], [32, 32, 32])
-        let setup = try createSpace(
-            appId: "com.example.tasks",
-            first: NewDevice(keys: ka, name: "A"),
-            others: [NewDevice(keys: kb, name: "B")])
-        XCTAssertEqual(setup.envelopes.count, 2)
+        let setup = try createSpace(appId: "com.example.tasks", first: NewDevice(keys: ka, name: "A"))
+        XCTAssertEqual(setup.envelopes.count, 1)
         XCTAssertEqual(try parseEnvelope(text: Data(setup.envelopes[0].utf8)).payloadType, "snailfish.genesis.v1")
-        XCTAssertEqual(try parseEnvelope(text: Data(setup.envelopes[1].utf8)).payloadType, "snailfish.grant.v1")
+        // A new device shows the session: its payload names role n.
+        let enrollment = try NewEnrollment(relayUrl: "https://r.example", keys: kb, name: "B", scanned: nil)
+        let payload = try XCTUnwrap(try enrollment.payload())
+        XCTAssertEqual(try enrollParsePayload(text: payload).role, "n")
+        XCTAssertEqual(try enrollment.state(), .busy)
+        let hello = try XCTUnwrap(try enrollment.nextRequest())
+        XCTAssertEqual(hello.method, "POST")
+        XCTAssertTrue(hello.url.hasPrefix("https://r.example/v1/e/e_"))
+        try enrollment.handleResponse(status: 404, body: Data(#"{"error":"unknown_session","message":""}"#.utf8))
+        XCTAssertEqual(try enrollment.state(), .waiting)
+        XCTAssertNil(try enrollment.joined())
         XCTAssertEqual(try recoveryParse(text: setup.recoveryKey).count, 16)
         ka.appKey = setup.appKey
         let space = SpaceRef(

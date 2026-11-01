@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use snailfish_engine::codec;
-pub use snailfish_engine::codec::{Envelope, KeySetInfo, PayloadClass, PayloadInfo};
+pub use snailfish_engine::codec::{EnrollPayload, Envelope, KeySetInfo, PayloadClass, PayloadInfo};
+pub use snailfish_engine::enroll::EnrollState;
 pub use snailfish_engine::{EnqueueResult, Header, OutboxRow, Repair, Request, SpaceRef, Status};
 
 uniffi::setup_scaffolding!("snailfish");
@@ -116,9 +117,29 @@ pub enum Status {
     RelayUnavailable,
     RelayAuthority,
     RestoreHold,
+    RepairNeedsAnotherDevice,
     RelayTooOld,
     ClockSkew,
     Fork { cause: String },
+}
+
+/// A QR payload of an enrollment (`PROTOCOL.md` 11.1).
+#[uniffi::remote(Record)]
+pub struct EnrollPayload {
+    pub role: String,
+    pub relay_url: String,
+    pub session: Vec<u8>,
+}
+
+/// The state of an enrollment (DESIGN.md "Enrollment").
+#[uniffi::remote(Enum)]
+pub enum EnrollState {
+    Waiting,
+    Compare { code: String },
+    ConfirmAgain,
+    Busy,
+    Done,
+    Failed { cause: String },
 }
 
 /// A repair of the relay log that the engine made (S6).
@@ -224,7 +245,7 @@ pub struct Change {
     pub change_bytes: Vec<u8>,
 }
 
-/// A new space from key files on one machine (M2 setup).
+/// A new space with its first device.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SpaceSetup {
     /// The log ID text.
@@ -233,7 +254,7 @@ pub struct SpaceSetup {
     pub recovery_key: String,
     /// The 32-byte app key of epoch 1.
     pub app_key: Vec<u8>,
-    /// The genesis envelope, then the grant envelopes.
+    /// The genesis envelope.
     pub envelopes: Vec<String>,
 }
 
@@ -272,16 +293,15 @@ pub fn new_device_keys() -> Result<DeviceKeys> {
     ))
 }
 
-/// Make a new space: the genesis record with the first device and a grant
-/// to each other device.
+/// Make a new space: the genesis record with the first device. Each other
+/// device joins through enrollment.
 ///
 /// # Errors
 ///
 /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
 #[uniffi::export]
-pub fn create_space(app_id: &str, first: &NewDevice, others: &[NewDevice]) -> Result<SpaceSetup> {
-    let others = others.iter().map(new_device).collect::<Result<Vec<_>>>()?;
-    let s = snailfish_engine::setup::create_space(app_id, &new_device(first)?, &others)?;
+pub fn create_space(app_id: &str, first: &NewDevice) -> Result<SpaceSetup> {
+    let s = snailfish_engine::setup::create_space(app_id, &new_device(first)?)?;
     Ok(SpaceSetup {
         log_id: s.log_id,
         recovery_key: s.recovery_key,
@@ -307,6 +327,70 @@ pub fn install_setup(
         space,
         &keys.to_engine()?,
         envelopes,
+    )?)
+}
+
+/// The result of an enrollment on the new device.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Joined {
+    /// The tenant handle.
+    pub tenant: String,
+    /// The log ID text.
+    pub log_id: String,
+    /// The checkpoint position.
+    pub position: u64,
+    /// The 32-byte checkpoint digest.
+    pub digest: Vec<u8>,
+    /// The device ID of the trusted device.
+    pub trusted: String,
+    /// The device object of the new device, as JSON.
+    pub device: String,
+}
+
+impl Joined {
+    fn to_engine(&self) -> Result<snailfish_engine::enroll::Joined> {
+        Ok(snailfish_engine::enroll::Joined {
+            tenant: self.tenant.clone(),
+            log_id: self.log_id.clone(),
+            position: self.position,
+            digest: bytes32(&self.digest, "digest")?,
+            trusted: self.trusted.clone(),
+            device: self.device.clone(),
+        })
+    }
+
+    fn from_engine(j: &snailfish_engine::enroll::Joined) -> Self {
+        Self {
+            tenant: j.tenant.clone(),
+            log_id: j.log_id.clone(),
+            position: j.position,
+            digest: j.digest.to_vec(),
+            trusted: j.trusted.clone(),
+            device: j.device.clone(),
+        }
+    }
+}
+
+/// Create the engine state of a new device after its enrollment. Its
+/// syncs upload nothing until the log passes the checkpoint check
+/// ([ENR-9]).
+///
+/// # Errors
+///
+/// As [`Engine::open`], and [`SnailfishError::Invalid`] if the space does
+/// not match `joined`.
+#[uniffi::export]
+pub fn install_enrollment(
+    data_dir: &str,
+    space: SpaceRef,
+    keys: &DeviceKeys,
+    joined: &Joined,
+) -> Result<()> {
+    Ok(snailfish_engine::setup::install_enrollment(
+        &PathBuf::from(data_dir),
+        space,
+        &keys.to_engine()?,
+        &joined.to_engine()?,
     )?)
 }
 
@@ -545,6 +629,93 @@ pub fn recovery_display(secret: &[u8]) -> Result<String> {
     Ok(codec::recovery_display(secret)?)
 }
 
+/// The typed code of a session ID (`PROTOCOL.md` 11.1).
+///
+/// # Errors
+///
+/// [`SnailfishError::Invalid`].
+#[uniffi::export]
+pub fn enroll_display(session: &[u8]) -> Result<String> {
+    Ok(codec::enroll_display(session)?)
+}
+
+/// Read a typed code (`PROTOCOL.md` 11.1).
+///
+/// # Errors
+///
+/// [`SnailfishError::Invalid`].
+#[uniffi::export]
+pub fn enroll_parse_code(text: &str) -> Result<Vec<u8>> {
+    Ok(codec::enroll_parse_code(text)?)
+}
+
+/// Read a QR payload (`PROTOCOL.md` 11.1).
+///
+/// # Errors
+///
+/// [`SnailfishError::Invalid`].
+#[uniffi::export]
+pub fn enroll_parse_payload(text: &str) -> Result<EnrollPayload> {
+    Ok(codec::enroll_parse_payload(text)?)
+}
+
+/// The commitment of the trusted device (`PROTOCOL.md` 11.2).
+///
+/// # Errors
+///
+/// [`SnailfishError::Invalid`].
+#[uniffi::export]
+pub fn enroll_commitment(
+    session: &[u8],
+    t_id: &str,
+    n_id: &str,
+    t_nonce: &[u8],
+) -> Result<Vec<u8>> {
+    Ok(codec::enroll_commitment(session, t_id, n_id, t_nonce)?)
+}
+
+/// The 6-digit code of a transcript (`PROTOCOL.md` 11.2).
+///
+/// # Errors
+///
+/// [`SnailfishError::Invalid`].
+#[uniffi::export]
+pub fn enroll_code(
+    session: &[u8],
+    t_id: &str,
+    n_id: &str,
+    t_nonce: &[u8],
+    n_nonce: &[u8],
+) -> Result<String> {
+    Ok(codec::enroll_code(session, t_id, n_id, t_nonce, n_nonce)?)
+}
+
+/// Check a confirmation for a transcript, as the trusted device does
+/// (`PROTOCOL.md` 11.2).
+///
+/// # Errors
+///
+/// [`SnailfishError::Invalid`] for a confirmation that the trusted device
+/// refuses.
+#[uniffi::export]
+pub fn enroll_check_confirm(
+    envelope_json: &[u8],
+    session: &[u8],
+    t_id: &str,
+    new_device: &[u8],
+    t_nonce: &[u8],
+    n_nonce: &[u8],
+) -> Result<()> {
+    Ok(codec::enroll_check_confirm(
+        envelope_json,
+        session,
+        t_id,
+        new_device,
+        t_nonce,
+        n_nonce,
+    )?)
+}
+
 /// The Ed25519 seed and the X-Wing seed of a recovery secret.
 ///
 /// # Errors
@@ -699,6 +870,49 @@ impl Engine {
         ))
     }
 
+    /// The app key of epoch 1, if the engine has it. A new device has it
+    /// after its sync checks the enrollment checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn app_key(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .app_key()
+            .map(|k| k.to_vec()))
+    }
+
+    /// The grants that wait for the user to confirm them again ([LOG-7]).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn grants_to_confirm(&self) -> Result<Vec<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .grants_to_confirm()?)
+    }
+
+    /// Confirm again a grant that waits ([LOG-7]). A grant by the recovery
+    /// key needs the recovery key.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
+    #[allow(clippy::needless_pass_by_value)] // UniFFI has no `Option<&str>` argument: it passes an optional string by value.
+    pub fn confirm_grant(&self, device_id: &str, recovery_key: Option<String>) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .confirm_grant(device_id, recovery_key.as_deref())?)
+    }
+
     /// Start one exchange with the relay.
     ///
     /// # Errors
@@ -740,5 +954,223 @@ impl Sync {
         let mut engine = self.engine.inner.lock().map_err(|_| poisoned())?;
         let mut sync = self.inner.lock().map_err(|_| poisoned())?;
         Ok(sync.handle_response(&mut engine, status, headers, body)?)
+    }
+}
+
+/// The enrollment on a trusted device (DESIGN.md "Enrollment").
+#[derive(uniffi::Object)]
+pub struct TrustedEnrollment {
+    engine: std::sync::Arc<Engine>,
+    inner: Mutex<snailfish_engine::enroll::TrustedEnrollment>,
+}
+
+#[uniffi::export]
+impl TrustedEnrollment {
+    /// Start an enrollment. `scanned` is the payload or the typed code of
+    /// the new device, or `None` if this device shows the session. A
+    /// recovery key, if given, signs the grant.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
+    #[uniffi::constructor]
+    #[allow(clippy::needless_pass_by_value)] // UniFFI has no `Option<&str>` argument: it passes an optional string by value.
+    pub fn new(
+        engine: std::sync::Arc<Engine>,
+        scanned: Option<String>,
+        recovery_key: Option<String>,
+    ) -> Result<Self> {
+        let inner = {
+            let e = engine.inner.lock().map_err(|_| poisoned())?;
+            snailfish_engine::enroll::TrustedEnrollment::new(
+                &e,
+                scanned.as_deref(),
+                recovery_key.as_deref(),
+            )?
+        };
+        Ok(Self {
+            engine,
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// The QR payload to show, if this device shows the session, after the
+    /// relay opened it.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn payload(&self) -> Result<Option<String>> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.payload())
+    }
+
+    /// The typed code of the session, after the relay opened it if this
+    /// device shows it.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn code(&self) -> Result<Option<String>> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.code())
+    }
+
+    /// The current state.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn state(&self) -> Result<EnrollState> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.state())
+    }
+
+    /// The answer of the user to a comparison or a new confirmation.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
+    pub fn confirm(&self, yes: bool) -> Result<()> {
+        let mut engine = self.engine.inner.lock().map_err(|_| poisoned())?;
+        let mut t = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(t.confirm(&mut engine, yes)?)
+    }
+
+    /// The next request, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn next_request(&self) -> Result<Option<Request>> {
+        let mut engine = self.engine.inner.lock().map_err(|_| poisoned())?;
+        let mut t = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(t.next_request(&mut engine)?)
+    }
+
+    /// Read the response to the last request.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn handle_response(&self, status: u16, headers: &[Header], body: &[u8]) -> Result<()> {
+        // Lock order: the engine, then the enrollment, as in `Sync`.
+        let mut engine = self.engine.inner.lock().map_err(|_| poisoned())?;
+        let mut t = self.inner.lock().map_err(|_| poisoned())?;
+        Ok(t.handle_response(&mut engine, status, headers, body)?)
+    }
+}
+
+/// The enrollment on a new device (DESIGN.md "Enrollment").
+#[derive(uniffi::Object)]
+pub struct NewEnrollment {
+    inner: Mutex<snailfish_engine::enroll::NewEnrollment>,
+}
+
+#[uniffi::export]
+impl NewEnrollment {
+    /// Start an enrollment with the device keys and name. `scanned` is the
+    /// payload or the typed code of the trusted device, or `None` if this
+    /// device shows the session.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
+    #[uniffi::constructor]
+    #[allow(clippy::needless_pass_by_value)] // UniFFI has no `Option<&str>` argument: it passes an optional string by value.
+    pub fn new(
+        relay_url: &str,
+        keys: &DeviceKeys,
+        name: &str,
+        scanned: Option<String>,
+    ) -> Result<Self> {
+        let inner = snailfish_engine::enroll::NewEnrollment::new(
+            relay_url,
+            &keys.to_engine()?,
+            name,
+            scanned.as_deref(),
+        )?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// The QR payload to show, if this device shows the session.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn payload(&self) -> Result<Option<String>> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.payload())
+    }
+
+    /// The typed code of the session.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn code(&self) -> Result<String> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.code())
+    }
+
+    /// The relay URL of the session.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn relay_url(&self) -> Result<String> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.relay_url())
+    }
+
+    /// The current state.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn state(&self) -> Result<EnrollState> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.state())
+    }
+
+    /// The result, after `Done`.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn joined(&self) -> Result<Option<Joined>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .joined()
+            .as_ref()
+            .map(Joined::from_engine))
+    }
+
+    /// The answer of the user to the comparison.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
+    pub fn confirm(&self, yes: bool) -> Result<()> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.confirm(yes)?)
+    }
+
+    /// The next request, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn next_request(&self) -> Result<Option<Request>> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.next_request())
+    }
+
+    /// Read the response to the last request.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn handle_response(&self, status: u16, body: &[u8]) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .handle_response(status, body)?)
     }
 }

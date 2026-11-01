@@ -10,6 +10,7 @@
 //! the keys at [`Engine::open`] from its key store.
 
 pub mod codec;
+pub mod enroll;
 pub mod setup;
 mod state;
 mod sync;
@@ -27,7 +28,7 @@ use snailfish_protocol::sig::SecretKey;
 pub use sync::Sync;
 
 /// The schema version of the engine state file ([VER-14]).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The protocol levels that this engine can write ([VER-6]).
 pub const MAX_LEVEL: u64 = 1;
@@ -121,6 +122,11 @@ pub enum Status {
     /// the relay refuses changes until the user or the operator ends the
     /// hold ([LOG-14]). The engine keeps each change in its outbox.
     RestoreHold,
+    /// `paused: repair needs another device`: the grant of this device is
+    /// only in the range that the relay lost, and the relay head is not the
+    /// position before the grant ([LOG-12]). A device that is active in the
+    /// relay log must repair it.
+    RepairNeedsAnotherDevice,
     /// `stopped: relay too old` ([VER-11]).
     RelayTooOld,
     /// `stopped: clock skew`: the relay refused a request as expired after
@@ -165,7 +171,9 @@ pub struct DeviceKeys {
     pub sign_seed: [u8; 32],
     /// The X-Wing seed.
     pub seal_seed: [u8; 32],
-    /// The app key of epoch 1.
+    /// The app key of epoch 1. All zero if the app does not know it yet,
+    /// for example on a new device: the engine then opens it from the key
+    /// set of its grant in the verified log.
     pub app_key: [u8; 32],
 }
 
@@ -249,7 +257,10 @@ pub struct Engine {
     log_id: [u8; 16],
     device_id: Hash32,
     sign: SecretKey,
-    app_key: [u8; 32],
+    seal_seed: [u8; 32],
+    // `None` until the engine has the app key: a new device opens it from
+    // its grant after the checkpoint check ([ENR-9]).
+    app_key: Option<[u8; 32]>,
     status: Status,
     // Seconds to add to the device clock: relay time - device time ([WIR-7]).
     clock_offset: i64,
@@ -262,7 +273,7 @@ pub struct Engine {
 /// Check a relay URL and remove one trailing `/`. The relay routes only
 /// `/v1/...` and the signature covers the path as sent, so a URL with a path
 /// prefix can never reach it (`PROTOCOL.md` 8.3).
-fn relay_base(url: &str) -> Result<String, EngineError> {
+pub(crate) fn relay_base(url: &str) -> Result<String, EngineError> {
     let bad = || {
         EngineError::Invalid("relay URL: use http:// or https:// and the host, with no path".into())
     };
@@ -277,7 +288,7 @@ fn relay_base(url: &str) -> Result<String, EngineError> {
     Ok(url.strip_suffix('/').unwrap_or(url).to_owned())
 }
 
-fn system_time() -> u64 {
+pub(crate) fn system_time() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -320,18 +331,83 @@ impl Engine {
         state::open(&db, &log_id, &device_id)?;
         let mut space = space;
         space.relay_url = relay_base(&space.relay_url)?;
-        Ok(Self {
+        let mut e = Self {
             db,
             space,
             log_id,
             device_id,
             sign,
-            app_key: keys.app_key,
+            seal_seed: keys.seal_seed,
+            app_key: (keys.app_key != [0; 32]).then_some(keys.app_key),
             status: Status::Ok,
             clock_offset: 0,
             clock: system_time,
             _lock: lock,
-        })
+        };
+        if e.app_key.is_none() && state::checkpoint(&e.db)?.is_none() {
+            e.app_key = e.open_app_key()?;
+        }
+        Ok(e)
+    }
+
+    /// The app key of epoch 1, if the engine has it. A new device has it
+    /// after its sync checks the enrollment checkpoint ([ENR-9]). The app
+    /// can keep it in its key store.
+    #[must_use]
+    pub fn app_key(&self) -> Option<[u8; 32]> {
+        self.app_key
+    }
+
+    /// Open the app key of epoch 1 from the key set to this device in its
+    /// genesis record or grant, and check it against the commitment of the
+    /// genesis record (`PROTOCOL.md` 7.3). `None` if the verified log does
+    /// not name this device yet.
+    fn open_app_key(&self) -> Result<Option<[u8; 32]>, EngineError> {
+        use snailfish_protocol::records::{Author, Body};
+        let Some((_, json)) = state::activation(&self.db, &self.device_id)? else {
+            return Ok(None);
+        };
+        let bad = |m: &str| EngineError::Storage(format!("own key set: {m}"));
+        let env = snailfish_protocol::envelope::Envelope::parse(json.as_bytes())
+            .map_err(|e| bad(&e.to_string()))?;
+        let r = snailfish_protocol::records::parse_payload(&env.payload_type, &env.payload)
+            .map_err(|e| bad(&e.to_string()))?;
+        let (Body::Genesis { keys, .. } | Body::Grant { keys, .. }) = &r.body else {
+            return Err(bad("not a genesis record or a grant"));
+        };
+        let set = keys
+            .iter()
+            .find(|k| k.to == Author::Device(self.device_id))
+            .ok_or_else(|| bad("no key set to this device"))?;
+        let opened = snailfish_protocol::keys::open_key_set(
+            &self.seal_seed,
+            &self.log_id,
+            &self.device_id,
+            &set.epochs,
+            &set.sealed,
+        )
+        .map_err(|e| bad(&e.to_string()))?;
+        let key = *set
+            .epochs
+            .iter()
+            .zip(&opened)
+            .find(|(e, _)| **e == 1)
+            .map(|(_, k)| k)
+            .ok_or_else(|| bad("no key of epoch 1"))?;
+        let Some((_, genesis)) = state::log_range(&self.db, 1, 1)?.into_iter().next() else {
+            return Err(bad("no genesis record"));
+        };
+        let g = snailfish_protocol::envelope::Envelope::parse(genesis.as_bytes())
+            .map_err(|e| bad(&e.to_string()))?;
+        let gr = snailfish_protocol::records::parse_payload(&g.payload_type, &g.payload)
+            .map_err(|e| bad(&e.to_string()))?;
+        let Body::Genesis { commitment, .. } = gr.body else {
+            return Err(bad("position 1 is not a genesis record"));
+        };
+        if snailfish_protocol::keys::key_commitment(&self.log_id, 1, &key) != commitment {
+            return Err(bad("the key does not match the commitment of epoch 1"));
+        }
+        Ok(Some(key))
     }
 
     /// Replace the device clock, for tests of the clock correction.
@@ -391,6 +467,14 @@ impl Engine {
             return Err(EngineError::Invalid(format!(
                 "enqueue_many takes at most {MAX_ENQUEUE} rows"
             )));
+        }
+        // An app calls this at each startup ([DLV-2]), also on a new device
+        // that has no app key yet. With no row there is nothing to encrypt.
+        if rows.is_empty() {
+            return Ok(EnqueueResult {
+                stored: Vec::new(),
+                refused: Vec::new(),
+            });
         }
         state::enqueue(self, rows)
     }

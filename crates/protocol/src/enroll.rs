@@ -412,6 +412,35 @@ mod tests {
         );
     }
 
+    /// [ENR-8], `specs/enrollment/cp_unsigned.pv`: the new device accepts
+    /// only a checkpoint by the trusted device of the transcript, with a
+    /// valid signature and the checkpoint payload type.
+    #[test]
+    fn checkpoint_check_refuses_other_signers_and_types() {
+        use crate::sig::SecretKey;
+        let t = SecretKey::from_seed(&[1; 32]);
+        let t_id = [2; 32];
+        let at = Position {
+            position: 4,
+            digest: [3; 32],
+        };
+        let p = crate::write::checkpoint(&[5; 16], &t_id, &at);
+        let ty = "snailfish.checkpoint.v1";
+        let env = |key: &SecretKey, ty: &str| Envelope {
+            payload_type: ty.into(),
+            payload: p.clone(),
+            sig: key.sign_record(ty, &p),
+        };
+        assert_eq!(
+            check_checkpoint(&env(&t, ty), &t_id, &t.public()),
+            Ok(([5; 16], at))
+        );
+        let other = SecretKey::from_seed(&[9; 32]);
+        assert!(check_checkpoint(&env(&other, ty), &t_id, &t.public()).is_err());
+        assert!(check_checkpoint(&env(&t, ty), &[7; 32], &t.public()).is_err());
+        assert!(check_checkpoint(&env(&t, "snailfish.delete.v1"), &t_id, &t.public()).is_err());
+    }
+
     proptest! {
         #[test]
         fn code_round_trip(session in any::<[u8; 16]>()) {

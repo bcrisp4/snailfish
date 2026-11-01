@@ -242,9 +242,65 @@ fn exchange(relay: &snailfish_relay::core::Relay, engine: &std::sync::Arc<snailf
     }
 }
 
-/// The engine object through the binding: setup, the directory lock, a
-/// change from A to B through the real relay core, and the status
-/// variants. A marshalling fault in any record fails here.
+/// One request to the relay core, as the host app sends it.
+fn send(
+    relay: &snailfish_relay::core::Relay,
+    req: snailfish::Request,
+) -> (u16, Vec<snailfish::Header>, Vec<u8>) {
+    let url = req.url.strip_prefix("https://sync.example.net").unwrap();
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let resp = relay.handle(&snailfish_relay::core::Request {
+        method: req.method,
+        path: path.into(),
+        query: query.into(),
+        headers: req.headers.into_iter().map(|h| (h.name, h.value)).collect(),
+        body: req.body,
+    });
+    let time = vec![snailfish::Header {
+        name: "snailfish-time".into(),
+        value: resp.time.to_string(),
+    }];
+    (resp.status, time, resp.body)
+}
+
+/// Run an enrollment through the binding objects until both sides end.
+/// Each side answers the code comparison with its value of `answers`.
+fn drive(
+    relay: &snailfish_relay::core::Relay,
+    t: &snailfish::TrustedEnrollment,
+    n: &snailfish::NewEnrollment,
+    answers: (bool, bool),
+) {
+    use snailfish::EnrollState as S;
+    let end = |s: &S| matches!(s, S::Done | S::Failed { .. });
+    for _ in 0..400 {
+        let (ts, ns) = (t.state().unwrap(), n.state().unwrap());
+        if end(&ts) && end(&ns) {
+            return;
+        }
+        if matches!(ts, S::Compare { .. }) {
+            t.confirm(answers.0).unwrap();
+        }
+        if matches!(ns, S::Compare { .. }) {
+            n.confirm(answers.1).unwrap();
+        }
+        if let Some(req) = t.next_request().unwrap() {
+            let (st, h, b) = send(relay, req);
+            t.handle_response(st, &h, &b).unwrap();
+        }
+        if let Some(req) = n.next_request().unwrap() {
+            let (st, _, b) = send(relay, req);
+            n.handle_response(st, &b).unwrap();
+        }
+    }
+    panic!("the enrollment does not end");
+}
+
+/// The engine object through the binding: setup, the directory lock, an
+/// enrollment of B where B shows the session, a change from A to B
+/// through the real relay core, and the status variants. A marshalling
+/// fault in any record or enrollment state fails here ([ENR-1] to
+/// [ENR-9]).
 #[test]
 fn engine_object_syncs_two_devices() {
     let dir = tempfile::tempdir().unwrap();
@@ -255,32 +311,23 @@ fn engine_object_syncs_two_devices() {
     .unwrap();
     let tenant = relay.add_user("sam").unwrap();
     let mut ka = snailfish::new_device_keys().unwrap();
-    let mut kb = snailfish::new_device_keys().unwrap();
+    let kb = snailfish::new_device_keys().unwrap();
     let dev = |k: &snailfish::DeviceKeys, n: &str| snailfish::NewDevice {
         keys: k.clone(),
         name: n.into(),
     };
-    // The app key of a new device is not read: setup makes it.
-    let mut kb_no_app_key = kb.clone();
-    kb_no_app_key.app_key = vec![];
-    let setup = snailfish::create_space(
-        "com.example.tasks",
-        &dev(&ka, "A"),
-        &[dev(&kb_no_app_key, "B")],
-    )
-    .unwrap();
+    let setup = snailfish::create_space("com.example.tasks", &dev(&ka, "A")).unwrap();
     let short_seed = snailfish::DeviceKeys {
         sign_seed: vec![1; 31],
         ..ka.clone()
     };
     assert!(matches!(
-        snailfish::create_space("com.example.tasks", &dev(&short_seed, "A"), &[]),
+        snailfish::create_space("com.example.tasks", &dev(&short_seed, "A")),
         Err(snailfish::SnailfishError::Invalid { .. })
     ));
-    assert_eq!(setup.envelopes.len(), 2);
+    assert_eq!(setup.envelopes.len(), 1);
     assert!(codec::recovery_parse(&setup.recovery_key).is_ok());
     ka.app_key.clone_from(&setup.app_key);
-    kb.app_key.clone_from(&setup.app_key);
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
@@ -292,21 +339,56 @@ fn engine_object_syncs_two_devices() {
         locked.to_string(),
         "another engine uses this data directory"
     );
-    let short = snailfish::DeviceKeys {
-        app_key: vec![0; 31],
-        ..kb.clone()
-    };
-    let pb = dir.path().join("b");
-    let pb = pb.to_str().unwrap();
-    assert!(matches!(
-        snailfish::Engine::open(pb, sp.clone(), &short),
-        Err(snailfish::SnailfishError::Invalid { .. })
-    ));
-    let b = std::sync::Arc::new(snailfish::Engine::open(pb, sp, &kb).unwrap());
-
     exchange(&relay, &a);
     assert_eq!(a.status().unwrap(), snailfish::Status::Ok);
+    assert_eq!(a.app_key().unwrap(), Some(setup.app_key.clone()));
+
+    let ne = snailfish::NewEnrollment::new("https://sync.example.net", &kb, "B", None).unwrap();
+    let payload = ne.payload().unwrap().unwrap();
+    assert_eq!(codec::enroll_parse_payload(&payload).unwrap().role, "n");
+    assert_eq!(ne.relay_url().unwrap(), "https://sync.example.net");
+    assert_eq!(ne.code().unwrap().len(), 39);
+    let te = snailfish::TrustedEnrollment::new(a.clone(), Some(payload), None).unwrap();
+    assert_eq!(te.payload().unwrap(), None);
+    assert_eq!(te.code().unwrap(), Some(ne.code().unwrap()));
+    drive(&relay, &te, &ne, (true, true));
+    assert_eq!(te.state().unwrap(), snailfish::EnrollState::Done);
+    assert_eq!(ne.state().unwrap(), snailfish::EnrollState::Done);
     assert_eq!(a.verified_head().unwrap().position, 2);
+    assert_eq!(a.grants_to_confirm().unwrap(), Vec::<String>::new());
+    assert!(matches!(
+        a.confirm_grant(&a.device_id().unwrap(), None),
+        Err(snailfish::SnailfishError::Invalid { .. })
+    ));
+    let joined = ne.joined().unwrap().unwrap();
+    assert_eq!(
+        (joined.tenant.as_str(), joined.position),
+        (tenant.as_str(), 2)
+    );
+    assert_eq!(joined.digest, a.verified_head().unwrap().digest);
+    let pb = dir.path().join("b");
+    let pb = pb.to_str().unwrap();
+    let mut bad = joined.clone();
+    bad.digest = vec![0; 31];
+    assert!(matches!(
+        snailfish::install_enrollment(pb, sp.clone(), &kb, &bad),
+        Err(snailfish::SnailfishError::Invalid { .. })
+    ));
+    snailfish::install_enrollment(pb, sp.clone(), &kb, &joined).unwrap();
+    let b = std::sync::Arc::new(snailfish::Engine::open(pb, sp, &kb).unwrap());
+    assert_eq!(b.app_key().unwrap(), None);
+    exchange(&relay, &b);
+    assert_eq!(b.app_key().unwrap(), Some(setup.app_key.clone()));
+    change_reaches_b(&relay, &a, &b);
+}
+
+/// A change of A reaches B through the relay, and the reset rule of
+/// `changes_after` crosses the binding ([DLV-10], [DLV-12]).
+fn change_reaches_b(
+    relay: &snailfish_relay::core::Relay,
+    a: &std::sync::Arc<snailfish::Engine>,
+    b: &std::sync::Arc<snailfish::Engine>,
+) {
     let id = a.new_change_id().unwrap();
     assert_eq!(id.len(), 16);
     let r = a
@@ -317,9 +399,9 @@ fn engine_object_syncs_two_devices() {
         .unwrap();
     assert_eq!((r.stored, r.refused), (vec![id.clone()], vec![]));
     assert_eq!(a.outbox_len().unwrap(), 1);
-    exchange(&relay, &a);
+    exchange(relay, a);
     assert_eq!(a.outbox_len().unwrap(), 0);
-    exchange(&relay, &b);
+    exchange(relay, b);
     let base = b.genesis_base().unwrap();
     assert_eq!((base.position, base.digest.len()), (0, 32));
     let got = b.changes_after(&base, 500).unwrap();
@@ -342,6 +424,113 @@ fn engine_object_syncs_two_devices() {
     assert_ne!(a.device_id().unwrap(), b.device_id().unwrap());
 }
 
+/// [ENR-7] through the binding: a code mismatch on the new device ends
+/// both sides with `Failed`, and A appends no grant.
+#[test]
+fn enrollment_mismatch_through_the_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = snailfish_relay::core::Relay::open(snailfish_relay::core::Config::new(
+        dir.path().join("relay"),
+        "sync.example.net",
+    ))
+    .unwrap();
+    let tenant = relay.add_user("sam").unwrap();
+    let mut ka = snailfish::new_device_keys().unwrap();
+    let setup = snailfish::create_space(
+        "com.example.tasks",
+        &snailfish::NewDevice {
+            keys: ka.clone(),
+            name: "A".into(),
+        },
+    )
+    .unwrap();
+    ka.app_key.clone_from(&setup.app_key);
+    let sp = space(&setup.log_id, &tenant);
+    let pa = dir.path().join("a");
+    let pa = pa.to_str().unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
+    exchange(&relay, &a);
+    let te = snailfish::TrustedEnrollment::new(a.clone(), None, None).unwrap();
+    assert_eq!(te.payload().unwrap(), None, "no payload before the open");
+    let (st, h, b) = send(&relay, te.next_request().unwrap().unwrap());
+    te.handle_response(st, &h, &b).unwrap();
+    let kb = snailfish::new_device_keys().unwrap();
+    let ne =
+        snailfish::NewEnrollment::new("https://sync.example.net", &kb, "B", te.payload().unwrap())
+            .unwrap();
+    drive(&relay, &te, &ne, (true, false));
+    assert!(matches!(
+        te.state().unwrap(),
+        snailfish::EnrollState::Failed { .. }
+    ));
+    assert!(matches!(
+        ne.state().unwrap(),
+        snailfish::EnrollState::Failed { .. }
+    ));
+    assert_eq!(ne.joined().unwrap(), None);
+    exchange(&relay, &a);
+    assert_eq!(a.verified_head().unwrap().position, 1);
+}
+
+/// `vectors/enroll.json` through the exported enrollment functions
+/// (`PROTOCOL.md` 11.1 and 11.2). The Python and Swift tests run the same
+/// cases across the FFI.
+#[test]
+fn enroll_vectors_through_the_binding() {
+    let v = load("enroll.json");
+    for c in v["codes"].as_array().unwrap() {
+        let session = codec::enroll_parse_code(s(&c["display"])).unwrap();
+        assert_eq!(codec::enroll_display(&session).unwrap(), s(&c["display"]));
+        let p = codec::enroll_parse_payload(s(&c["payload_n"])).unwrap();
+        assert_eq!((p.role.as_str(), p.session), ("n", session));
+    }
+    assert!(codec::enroll_display(&[0; 15]).is_err());
+    for c in v["typed"]["invalid"].as_array().unwrap() {
+        assert!(codec::enroll_parse_code(s(&c["text"])).is_err());
+    }
+    for c in v["payloads"]["invalid"].as_array().unwrap() {
+        assert!(codec::enroll_parse_payload(s(&c["text"])).is_err());
+    }
+    let ts = v["transcripts"].as_array().unwrap();
+    for t in ts {
+        let session = codec::enroll_parse_code(&ts_display(t)).unwrap();
+        let c =
+            codec::enroll_commitment(&session, s(&t["t_id"]), s(&t["n_id"]), &hex(&t["t_nonce"]))
+                .unwrap();
+        assert_eq!(c, hex(&t["commitment"]));
+        let code = codec::enroll_code(
+            &session,
+            s(&t["t_id"]),
+            s(&t["n_id"]),
+            &hex(&t["t_nonce"]),
+            &hex(&t["n_nonce"]),
+        )
+        .unwrap();
+        assert_eq!(code, s(&t["code"]));
+    }
+    for c in v["confirmations"].as_array().unwrap() {
+        let t = ts.iter().find(|t| t["name"] == c["transcript"]).unwrap();
+        let session = codec::enroll_parse_code(&ts_display(t)).unwrap();
+        let ok = codec::enroll_check_confirm(
+            s(&c["envelope"]).as_bytes(),
+            &session,
+            s(&t["t_id"]),
+            s(&t["new_device"]).as_bytes(),
+            &hex(&t["t_nonce"]),
+            &hex(&t["n_nonce"]),
+        )
+        .is_ok();
+        assert_eq!(ok, c["valid"].as_bool().unwrap(), "{}", s(&c["name"]));
+    }
+}
+
+/// The typed code of the session of a transcript case.
+fn ts_display(t: &Value) -> String {
+    let id = ::hex::decode(s(&t["session"]).strip_prefix("e_").unwrap()).unwrap();
+    codec::enroll_display(&id).unwrap()
+}
+
 /// S6 through the binding: after a restore, the engine repairs the lost
 /// position, reports the repair through `take_repairs`, and the relay holds
 /// the space (`Status::RestoreHold`).
@@ -360,7 +549,7 @@ fn engine_object_reports_a_repair() {
         keys: ka.clone(),
         name: "A".into(),
     };
-    let setup = snailfish::create_space("com.example.tasks", &first, &[]).unwrap();
+    let setup = snailfish::create_space("com.example.tasks", &first).unwrap();
     ka.app_key.clone_from(&setup.app_key);
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");

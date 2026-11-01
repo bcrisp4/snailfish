@@ -398,3 +398,118 @@ pub fn recovery_derive(secret: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
     let (sign, seal) = recovery::derive(&arr(secret, "secret")?);
     Ok(vec![sign.to_vec(), seal.to_vec()])
 }
+
+/// A QR payload of `PROTOCOL.md` 11.1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollPayload {
+    /// `t` or `n`: the role of the device that shows the payload.
+    pub role: String,
+    /// The relay URL.
+    pub relay_url: String,
+    /// The 16-byte session ID.
+    pub session: Vec<u8>,
+}
+
+/// The typed code of a 16-byte session ID (`PROTOCOL.md` 11.1).
+///
+/// # Errors
+///
+/// Refuses a session ID that is not 16 bytes.
+pub fn enroll_display(session: &[u8]) -> Result<String, CodecError> {
+    Ok(snailfish_protocol::enroll::display(&arr(
+        session, "session",
+    )?))
+}
+
+/// Read a typed code (`PROTOCOL.md` 11.1).
+///
+/// # Errors
+///
+/// Refuses a text that breaks the reader steps or the check.
+pub fn enroll_parse_code(text: &str) -> Result<Vec<u8>, CodecError> {
+    snailfish_protocol::enroll::parse_code(text)
+        .map(|s| s.to_vec())
+        .map_err(err)
+}
+
+/// Read a QR payload (`PROTOCOL.md` 11.1).
+///
+/// # Errors
+///
+/// Refuses a payload that breaks 11.1.
+pub fn enroll_parse_payload(text: &str) -> Result<EnrollPayload, CodecError> {
+    let p = snailfish_protocol::enroll::parse_payload(text).map_err(err)?;
+    Ok(EnrollPayload {
+        role: p.role.letter().to_owned(),
+        relay_url: p.relay_url,
+        session: p.session.to_vec(),
+    })
+}
+
+/// The commitment of the trusted device (`PROTOCOL.md` 11.2). A test relay
+/// that substitutes keys needs it to reach the code comparison.
+///
+/// # Errors
+///
+/// Refuses a session or a nonce of the wrong size, or a bad device ID.
+pub fn enroll_commitment(
+    session: &[u8],
+    t_id: &str,
+    n_id: &str,
+    t_nonce: &[u8],
+) -> Result<Vec<u8>, CodecError> {
+    Ok(snailfish_protocol::enroll::commitment(
+        &arr(session, "session")?,
+        &decode_id::<32>(t_id, "d_").map_err(err)?,
+        &decode_id::<32>(n_id, "d_").map_err(err)?,
+        &arr(t_nonce, "t_nonce")?,
+    )
+    .to_vec())
+}
+
+/// The 6-digit code of a transcript (`PROTOCOL.md` 11.2).
+///
+/// # Errors
+///
+/// As [`enroll_commitment`].
+pub fn enroll_code(
+    session: &[u8],
+    t_id: &str,
+    n_id: &str,
+    t_nonce: &[u8],
+    n_nonce: &[u8],
+) -> Result<String, CodecError> {
+    Ok(snailfish_protocol::enroll::code(
+        &arr(session, "session")?,
+        &decode_id::<32>(t_id, "d_").map_err(err)?,
+        &decode_id::<32>(n_id, "d_").map_err(err)?,
+        &arr(t_nonce, "t_nonce")?,
+        &arr(n_nonce, "n_nonce")?,
+    ))
+}
+
+/// Check a confirmation envelope for a transcript, as the trusted device
+/// does (`PROTOCOL.md` 11.2). `new_device` is the device object JSON of
+/// `new.hello`.
+///
+/// # Errors
+///
+/// Refuses each confirmation that the trusted device refuses.
+pub fn enroll_check_confirm(
+    envelope_json: &[u8],
+    session: &[u8],
+    t_id: &str,
+    new_device: &[u8],
+    t_nonce: &[u8],
+    n_nonce: &[u8],
+) -> Result<(), CodecError> {
+    let env = envelope::Envelope::parse(envelope_json).map_err(err)?;
+    let t = snailfish_protocol::enroll::Transcript {
+        session: arr(session, "session")?,
+        t_id: decode_id::<32>(t_id, "d_").map_err(err)?,
+        new_device: records::parse_device_json(new_device).map_err(err)?,
+        t_nonce: arr(t_nonce, "t_nonce")?,
+        n_nonce: arr(n_nonce, "n_nonce")?,
+    };
+    snailfish_protocol::enroll::check_confirm(&env, &t).map_err(err)
+}

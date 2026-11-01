@@ -144,3 +144,43 @@ def test_payload_classes() -> None:
     assert sf.classify("snailfish.change.v1") == sf.PayloadClass.RECORD
     assert sf.classify("snailfish.change.v2") == sf.PayloadClass.UNKNOWN_CONTENT
     assert sf.classify("snailfish.grant.v2") == sf.PayloadClass.UPDATE_REQUIRED
+
+
+def test_enrollment_vectors() -> None:
+    """`vectors/enroll.json` across the FFI (`PROTOCOL.md` 11.1 and 11.2)."""
+    v = load("enroll.json")
+    for c in v["codes"]:
+        session = sf.enroll_parse_code(c["display"])
+        assert sf.enroll_display(session) == c["display"]
+        p = sf.enroll_parse_payload(c["payload_t"])
+        assert (p.role, p.relay_url, p.session) == ("t", v["relay_url"], session)
+    for c in v["typed"]["valid"]:
+        assert sf.enroll_parse_code(c["text"]).hex() == c["session"][2:]
+    for c in v["typed"]["invalid"]:
+        with pytest.raises(sf.SnailfishError.Invalid):
+            sf.enroll_parse_code(c["text"])
+    for c in v["payloads"]["invalid"]:
+        with pytest.raises(sf.SnailfishError.Invalid):
+            sf.enroll_parse_payload(c["text"])
+    transcripts = {t["name"]: t for t in v["transcripts"]}
+    for t in v["transcripts"]:
+        session = bytes.fromhex(t["session"][2:])
+        tn, nn = bytes.fromhex(t["t_nonce"]), bytes.fromhex(t["n_nonce"])
+        c = sf.enroll_commitment(session, t["t_id"], t["n_id"], tn)
+        assert c.hex() == t["commitment"]
+        assert sf.enroll_code(session, t["t_id"], t["n_id"], tn, nn) == t["code"]
+    for c in v["confirmations"]:
+        t = transcripts[c["transcript"]]
+        args = (
+            c["envelope"].encode(),
+            bytes.fromhex(t["session"][2:]),
+            t["t_id"],
+            t["new_device"].encode(),
+            bytes.fromhex(t["t_nonce"]),
+            bytes.fromhex(t["n_nonce"]),
+        )
+        if c["valid"]:
+            sf.enroll_check_confirm(*args)
+        else:
+            with pytest.raises(sf.SnailfishError.Invalid):
+                sf.enroll_check_confirm(*args)
