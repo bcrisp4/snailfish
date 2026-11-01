@@ -22,13 +22,10 @@ pub enum Kind {
 }
 
 /// The schema version of every file kind.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
-impl Kind {
-    fn ddl(self) -> &'static str {
-        match self {
-            Self::Directory => {
-                "CREATE TABLE IF NOT EXISTS users (
+/// The schema of `directory.db`.
+const DIRECTORY_DDL: &str = "CREATE TABLE IF NOT EXISTS users (
                     user_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL UNIQUE,
                     tenant_id TEXT NOT NULL
@@ -36,8 +33,18 @@ impl Kind {
                  CREATE TABLE IF NOT EXISTS tenants (
                     tenant_id TEXT PRIMARY KEY,
                     handle TEXT NOT NULL UNIQUE
-                 ) WITHOUT ROWID;"
-            }
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS enroll_sessions (
+                    session TEXT PRIMARY KEY, tenant TEXT NOT NULL, log_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL, expires INTEGER NOT NULL, state TEXT NOT NULL,
+                    m0 TEXT, m1 TEXT, m2 TEXT, m3 TEXT, m4 TEXT, m5 TEXT
+                 ) WITHOUT ROWID;
+                 CREATE INDEX IF NOT EXISTS enroll_sessions_expires ON enroll_sessions (expires);";
+
+impl Kind {
+    fn ddl(self) -> &'static str {
+        match self {
+            Self::Directory => DIRECTORY_DDL,
             Self::Tenant => {
                 "CREATE TABLE IF NOT EXISTS tenant (
                     id INTEGER PRIMARY KEY CHECK (id = 1),

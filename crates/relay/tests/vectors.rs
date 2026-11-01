@@ -297,3 +297,49 @@ fn repair_cases_return_the_vector_results() {
         assert_eq!(fx.record_hashes(fx.tenant()), want, "{name}");
     }
 }
+
+/// `PROTOCOL.md` 10.10, [ENR-1] to [ENR-8]: each step of each Go enrollment
+/// scenario gives the vector status, error code and response body. A step
+/// with `digest_body` signs the digest of that body and sends `body`, so
+/// the relay must refuse it with `bad_digest` before it parses the body.
+#[test]
+fn enroll_cases_return_the_vector_results() {
+    let h = common::load("http.json");
+    let cases = h["enroll"].as_array().unwrap();
+    assert!(cases.len() >= 17);
+    for c in cases {
+        let name = s(&c["name"]);
+        let fx = fresh(&h, s(&h["authority"]), true);
+        for (i, st) in c["steps"].as_array().unwrap().iter().enumerate() {
+            fx.now.store(
+                st["at"].as_u64().unwrap(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let (method, path, body) = (s(&st["method"]), s(&st["path"]), s(&st["body"]));
+            let req = match st["signer"].as_str() {
+                Some(signer) if !signer.is_empty() => {
+                    let signed_body = st["digest_body"].as_str().unwrap_or(body);
+                    let mut r = fx.signed(method, path, "", signed_body.as_bytes(), signer);
+                    r.body = body.as_bytes().to_vec();
+                    r
+                }
+                _ => Request {
+                    method: method.to_owned(),
+                    path: path.to_owned(),
+                    query: String::new(),
+                    headers: Vec::new(),
+                    body: body.as_bytes().to_vec(),
+                },
+            };
+            let r = fx.relay.handle(&req);
+            let why = format!("{name} step {i}: {}", String::from_utf8_lossy(&r.body));
+            assert_eq!(u64::from(r.status), st["status"].as_u64().unwrap(), "{why}");
+            if let Some(code) = st["error"].as_str() {
+                assert_eq!(error_code(&r), code, "{why}");
+            } else {
+                let got: Value = serde_json::from_slice(&r.body).unwrap();
+                assert_eq!(got, st["response"], "{why}");
+            }
+        }
+    }
+}

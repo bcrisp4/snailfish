@@ -26,6 +26,8 @@ use snailfish_protocol::wire::{self, AppendResult, Head, Limits, RepairItem};
 
 use crate::store::{self, Kind, StoreError};
 
+mod enroll;
+
 /// The protocol levels that the relay accepts ([VER-6]).
 pub const LEVELS: [u64; 1] = [1];
 
@@ -395,6 +397,15 @@ impl Relay {
             ("POST", ["", "v1", "t", t, "s", l, "repair", "finish"]) => {
                 self.repair(req, now, t, l, RepairRoute::Finish)
             }
+            ("POST", ["", "v1", "t", t, "s", l, "enroll"]) => self.enroll_open(req, now, t, l),
+            ("GET", ["", "v1", "t", t, "s", l, "enroll", e]) => {
+                self.enroll_read(req, now, Some((t, l)), e)
+            }
+            ("POST", ["", "v1", "t", t, "s", l, "enroll", e]) => {
+                self.enroll_write(req, now, Some((t, l)), e)
+            }
+            ("GET", ["", "v1", "e", e]) => self.enroll_read(req, now, None, e),
+            ("POST", ["", "v1", "e", e]) => self.enroll_write(req, now, None, e),
             _ => Err(api(404, "not_found", "no route has this path")),
         }
     }

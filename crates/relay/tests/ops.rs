@@ -262,7 +262,7 @@ fn space_creation_waits_for_a_backup() {
     assert_eq!(fx.put_genesis(fx.tenant()).status, 201);
 }
 
-/// [VER-14]: a schema 1 file from M2 opens and gains the M3 tables.
+/// [VER-14]: a schema 1 file from M2 opens and gains the M3 and M4 tables.
 #[test]
 fn schema_one_files_migrate_forward() {
     let mut fx = Fx::new();
@@ -270,6 +270,7 @@ fn schema_one_files_migrate_forward() {
     for (path, table) in [
         (fx.tenant_db(fx.tenant()), "holds"),
         (fx.space_file(fx.tenant()), "staging"),
+        (fx.dir.path().join("directory.db"), "enroll_sessions"),
     ] {
         let c = rusqlite::Connection::open(&path).unwrap();
         c.execute_batch(&format!("DROP TABLE {table}; PRAGMA user_version = 1;"))
@@ -283,6 +284,15 @@ fn schema_one_files_migrate_forward() {
     fx.cut_log(fx.tenant(), 3);
     let (sid, _) = start(&fx, "A", head_of(&fx, 3), 4, 4);
     assert_eq!(finish(&fx, "A", sid, head_of(&fx, 4)), 200);
+    // directory.db migrated at the restart: an enrollment session opens.
+    let path = format!("{}/enroll", fx.space_path(fx.tenant(), fx.log()));
+    let open = snailfish_protocol::mailbox::open_body(&[1; 16]);
+    assert_eq!(
+        fx.relay
+            .handle(&fx.signed("POST", &path, "", &open, "A"))
+            .status,
+        201
+    );
 }
 
 /// [LOG-11], PROTOCOL.md 10.9: a session expires at its start + 86,400
