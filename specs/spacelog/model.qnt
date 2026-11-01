@@ -35,6 +35,7 @@ module spacelog {
     | EvCheckpoint | EvEnrolled | EvEpochVerified | EvForkBranch | EvForkDetected
     | EvForgedRejected | EvDeviceRejected | EvForged | EvReplayed | EvStaleWrite | EvThiefSigned
     | EvInvalidSigned | EvInvalidRelayRefused | EvInvalidStored | EvInvalidClientRejected
+    | EvResigned | EvReconfirmed
 
   type LogRec = {
     id: int,               // unique for each signature. Stands for the signature bytes.
@@ -64,11 +65,19 @@ module spacelog {
   // A signed statement of one log position and its digest (Enrollment, step 8).
   type Checkpoint = { has: bool, pos: int, dig: int }
 
+  // The grant that the user confirmed on a device, and the active and removed
+  // devices that the device showed at that time ([LOG-7]).
+  type Confirm = { has: bool, subject: Key, active: Set[Key], removed: Set[Key] }
+
+  // Ghost: the device list that the user confirmed for a signed grant.
+  type Confirmed = { id: int, active: Set[Key], removed: Set[Key] }
+
   type Device = {
     log: Log,              // the verified log
     status: Status,        // Forked and Rejected are "stopped"
     wepoch: int,           // the epoch that the device encrypts a new change with
     cp: Checkpoint,
+    conf: Confirm,         // the last grant that the user confirmed on this device
   }
 
   // Ghost state for properties and witnesses. No device or relay reads it, except
@@ -82,6 +91,7 @@ module spacelog {
     badWrite: bool,            // an honest device wrote with an epoch that is not its verified epoch
     staleStored: bool,         // a relay stored a change with an epoch below a stored epoch record
     lastKey: Key -> int,       // the key of the last epoch record that a device signed
+    confirms: Set[Confirmed],  // the confirmed device list of each signed grant
     events: Set[Event],
   }
 
@@ -126,6 +136,7 @@ module spacelog {
     "epochSkipAllowed",     // an epoch record need not carry the next epoch number
     "selfRemovalAllowed",   // an epoch record can remove its own author
     "grantActiveSubject",   // a grant for a device that is already active is valid
+    "resignNoReconfirm",    // after stale_base the engine signs a grant again without a new confirmation, also after a grant or a removal arrived
   )
 
   pure val DEVICE_ONLY: Set[str] = Set("trustsRelayVerdict", "baseUnchecked", "staleWriteEpoch")
@@ -151,8 +162,9 @@ module spacelog {
 
   pure val emptySpace: Space = { active: Set(), removed: Set(), epoch: 0, keys: Set(), lastSec: 0 }
   pure val emptyLog: Log = { recs: List(), sp: emptySpace }
+  pure val noConfirm: Confirm = { has: false, subject: 0, active: Set(), removed: Set() }
   pure val freshDevice: Device =
-    { log: emptyLog, status: Running, wepoch: 0, cp: { has: false, pos: 0, dig: 0 } }
+    { log: emptyLog, status: Running, wepoch: 0, cp: { has: false, pos: 0, dig: 0 }, conf: noConfirm }
 
   // The keys that a record seals, and the keys that can open them.
   pure def sealedKeys(r: LogRec): Set[int] = match r.kind {
@@ -317,7 +329,8 @@ module spacelog {
     branches' = BR.mapBy(_ => emptyLog),
     pending' = Set(),
     env' = { nextId: 1, attacks: 0, signed: Set(), hostile: Set(), conflictSeen: Set(),
-             badWrite: false, staleStored: false, lastKey: DEVS.mapBy(_ => 0), events: Set() },
+             badWrite: false, staleStored: false, lastKey: DEVS.mapBy(_ => 0), confirms: Set(),
+             events: Set() },
   }
 
   // The recovery key signs the genesis record. It holds the first grant.
@@ -330,7 +343,7 @@ module spacelog {
       id == 1,
       id <= MAX_REC,
       devs' = devs.set(d, { log: appendRec(emptyLog, g, deviceBug(BUG)), status: Running, wepoch: 1,
-                            cp: { has: true, pos: 0, dig: 0 } }),
+                            cp: { has: true, pos: 0, dig: 0 }, conf: noConfirm }),
       branches' = branches,
       pending' = pending.union(Set(g)),
       env' = { ...ev(EvGenesis), nextId: id + 1, signed: env.signed.union(Set(g)) },
@@ -358,25 +371,48 @@ module spacelog {
   def signerOk(d: Key, signer: Key): bool =
     ready(d) and (signer == d or (FAULTS.contains("recovery") and signer == RK))
 
-  // The signed record goes to the relay.
-  action submit(d: Key, r: LogRec, es: Set[Event], nextKey: Key -> int, bw: bool): bool = all {
+  // The signed record goes to the relay. `conf` is the new confirmation state of
+  // the device, and `cs` the ghost confirmations.
+  action submitConf(d: Key, r: LogRec, es: Set[Event], nextKey: Key -> int, bw: bool,
+                    conf: Confirm, cs: Set[Confirmed]): bool = all {
     r.id <= MAX_REC,
     selfOk(d, r),
-    devs' = devs,
+    devs' = devs.set(d, { ...dev(d), conf: conf }),
     branches' = branches,
     pending' = pending.union(Set(r)),
     env' = { ...evs(es.union(if (BAD.contains(d) and dev(d).log.sp.removed.contains(d)) Set(EvThiefSigned) else Set())),
              nextId: env.nextId + 1, signed: env.signed.union(Set(r)), lastKey: nextKey,
-             badWrite: env.badWrite or bw },
+             badWrite: env.badWrite or bw, confirms: cs },
   }
 
-  // Enrollment, step 8: a trusted device appends a grant for the new device.
+  action submit(d: Key, r: LogRec, es: Set[Event], nextKey: Key -> int, bw: bool): bool =
+    submitConf(d, r, es, nextKey, bw, dev(d).conf, env.confirms)
+
+  // Enrollment, step 8: a trusted device, or the recovery key that the user
+  // types on it, appends a grant for the new device. The user confirms the grant
+  // against the device list that the device shows.
+  // [LOG-7]: after `stale_base` the engine fetches, checks the space state again
+  // (selfOk refuses a grant for a device that is now active) and signs again on
+  // the new tip. It asks the user again only if a grant or a removal arrived,
+  // that is, if the active or removed devices differ from the confirmed list.
   action signGrant(d: Key, signer: Key, subject: Key): bool = {
-    val r = { ...blank(env.nextId, Grant, signer, dev(d).log), subject: subject, sealed: dev(d).log.sp.keys }
+    val view = dev(d).log
+    val c = dev(d).conf
+    val retry = c.has and c.subject == subject
+    val same = c.active == view.sp.active and c.removed == view.sp.removed
+    val keep = retry and (same or BUG == "resignNoReconfirm")
+    val conf = if (keep) c else { has: true, subject: subject, active: view.sp.active, removed: view.sp.removed }
+    val r = { ...blank(env.nextId, Grant, signer, view), subject: subject, sealed: view.sp.keys }
+    val es = Set(
+      if (signer == RK) Set(EvRecoveryGrant) else Set(),
+      if (keep) Set(EvResigned) else Set(),
+      if (retry and not(keep)) Set(EvReconfirmed) else Set(),
+    ).flatten()
     all {
       signerOk(d, signer),
       subject != RK,
-      submit(d, r, if (signer == RK) Set(EvRecoveryGrant) else Set(), env.lastKey, false),
+      submitConf(d, r, es, env.lastKey, false, conf,
+                 env.confirms.union(Set({ id: r.id, active: conf.active, removed: conf.removed }))),
     }
   }
 
@@ -789,6 +825,19 @@ module spacelog {
     recs.indices().forall(i => {
       val r = recs.nth(i)
       r.kind == Grant implies not(refActive(recs.slice(0, i)).contains(r.subject))
+    })
+  })
+
+  // I16. Each grant in a verified log carries the device list that the user
+  // confirmed: the active and removed devices at its base ([LOG-7]). A grant
+  // that the engine signs again after a grant or a removal arrived needs a new
+  // confirmation.
+  val grantConfirmed: bool = HON.forall(d => {
+    val recs = dev(d).log.recs
+    recs.indices().forall(i => {
+      val r = recs.nth(i)
+      r.kind == Grant implies env.confirms.forall(c => c.id == r.id implies
+        (c.active == refActive(recs.slice(0, r.bpos)) and c.removed == refRemoved(recs.slice(0, r.bpos))))
     })
   })
 

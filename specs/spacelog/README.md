@@ -23,6 +23,8 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | [LOG-2] [LOG-8] | `authorOk`, `stateOk` |
 | [LOG-9] | `relayVerdict`, `relayAppend`, `relayRefuse` |
 | [ENR-8] [ENR-9] (partly) | `sendCheckpoint`, `fetchOne` with the checkpoint check |
+| [LOG-7] retry after `stale_base` | `signGrant`: the confirmed device list (`Confirm`), a new confirmation after a grant or a removal arrived, `grantConfirmed`, mutant `resignNoReconfirm`, tests `resignReconfirmTest` and `retryChecksStateTest` |
+| Grant by the recovery key (M4 decision 1) | `signGrant` with signer `RK` (fault class `recovery`), test `recoveryGrantTest` |
 
 `specs/coverage.toml` lists the LOG rules that the model does not encode (hashes, repair sessions, deletion and the restore hold).
 
@@ -60,6 +62,7 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | `epochSequential` | A verified rotation advances the epoch by one. |
 | `noSelfRemoval` | A verified rotation does not remove its own author. |
 | `grantSubjectNew` | A verified grant does not grant an active device again. |
+| `grantConfirmed` | A verified grant carries the device list that the user confirmed: the active and removed devices at its base. |
 
 ## Results
 
@@ -113,7 +116,8 @@ Lesson: a mutant baseline must be large enough for the bug to change a verdict.
 
 ## Not covered
 
-- Recovery records, protocol levels, the device record and the level record.
+- Recovery record replacement, protocol levels, the device record and the level record. A grant by the recovery key is covered.
+- The user confirmation of an epoch record. The [LOG-7] retry covers grants only, because M4 has no removal.
 - Repair sessions, deletion and the restore hold (the delivery model has those).
 - Log compaction: snapshots, stubs and accept records.
 - Key secrecy as such. The model tracks which keys each record seals to which devices.

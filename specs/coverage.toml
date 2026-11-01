@@ -4,6 +4,7 @@
 # `partial` lists cited rules with a part that no model encodes yet.
 
 [partial]
+"ENR-9" = "ProVerif checks the grant, the checkpoint signature and that the new device uploads nothing before both checks. It does not check the log from the genesis record. specs/spacelog checks the log up to the checkpoint (fetchOne). Rust: crates/engine enrollment tests"
 "LOG-11" = "snapshot rule: the relay moves staged entries only if the usable snapshot covers every staged stub. M3 has no stubs, and the relay refuses each staged stub (crates/relay/tests). Model it with compaction (M8)"
 
 [not_modelled]
@@ -42,7 +43,6 @@
 "CMP-20" = "compaction model not written yet"
 "CMP-21" = "compaction model not written yet"
 "ENR-2" = "tenant binding on the signed route is outside the ProVerif model, which has no tenants"
-"ENR-9" = "the ProVerif model checks the grant and the checkpoint signature, not the log from the genesis record"
 "FRK-2" = "fork repair model not written yet"
 "FRK-3" = "fork repair model not written yet"
 "FRK-4" = "fork repair model not written yet"

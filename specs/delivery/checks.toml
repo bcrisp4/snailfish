@@ -247,6 +247,14 @@ caught_by = "tests"
 test_module = "deliveryTestLate"
 test = "lateDeviceRepairTest"
 
+# [LOG-12] engine part: a device whose grant is only in the lost range starts
+# at the position before its grant. Availability, not safety (README).
+[mutants.lateRepairNoBase]
+base = "lateGrant"
+caught_by = "tests"
+test_module = "deliveryTestLate"
+test = "lateDeviceRepairTest"
+
 # ---------------------------------------------------------------- exhaustive (TLC)
 # TLC checks every reachable state of a small config, at any depth. Each listed
 # mutant must also fail on the same config, so the config is big enough to

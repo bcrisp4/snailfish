@@ -22,7 +22,7 @@
 | Signed base refused if not in the relay log | `verdict` (`BadBase`) |
 | Repair session after a rollback [LOG-10] | `startRepair`, `chunkRepair`, `finishRepair`, mutant `noRepair` |
 | One session per space, staging until the finish, 24 hour expiry [LOG-11] | `startRepair`, `expireSession`, mutants `repairMultiSession`, `repairMovesEarly`, `repairNoExpiry`, tests `oneRepairSessionTest`, `repairStagesUntilFinishTest`, `repairExpiryTest` |
-| A device whose grant is only in the lost range repairs the log [LOG-12] | `grantDevice`, `startRepair` (signer active in the log or the chunk), mutant `repairNeedsLogGrant`, test `lateDeviceRepairTest` in module `deliveryTestLate` |
+| A device whose grant is only in the lost range repairs the log [LOG-12] | `grantDevice`, `startRepair` (signer active in the log or the chunk, and a device that is not active starts at the position before its own grant), mutants `repairNeedsLogGrant` and `lateRepairNoBase`, tests `lateDeviceRepairTest` and `lateRepairBlockedTest` in module `deliveryTestLate` |
 | Restore hold. Only the user or the relay operator ends it. | `restoreRelay`, `reportStatus` (each report replaces the tip, the fresh mark stays), `releaseHold` (after each device of the space has a reported tip in the log), `releaseHoldEarly` (before), mutant `noHold` |
 | Fork detection stops sync | `fetchConflict`, mutant `adoptFork` |
 
@@ -83,7 +83,7 @@ A log entry is a record hash: an int that holds the change ID and a counter `gen
 
 Mutant `freshClearsOnFetch` needs a restore, an engine state loss and a fetch, in that order, during one hold. Random sampling seldom finds this path. `checks.toml` sets `caught_by = "tests"` for it, so `verify.py` runs the scenario tests with its `BUG`, and `notRepairedMarkTest` catches this one.
 
-The four repair-session mutants (`repairMultiSession`, `repairMovesEarly`, `repairNoExpiry`, `repairNeedsLogGrant`) break availability, not a safety invariant. In this model a partial or concurrent repair still writes a prefix of a verified log, and a device that cannot repair keeps its verified log. Each mutant has `caught_by = "tests"`, and its scripted test fails on each run.
+The five repair-session mutants (`repairMultiSession`, `repairMovesEarly`, `repairNoExpiry`, `repairNeedsLogGrant`, `lateRepairNoBase`) break availability, not a safety invariant. In this model a partial or concurrent repair still writes a prefix of a verified log, and a device that cannot repair keeps its verified log. Each mutant has `caught_by = "tests"`, and its scripted test fails on each run.
 
 The engine starts with `fresh` false. A Rust engine marks each new state file, also on a first install. That reports more devices as "not repaired" than the model, which only adds warnings.
 
@@ -91,7 +91,7 @@ Mutant `noHold` breaks `refusedNotStored`. Sampling of `restoreBase` at 5,000 tr
 
 ## Not covered
 
-- The device learns the relay head from a fetch. A device whose grant is only in the lost range cannot fetch (403), so the M3 engine cannot find the base of a repair. The model lets it start at the relay head. The relay part of [LOG-12] is in Rust (`crates/relay/tests`). The engine part is open for M4.
+- A device whose grant is only in the lost range, after a relay that also lost the entry before the grant. The device cannot start a repair (`lateRepairBlockedTest`) and reports the cause. Another device that is active in the relay log must repair it.
 - A repair session in a restored or rolled back space file. Both faults end the session in the model.
 - Stubs in a repair session, and the snapshot rule of [LOG-11] (`specs/coverage.toml` `partial`).
 
@@ -135,7 +135,7 @@ Each Rust test above fails with the corresponding fault in the Rust or Python co
 | `restoreSetsHoldTest` | [LOG-14] | `crates/relay/tests/ops.rs::backup_and_restore_hold_each_space`, `demo/tests/test_integrity.py::test_change_during_hold_waits_in_the_outbox` |
 | `notRepairedMarkTest` | [LOG-14] [LOG-15] (F3) | `crates/engine/src/tests.rs::new_engine_state_file_is_not_repaired_until_the_hold_ends`, `crates/relay/tests/ops.rs::not_repaired_mark_stays_and_blocks_release_without_force`, `demo/tests/test_integrity.py::test_release_refuses_a_new_engine_state_file` |
 | `forkStopsTest` | [FRK-1] [LOG-6] | `crates/engine/src/tests.rs::record_with_a_base_outside_the_verified_log_stops_with_fork`, `demo/tests/test_integrity.py::test_record_with_a_foreign_base_stops_with_fork` |
-| `lateDeviceRepairTest` | [LOG-12] | `crates/relay/tests/ops.rs::device_with_a_lost_grant_repairs_the_log` (relay only, see Not covered) |
+| `lateDeviceRepairTest` | [LOG-12] | `crates/relay/tests/ops.rs::device_with_a_lost_grant_repairs_the_log` (relay). M4 adds the engine test below. |
 | `oneRepairSessionTest`, `repairExpiryTest`, `repairStagesUntilFinishTest` | [LOG-11] | `vectors/http.json` `repair` cases `second-device-busy`, `session-after-expiry`, `start-and-chunks`, run by `crates/relay/tests/vectors.rs::repair_cases_return_the_vector_results` |
 
 `make rust-mutants-diff` checks these tests by mutation. Scenarios `resetRequiredTest` and `refusedSplitTest` have no Rust test yet.

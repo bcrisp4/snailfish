@@ -1,0 +1,2 @@
+(* Variant vEarlyUpload. Run: proverif -lib lib.pvl early_upload.pv *)
+process System(vEarlyUpload)

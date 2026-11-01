@@ -140,6 +140,7 @@ module delivery {
     "repairMovesEarly",     // the relay puts each chunk into the log at once, not after the finish [LOG-11]
     "repairNoExpiry",       // a repair session never expires [LOG-11]
     "repairNeedsLogGrant",  // a repair signer must be active in the relay log, not in the entries [LOG-12]
+    "lateRepairNoBase",     // an engine that cannot fetch does not start a repair [LOG-12]
   )
 
   // A grant record. It is larger than every change record, because gen is at most MAX_FAULTS.
@@ -158,6 +159,10 @@ module delivery {
     l.foldl(Set(), (s, x) => if (isGrant(x)) s.union(Set(x - GRANT)) else s)
 
   // Rules: [LOG-8]
+  // The number of entries before the grant of d in l. l.length() if l has no grant for d.
+  pure def grantIndex(d: Dev, l: List[Rcd]): int =
+    l.indices().fold(l.length(), (m, i) => if (l.nth(i) == GRANT + d and i < m) i else m)
+
   pure def activeIn(d: Dev, l: List[Rcd]): bool = not(LATE.contains(d)) or grantsIn(l).contains(d)
 
   pure def isPrefix(a: List[Rcd], b: List[Rcd]): bool =
@@ -420,12 +425,16 @@ module delivery {
   // active in the log or in the staged entries, so a device whose grant is only
   // in the lost range can repair. The relay accepts a repair during a restore hold.
   // Rules: [LOG-10] [LOG-11] [LOG-12] [LOG-14]
-  // Partial: the device learns the relay head from a fetch, which a device that
-  // is not active cannot do. PROTOCOL.md 10.9 needs the relay head as the base.
+  // An active device learns the relay head from a fetch. A device whose grant
+  // is only in the lost range cannot fetch (unknown_device), so it starts at
+  // the position before its own grant. If the relay head is another position,
+  // the relay answers bad_repair and the engine reports the cause: the model
+  // has no start for that device.
   action startRepair(d: Dev, n: int): bool = {
     val h = relay.log.length()
     val chunk = eng(d).log.slice(h, h + n)
     val signerOk = active(d) or (BUG != "repairNeedsLogGrant" and activeIn(d, relay.log.concat(chunk)))
+    val baseOk = active(d) or (BUG != "lateRepairNoBase" and h == grantIndex(d, eng(d).log))
     val early = BUG == "repairMovesEarly"
     all {
       BUG != "noRepair",
@@ -433,6 +442,7 @@ module delivery {
       1 <= n, h + n <= eng(d).log.length(),
       not(relay.session.live) or relay.session.owner == d or BUG == "repairMultiSession",
       signerOk,
+      baseOk,
       relay' = { ...relay,
         log: if (early) relay.log.concat(chunk) else relay.log,
         session: { live: true, owner: d,

@@ -10,6 +10,7 @@ type sess.
 type code.
 type devkeys.
 type variant.
+type tinst.
 
 (* Variants. vNone is the design in DESIGN.md. Each other value is one deliberate flaw. *)
 const vNone: variant.
@@ -19,6 +20,7 @@ const vCpUnsigned: variant.
 const vConfUnsigned: variant.
 const vConfNoMeta: variant.
 const vUserBlind: variant.
+const vEarlyUpload: variant.
 
 (* The network, and the relay, are the attacker. *)
 free c: channel.
@@ -28,10 +30,14 @@ free ui_n: channel [private].
 free ok_t: channel [private].
 free ok_n: channel [private].
 
-(* Long-term keys of the trusted device and the space app key. *)
+(* Long-term keys of the trusted device, the recovery signing key, the space
+   app key, and the local data of each new device. The user types the
+   recovery key on the trusted device to sign a grant with it (M4 decision 1). *)
 free skT: skey [private].
 free dkT: kskey [private].
+free skR: skey [private].
 free appk: bitstring [private].
+free ndata: bitstring [private].
 
 (* Labels for signed structures. *)
 const lconf: bitstring.
@@ -42,6 +48,12 @@ const lcp: bitstring.
 fun pk(skey): pkey.
 fun sign(bitstring, skey): bitstring.
 reduc forall m: bitstring, k: skey; checksig(sign(m, k), pk(k)) = m.
+(* A signature does not hide its message. *)
+reduc forall m: bitstring, k: skey; getmess(sign(m, k)) = m.
+
+(* The app cipher: the new device encrypts its local data with the app key. *)
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m, k), k) = m.
 
 (* X-Wing as an ideal KEM, used to seal the app key to the new device. *)
 fun kpub(kskey): kpkey.
@@ -55,7 +67,7 @@ const nokeys: devkeys.
 
 (* Nonces and commitments. A commitment is a hash. It has no inverse. *)
 fun nb(nonce): bitstring [data].
-fun commit(nonce, devkeys, devkeys): bitstring.
+fun commit(sess, nonce, devkeys, devkeys): bitstring.
 fun ext(bitstring, bitstring): bitstring.
 
 (* The 6-digit code is a truncated SHA-256. Truncation has no inverse.
@@ -63,22 +75,26 @@ fun ext(bitstring, bitstring): bitstring.
    that it sends, when it knows the other nonce. This is the 1-in-10^6 guess,
    repeated about 10^6 times. ProVerif cannot count probabilities. It can only
    show whether the attacker has the information that makes such a search possible. *)
-fun h(devkeys, devkeys, nonce, nonce): bitstring.
+fun h(sess, devkeys, devkeys, nonce, nonce): bitstring.
 fun trunc(bitstring): code.
-fun ngrind(code, devkeys, devkeys, nonce): nonce.
-fun tgrind(code, devkeys, devkeys, nonce): nonce.
-equation forall k: code, a: devkeys, b: devkeys, t: nonce;
-  trunc(h(a, b, t, ngrind(k, a, b, t))) = k.
-equation forall k: code, a: devkeys, b: devkeys, n: nonce;
-  trunc(h(a, b, tgrind(k, a, b, n), n)) = k.
+fun ngrind(code, sess, devkeys, devkeys, nonce): nonce.
+fun tgrind(code, sess, devkeys, devkeys, nonce): nonce.
+equation forall k: code, s: sess, a: devkeys, b: devkeys, t: nonce;
+  trunc(h(s, a, b, t, ngrind(k, s, a, b, t))) = k.
+equation forall k: code, s: sess, a: devkeys, b: devkeys, n: nonce;
+  trunc(h(s, a, b, tgrind(k, s, a, b, n), n)) = k.
 
 (* The variants differ only in these functions and in User. *)
-letfun codeof(v: variant, kt: devkeys, kn: devkeys, nt: nonce, nn: nonce) =
-  if v = vNoKeyBinding then trunc(h(nokeys, nokeys, nt, nn)) else trunc(h(kt, kn, nt, nn)).
-letfun cmsg(v: variant, nt: nonce, kt: devkeys, kn: devkeys) =
+letfun codeof(v: variant, s: sess, kt: devkeys, kn: devkeys, nt: nonce, nn: nonce) =
+  if v = vNoKeyBinding then trunc(h(s, nokeys, nokeys, nt, nn)) else trunc(h(s, kt, kn, nt, nn)).
+letfun cmsg(v: variant, s: sess, nt: nonce, kt: devkeys, kn: devkeys) =
   if v = vNoCommit then nb(nt)
-  else if v = vNoKeyBinding then commit(nt, nokeys, nokeys)
-  else commit(nt, kt, kn).
+  else if v = vNoKeyBinding then commit(s, nt, nokeys, nokeys)
+  else commit(s, nt, kt, kn).
+(* A grant is valid if the trusted device of the transcript or the recovery
+   key of the genesis record signs it. Rules: [ENR-8] [ENR-9] *)
+letfun grantmsg(g: bitstring, kt: devkeys) =
+  let m = checksig(g, sigpk(kt)) in m else checksig(g, pk(skR)).
 letfun cmeta(v: variant, meta: bitstring) =
   if v = vConfNoMeta then lconf else meta.
 
@@ -94,10 +110,12 @@ event UserConfirms(sess, sess).
    one T session can take two different new-device nonces, reveal its nonce for
    the first, and show the code for the second. A real session reads each input
    once. Each event below marks one input of one session, and the restrictions
-   make the value unique per session. *)
-event TIn1(sess, devkeys, bitstring).
-event TIn2(sess, nonce).
-event TIn3(sess, bitstring).
+   make the value unique per session. A T session is keyed by a fresh instance
+   name, not by its session ID: the attacker can give one scanned session ID to
+   two T sessions. *)
+event TIn1(tinst, devkeys, bitstring).
+event TIn2(tinst, nonce).
+event TIn3(tinst, bitstring).
 event NIn1(skey, sess).
 event NIn2(skey, devkeys).
 event NIn3(skey, bitstring).
@@ -105,11 +123,11 @@ event NIn4(skey, nonce).
 event NIn5(skey, sess).
 event NIn6(skey, bitstring, bitstring, bitstring).
 
-restriction i: sess, a: devkeys, b: devkeys, m: bitstring, n: bitstring;
+restriction i: tinst, a: devkeys, b: devkeys, m: bitstring, n: bitstring;
   event(TIn1(i, a, m)) && event(TIn1(i, b, n)) ==> a = b && m = n.
-restriction i: sess, a: nonce, b: nonce;
+restriction i: tinst, a: nonce, b: nonce;
   event(TIn2(i, a)) && event(TIn2(i, b)) ==> a = b.
-restriction i: sess, a: bitstring, b: bitstring;
+restriction i: tinst, a: bitstring, b: bitstring;
   event(TIn3(i, a)) && event(TIn3(i, b)) ==> a = b.
 restriction i: skey, a: sess, b: sess;
   event(NIn1(i, a)) && event(NIn1(i, b)) ==> a = b.
@@ -124,61 +142,68 @@ restriction i: skey, a: sess, b: sess;
 restriction i: skey, a: bitstring, b: bitstring, c: bitstring, d: bitstring, e: bitstring, f: bitstring;
   event(NIn6(i, a, b, c)) && event(NIn6(i, d, e, f)) ==> a = d && b = e && c = f.
 
-(* Trusted device. Steps 1 to 8 of Enrollment.
-   Rules: [ENR-1] [ENR-3] [ENR-4] [ENR-6] [ENR-7] [ENR-8] *)
-let T(v: variant) =
-  new s: sess;
-  out(c, s);
+(* Trusted device. Steps 2 to 8 of Enrollment, after it has the session ID.
+   The relay chooses whether the grant has the signature of the device key or
+   of the recovery key.
+   Rules: [ENR-3] [ENR-4] [ENR-6] [ENR-7] [ENR-8] *)
+let T(v: variant, s: sess) =
+  new ti: tinst;
   in(c, (=s, kn: devkeys, meta: bitstring));
-  event TIn1(s, kn, meta);
+  event TIn1(ti, kn, meta);
   let kt = keys(pk(skT), kpub(dkT)) in
-  out(c, (s, kt));
   new nT: nonce;
-  let cm = cmsg(v, nT, kt, kn) in
-  out(c, (s, cm));
+  let cm = cmsg(v, s, nT, kt, kn) in
+  out(c, (s, kt, cm));
   in(c, (=s, nN: nonce));
-  event TIn2(s, nN);
+  event TIn2(ti, nN);
   out(c, (s, nT));
-  let cd = codeof(v, kt, kn, nT, nN) in
+  let cd = codeof(v, s, kt, kn, nT, nN) in
   out(ui_t, (s, cd));
   in(ok_t, (=s, =cd));
   in(c, (=s, cf: bitstring));
-  event TIn3(s, cf);
+  event TIn3(ti, cf);
   let cmt = cmeta(v, meta) in
   let tr = (lconf, s, kt, kn, cmt, nT, nN) in
   if v = vConfUnsigned || checksig(cf, sigpk(kn)) = tr then
   let keys(pkN, kN) = kn in
+  in(c, byRecovery: bool);
+  let gk = if byRecovery then skR else skT in
   event TAppends(s, kt, kn, meta);
   new prev: bitstring;
-  let grant = sign((lgrant, kn, meta, aenc(appk, kN)), skT) in
+  let grant = sign((lgrant, kn, meta, aenc(appk, kN)), gk) in
   let r = ext(prev, grant) in
   event TSignsCp(kt, r);
   let cp = if v = vCpUnsigned then (lcp, r) else sign((lcp, r), skT) in
   out(c, (s, prev, grant, cp)).
 
-(* New device. Steps 1 to 9 of Enrollment.
-   Rules: [ENR-1] [ENR-3] [ENR-5] [ENR-6] [ENR-7] [ENR-8]
-   Step 9 is partial: N checks the grant and the checkpoint signature, not the log
-   from the genesis record. It scans the session ID that the attacker gives it. *)
-let N(v: variant) =
-  new skN: skey;
+(* Either device shows the session ID, and the trusted device opens the session
+   on the relay in both cases. Each device here reads the session ID from the
+   attacker. This covers both directions: the attacker can pass on a fresh
+   session ID that it made, so a device that shows a fresh ID adds no behaviour.
+   One process with both directions took more than 25 minutes for user_blind.pv.
+   Rules: [ENR-1] *)
+let TScans(v: variant) = in(c, s: sess); T(v, s).
+
+(* New device. Steps 3 to 9 of Enrollment, after it has the session ID.
+   Rules: [ENR-3] [ENR-5] [ENR-6] [ENR-7] [ENR-8] [ENR-9]
+   Step 9 is partial: N checks the grant and the checkpoint signature, not the
+   log from the genesis record. N uploads its local data only after both
+   checks pass. Variant vEarlyUpload uploads with the key of an unchecked grant. *)
+let N(v: variant, skN: skey, s: sess) =
   new dkN: kskey;
   new meta: bitstring;
-  in(c, s: sess);
-  event NIn1(skN, s);
   let kn = keys(pk(skN), kpub(dkN)) in
   out(c, (s, kn, meta));
-  in(c, (=s, kt: devkeys));
+  in(c, (=s, kt: devkeys, cm: bitstring));
   event NIn2(skN, kt);
-  in(c, (=s, cm: bitstring));
   event NIn3(skN, cm);
   new nN: nonce;
   out(c, (s, nN));
   in(c, (=s, nT: nonce));
   event NIn4(skN, nT);
-  let cm2 = cmsg(v, nT, kt, kn) in
+  let cm2 = cmsg(v, s, nT, kt, kn) in
   if cm = cm2 then
-  let cd = codeof(v, kt, kn, nT, nN) in
+  let cd = codeof(v, s, kt, kn, nT, nN) in
   out(ui_n, (s, cd));
   in(ok_n, (=s, =cd));
   event NConfirms(s, kt, kn, meta);
@@ -186,11 +211,20 @@ let N(v: variant) =
   out(c, (s, sign((lconf, s, kt, kn, cmt, nT, nN), skN)));
   in(c, (=s, prev: bitstring, grant: bitstring, cp: bitstring));
   event NIn6(skN, prev, grant, cp);
-  let (=lgrant, =kn, =meta, sealed: bitstring) = checksig(grant, sigpk(kt)) in
-  let r = ext(prev, grant) in
-  if (v = vCpUnsigned && cp = (lcp, r)) || (v <> vCpUnsigned && checksig(cp, sigpk(kt)) = (lcp, r)) then
-  let k = adec(sealed, dkN) in
-  event NAccepts(s, kt, kn, meta, r).
+  (
+    if v = vEarlyUpload then
+    let (=lgrant, =kn, =meta, se: bitstring) = getmess(grant) in
+    out(c, senc(ndata, adec(se, dkN)))
+  ) | (
+    let (=lgrant, =kn, =meta, sealed: bitstring) = grantmsg(grant, kt) in
+    let r = ext(prev, grant) in
+    if (v = vCpUnsigned && cp = (lcp, r)) || (v <> vCpUnsigned && checksig(cp, sigpk(kt)) = (lcp, r)) then
+    let k = adec(sealed, dkN) in
+    event NAccepts(s, kt, kn, meta, r);
+    out(c, senc(ndata, k))
+  ).
+
+let NScans(v: variant) = new skN: skey; in(c, s: sess); event NIn1(skN, s); N(v, skN, s).
 
 (* A confirm press names the code on the screen where it happens. Without the code,
    ProVerif would let one T session take a confirm that the user gave to another
@@ -206,7 +240,8 @@ let User(v: variant) =
   out(ok_t, (st, c1));
   out(ok_n, (sn, c2)).
 
-let System(v: variant) = !T(v) | !N(v) | !User(v).
+let System(v: variant) =
+  out(c, pk(skR)); (!TScans(v) | !NScans(v) | !User(v)).
 
 (* Queries. *)
 
@@ -225,6 +260,9 @@ query s: sess, kt: devkeys, kn: devkeys, m: bitstring, r: bitstring;
 
 (* (e) The attacker never learns the app key. *)
 query attacker(appk).
+
+(* (f) The attacker never learns the local data of a new device. [ENR-9] *)
+query attacker(ndata).
 
 (* (d) Reachability. A pass of (a) to (c) must not be vacuous. *)
 query s: sess, kt: devkeys, kn: devkeys, m: bitstring;

@@ -317,6 +317,21 @@ module deliveryTestLate {
       .expect(wLateRepair and relay.log == [0])
       .then(finishRepair(2))
       .expect(relay.log == [0, GRANT + 2, 1] and active(2))
+
+  // [LOG-12] The relay lost the entry before the grant of device 2 too. Device
+  // 2 cannot fetch, and the relay head is not the position before its grant,
+  // so it cannot start a repair. Device 1 is active in the relay log and can
+  // repair it (relayRestoreRepairTest).
+  run lateRepairBlockedTest =
+    init
+      .then(editAndPush(1, 0))
+      .then(fetchExtend(1, 1))
+      .then(grantDevice(1, 2))
+      .then(fetchExtend(2, 2))
+      .then(fetchExtend(1, 2))
+      .then(restoreRelay(0))
+      .expect(relay.log == [] and needsRepair(2) and needsRepair(1) and not(active(2)))
+      .then(startRepair(2, 2).fail())
 }
 
 // The mutant noHold (restoreRelay sets no hold) breaks the hold in each test

@@ -128,7 +128,7 @@ module spacelogTest {
 // passes on the design and fails under the BUG that checks.toml names for it.
 module spacelogTest4 {
   import spacelog(DEVS = Set(1, 2, 3, 4), BAD = Set(), MAX_REC = 9, MAX_ATTACKS = 0,
-                  FAULTS = Set(), BUG = "none").* from "./model"
+                  FAULTS = Set("recovery"), BUG = "none").* from "./model"
 
   action appendId(k: int): bool = {
     nondet r = pending.filter(x => x.id == k).oneOf()
@@ -181,6 +181,49 @@ module spacelogTest4 {
       .then(signEpoch(2, 2, 1)).then(appendId(6))
       .then(fetchOne(2, 0))
       .expect(removedKeyIsolation)
+
+  // Mutant resignNoReconfirm ([LOG-7]). Device 1 signs a grant for device 3
+  // and device 2 a grant for device 4 on the same base. The relay appends the
+  // grant for device 4 and refuses the other with stale_base. Device 1 fetches.
+  // A grant arrived, so the user confirms the grant for device 3 again before
+  // device 1 signs it on the new tip.
+  run resignReconfirmTest =
+    enrolTwo
+      .then(signGrant(1, 1, 3)).then(signGrant(2, 2, 4))
+      .then(appendId(4)).then(refuseId(3))
+      .expect(happened(EvRefusedBaseRule))
+      .then(fetchOne(1, 0))
+      .then(signGrant(1, 1, 3))
+      .then(appendId(5)).then(fetchOne(1, 0))
+      .expect(branches.get(0).sp.active == Set(1, 2, 3, 4) and dev(1).log.recs.length() == 4)
+      .expect(grantConfirmed)
+      .expect(happened(EvReconfirmed) and not(happened(EvResigned)))
+
+  // [LOG-7] A retry with no grant or removal in between keeps the confirmation.
+  // A second copy of the grant on the same base is refused with stale_base.
+  // After the fetch, the engine checks the space state again: device 3 is
+  // active, so it signs no grant for it.
+  run retryChecksStateTest =
+    enrolTwo
+      .then(signGrant(1, 1, 3)).then(signGrant(1, 1, 3))
+      .expect(happened(EvResigned) and not(happened(EvReconfirmed)))
+      .then(appendId(3)).then(refuseId(4))
+      .expect(happened(EvRefusedBaseRule) and grantConfirmed)
+      .then(fetchOne(1, 0))
+      .expect(dev(1).log.sp.active == Set(1, 2, 3))
+      .then(signGrant(1, 1, 3)).fail()
+
+  // M4 decision 1: the user types the recovery key on device 1, which signs the
+  // grant for device 3 with it. The new device verifies the log to the
+  // checkpoint, and its grant counts as authorised.
+  run recoveryGrantTest =
+    enrolTwo
+      .then(signGrant(1, RK, 3)).then(appendId(3))
+      .expect(happened(EvRecoveryGrant) and branches.get(0).recs.nth(2).author == RK)
+      .then(fetchOne(1, 0)).then(sendCheckpoint(1, 3))
+      .then(fetchOne(3, 0)).then(fetchOne(3, 0)).then(fetchOne(3, 0))
+      .expect(dev(3).status == Running and dev(3).log.sp.active == Set(1, 2, 3))
+      .expect(grantAuthorized and grantConfirmed and grantSealsAllKeys)
 }
 
 // A thief (device 2) ignores its own removal.

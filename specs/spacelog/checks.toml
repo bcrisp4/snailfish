@@ -16,7 +16,7 @@ invariants = [
   "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
   "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
   "noStaleChangeStored", "grantSealsAllKeys", "epochSequential", "noSelfRemoval",
-  "grantSubjectNew",
+  "grantSubjectNew", "grantConfirmed",
 ]
 
 witness_configs = ["honest", "forkRelay", "forgeRelay", "reorderRelay", "thief",
@@ -213,6 +213,15 @@ caught_by = "noSelfRemoval"
 base = "compromisedHonest"
 caught_by = "grantSubjectNew"
 
+# [LOG-7] A retry after stale_base needs a new confirmation if a grant or a
+# removal arrived. Two devices cannot reach it: the other grant needs a third
+# device that is not the subject (finding S1).
+[mutants.resignNoReconfirm]
+base = "honest4"
+caught_by = "tests"
+test_module = "spacelogTest4"
+test = "resignReconfirmTest"
+
 # ---------------------------------------------------------------- exhaustive (TLC)
 # TLC checks every reachable state of a small config, at any depth. Each listed
 # mutant must also fail on the same config, so the config is big enough to
@@ -224,7 +233,7 @@ invariants = [
   "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
   "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
   "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
-  "noStaleChangeStored",
+  "noStaleChangeStored", "grantConfirmed",
 ]
 mutants = ["epochSealsToAll", "verifierIgnoresRemovals"]
 why = "An honest relay with 2 devices and 4 records: about 9 000 states, 13 seconds."
@@ -241,7 +250,7 @@ invariants = [
   "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
   "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
   "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
-  "noStaleChangeStored",
+  "noStaleChangeStored", "grantConfirmed",
 ]
 why = "A thief ignores its own removal: about 35 000 states, 77 seconds."
 
@@ -260,7 +269,7 @@ invariants = [
   "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
   "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
   "writeEpochCurrent", "logChangeEpoch", "grantSealsAllKeys", "epochSequential",
-  "noSelfRemoval", "grantSubjectNew",
+  "noSelfRemoval", "grantSubjectNew", "grantConfirmed",
 ]
 mutants = ["grantSealedUnchecked", "epochSkipAllowed"]
 why = "A compromised key and a malicious relay, 2 devices, 3 records, 2 adversary actions (bounded templates only)."
