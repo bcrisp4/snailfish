@@ -232,7 +232,7 @@ jobs:
 
   fuzz:
     # A short run of every fuzz target on each push, so a new parser target
-    # (M3: repair and status) runs before the merge. `make rust-fuzz` runs
+    # (M3: repair and status, M4: enroll_code and mailbox) runs before the merge. `make rust-fuzz` runs
     # each target that `cargo fuzz list` names, from its seeds.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
