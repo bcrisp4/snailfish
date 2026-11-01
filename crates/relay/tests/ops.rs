@@ -295,6 +295,62 @@ fn schema_one_files_migrate_forward() {
     );
 }
 
+/// [VER-14], [QTA-1]: schema 3 files from M4 open and gain the M5 tables.
+/// The space file gets its usage from the stored changes, so the quota
+/// counts the changes from before the migration.
+#[test]
+fn schema_three_files_migrate_forward() {
+    let mut fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let want: u64 = fx.h["space"]["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| common::s(&e["envelope"]))
+        .filter(|e| e.contains("\"snailfish.change.v1\""))
+        .map(|e| e.len() as u64)
+        .sum();
+    assert!(want > 0);
+    for (path, tables) in [
+        (
+            fx.tenant_db(fx.tenant()),
+            &[
+                "limits",
+                "device_status",
+                "groups",
+                "group_devices",
+                "webhook",
+                "alerts",
+                "webhook_outbox",
+            ][..],
+        ),
+        (fx.space_file(fx.tenant()), &["usage"][..]),
+        (
+            fx.dir.path().join("directory.db"),
+            &[
+                "passkeys",
+                "invites",
+                "sessions",
+                "codes",
+                "setup_tokens",
+                "setup_nonces",
+            ][..],
+        ),
+    ] {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        for t in tables {
+            c.execute_batch(&format!("DROP TABLE {t};")).unwrap();
+        }
+        c.execute_batch("PRAGMA user_version = 3;").unwrap();
+    }
+    fx.restart(common::limits_of(&fx.h));
+    assert_eq!(fx.fetch(fx.tenant(), 0, 10).status, 200);
+    assert_eq!(fx.usage(fx.tenant()), want);
+    // directory.db migrated at the restart: an invite and a setup token work.
+    assert!(fx.relay.invite("sam").unwrap().contains("#it_"));
+    fx.setup_token("sam", "A");
+}
+
 /// [LOG-11], PROTOCOL.md 10.9: a session expires at its start + 86,400
 /// seconds exactly. A chunk one second before goes in.
 #[test]

@@ -10,11 +10,13 @@ from __future__ import annotations
 import base64
 import http.client
 import os
+import time
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import pytest
 import snailfish as sf
+from snailfish_demo.softbrowser import SoftBrowser
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -23,20 +25,39 @@ APP = "com.example.tasks"
 
 
 class Relay:
-    """The relay that `make test-python` starts, and its tenant handle.
+    """The relay that `make test-python` starts, and a signed-in browser.
 
     `bindings/scripts/with-relay.sh` starts `snailfish-relay` on a free port
-    and sets `SNAILFISH_RELAY_URL` and `SNAILFISH_TENANT`.
+    and sets `SNAILFISH_RELAY_URL` and `SNAILFISH_INVITE`. The software
+    browser of the demo registers a passkey with the invite once.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, browser: SoftBrowser) -> None:
         """Read the relay from the environment."""
         url = os.environ.get("SNAILFISH_RELAY_URL")
-        tenant = os.environ.get("SNAILFISH_TENANT")
-        if not url or not tenant:
+        if not url:
             pytest.fail("SNAILFISH_RELAY_URL is not set: run make test-python")
         self.url = url
-        self.tenant = tenant
+        self.browser = browser
+
+    def setup_token(self, keys: sf.DeviceKeys) -> sf.SetupToken:
+        """The native sign-in of PROTOCOL.md 12.2 and 12.3 through the
+        binding: the setup token and the tenant handle ([USR-4], [USR-5])."""
+        si = sf.SignIn(self.url, "com.example.tasks:/callback")
+        redirect = self.browser.approve(si.authorize_url(), "sam")
+        req = si.token_request(redirect, keys, int(time.time()))
+        status, _, body = self.send(req.method, req.url, req.headers, req.body)
+        return si.read_token(status, body)
+
+    def first_device(
+        self, ka: sf.DeviceKeys, log_id: str, url: str = ""
+    ) -> tuple[sf.SpaceRef, str]:
+        """Sign in for device A. Returns its space and its setup token."""
+        token = self.setup_token(ka)
+        space = sf.SpaceRef(
+            relay_url=url or self.url, tenant=token.tenant, log_id=log_id, app_id=APP
+        )
+        return space, token.token
 
     def send(
         self, method: str, url: str, headers: list[sf.Header], body: bytes
@@ -55,10 +76,22 @@ class Relay:
         return resp.status, hs, out
 
 
+@pytest.fixture(scope="session")
+def browser(tmp_path_factory: pytest.TempPathFactory) -> SoftBrowser:
+    """A software browser that registered the passkey of "sam" once."""
+    url = os.environ.get("SNAILFISH_RELAY_URL", "")
+    invite = os.environ.get("SNAILFISH_INVITE", "")
+    if not url or not invite:
+        pytest.fail("SNAILFISH_INVITE is not set: run make test-python")
+    b = SoftBrowser(tmp_path_factory.mktemp("browser") / "state.json", url)
+    b.register(invite)
+    return b
+
+
 @pytest.fixture
-def relay() -> Relay:
+def relay(browser: SoftBrowser) -> Relay:
     """The running relay."""
-    return Relay()
+    return Relay(browser)
 
 
 def exchange(relay: Relay, engine: sf.Engine) -> None:
@@ -108,10 +141,8 @@ def test_change_from_a_reaches_b(relay: Relay, tmp_path: Path) -> None:
     kb = sf.new_device_keys()
     setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
-    space = sf.SpaceRef(
-        relay_url=relay.url, tenant=relay.tenant, log_id=setup.log_id, app_id=APP
-    )
-    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes)
+    space, token = relay.first_device(ka, setup.log_id)
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token)
     a = sf.Engine.open(str(tmp_path / "a"), space, ka)
     exchange(relay, a)
     assert a.status() == sf.Status.OK()
@@ -147,11 +178,9 @@ def test_wrong_authority_is_paused(relay: Relay, tmp_path: Path) -> None:
     ka = sf.new_device_keys()
     setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
-    url = relay.url.replace("127.0.0.1", "localhost")
-    space = sf.SpaceRef(
-        relay_url=url, tenant=relay.tenant, log_id=setup.log_id, app_id=APP
-    )
-    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes)
+    url = relay.url.replace("localhost", "127.0.0.1")
+    space, token = relay.first_device(ka, setup.log_id, url)
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token)
     a = sf.Engine.open(str(tmp_path / "a"), space, ka)
     exchange(relay, a)
     assert a.status() == sf.Status.RELAY_AUTHORITY()
@@ -184,10 +213,8 @@ def test_hold_and_repair_cross_the_binding(relay: Relay, tmp_path: Path) -> None
     ka = sf.new_device_keys()
     setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
-    space = sf.SpaceRef(
-        relay_url=relay.url, tenant=relay.tenant, log_id=setup.log_id, app_id=APP
-    )
-    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes)
+    space, token = relay.first_device(ka, setup.log_id)
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token)
     a = sf.Engine.open(str(tmp_path / "a"), space, ka)
     exchange(relay, a)
     a.enqueue_many([sf.OutboxRow(change_id=a.new_change_id(), change_bytes=b"x")])
@@ -238,10 +265,8 @@ def test_code_mismatch_appends_no_grant(relay: Relay, tmp_path: Path) -> None:
     ka = sf.new_device_keys()
     setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
-    space = sf.SpaceRef(
-        relay_url=relay.url, tenant=relay.tenant, log_id=setup.log_id, app_id=APP
-    )
-    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes)
+    space, token = relay.first_device(ka, setup.log_id)
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token)
     a = sf.Engine.open(str(tmp_path / "a"), space, ka)
     exchange(relay, a)
     t, n = enroll(relay, a, sf.new_device_keys(), (True, False))

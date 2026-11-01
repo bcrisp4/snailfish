@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use snailfish_engine::codec;
 pub use snailfish_engine::codec::{EnrollPayload, Envelope, KeySetInfo, PayloadClass, PayloadInfo};
 pub use snailfish_engine::enroll::EnrollState;
+pub use snailfish_engine::signin::SetupToken;
 pub use snailfish_engine::{EnqueueResult, Header, OutboxRow, Repair, Request, SpaceRef, Status};
 
 uniffi::setup_scaffolding!("snailfish");
@@ -117,10 +118,27 @@ pub enum Status {
     RelayUnavailable,
     RelayAuthority,
     RestoreHold,
+    Quota,
     RepairNeedsAnotherDevice,
     RelayTooOld,
     ClockSkew,
     Fork { cause: String },
+    SetupFailed { cause: String },
+}
+
+/// The status text of DESIGN.md "Sync status", without its cause.
+#[uniffi::export]
+#[must_use]
+pub fn status_text(status: &Status) -> String {
+    status.text().to_owned()
+}
+
+/// The result of a native sign-in (`PROTOCOL.md` 12.3).
+#[uniffi::remote(Record)]
+pub struct SetupToken {
+    pub token: String,
+    pub tenant: String,
+    pub expires: u64,
 }
 
 /// A QR payload of an enrollment (`PROTOCOL.md` 11.1).
@@ -310,7 +328,8 @@ pub fn create_space(app_id: &str, first: &NewDevice) -> Result<SpaceSetup> {
     })
 }
 
-/// Give the setup records to the engine of the first device.
+/// Give the setup records and the setup token to the engine of the first
+/// device.
 ///
 /// # Errors
 ///
@@ -321,13 +340,63 @@ pub fn install_setup(
     space: SpaceRef,
     keys: &DeviceKeys,
     envelopes: &[String],
+    setup_token: &str,
 ) -> Result<()> {
     Ok(snailfish_engine::setup::install_setup(
         &PathBuf::from(data_dir),
         space,
         &keys.to_engine()?,
         envelopes,
+        setup_token,
     )?)
+}
+
+/// A native sign-in of a first device (`PROTOCOL.md` 12.2 and 12.3).
+#[derive(Debug, uniffi::Object)]
+pub struct SignIn {
+    inner: snailfish_engine::signin::SignIn,
+}
+
+#[uniffi::export]
+impl SignIn {
+    /// Start a sign-in at the relay for a loopback or private-use redirect
+    /// URI.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    #[uniffi::constructor]
+    pub fn new(relay_url: &str, redirect_uri: &str) -> Result<Self> {
+        Ok(Self {
+            inner: snailfish_engine::signin::SignIn::new(relay_url, redirect_uri)?,
+        })
+    }
+
+    /// The URL for the system browser.
+    #[must_use]
+    pub fn authorize_url(&self) -> String {
+        self.inner.authorize_url()
+    }
+
+    /// The setup token request for the URL that the browser redirected to.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn token_request(&self, redirect: &str, keys: &DeviceKeys, now: u64) -> Result<Request> {
+        Ok(self
+            .inner
+            .token_request(redirect, &keys.to_engine()?, now)?)
+    }
+
+    /// Read the answer of the setup token request.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`] with the relay error code.
+    pub fn read_token(&self, status: u16, body: &[u8]) -> Result<SetupToken> {
+        Ok(self.inner.read_token(status, body)?)
+    }
 }
 
 /// The result of an enrollment on the new device.
@@ -857,6 +926,20 @@ impl Engine {
     /// [`SnailfishError::Engine`].
     pub fn outbox_len(&self) -> Result<u64> {
         Ok(self.inner.lock().map_err(|_| poisoned())?.outbox_len()?)
+    }
+
+    /// Replace the setup token of a space that this device creates, after a
+    /// new sign-in (`stopped: setup failed`).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn set_setup_token(&self, token: &str) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .set_setup_token(token)?)
     }
 
     /// The last verified position and its digest.

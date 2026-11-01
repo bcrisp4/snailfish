@@ -45,7 +45,11 @@ func TestHTTPSignedCasesPass(t *testing.T) {
 	for _, c := range h.Signed {
 		r := *rs
 		r.authority = c.Authority
-		if code := r.verifyRequest(request{c.Method, c.Path, c.Query, c.Body, c.Headers}); code != "" {
+		verify := r.verifyRequest
+		if c.Path == setupPath {
+			verify = r.verifySetupRequest
+		}
+		if code := verify(request{c.Method, c.Path, c.Query, c.Body, c.Headers}); code != "" {
 			t.Errorf("%s: %s", c.Name, code)
 		}
 	}
@@ -141,7 +145,7 @@ func TestHTTPFetchHasMore(t *testing.T) {
 	}
 }
 
-// Each relay fault of the M3 and M4 rules must change the result of a named case, so
+// Each relay fault of the M3, M4 and M5 rules must change the result of a named case, so
 // a relay with the fault cannot pass the vectors.
 func TestHTTPVectorsDetectRelayFaults(t *testing.T) {
 	h, w := testHTTP(t)
@@ -176,6 +180,15 @@ func TestHTTPVectorsDetectRelayFaults(t *testing.T) {
 		{"enroll-open-retry-new-expires", "enroll open-exact-retry"},
 		{"enroll-no-tenant-check", "enroll done-other-tenant"},
 		{"enroll-body-before-digest", "enroll check-order"},
+		{"no-quota", "append_quota change-one-byte-over"},
+		{"quota-checks-security", "append_quota grant-at-full-quota"},
+		{"quota-ignores-request", "append_quota earlier-envelope-counts"},
+		{"setup-any-keyid", "setup_token keyid-not-device"},
+		{"setup-expiry-after", "setup_token code-at-expiry"},
+		{"setup-no-pkce", "setup_token other-verifier"},
+		{"put-setup-any-text", "put setup-uppercase-hex"},
+		{"put-expiry-after", "put token-at-expiry"},
+		{"put-any-tenant", "put token-of-other-tenant"},
 	} {
 		err := checkHTTPWith(h, w, tc.mut)
 		if err == nil {

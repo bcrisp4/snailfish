@@ -162,7 +162,20 @@ fn migrate(db: &Connection) -> Result<(), EngineError> {
              COMMIT;",
         )?;
     }
-    const { assert!(SCHEMA_VERSION == 4) };
+    if found < 5 {
+        // M5: the setup token of the first device (PROTOCOL.md 12.3), and
+        // the fields of the device status report (10.11).
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE setup_token (id INTEGER PRIMARY KEY CHECK (id = 1), token BLOB NOT NULL);
+             ALTER TABLE meta ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE outbox ADD COLUMN queued INTEGER;
+             UPDATE outbox SET queued = CAST(strftime('%s', 'now') AS INTEGER);
+             PRAGMA user_version = 5;
+             COMMIT;",
+        )?;
+    }
+    const { assert!(SCHEMA_VERSION == 5) };
     Ok(())
 }
 
@@ -281,9 +294,9 @@ pub(crate) fn enqueue(e: &mut Engine, rows: &[OutboxRow]) -> Result<EnqueueResul
             }
             (None, None) => {
                 tx.execute(
-                    "INSERT INTO outbox (change_id, content_hash, ciphertext, envelope, state)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![&cid[..], &hash[..], ct, env, PENDING],
+                    "INSERT INTO outbox (change_id, content_hash, ciphertext, envelope, state, queued)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![&cid[..], &hash[..], ct, env, PENDING, to_i64(e.now())?],
                 )?;
                 out.stored.push(cid.to_vec());
             }
@@ -699,6 +712,57 @@ pub(crate) fn add_setup(db: &Connection, envelopes: &[String]) -> Result<(), Eng
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Store the setup token of the first device (`PROTOCOL.md` 12.3).
+pub(crate) fn set_setup_token(db: &Connection, token: &str) -> Result<(), EngineError> {
+    let t =
+        snailfish_protocol::setup::parse_token(snailfish_protocol::setup::TokenKind::Setup, token)
+            .map_err(|e| EngineError::Invalid(format!("setup token: {e}")))?;
+    db.execute(
+        "INSERT INTO setup_token (id, token) VALUES (1, ?1)
+         ON CONFLICT (id) DO UPDATE SET token = excluded.token",
+        [&t[..]],
+    )?;
+    Ok(())
+}
+
+/// The setup token of the first device, if the app gave one.
+pub(crate) fn setup_token(db: &Connection) -> Result<Option<[u8; 32]>, EngineError> {
+    let t: Option<Vec<u8>> = db
+        .query_row("SELECT token FROM setup_token WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    t.map(|t| {
+        <[u8; 32]>::try_from(t)
+            .map_err(|_| EngineError::Storage("a stored setup token is not 32 bytes".into()))
+    })
+    .transpose()
+}
+
+/// Keep the applied position of the last `changes_after` call (10.11).
+pub(crate) fn set_applied(db: &Connection, position: u64) -> Result<(), EngineError> {
+    db.execute("UPDATE meta SET applied = ?1", [to_i64(position)?])?;
+    Ok(())
+}
+
+/// The fields of the device status report (10.11): the applied position,
+/// the pending outbox rows and the queue time of the oldest one.
+pub(crate) fn report_fields(db: &Connection) -> Result<(u64, u64, Option<u64>), EngineError> {
+    let applied: i64 = db.query_row("SELECT applied FROM meta", [], |r| r.get(0))?;
+    let (n, oldest): (i64, Option<i64>) = db.query_row(
+        "SELECT count(*), MIN(COALESCE(queued, 0)) FROM outbox WHERE state = ?1",
+        [PENDING],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let n = to_u64(n)?;
+    let oldest = if n == 0 {
+        None
+    } else {
+        oldest.map(to_u64).transpose()?
+    };
+    Ok((to_u64(applied)?, n, oldest))
 }
 
 /// The genesis record of the setup, if the verified log does not hold it.

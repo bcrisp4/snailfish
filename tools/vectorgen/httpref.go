@@ -42,10 +42,13 @@ type space struct {
 	recovery   map[string]ed25519.PublicKey // the current recovery ID text to its signing key (10.2)
 	writeLevel int64
 	changes    map[string]chgRef // change ID text to the stored change
+	inRequest  bool              // an append request runs, for the mutant quota-ignores-request
 	lastSec    int               // position of the last security record (10.6 step 10)
 	hold       bool              // restore hold ([LOG-14])
 	reports    map[string]report // device ID text to its last status report (10.8)
 	sess       *repairSession    // at most one repair session (10.9)
+	quota      int64             // space quota in bytes (10.6 step 14). 0 means no quota.
+	used       int64             // stored change bytes (10.6 step 14)
 	// mut names a deliberate fault. Only the tests of http_test.go set it, to
 	// show that the vectors detect the fault. The generator keeps it "".
 	mut string
@@ -101,6 +104,7 @@ type record struct {
 	payload, sig []byte
 	m            map[string]any
 	rh           []byte
+	envLen       int64 // byte length of the envelope JSON text as the request holds it
 }
 
 func parseRecord(env string) (*record, error) {
@@ -113,7 +117,7 @@ func parseRecord(env string) (*record, error) {
 	}
 	v, _ := parseStrict(pe.payload)
 	m := v.(map[string]any)
-	return &record{pe.ptype, pe.payload, pe.sig, m, recordHash(pe.ptype, pe.payload, pe.sig)}, nil
+	return &record{pe.ptype, pe.payload, pe.sig, m, recordHash(pe.ptype, pe.payload, pe.sig), int64(len(env))}, nil
 }
 
 func (r *record) str(k string) string { x, _ := r.m[k].(string); return x }
@@ -146,6 +150,9 @@ func (sp *space) push(r *record) int {
 	if id := r.changeID(); id != "" {
 		cid, _ = decodeID(id, "c_", 16)
 		sp.changes[id] = chgRef{hx(r.rh), n}
+	}
+	if r.ptype == "snailfish.change.v1" && (sp.mut != "quota-ignores-request" || !sp.inRequest) {
+		sp.used += r.envLen
 	}
 	eh := entryHash(r.ptype, cid, r.rh)
 	sp.entries = append(sp.entries, spEntry{r.rh, digestN(sp.digestAt(n-1), n, eh)})
@@ -227,6 +234,8 @@ func (sp *space) appendBatch(keyid, body string, lim limitsJ) ([]result, error) 
 		return nil, fmt.Errorf("bad_request: %d envelopes", len(req.Envelopes))
 	}
 	var out []result
+	sp.inRequest = true
+	defer func() { sp.inRequest = false }()
 	for _, raw := range req.Envelopes {
 		out = append(out, sp.appendOne(keyid, string(raw), lim))
 	}
@@ -267,6 +276,10 @@ func (sp *space) appendOne(keyid, env string, lim limitsJ) result {
 		return refuse(code)
 	}
 	// 14
+	if (r.ptype == "snailfish.change.v1" || sp.mut == "quota-checks-security") && sp.quota > 0 && sp.used+r.envLen > sp.quota && sp.mut != "no-quota" {
+		return refuse("quota")
+	}
+	// 15
 	return result{status: "stored", pos: sp.push(r)}
 }
 
@@ -409,6 +422,8 @@ var errStatus = map[string]int{
 	"bad_request": 400, "bad_digest": 400, "unknown_device": 403, "repair_busy": 409, "bad_repair": 409,
 	"invalid_record": 422, "uncovered_stub": 422, "too_large": 413,
 	"unknown_session": 404, "session_exists": 409, "bad_step": 409, "session_closed": 409,
+	"bad_signature": 401, "expired": 401, "nonce_reused": 401, "wrong_authority": 421,
+	"bad_setup": 403, "space_exists": 409, "internal": 500,
 }
 
 type repairSession struct {
@@ -1066,6 +1081,7 @@ type relayState struct {
 	now       int64
 	space     *space
 	used      map[[2]string]bool
+	mut       string // a deliberate fault, as space.mut
 }
 
 var paramsRe = regexp.MustCompile(`^\("@method" "@authority" "@path" "@query" "content-digest"\);created=([1-9][0-9]*);expires=([1-9][0-9]*);nonce="([0-9a-f]{32})";keyid="(d_[0-9a-f]{64})";alg="ed25519";tag="snailfish\.request\.v1"$`)
@@ -1107,9 +1123,28 @@ func parseParams(line string) (*parsedParams, error) {
 // verifyRequest returns the error code of the first failed check, or "" if the
 // request passes. It does not store the nonce.
 func (rs *relayState) verifyRequest(rq request) string {
+	pp, sig, code := rs.checkHeaders(rq)
+	if code != "" {
+		return code
+	}
+	// 5
+	key := rs.space.active[pp.keyid]
+	if key == nil {
+		return "unknown_device"
+	}
+	return rs.checkSignature(rq, pp, sig, key)
+}
+
+// checkHeaders is the cookie rule of PROTOCOL.md 10 and 8.6 steps 1 to 4.
+// PROTOCOL.md gives no order for the cookie rule. The vectors hold no case
+// that depends on it.
+func (rs *relayState) checkHeaders(rq request) (*parsedParams, []byte, string) {
+	if len(headerValues(rq.headers, "cookie")) > 0 {
+		return nil, nil, "bad_request"
+	}
 	// 1
 	if v := headerValues(rq.headers, "snailfish-authority"); len(v) == 1 && v[0] != rs.authority {
-		return "wrong_authority"
+		return nil, nil, "wrong_authority"
 	}
 	// 2
 	one := func(name string) (string, bool) {
@@ -1124,41 +1159,42 @@ func (rs *relayState) verifyRequest(rq request) string {
 	sg, ok3 := one("signature")
 	au, ok4 := one("snailfish-authority")
 	if !ok1 || !ok2 || !ok3 || !ok4 {
-		return "bad_signature"
+		return nil, nil, "bad_signature"
 	}
 	_ = au
 	if !digestRe.MatchString(cd) {
-		return "bad_signature"
+		return nil, nil, "bad_signature"
 	}
 	// 8.1: standard base64 with padding and no other form, so non-zero
 	// trailing bits break the header form (step 2), not the digest (step 4).
 	if _, err := decodeB64(cd[len("sha-256=:") : len(cd)-1]); err != nil {
-		return "bad_signature"
+		return nil, nil, "bad_signature"
 	}
 	if !strings.HasPrefix(si, "sf=") || !strings.HasPrefix(sg, "sf=:") || !strings.HasSuffix(sg, ":") || len(sg) < 5 {
-		return "bad_signature"
+		return nil, nil, "bad_signature"
 	}
 	pp, err := parseParams(si[3:])
 	if err != nil {
-		return "bad_signature"
+		return nil, nil, "bad_signature"
 	}
 	sig, err := decodeB64(sg[4 : len(sg)-1])
 	if err != nil || len(sig) != 64 {
-		return "bad_signature"
+		return nil, nil, "bad_signature"
 	}
 	// 3
 	if pp.expires < rs.now || pp.created > rs.now+60 {
-		return "expired"
+		return nil, nil, "expired"
 	}
 	// 4
 	if cd != digestHeader(rq.body) {
-		return "bad_digest"
+		return nil, nil, "bad_digest"
 	}
-	// 5
-	key := rs.space.active[pp.keyid]
-	if key == nil {
-		return "unknown_device"
-	}
+	return pp, sig, ""
+}
+
+// checkSignature is 8.6 steps 6 and 7 with the signing key of step 5.
+func (rs *relayState) checkSignature(rq request, pp *parsedParams, sig []byte, key ed25519.PublicKey) string {
+	cd := headerValues(rq.headers, "content-digest")[0]
 	// 6
 	base := sigBase(strings.ToUpper(rq.method), rs.authority, rq.path, rq.query, cd, pp.line)
 	if !ed25519.Verify(key, []byte(base), sig) {

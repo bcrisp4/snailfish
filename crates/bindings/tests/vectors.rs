@@ -243,6 +243,35 @@ fn exchange(relay: &snailfish_relay::core::Relay, engine: &std::sync::Arc<snailf
 }
 
 /// One request to the relay core, as the host app sends it.
+/// The native sign-in of `PROTOCOL.md` 12.2 and 12.3 through the binding,
+/// against the real relay core. The relay issues the code for the challenge,
+/// in place of the browser approval. A marshalling fault in `SignIn` or
+/// `SetupToken` fails here ([USR-4], [USR-5]).
+fn sign_in(relay: &snailfish_relay::core::Relay, keys: &snailfish::DeviceKeys) -> String {
+    let redirect = "com.example.tasks:/cb";
+    let si = snailfish::SignIn::new("https://sync.example.net", redirect).unwrap();
+    let url = si.authorize_url();
+    let (_, query) = url.split_once('?').unwrap();
+    let field = |k: &str| {
+        query
+            .split('&')
+            .find_map(|p| p.strip_prefix(&format!("{k}=")))
+            .unwrap()
+            .to_owned()
+    };
+    let code = relay
+        .issue_code("sam", &field("code_challenge"), redirect)
+        .unwrap();
+    let back = format!("{redirect}?code={code}&state={}", field("state"));
+    let req = si
+        .token_request(&back, keys, snailfish_relay::core::system_time())
+        .unwrap();
+    let (status, _, body) = send(relay, req);
+    let t = si.read_token(status, &body).unwrap();
+    assert!(t.token.starts_with("st_"));
+    t.token
+}
+
 fn send(
     relay: &snailfish_relay::core::Relay,
     req: snailfish::Request,
@@ -331,7 +360,7 @@ fn engine_object_syncs_two_devices() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
     let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), &ka).unwrap());
     let locked = snailfish::Engine::open(pa, sp.clone(), &ka).err().unwrap();
     assert!(matches!(locked, snailfish::SnailfishError::Locked));
@@ -448,7 +477,7 @@ fn enrollment_mismatch_through_the_binding() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
     let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
     exchange(&relay, &a);
     let te = snailfish::TrustedEnrollment::new(a.clone(), None, None).unwrap();
@@ -554,7 +583,7 @@ fn engine_object_reports_a_repair() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
     let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
     exchange(&relay, &a);
     let backup = dir.path().join("backup");
@@ -604,7 +633,7 @@ fn confirm_again_crosses_the_binding() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
     let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), &ka).unwrap());
     exchange(&relay, &a);
     let open = |t: &snailfish::TrustedEnrollment| {

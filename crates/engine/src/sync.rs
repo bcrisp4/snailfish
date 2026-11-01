@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use rusqlite::{Transaction, TransactionBehavior};
 use snailfish_protocol::encoding::encode_id;
 use snailfish_protocol::request::{self, Params, Target};
+use snailfish_protocol::setup;
 use snailfish_protocol::space::{self, Mode, Verdict};
 use snailfish_protocol::wire::{self, AppendResult, FetchEntry, Head, Limits};
 
@@ -29,6 +30,7 @@ enum Phase {
     Grants,
     Push,
     LastFetch,
+    DeviceReport,
     Done,
 }
 
@@ -49,6 +51,7 @@ enum Sent {
     RepairChunk(Vec<(u64, String)>),
     RepairFinish,
     Status,
+    DeviceStatus,
 }
 
 /// A repair session in this exchange (`PROTOCOL.md` 10.9).
@@ -151,6 +154,7 @@ impl Sync {
                     next
                 }
                 Phase::Report => Some(Sent::Status),
+                Phase::DeviceReport => Some(Sent::DeviceStatus),
                 Phase::Grants | Phase::Push => {
                     if !self.queued {
                         self.queue(engine)?;
@@ -240,11 +244,14 @@ impl Sync {
             ),
             Sent::Create => {
                 let g = state::setup_genesis(&engine.db)?.ok_or(EngineError::UnexpectedResponse)?;
+                // An engine without a token sends none of its own: the
+                // relay answers `bad_request`, and the status names it.
+                let token = state::setup_token(&engine.db)?.unwrap_or([0; 32]);
                 (
                     "PUT",
                     space_path,
                     String::new(),
-                    wire::genesis_body(&g),
+                    wire::genesis_body(&g, &token),
                     true,
                 )
             }
@@ -288,6 +295,23 @@ impl Sync {
                 (
                     "POST",
                     format!("{space_path}/status"),
+                    String::new(),
+                    body,
+                    true,
+                )
+            }
+            Sent::DeviceStatus => {
+                let (applied, outbox, oldest) = state::report_fields(&engine.db)?;
+                let body = setup::device_status_body(&setup::DeviceStatus {
+                    state: engine.status.text().to_owned(),
+                    outbox,
+                    oldest,
+                    applied,
+                    epoch: 1,
+                });
+                (
+                    "POST",
+                    format!("{space_path}/device-status"),
                     String::new(),
                     body,
                     true,
@@ -380,6 +404,10 @@ impl Sync {
             Sent::RepairChunk(chunk) => self.repair_answer(&chunk, body, false),
             Sent::RepairFinish => self.repair_finished(engine, body),
             Sent::Status => self.status_answer(engine, body),
+            Sent::DeviceStatus => {
+                self.phase = Phase::Done;
+                Ok(())
+            }
         };
         match result {
             Ok(()) => Ok(()),
@@ -411,6 +439,12 @@ impl Sync {
             self.phase = Phase::Repair;
             return Ok(());
         }
+        // A refused status report changes no status: the report is for the
+        // user page only.
+        if matches!(sent, Sent::DeviceStatus) {
+            self.phase = Phase::Done;
+            return Ok(());
+        }
         let late = self.repair.as_ref().is_some_and(|r| r.late);
         engine.status = match code.as_deref() {
             Some("wrong_authority") => Status::RelayAuthority,
@@ -424,6 +458,13 @@ impl Sync {
             // the chain check, so the relay does not know the signer.
             Some("bad_repair" | "unknown_device") if late => Status::RepairNeedsAnotherDevice,
             Some("expired") => Status::ClockSkew,
+            Some(code @ ("bad_setup" | "space_limit" | "bad_request"))
+                if matches!(sent, Sent::Create) =>
+            {
+                Status::SetupFailed {
+                    cause: code.to_owned(),
+                }
+            }
             Some("space_exists") => Status::Fork {
                 cause: "the relay holds another genesis record for this log".into(),
             },
@@ -585,6 +626,8 @@ impl Sync {
         }
         self.phase = match self.phase {
             Phase::FirstFetch => self.after_first_fetch(engine).map_err(Answer::Engine)?,
+            // PROTOCOL.md 10.11: the status report is the last request.
+            Phase::LastFetch => Phase::DeviceReport,
             _ => Phase::Done,
         };
         Ok(())
@@ -682,6 +725,11 @@ impl Sync {
                 // outbox and goes again after the hold.
                 AppendResult::Refused(code) if code == "on_hold" => {
                     engine.status = Status::RestoreHold;
+                }
+                // [QTA-4]: transient. The change stays in the outbox and
+                // goes again at each later sync.
+                AppendResult::Refused(code) if code == "quota" => {
+                    engine.status = Status::Quota;
                 }
                 // [DLV-9]: a permanent refusal.
                 AppendResult::Refused(code) => {

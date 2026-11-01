@@ -55,6 +55,7 @@ fn signed_requests_are_accepted_with_the_vector_headers() {
         let name = s(&c["name"]);
         let create = c["method"] == "PUT";
         let fx = fresh(&h, s(&c["authority"]), !create);
+        seed_setup(&fx, &h);
         let r = fx.relay.handle(&request(c, s(&c["method"])));
         // The vector `fetch-query-several-params` carries a query that 10.7
         // refuses after the signature verifies: it tests the signed query.
@@ -340,6 +341,205 @@ fn enroll_cases_return_the_vector_results() {
                 let got: Value = serde_json::from_slice(&r.body).unwrap();
                 assert_eq!(got, st["response"], "{why}");
             }
+        }
+    }
+}
+
+/// The codes and setup tokens that the relay holds before each setup case.
+fn seed_setup(fx: &Fx, h: &Value) {
+    for c in h["setup_codes"].as_array().unwrap() {
+        fx.seed_code(
+            s(&c["code"]),
+            s(&c["challenge"]),
+            s(&c["redirect_uri"]),
+            s(&c["tenant"]),
+            c["expires"].as_u64().unwrap(),
+            c["used"].as_bool().unwrap(),
+        );
+    }
+    for t in h["setup_tokens"].as_array().unwrap() {
+        fx.seed_setup_token(
+            s(&t["token"]),
+            s(&t["device"]),
+            s(&t["tenant"]),
+            t["expires"].as_u64().unwrap(),
+        );
+    }
+}
+
+/// `PROTOCOL.md` 12.3 ([USR-4], [USR-5]): each setup token case gives its
+/// status and error, and a valid exchange names the tenant of the code.
+#[test]
+fn setup_token_cases() {
+    let h = common::load("http.json");
+    let cases = h["setup_token"].as_array().unwrap();
+    assert!(cases.len() >= 19);
+    for c in cases {
+        let name = s(&c["name"]);
+        let fx = fresh(&h, s(&h["authority"]), true);
+        seed_setup(&fx, &h);
+        let req = Request {
+            method: "POST".into(),
+            path: "/v1/setup/token".into(),
+            query: String::new(),
+            headers: c["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| (s(&p[0]).to_owned(), s(&p[1]).to_owned()))
+                .collect(),
+            body: s(&c["body"]).as_bytes().to_vec(),
+        };
+        let r = fx.relay.handle(&req);
+        assert_eq!(
+            r.status,
+            u16::try_from(c["status"].as_u64().unwrap()).unwrap(),
+            "{name}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        if let Some(code) = c["error"].as_str() {
+            assert_eq!(error_code(&r), code, "{name}");
+        } else {
+            let t = snailfish_protocol::setup::parse_token_response(&r.body).unwrap();
+            assert_eq!(t.tenant, s(&c["response"]["tenant"]), "{name}");
+            assert_eq!(
+                t.expires,
+                c["response"]["expires"].as_u64().unwrap(),
+                "{name}"
+            );
+            // The code works once ([USR-4]).
+            let again = fx.relay.handle(&req);
+            assert_ne!(again.status, 200, "{name}: a second exchange");
+        }
+    }
+}
+
+/// `PROTOCOL.md` 10.5 ([USR-6], [QTA-5]): each PUT case gives its status,
+/// error and head.
+#[test]
+fn put_cases() {
+    let h = common::load("http.json");
+    let cases = h["put"].as_array().unwrap();
+    assert!(cases.len() >= 18);
+    for c in cases {
+        let name = s(&c["name"]);
+        let fx = fresh(&h, s(&h["authority"]), false);
+        if let Some(g) = c["existing"].as_str().filter(|g| !g.is_empty()) {
+            let token = fx.setup_token("sam", "A");
+            let path = fx.space_path(fx.tenant(), fx.log());
+            let r =
+                fx.relay
+                    .handle(&fx.signed("PUT", &path, "", &wire::genesis_body(g, &token), "A"));
+            assert_eq!(r.status, 201, "{name}: existing space");
+        }
+        seed_setup(&fx, &h);
+        let r = fx.relay.handle(&fx.signed(
+            "PUT",
+            s(&c["path"]),
+            "",
+            s(&c["body"]).as_bytes(),
+            s(&c["signer"]),
+        ));
+        assert_eq!(
+            r.status,
+            u16::try_from(c["status"].as_u64().unwrap()).unwrap(),
+            "{name}: {}",
+            String::from_utf8_lossy(&r.body)
+        );
+        if let Some(code) = c["error"].as_str() {
+            assert_eq!(error_code(&r), code, "{name}");
+        } else {
+            let head = wire::parse_head_body(&r.body).unwrap();
+            assert_eq!(
+                head.position,
+                c["head"]["position"].as_u64().unwrap(),
+                "{name}"
+            );
+            assert_eq!(hex::encode(head.digest), s(&c["head"]["digest"]), "{name}");
+        }
+    }
+}
+
+/// `PROTOCOL.md` 10.6 step 14 ([QTA-1], [QTA-3]), against
+/// `specs/quota/test.qnt::fullQuotaKeepsOutboxTest`,
+/// `securityAtFullQuotaTest` and `knownBeforeQuotaTest`.
+#[test]
+fn append_quota_cases() {
+    let h = common::load("http.json");
+    let cases = h["append_quota"].as_array().unwrap();
+    assert!(cases.len() >= 7);
+    for c in cases {
+        let name = s(&c["name"]);
+        let fx = fresh(&h, s(&h["authority"]), true);
+        assert_eq!(
+            fx.usage(fx.tenant()),
+            c["used"].as_u64().unwrap(),
+            "{name}: usage"
+        );
+        fx.relay
+            .set_quotas("sam", None, c["quota"].as_u64())
+            .unwrap();
+        let path = format!("{}/append", fx.space_path(fx.tenant(), fx.log()));
+        let r = fx.relay.handle(&fx.signed(
+            "POST",
+            &path,
+            "",
+            s(&c["body"]).as_bytes(),
+            s(&c["signer"]),
+        ));
+        assert_eq!(r.status, 200, "{name}");
+        let (got, head) = wire::parse_append_response(&r.body).unwrap();
+        let want: Vec<AppendResult> = c["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| match s(&x["status"]) {
+                "stored" => AppendResult::Stored(x["position"].as_u64().unwrap()),
+                "known" => AppendResult::Known(x["position"].as_u64().unwrap()),
+                _ => AppendResult::Refused(s(&x["error"]).to_owned()),
+            })
+            .collect();
+        assert_eq!(got, want, "{name}");
+        assert_eq!(
+            head.position,
+            c["head"]["position"].as_u64().unwrap(),
+            "{name}"
+        );
+        // A refused change stores nothing, and the usage counts only stored
+        // changes ([QTA-1]).
+        assert!(
+            fx.usage(fx.tenant())
+                <= c["quota"]
+                    .as_u64()
+                    .unwrap()
+                    .max(c["used"].as_u64().unwrap()),
+            "{name}"
+        );
+        // [QTA-2]: the relay serves the stored records at a full quota.
+        let page = wire::parse_fetch(&fx.fetch(fx.tenant(), 0, 500).body).unwrap();
+        assert_eq!(page.entries.len() as u64, head.position, "{name}");
+    }
+}
+
+/// `PROTOCOL.md` 10.11: each device status body is accepted or refused.
+#[test]
+fn device_status_cases() {
+    let h = common::load("http.json");
+    let fx = fresh(&h, s(&h["authority"]), true);
+    let path = format!("{}/device-status", fx.space_path(fx.tenant(), fx.log()));
+    for c in h["device_status"].as_array().unwrap() {
+        let name = s(&c["name"]);
+        let r = fx
+            .relay
+            .handle(&fx.signed("POST", &path, "", s(&c["body"]).as_bytes(), "A"));
+        match c["error"].as_str() {
+            Some(code) => assert_eq!((r.status, error_code(&r).as_str()), (400, code), "{name}"),
+            None => assert_eq!(
+                r.status,
+                200,
+                "{name}: {}",
+                String::from_utf8_lossy(&r.body)
+            ),
         }
     }
 }

@@ -5,6 +5,8 @@
 // Each test crate uses a different part of this module.
 #![allow(dead_code)]
 
+pub mod passkey;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 use snailfish_protocol::encoding::{decode_id, encode_b64};
 use snailfish_protocol::envelope::Envelope;
+use snailfish_protocol::records::Keys;
 use snailfish_protocol::request::{self, Params, Target};
+use snailfish_protocol::setup;
 use snailfish_protocol::sig::SecretKey;
 use snailfish_protocol::wire::{self, AppendResult, Head, Limits};
 use snailfish_relay::core::{Config, Relay, Request, Response};
@@ -39,6 +43,22 @@ pub fn limits_of(h: &Value) -> Limits {
         max_snapshot_bytes: g("max_snapshot_bytes"),
         max_append_envelopes: g("max_append_envelopes"),
         max_fetch_entries: g("max_fetch_entries"),
+    }
+}
+
+/// The keys object of device `name` of `vectors/protocol.json`.
+pub fn keys_of(name: &str) -> Keys {
+    let p = load("protocol.json");
+    let d = p["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == name)
+        .unwrap();
+    let b = |k: &str| hex::decode(s(&d[k])).unwrap();
+    Keys {
+        sign: b("sign_pk").try_into().unwrap(),
+        seal: Box::new(b("seal_pk").try_into().unwrap()),
     }
 }
 
@@ -92,6 +112,8 @@ impl Fx {
     ) -> Result<Relay, snailfish_relay::core::OpenError> {
         let n = Arc::clone(now);
         let mut cfg = Config::new(dir.path(), authority);
+        // Each test has its own secrets, not the shared temporary directory.
+        cfg.secrets_dir = dir.path().join("secrets");
         cfg.limits = limits;
         cfg.clock = Arc::new(move || n.load(Ordering::SeqCst));
         Relay::open(cfg)
@@ -195,11 +217,45 @@ impl Fx {
         }
     }
 
+    /// A setup token of `user` for device `name`, through the real code
+    /// exchange of `PROTOCOL.md` 12.3. Only the browser approval is skipped.
+    pub fn setup_token(&self, user: &str, name: &str) -> [u8; 32] {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let redirect = "com.example.tasks:/cb";
+        let code = self
+            .relay
+            .issue_code(user, &setup::challenge(verifier), redirect)
+            .unwrap();
+        let body = setup::token_request_body(&setup::TokenRequest {
+            code: setup::parse_token(setup::TokenKind::Code, &code).unwrap(),
+            verifier: verifier.into(),
+            redirect_uri: redirect.into(),
+            device: keys_of(name),
+        });
+        let r = self
+            .relay
+            .handle(&self.signed("POST", "/v1/setup/token", "", &body, name));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        setup::parse_token_response(&r.body).unwrap().token
+    }
+
+    /// The user name of a tenant handle, or "sam" for an unknown handle.
+    pub fn user_of(&self, tenant: &str) -> String {
+        let c = rusqlite::Connection::open(self.dir.path().join("directory.db")).unwrap();
+        c.query_row(
+            "SELECT u.name FROM users u JOIN tenants t ON t.tenant_id = u.tenant_id WHERE t.handle = ?1",
+            [tenant],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "sam".to_owned())
+    }
+
     pub fn put_genesis(&self, tenant: &str) -> Response {
         let g = s(&self.h["space"]["genesis"]);
         let path = self.space_path(tenant, self.log());
+        let token = self.setup_token(&self.user_of(tenant), "A");
         self.relay
-            .handle(&self.signed("PUT", &path, "", &wire::genesis_body(g), "A"))
+            .handle(&self.signed("PUT", &path, "", &wire::genesis_body(g, &token), "A"))
     }
 
     /// Create the space of `space.log` in `tenant`: genesis, then the other
@@ -338,6 +394,98 @@ impl Fx {
             rusqlite::params![keyid, nonce, i64::try_from(expires).unwrap()],
         )
         .unwrap();
+    }
+
+    /// Make sure a tenant with this handle exists, with a user of its own.
+    pub fn ensure_tenant(&self, handle: &str) {
+        let c = rusqlite::Connection::open(self.dir.path().join("directory.db")).unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tenants WHERE handle = ?1",
+                [handle],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if n == 0 {
+            self.relay
+                .add_user_with_handle(&format!("user-{handle}"), handle)
+                .unwrap();
+        }
+    }
+
+    fn user_id_of(&self, handle: &str) -> String {
+        self.ensure_tenant(handle);
+        let c = rusqlite::Connection::open(self.dir.path().join("directory.db")).unwrap();
+        c.query_row(
+            "SELECT u.user_id FROM users u JOIN tenants t ON t.tenant_id = u.tenant_id WHERE t.handle = ?1",
+            [handle],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Store an authorization code as the approval of 12.2 stores it.
+    pub fn seed_code(
+        &self,
+        code: &str,
+        challenge: &str,
+        redirect: &str,
+        handle: &str,
+        expires: u64,
+        used: bool,
+    ) {
+        let user_id = self.user_id_of(handle);
+        let t = setup::parse_token(setup::TokenKind::Code, code).unwrap();
+        let c = rusqlite::Connection::open(self.dir.path().join("directory.db")).unwrap();
+        c.execute(
+            "INSERT INTO codes (code_hash, user_id, challenge, redirect_uri, expires, used)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                setup::token_hash(&t).as_slice(),
+                user_id,
+                challenge,
+                redirect,
+                i64::try_from(expires).unwrap(),
+                i64::from(used)
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Store a setup token as the exchange of 12.3 stores it.
+    pub fn seed_setup_token(&self, token: &str, device: &str, handle: &str, expires: u64) {
+        let user = self.user_id_of(handle);
+        let t = setup::parse_token(setup::TokenKind::Setup, token).unwrap();
+        let id = self.key(device).1;
+        let c = rusqlite::Connection::open(self.dir.path().join("directory.db")).unwrap();
+        c.execute(
+            "INSERT INTO setup_tokens (token_hash, user_id, device_id, expires) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![setup::token_hash(&t).as_slice(), user, id.as_slice(), i64::try_from(expires).unwrap()],
+        )
+        .unwrap();
+    }
+
+    /// The stored change bytes of the space of `space.log` ([QTA-1]).
+    pub fn usage(&self, handle: &str) -> u64 {
+        let tc = rusqlite::Connection::open(self.tenant_db(handle)).unwrap();
+        let file: String = tc
+            .query_row(
+                "SELECT file_name FROM spaces WHERE log_id = ?1",
+                [self.log()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let dir = self
+            .tenant_db(handle)
+            .parent()
+            .unwrap()
+            .join("spaces")
+            .join(format!("{file}.db"));
+        let sc = rusqlite::Connection::open(dir).unwrap();
+        let n: i64 = sc
+            .query_row("SELECT bytes FROM usage WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        u64::try_from(n).unwrap()
     }
 
     pub fn nonce_count(&self, handle: &str) -> i64 {

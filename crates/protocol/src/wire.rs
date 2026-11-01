@@ -99,6 +99,17 @@ struct AppendBody<'a> {
 struct GenesisBody<'a> {
     #[serde(borrow)]
     genesis: &'a RawValue,
+    setup: String,
+}
+
+/// The body of `PUT /v1/t/{tenant}/s/{log}`: the genesis envelope and the
+/// setup token (`PROTOCOL.md` 10.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateBody {
+    /// The genesis envelope.
+    pub genesis: RawEnvelope,
+    /// The setup token.
+    pub setup: [u8; 32],
 }
 
 /// Parse an append request body (`PROTOCOL.md` 10.6).
@@ -129,17 +140,26 @@ pub fn append_body(envelopes: &[String]) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Refuses a body without a valid `genesis` envelope.
-pub fn parse_genesis(body: &[u8]) -> Result<RawEnvelope, WireError> {
+/// Refuses a body with a duplicate or unknown field, without a valid setup
+/// token, or without a valid `genesis` envelope. The text of a body error starts with
+/// `genesis body:`. Each other error is about the envelope.
+pub fn parse_genesis(body: &[u8]) -> Result<CreateBody, WireError> {
     let parsed: GenesisBody<'_> =
         serde_json::from_slice(body).map_err(|e| bad(format!("genesis body: {e}")))?;
-    raw_envelope(parsed.genesis).map_err(WireError)
+    let setup = crate::setup::parse_token(crate::setup::TokenKind::Setup, &parsed.setup)
+        .map_err(|e| bad(format!("genesis body: setup: {e}")))?;
+    let genesis = raw_envelope(parsed.genesis).map_err(WireError)?;
+    Ok(CreateBody { genesis, setup })
 }
 
 /// The body of a create request.
 #[must_use]
-pub fn genesis_body(envelope: &str) -> Vec<u8> {
-    format!("{{\"genesis\":{envelope}}}").into_bytes()
+pub fn genesis_body(envelope: &str, setup: &[u8; 32]) -> Vec<u8> {
+    format!(
+        "{{\"genesis\":{envelope},\"setup\":\"{}\"}}",
+        crate::setup::token_text(crate::setup::TokenKind::Setup, setup)
+    )
+    .into_bytes()
 }
 
 /// A position and its digest.

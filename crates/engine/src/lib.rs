@@ -12,6 +12,7 @@
 pub mod codec;
 pub mod enroll;
 pub mod setup;
+pub mod signin;
 mod state;
 mod sync;
 
@@ -28,7 +29,7 @@ use snailfish_protocol::sig::SecretKey;
 pub use sync::Sync;
 
 /// The schema version of the engine state file ([VER-14]).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The protocol levels that this engine can write ([VER-6]).
 pub const MAX_LEVEL: u64 = 1;
@@ -122,6 +123,10 @@ pub enum Status {
     /// the relay refuses changes until the user or the operator ends the
     /// hold ([LOG-14]). The engine keeps each change in its outbox.
     RestoreHold,
+    /// `paused: quota`: the relay refused a change because the space is at
+    /// its quota ([QTA-4]). The engine keeps each change in its outbox and
+    /// sends it again at each later sync.
+    Quota,
     /// `paused: repair needs another device`: the grant of this device is
     /// only in the range that the relay lost, and the relay head is not the
     /// position before the grant ([LOG-12]). A device that is active in the
@@ -138,6 +143,34 @@ pub enum Status {
         /// The cause.
         cause: String,
     },
+    /// `stopped: setup failed`: the relay refused to create the space
+    /// (`bad_setup` or `space_limit`, `PROTOCOL.md` 10.5). The app signs in
+    /// again and gives the engine a new setup token.
+    SetupFailed {
+        /// The error code of the relay.
+        cause: String,
+    },
+}
+
+impl Status {
+    /// The status text of DESIGN.md "Sync status", without its cause. The
+    /// device status report sends it (`PROTOCOL.md` 10.11).
+    #[must_use]
+    pub fn text(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Degraded { .. } => "degraded",
+            Self::RelayUnavailable => "paused: relay unavailable",
+            Self::RelayAuthority => "paused: relay authority",
+            Self::RestoreHold => "paused: restore hold",
+            Self::Quota => "paused: quota",
+            Self::RepairNeedsAnotherDevice => "paused: repair needs another device",
+            Self::RelayTooOld => "stopped: relay too old",
+            Self::ClockSkew => "stopped: clock skew",
+            Self::Fork { .. } => "stopped: fork",
+            Self::SetupFailed { .. } => "stopped: setup failed",
+        }
+    }
 }
 
 /// One HTTP header.
@@ -510,7 +543,20 @@ impl Engine {
         applied: &Applied,
         max_changes: usize,
     ) -> Result<Vec<Change>, EngineError> {
+        state::set_applied(&self.db, applied.position)?;
         state::changes_after(self, applied, max_changes.clamp(1, MAX_BATCH))
+    }
+
+    /// Replace the setup token of a space that this device creates
+    /// (`PROTOCOL.md` 12.3). The app calls it after a new sign-in, for
+    /// example after `stopped: setup failed`.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Invalid`] for a text that is not a setup token, and
+    /// [`EngineError::Storage`].
+    pub fn set_setup_token(&mut self, token: &str) -> Result<(), EngineError> {
+        state::set_setup_token(&self.db, token)
     }
 
     /// Take the repairs that this engine made since the last call, oldest

@@ -99,8 +99,33 @@ impl World {
             lose_next: false,
             recovery_key: s.recovery_key.clone(),
         };
-        install_setup(&root.join("a"), w.space(), &w.keys[0], &s.envelopes).unwrap();
+        let token = w.sign_in(&w.keys[0]).token;
+        install_setup(&root.join("a"), w.space(), &w.keys[0], &s.envelopes, &token).unwrap();
         w
+    }
+
+    /// The native sign-in of 12.2 and 12.3 through the engine and the real
+    /// relay core. Only the browser approval is skipped: the relay issues
+    /// the code for the challenge of the sign-in.
+    fn sign_in(&self, keys: &DeviceKeys) -> crate::signin::SetupToken {
+        let si = crate::signin::SignIn::new(URL, "com.example.tasks:/cb").unwrap();
+        let code = self
+            .relay
+            .issue_code("sam", si.challenge(), "com.example.tasks:/cb")
+            .unwrap();
+        // The relay redirects to the URI with the code and the state.
+        let state = si
+            .authorize_url()
+            .rsplit_once("state=")
+            .unwrap()
+            .1
+            .to_owned();
+        let redirect = format!("com.example.tasks:/cb?code={code}&state={state}");
+        let req = si
+            .token_request(&redirect, keys, RELAY_TIME.load(Ordering::SeqCst))
+            .unwrap();
+        let (status, _, body) = self.send(&req);
+        si.read_token(status, &body).unwrap()
     }
 
     /// Enroll B (keys[1]) with the trusted engine `t`: A shows the session.
@@ -287,6 +312,32 @@ impl World {
     /// The restore hold report of the space.
     fn hold(&self) -> snailfish_relay::ops::HoldReport {
         snailfish_relay::ops::hold_report(&self.relay_data(), "sam", &self.log_id).unwrap()
+    }
+
+    /// The last device status report of `e` in the relay tenant file
+    /// (`PROTOCOL.md` 10.11): the state and the outbox size.
+    fn device_state(&self, e: &Engine) -> Option<(String, u64)> {
+        self.status_row(e, "state, outbox")
+            .map(|(a, b)| (a, u64::try_from(b.unwrap_or(0)).unwrap()))
+    }
+
+    /// The applied position of the last report of `e`.
+    fn device_applied(&self, e: &Engine) -> Option<u64> {
+        self.status_row(e, "'', applied")
+            .and_then(|(_, b)| b)
+            .map(|n| u64::try_from(n).unwrap())
+    }
+
+    fn status_row(&self, e: &Engine, cols: &str) -> Option<(String, Option<i64>)> {
+        let tenants = self.relay_data().join("tenants");
+        let t = std::fs::read_dir(tenants).unwrap().next()?.unwrap().path();
+        let c = Connection::open(t.join("tenant.db")).unwrap();
+        c.query_row(
+            &format!("SELECT {cols} FROM device_status WHERE log_id = ?1 AND device_id = ?2"),
+            [&self.log_id, &e.device_id()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
     }
 
     /// A storage fault: the relay log loses the entries after `n`, with no
@@ -1481,6 +1532,55 @@ fn fetched_grant_below_the_write_level_stops() {
         "{v:?}"
     );
     let _ = (dir, ka);
+}
+
+/// `specs/quota/test.qnt::fullQuotaKeepsOutboxTest` and
+/// `raiseStoresQueuedTest` ([QTA-1], [QTA-4]): at a full quota the relay
+/// refuses the change, the engine keeps it in its outbox and reports
+/// `paused: quota`, and the device status report says so. After the
+/// operator raises the quota, the next sync stores it and the pause ends.
+#[test]
+fn quota_refusal_keeps_the_outbox_and_pauses() {
+    let (mut w, mut a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    w.relay.set_quotas("sam", None, Some(0)).unwrap();
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Quota);
+    assert_eq!(
+        ea.outbox_len().unwrap(),
+        1,
+        "the change waits in the outbox"
+    );
+    assert_eq!(w.device_state(&ea), Some(("paused: quota".to_owned(), 1)));
+    // A second sync at a full quota keeps the change and the pause.
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Quota);
+    assert_eq!(ea.outbox_len().unwrap(), 1);
+    w.relay.set_quotas("sam", None, None).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Ok);
+    assert_eq!(ea.outbox_len().unwrap(), 0);
+    assert_eq!(w.device_state(&ea), Some(("ok".to_owned(), 0)));
+}
+
+/// `PROTOCOL.md` 10.11: the report holds the applied position of the last
+/// `changes_after` call.
+#[test]
+fn device_status_report_holds_the_applied_position() {
+    let (mut w, mut a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    assert_eq!(w.device_applied(&ea), Some(0), "no call yet");
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(a.applied.position, 3);
+    assert_eq!(w.device_applied(&ea), Some(3));
 }
 
 /// [VER-15]: a version 1 state file (M1) migrates forward to the current

@@ -1,6 +1,6 @@
 # Snailfish protocol
 
-Status: draft for M4. This file gives the exact bytes of the protocol (DESIGN.md "Wire format", [WIR-1] to [WIR-9]). DESIGN.md gives the rules and the reasons. If the two differ, change the Quint model first, then DESIGN.md, then this file, then `tools/vectorgen`, then the Rust code.
+Status: draft for M5. This file gives the exact bytes of the protocol (DESIGN.md "Wire format", [WIR-1] to [WIR-9]). DESIGN.md gives the rules and the reasons. If the two differ, change the Quint model first, then DESIGN.md, then this file, then `tools/vectorgen`, then the Rust code.
 
 Before the first public release, formats can change without notice, and the vectors are regenerated (DESIGN.md "Versioning").
 
@@ -15,8 +15,9 @@ Before the first public release, formats can change without notice, and the vect
 | 7. Signatures and keys | Done | `snailfish_protocol::sig`, `snailfish_protocol::keys` | `vectors/third_party/`, `vectors/protocol.json` |
 | 8. Request signatures | Done | `snailfish_protocol::request` | `vectors/http.json` |
 | 9. Recovery key encoding | Done | `snailfish_protocol::recovery` | `vectors/protocol.json`, `vectors/recovery-key.json` |
-| 10. HTTP API | Done (M4 routes) | `snailfish_protocol::wire`, `snailfish-relay` | `vectors/http.json` |
+| 10. HTTP API | Done (M5 routes) | `snailfish_protocol::wire`, `snailfish-relay` | `vectors/http.json` |
 | 11. Enrollment | Done | `snailfish_protocol::enroll`, `snailfish-engine` | `vectors/enroll.json`, `vectors/http.json` |
+| 12. User and setup surface | Done | `snailfish_protocol::setup`, `snailfish-relay`, `snailfish-engine` | `vectors/http.json` |
 
 `vectors/README.md` describes each vector file and the programs that make and check them.
 
@@ -72,6 +73,9 @@ Each identifier has a text form with a prefix and lowercase hex. A reader refuse
 | Device ID | 32 | `d_` + 64 hex digits | `SHA-256(frame("snailfish.device-id.v1", sign_pk, seal_pk))` |
 | Recovery ID | 32 | `r_` + 64 hex digits | `SHA-256(frame("snailfish.recovery-id.v1", sign_pk, seal_pk))` |
 | Session ID | 16 | `e_` + 32 hex digits | 128 random bits from the device that shows the enrollment code (section 11) |
+| Invite token | 32 | `it_` + 64 hex digits | 256 random bits from the relay (section 12.1) |
+| Authorization code | 32 | `ac_` + 64 hex digits | 256 random bits from the relay (section 12.2) |
+| Setup token | 32 | `st_` + 64 hex digits | 256 random bits from the relay (section 12.3) |
 
 - `sign_pk` is the 32-byte Ed25519 public key. `seal_pk` is the 1,216-byte X-Wing public key.
 - A device ID or a recovery ID names both keys, so an ID cannot name a different key (DESIGN.md "Cryptography").
@@ -392,10 +396,12 @@ seal_seed = HKDF-Expand(prk, "snailfish.recovery.seal.v1", 32)
 
 ## 10. HTTP API
 
-This section gives the sync surface routes of M4. Later milestones add routes under the same prefix ([VER-12]). Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
+This section gives the sync and setup surface routes of M5. Later milestones add routes under the same prefix ([VER-12]). Section 12 gives the user surface. Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
 
 - The relay refuses a request body, or an object inside it, with a field that this section does not name (`bad_request`). The relay is upgraded before the engines ([VER-11]), so a newer engine never meets an older relay. The envelopes inside a body follow the looser rule of section 4.
 - The engine ignores unknown fields in a response body ([VER-13]).
+- The relay refuses a request on a route of this section that has a `cookie` header (`bad_request`, [USR-7]). These routes take no browser session. This check runs before every other check of the route.
+- The bodies of 10.11 and 12.3 follow the strict JSON rules of section 3: no duplicate key, and integers only.
 
 ### 10.1 Routes
 
@@ -403,10 +409,12 @@ This section gives the sync surface routes of M4. Later milestones add routes un
 | --- | --- | --- | --- |
 | `GET` | `/v1/health` | No | `200` with `{"status":"ok"}` |
 | `GET` | `/v1/info` | No | `200` with the info object (10.4) ([WIR-8]) |
-| `PUT` | `/v1/t/{tenant}/s/{log}` | Yes, by the device of the genesis record | Create the space with its genesis record (10.5) |
+| `POST` | `/v1/setup/token` | Yes, by the device of the keys in the body | Exchange an authorization code for a setup token (12.3) |
+| `PUT` | `/v1/t/{tenant}/s/{log}` | Yes, by the device of the genesis record | Create the space with its genesis record and a setup token (10.5) |
 | `POST` | `/v1/t/{tenant}/s/{log}/append` | Yes, by an active device | Append records (10.6) |
 | `GET` | `/v1/t/{tenant}/s/{log}/entries?after={n}&limit={m}` | Yes, by an active device | Fetch entries after position `n` (10.7) |
 | `POST` | `/v1/t/{tenant}/s/{log}/status` | Yes, by an active device | Report the verified tip during a restore hold (10.8) |
+| `POST` | `/v1/t/{tenant}/s/{log}/device-status` | Yes, by an active device | Report the sync status of the device (10.11) |
 | `POST` | `/v1/t/{tenant}/s/{log}/repair` | Yes, by a device that is active in the log or in the request entries | Start a repair session with the first chunk (10.9) |
 | `POST` | `/v1/t/{tenant}/s/{log}/repair/chunk` | Yes, by the device of the session | Add a chunk to the repair session (10.9) |
 | `POST` | `/v1/t/{tenant}/s/{log}/repair/finish` | Yes, by the device of the session | Move the staged entries into the log (10.9) |
@@ -420,7 +428,8 @@ This section gives the sync surface routes of M4. Later milestones add routes un
 - `{log}` is the log ID text (section 2.2).
 - `{session}` is the session ID text (section 2.2).
 - The relay finds the tenant only through the handle, and the space only through the space index of the tenant file ([STO-3]).
-- M4 creates a space with a device signature only. M5 adds the setup token of the setup surface.
+- Space creation needs a device signature and a setup token ([USR-6]).
+- The relay limits the request rate for each IP address on `GET /v1/e/{session}`, `POST /v1/e/{session}` and `POST /v1/setup/token` (12.6).
 
 ### 10.2 Active devices
 
@@ -446,6 +455,7 @@ Each error response has an HTTP status and this body:
 | `expired` | 401 | The request is outside its time window (8.6 step 3) | Correct the clock offset and send again once, then `stopped: clock skew` |
 | `nonce_reused` | 401 | The nonce was used before | `paused: relay unavailable` |
 | `timeout` | 408 | The request did not end within the relay time limit. An append can still commit after this answer. | `paused: relay unavailable` |
+| `bad_setup` | 403 | The authorization code is unknown, used, expired, or bound to another challenge or redirect URI (12.3), or the setup token is unknown, expired, or bound to another device or tenant (10.5) | Token exchange: the sign-in fails, and the app starts it again. Space creation: `stopped: setup failed`. The app signs in again and gives the engine the new setup token. |
 | `unknown_device` | 403 | `keyid` names no active device of the space | `paused: relay unavailable`. On a fetch, if the verified log holds the grant of the device, the engine starts a repair first ([LOG-12], 10.9). |
 | `unknown_tenant` | 404 | No tenant has the handle | `paused: relay unavailable` |
 | `unknown_space` | 404 | The tenant has no space with the log ID | `paused: relay unavailable` |
@@ -460,9 +470,11 @@ Each error response has an HTTP status and this body:
 | `invalid_record` | 422 | The genesis record of a `PUT` breaks 10.5, or a repair entry fails the chain check of 10.9 | `stopped: fork` |
 | `uncovered_stub` | 422 | A repair entry is a stub that no usable snapshot of the staged range covers ([LOG-11]) | `stopped: fork` |
 | `too_large` | 413 | The body is larger than `max_request_bytes`, or a repair body is larger than `max_request_bytes` + 1,024 bytes (10.9) | `degraded` |
+| `rate_limited` | 429 | The IP address sent too many requests to a limited route (12.6) | `paused: relay unavailable`. A new device in enrollment waits and sends again. |
 | `wrong_authority` | 421 | `snailfish-authority` differs from the relay configuration (8.6 step 1) | `paused: relay authority` |
 | `internal` | 500 | A relay failure | `paused: relay unavailable` |
 | `backup_running` | 503 | `PUT` while `snailfish-relay backup` runs ([STO-8]) | `paused: relay unavailable` |
+| `space_limit` | 507 | `PUT` of a new space when the tenant holds the most spaces that its configuration allows ([QTA-5]) | `stopped: setup failed`. The app tells the user to ask the relay operator. |
 
 A response that is not JSON, or JSON without a string `error`, is a fault outside the relay, for example a proxy page. The engine reports `paused: relay unavailable`.
 
@@ -486,9 +498,18 @@ The append refusals of 10.6 are results inside a `200` response, not error respo
 
 ### 10.5 `PUT /v1/t/{tenant}/s/{log}`
 
-Request body: `{"genesis":<envelope>}`.
+Request body: `{"genesis":<envelope>,"setup":"st_..."}`. `setup` is the setup token of section 12.3. A body that is not this object, with a duplicate or unknown field or a malformed `setup`, gets `bad_request`. A `genesis` value that breaks section 4 or 6 gets `invalid_record`.
 
-The relay runs 8.6 steps 1 to 4, then parses the body. It checks the genesis record: the envelope (section 4), the payload (section 6), the signature by the recovery key of the record, and `log` equal to `{log}`. The request signer must be the device of the record (8.6 steps 5 to 7). The relay then creates the space file, with the genesis record at position 1.
+The relay runs 8.6 steps 1 to 4, then parses the body. It checks the genesis record: the envelope (section 4), the payload (section 6), the signature by the recovery key of the record, and `log` equal to `{log}`. The request signer must be the device of the record (8.6 steps 5 to 7). Then:
+
+1. If the space exists with the same genesis record hash, return `200`. This is an exact retry, and the relay does not check the setup token.
+2. If the space exists with another genesis record, return `space_exists`.
+3. If the relay holds no setup token with the value of `setup`, or the token expired (relay time at or after its expiry), if the device ID of the token differs from the request `keyid`, or if the tenant of the token is not the tenant of `{tenant}`, return `bad_setup` ([USR-6]).
+4. If the tenant holds the most spaces that its configuration allows, return `space_limit` ([QTA-5]).
+5. If `snailfish-relay backup` runs, return `backup_running`.
+6. Create the space file, with the genesis record at position 1.
+
+A setup token works for each `PUT` of its device until it expires, so a lost response can be sent again.
 
 The device that made the space holds its genesis record from the setup. If position 1 of the relay log has another record hash, the engine stops with `stopped: fork`.
 
@@ -497,6 +518,8 @@ The device that made the space holds its genesis record from the setup. If posit
 | Created | 201 | `{"position":1,"digest":"<base64>"}` |
 | The space exists with the same genesis record hash | 200 | `{"position":1,"digest":"<base64>"}`. This is an exact retry. |
 | The space exists with another genesis record | 409 | Error `space_exists` |
+| The setup token is not valid for the request | 403 | Error `bad_setup` |
+| The tenant holds its most spaces | 507 | Error `space_limit` |
 | The record is not valid | 422 | `{"error":"invalid_record","message":"..."}` |
 | `snailfish-relay backup` runs | 503 | Error `backup_running`. The relay creates no space file. |
 
@@ -507,7 +530,7 @@ Request body: `{"envelopes":[<envelope>, ...]}`, with 1 to `max_append_envelopes
 The relay checks and appends the envelopes in list order, in one transaction in the space file ([STO-11]). Each envelope gets one result. A refusal of one envelope does not stop the others. The response is `200`:
 
 ```json
-{"results":[{"status":"stored","position":7},{"status":"known","position":3},{"status":"conflict","position":4},{"status":"refused","error":"bad_base"}],"head":{"position":7,"digest":"<base64>"}}
+{"results":[{"status":"stored","position":7},{"status":"known","position":3},{"status":"conflict","position":4},{"status":"refused","error":"bad_base"},{"status":"refused","error":"quota"}],"head":{"position":7,"digest":"<base64>"}}
 ```
 
 The relay checks each envelope in this order:
@@ -525,11 +548,13 @@ The relay checks each envelope in this order:
 11. If the record type is not `snailfish.change.v1` or `snailfish.grant.v1`, the result is `refused` with `unsupported`. M4 accepts only these two types. A change has a device ID author (section 6.2), so a record by the recovery key is a grant.
 12. If a change names an epoch other than the current epoch (1 in M4), the result is `refused` with `wrong_epoch`.
 13. If a grant names a device that is already active, or a level below the space write level, the result is `refused` with `invalid_record`.
-14. Otherwise the relay appends the record at the next position. Positions are dense ([LOG-1]). The relay stores the log digest of the new entry (section 5). The result is `stored` with the position.
+14. If the record is a change, and the stored change bytes of the space plus the byte length of its envelope JSON exceed the space quota, the result is `refused` with `quota` ([QTA-1]). The byte length of an envelope is the length of its JSON text exactly as the request holds it, which is also the text that the relay stores (10.7). The stored change bytes are the sum of these lengths for every change in the log, also a change that an earlier envelope of the same request stored. Security records do not count, and this step never refuses one ([QTA-3]).
+15. Otherwise the relay appends the record at the next position. Positions are dense ([LOG-1]). The relay stores the log digest of the new entry (section 5). The result is `stored` with the position.
 
 - `head` is the last position and its log digest after the transaction.
 - A known envelope earlier in the same request counts: a second copy in one request is `known`.
-- `bad_base`, `stale_base` and `on_hold` are transient. Each other refusal is permanent for that envelope ([DLV-9]).
+- `bad_base`, `stale_base`, `on_hold` and `quota` are transient. Each other refusal is permanent for that envelope ([DLV-9]).
+- After `quota`, the engine keeps the envelope in its outbox, reports `paused: quota`, and sends it again at each later sync ([QTA-4]). The relay serves fetches at a full quota ([QTA-2]).
 - After `on_hold`, the engine keeps the envelope in its outbox and reports `paused: restore hold`. It sends the envelope again after the hold ends.
 - After `stale_base`, the engine fetches and checks the space state again ([LOG-7]). If the verified log holds a grant for the device of a refused grant, the engine drops the refused grant. Otherwise, if the active devices equal the list that the user confirmed, the engine signs the grant again with a new base. Otherwise it asks the user to confirm again. A grant that the recovery key signed needs the recovery key again, so the engine always asks for it.
 - The engine applies steps 5 and 7 to 13 to each fetched record. A fetched record that fails one of them stops the engine with `stopped: fork` ([FRK-1]). The engine verifies the signature (step 8) before it changes any state for the record ([WIR-2]).
@@ -715,6 +740,31 @@ Limits:
 - A party that knows the session ID can read the session until it expires, so it can learn the tenant handle and the log ID. It can then ask 8.6 step 5 whether a device ID is active. Each request still needs a device signature, so it can do nothing else with them (T11).
 - A party that knows the session ID can write a slot of the new device before the new device does, or cancel the session. A device that is active in another space on the relay can also open a scanned session ID first (`session_exists`). In each case the codes differ, or the session takes no more messages, and the enrollment fails. The user starts a new session.
 
+### 10.11 `POST /v1/t/{tenant}/s/{log}/device-status`
+
+The engine sends its status after each sync, as the last request of the sync (DESIGN.md "Monitoring and alerting" item 6). The user page shows it (section 12.4).
+
+Request body:
+
+```json
+{"state":"ok","outbox":2,"oldest":1767225000,"applied":12,"epoch":1}
+```
+
+| Field | Content |
+| --- | --- |
+| `state` | The sync status text of the engine, for example `ok`, `degraded` or `paused: quota`. 1 to 64 bytes of printable ASCII (0x20 to 0x7E). |
+| `outbox` | The number of own changes that the engine holds and the verified log does not hold yet |
+| `oldest` | The relay time of the oldest of these changes, in Unix seconds, from the corrected device clock (8.5). `null` if `outbox` is 0. |
+| `applied` | The position of the applied position that the app gave in its last `changes_after` call (DESIGN.md "App integration"), an integer from 0. The engine keeps it in its state file. 0 before the first call. |
+| `epoch` | The current epoch of the device, an integer from 1 |
+
+The response is `200` with `{}`.
+
+- The relay runs 8.6 steps 1 to 4, returns `bad_request` for a body that breaks this section, and runs 8.6 steps 5 to 7.
+- `oldest` is `null` exactly when `outbox` is 0. Otherwise the body breaks this section.
+- The relay stores the last report of each device in the tenant file, with the relay time of the report. A new report replaces the old one.
+- The relay also takes reports during a restore hold.
+
 ## 11. Enrollment
 
 This section gives the transcript of DESIGN.md "Enrollment" ([ENR-1] to [ENR-9]). `specs/enrollment/` checks it in a symbolic model.
@@ -785,3 +835,160 @@ If a check fails, the engine stops with `stopped: fork`. After the checks pass, 
 - Neither device uses data from the session before the user confirms the match (T6).
 - A session takes one message for each slot, so a relay that substitutes keys gets one guess at the code for each session. The trusted device commits to its nonce before the new device sends its nonce, so a relay cannot choose a nonce that makes the two codes equal.
 - The code reduction `mod 1000000` has a bias below 2^-44 for each value.
+
+## 12. User and setup surface
+
+The relay serves the user page and the native sign-in under `/u/` (DESIGN.md "Interfaces", [USR-1] to [USR-8]). The page is HTML for a browser, so this section fixes its security rules and its JSON routes, not its HTML. The setup routes of section 10 (`POST /v1/setup/token`, `PUT /v1/t/{tenant}/s/{log}`) take the setup token of 12.3.
+
+### 12.1 Invite links
+
+`snailfish-relay user add <name>` creates a user and its tenant. `snailfish-relay user invite <name>` makes a new link for a user. Each prints the link:
+
+```text
+<origin>/u/invite#it_<64 hex digits>
+```
+
+- `<origin>` is the configured user page origin (12.4). The token is in the fragment, so a browser does not send it in a request line or a `Referer` header. The script of the invite page reads it.
+- The relay stores SHA-256 of the 32 token bytes, the user ID and the expiry time, the relay time of the command plus 604,800 seconds ([USR-1]).
+- A user has at most one invite. A new link replaces the old one. It also removes every passkey and every browser session of the user, in the same transaction ([USR-2]).
+- A link works once: the registration that uses it deletes it, in the transaction that stores the passkey.
+
+### 12.2 Native sign-in: authorization code
+
+The app opens the system browser at:
+
+```text
+<origin>/u/authorize?response_type=code&code_challenge=<challenge>&code_challenge_method=S256&redirect_uri=<uri>&state=<state>
+```
+
+| Parameter | Rule |
+| --- | --- |
+| `response_type` | `code` |
+| `code_challenge` | `BASE64URL(SHA-256(ASCII(code_verifier)))`, without padding: 43 characters (RFC 7636 section 4.2). The last character carries no non-zero trailing bits, so each 32-byte hash has one form. |
+| `code_challenge_method` | `S256` |
+| `redirect_uri` | A redirect URI of the form below, percent-encoded as a query value. The relay decodes the value once, checks the decoded URI and stores the decoded URI. |
+| `state` | 1 to 128 characters of `A-Z a-z 0-9 - . _ ~`, chosen by the app |
+
+- The relay decodes each name and value as `application/x-www-form-urlencoded`: `+` is a space and `%XX` is a byte.
+- Each parameter occurs once, in any order. The relay refuses another parameter, a missing parameter and a value that breaks its rule. It then shows an error page and does not redirect, because the redirect URI is not checked.
+- `code_verifier` is 43 to 128 characters of `A-Z a-z 0-9 - . _ ~` (RFC 7636 section 4.1). The engine makes it from 32 random bytes in base64url without padding.
+
+A redirect URI is at most 512 bytes, with no query, no fragment and no user part, in one of these forms (RFC 8252 section 7):
+
+| Form | Rule |
+| --- | --- |
+| Loopback | `http://127.0.0.1:<port><path>` or `http://[::1]:<port><path>`. `<port>` is a decimal from 1 to 65535 with no leading zero. `<path>` starts with `/`. |
+| Private-use scheme | `<scheme>:/<path>`. `<scheme>` is lowercase `a-z 0-9 + - .`, starts with a letter and holds at least one `.`, for example `com.example.tasks:/callback`. `<path>` does not start with `/`, so the URI has no authority part. `<path>` can be empty. |
+
+`<path>` holds only the characters `A-Z a-z 0-9 - . _ ~ / %`, and each `%` starts a percent-encoded byte with two uppercase hex digits.
+
+If the browser has no session, the page asks the user to sign in first (12.4). With a session, the page shows the request and an "Allow" button. The button sends `POST /u/authorize` with the five parameters and `csrf` as form fields, under the write rules of 12.4. The relay then:
+
+1. Makes an authorization code and stores SHA-256 of its 32 bytes with the user ID, the challenge, the redirect URI and the expiry time, the relay time plus 60 seconds ([USR-4]).
+2. Answers `303` with `Location: <redirect_uri>?code=ac_<64 hex digits>&state=<state>`.
+
+### 12.3 Setup token
+
+`POST /v1/setup/token` exchanges the code for a setup token. The device of the keys in the body signs the request (section 8).
+
+```json
+{"code":"ac_...","code_verifier":"...","redirect_uri":"...","device":{"sign":"<base64>","seal":"<base64>"}}
+```
+
+`device` is a keys object (section 6.1). The response is `200`:
+
+```json
+{"token":"st_...","tenant":"t_...","expires":1767226200}
+```
+
+The relay checks a token request in this order:
+
+1. 8.6 steps 1 to 4.
+2. If the body breaks this section, return `bad_request`. A `code_verifier` or a `redirect_uri` that breaks the form of 12.2 breaks this section.
+3. 8.6 steps 5 to 7. Step 5 accepts only the device ID of `device`. Step 7 keeps the nonce in `directory.db`, because the request names no tenant.
+4. If the relay holds no code with the value of `code`, or the code is used or expired (relay time at or after its expiry), return `bad_setup`.
+5. If `redirect_uri` differs byte for byte from the decoded redirect URI that the relay stored for the code, or `BASE64URL(SHA-256(ASCII(code_verifier)))` differs from its challenge, return `bad_setup`.
+6. Mark the code as used, and store SHA-256 of the 32 setup token bytes with the user ID, the device ID and the expiry time, the relay time plus 600 seconds ([USR-5]). Both writes are one transaction.
+
+- `tenant` is the tenant handle of the user of the code ([USR-3]). This is how a first device gets its tenant handle.
+- A code works once. If the response is lost, the app starts the sign-in again.
+- The relay never selects a tenant from a value of the request: the user of the code selects it ([USR-3]).
+
+### 12.4 User page routes
+
+The relay configuration sets the origin of the user page, for example `https://sync.example.net`. Its default is `https://` and the configured authority. The WebAuthn relying party ID is the host of the origin, so the host must be a domain name, not an IP address.
+
+| Method | Path | Session | Content |
+| --- | --- | --- | --- |
+| `GET` | `/u/` | Yes | Spaces, devices with their status, machine groups, usage against quota, passkeys, restore holds and the webhook |
+| `GET` | `/u/signin`, `/u/invite` | No | Pages |
+| `GET` | `/u/authorize` | Optional | Without a session, the sign-in page. With a session, the request and the "Allow" form with the anti-CSRF token (12.2). |
+| `GET` | `/u/app.js` | No | The script of the WebAuthn calls |
+| `POST` | `/u/signin/start`, `/u/signin/finish` | No | Passkey sign-in. The start body is `{"name":"<user name>"}`. |
+| `POST` | `/u/invite/start`, `/u/invite/finish` | No | Passkey registration with an invite token |
+| `POST` | `/u/passkeys/start`, `/u/passkeys/finish` | Yes | Register one more passkey |
+| `POST` | `/u/authorize` | Yes | Approve a native sign-in (12.2) |
+| `POST` | `/u/signout` | Yes | End the session |
+| `POST` | `/u/groups`, `/u/groups/delete`, `/u/groups/members` | Yes | Create a machine group, delete one, add or remove a device |
+| `POST` | `/u/hold/release` | Yes | Release the restore hold of a space |
+| `POST` | `/u/webhook`, `/u/webhook/test` | Yes | Set or clear the webhook URL, send a test message |
+| `POST` | `/u/tenant/delete` | Yes | Delete the tenant and the user, if the tenant has no space |
+
+Sessions:
+
+- A session ID is 16 random bytes. The cookie is `sf_session=<32 hex digits>.<64 hex digits>`: the ID, then HMAC-SHA256 with `session.key` over `frame("snailfish.session.v1", id)`.
+- The cookie has the attributes `Path=/u; HttpOnly; SameSite=Strict; Max-Age=43200`, and `Secure` if the origin is `https`.
+- The relay stores SHA-256 of the session ID with the user ID and the expiry time, the relay time of the sign-in plus 43,200 seconds. The session selects the user, and the user selects the tenant ([USR-3]).
+- The anti-CSRF token of a session is the lowercase hex of HMAC-SHA256 with `session.key` over `frame("snailfish.csrf.v1", id)`.
+
+Write rules ([USR-7]):
+
+1. If a `/u/` request has a `signature` or `signature-input` header, return `bad_request`. A user route takes no device signature.
+2. If a `POST` has no `origin` header, or its value differs from the configured origin, return `bad_origin`.
+3. If a route needs a session and the request has no valid, unexpired session cookie, return `signed_out`.
+4. If a route needs a session and the `csrf` form field, or the `snailfish-csrf` header of a JSON route, differs from the anti-CSRF token of the session, return `bad_csrf`.
+
+- A form body is `application/x-www-form-urlencoded`. Each field of the route occurs once, and the relay refuses another field (`bad_request`). The JSON routes follow the strict body rule of section 10.
+- The JSON of the WebAuthn routes is the JSON of the `webauthn-rs` crate, version 0.5, which the browser API takes and returns. A start response also holds `ceremony`, 16 random bytes as 32 hex digits, which the finish request names. The relay keeps a ceremony in memory for 300 seconds.
+- A `GET` of a page without a valid session shows the sign-in page.
+- A device in a machine group is a device ID that is active in a space of the tenant. A group name is 1 to 64 UTF-8 bytes.
+
+| Code | HTTP status | Cause |
+| --- | --- | --- |
+| `bad_origin` | 403 | Write rule 2 |
+| `signed_out` | 401 | Write rule 3 |
+| `bad_csrf` | 403 | Write rule 4 |
+| `bad_invite` | 403 | The invite token is unknown, used or expired |
+| `bad_passkey` | 403 | The WebAuthn response does not verify, or the ceremony is unknown or expired |
+| `bad_webhook` | 400 | The webhook URL breaks 12.5 |
+| `not_empty` | 409 | A tenant delete while the tenant has a space |
+
+### 12.5 Webhooks
+
+A webhook URL is at most 512 bytes ([USR-8]): `https://` or `http://`, a host, an optional `:<port>`, and a target that starts with `/`.
+
+- The host is a lowercase domain name of `a-z 0-9 - .`, an IPv4 literal, or an IPv6 literal in brackets in its shortest lowercase form (RFC 5952).
+- `<port>` is a decimal from 1 to 65535 with no leading zero. The default is 443 for `https` and 80 for `http`.
+- The target is a path with an optional query. It holds only bytes from 0x21 to 0x7E, except `# " < > \ ^ ` { | }`. So the URL has no fragment. The host part has no `@`, so the URL has no user part.
+
+- The relay operator sets an allowlist of hosts. An empty allowlist turns webhooks off. The host of the URL must be in the allowlist, in the same form. An IPv6 entry of the allowlist has no brackets.
+- The relay resolves the host each time it sends, and connects only to an address that it checked. It refuses a loopback, link-local, private, unique local, unspecified or multicast address, unless the allowlist names that address as a literal.
+- The relay checks a URL when the user sets it, and again at each send.
+
+The relay sends `POST` with `content-type: application/json` and this body:
+
+```json
+{"text":"Snailfish: device \"Sam's phone\" in com.example.tasks is stalled: no sync for 7 days."}
+```
+
+- The body holds only `text`, a string. Slack incoming webhooks accept this form.
+- The JSON writer keeps non-ASCII characters as UTF-8. It escapes `"`, `\`, LF as `\n`, CR as `\r`, TAB as `\t`, and each other control character as `\u` and 4 lowercase hex digits.
+- The relay sends a message for a stalled device and for a space at 80% of its quota (DESIGN.md "Monitoring and alerting" items 7 and 9), once for each case until the case ends.
+- The relay follows no redirect, waits at most 10 seconds, and reads at most 4 KiB of the response. A `2xx` status is a success.
+
+### 12.6 Rate limit
+
+The relay limits the requests of each IP address to the routes `GET /v1/e/{session}`, `POST /v1/e/{session}`, `POST /v1/setup/token`, `POST /u/signin/start`, `POST /u/signin/finish`, `POST /u/invite/start` and `POST /u/invite/finish`.
+
+- The limit is a token bucket for each address: 120 requests, filled at 2 requests each second. A request with no token gets `rate_limited`.
+- The address is the peer address of the TCP connection. Behind a reverse proxy, all clients share the address of the proxy.

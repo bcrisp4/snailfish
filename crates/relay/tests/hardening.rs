@@ -95,8 +95,13 @@ fn put_genesis(fx: &Fx, genesis: &Envelope) -> Response {
     let r = parse_payload(&genesis.payload_type, &genesis.payload).unwrap();
     let json = genesis.to_json(&encode_id("r_", r.author.id()));
     let path = fx.space_path(fx.tenant(), fx.log());
-    fx.relay
-        .handle(&fx.signed("PUT", &path, "", &wire::genesis_body(&json), "A"))
+    fx.relay.handle(&fx.signed(
+        "PUT",
+        &path,
+        "",
+        &wire::genesis_body(&json, &fx.setup_token("sam", "A")),
+        "A",
+    ))
 }
 
 fn space_conn(fx: &Fx) -> Connection {
@@ -304,7 +309,7 @@ fn put_checks_the_request_before_the_body() {
     assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_request"));
     let r = fx
         .relay
-        .handle(&fx.signed("PUT", &path, "", br#"{"genesis":{}}"#, "A"));
+        .handle(&fx.signed("PUT", &path, "", br#"{"genesis":{},"setup":"st_0000000000000000000000000000000000000000000000000000000000000000"}"#, "A"));
     assert_eq!((r.status, error_code(&r).as_str()), (422, "invalid_record"));
 }
 

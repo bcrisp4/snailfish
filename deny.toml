@@ -30,6 +30,11 @@ allow = [
   "CC0-1.0",
 ]
 confidence-threshold = 0.9
+# webpki-roots is the Mozilla CA root list that the relay webhook client
+# trusts (M5). The data has the permissive CDLA-Permissive-2.0 licence, which
+# allows use and redistribution with MIT and Apache-2.0 code. Only this
+# crate may use it.
+exceptions = [{ crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] }]
 # The allow list covers licences that M1 dependencies will bring.
 unused-allowed-license = "allow"
 
