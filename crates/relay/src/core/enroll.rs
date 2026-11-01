@@ -13,7 +13,7 @@ use snailfish_protocol::enroll::{Role, SESSION_SECONDS};
 use snailfish_protocol::mailbox::{self, Slot, State, Write};
 
 use super::{ApiResult, Relay, Request, api, to_i64};
-use crate::store::{self, Kind, StoreError};
+use crate::store::StoreError;
 
 /// The trusted device and space that opened a session.
 struct Owner<'a> {
@@ -126,14 +126,6 @@ fn body_of(session: &[u8; 16], row: &Row) -> Vec<u8> {
 }
 
 impl Relay {
-    fn directory(&self) -> Result<rusqlite::Connection, StoreError> {
-        store::open(
-            &self.cfg.data_dir.join("directory.db"),
-            Kind::Directory,
-            false,
-        )
-    }
-
     /// 8.6 steps 1 to 4 for a signed enrollment route. They run before the
     /// body parse (10.10 write step 1). No key matches yet, so a request
     /// that passes them stops at step 5, which runs after the parse.

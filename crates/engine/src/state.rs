@@ -24,7 +24,12 @@ pub(crate) const REFUSED: &str = "refused";
 
 /// Open the state file with the durable settings and the schema, and bind
 /// it to one log and one device.
-pub(crate) fn open(db: &Connection, log_id: &[u8; 16], device: &Hash32) -> Result<(), EngineError> {
+pub(crate) fn open(
+    db: &Connection,
+    log_id: &[u8; 16],
+    device: &Hash32,
+    checkpoint: Option<&PendingCheckpoint>,
+) -> Result<(), EngineError> {
     // [VER-15]: refuse a file from a newer engine before the first write.
     // The journal mode change below writes the file header.
     refuse_newer(db)?;
@@ -45,14 +50,23 @@ pub(crate) fn open(db: &Connection, log_id: &[u8; 16], device: &Hash32) -> Resul
         .optional()?;
     match bound {
         None => {
-            db.execute(
+            let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+            tx.execute(
                 // A new state file is fresh until a fetch reaches the relay
                 // head with no hold ([LOG-14], PROTOCOL.md 10.8).
                 "INSERT INTO meta (id, log_id, device_id, caught_up, fresh) VALUES (1, ?1, ?2, 0, 1)",
                 params![&log_id[..], &device[..]],
             )?;
+            if let Some(c) = checkpoint {
+                set_checkpoint(&tx, c)?;
+            }
+            tx.commit()?;
         }
-        Some((l, d)) if l == log_id && d == device => {}
+        Some((l, d)) if l == log_id && d == device => {
+            if let Some(c) = checkpoint {
+                set_checkpoint(db, c)?;
+            }
+        }
         Some(_) => {
             return Err(EngineError::Invalid(
                 "the state file belongs to another space or device".into(),
@@ -898,9 +912,9 @@ pub(crate) fn activation(
 
 /// Set the content hash of each change that the engine stored before it
 /// had the app key, for example during an enrollment ([DLV-13]). Returns
-/// the position of the first change that does not decrypt.
-pub(crate) fn fill_content(e: &Engine) -> Result<Option<u64>, EngineError> {
-    let tx = Transaction::new_unchecked(&e.db, TransactionBehavior::Immediate)?;
+/// the position of the first change that does not decrypt. The caller
+/// holds the transaction.
+pub(crate) fn fill_content(tx: &Connection, e: &Engine) -> Result<Option<u64>, EngineError> {
     let rows: Vec<(i64, String)> = {
         let mut st = tx.prepare(
             "SELECT position, envelope FROM log
@@ -925,6 +939,5 @@ pub(crate) fn fill_content(e: &Engine) -> Result<Option<u64>, EngineError> {
             }
         }
     }
-    tx.commit()?;
     Ok(failed)
 }

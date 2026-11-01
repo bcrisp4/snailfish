@@ -286,8 +286,10 @@ def join(
         "app_id": APP_ID,
     }
     data_dir.mkdir(parents=True, exist_ok=True)
-    write_private(data_dir / "keys.json", json.dumps({"space": space, "keys": keys_to_json(keys)}))
+    # The engine state comes first: a key file with no engine state would
+    # open a new state with no checkpoint ([ENR-9]).
     sf.install_enrollment(str(data_dir / "engine"), sf.SpaceRef(**space), keys, joined)
+    write_private(data_dir / "keys.json", json.dumps({"space": space, "keys": keys_to_json(keys)}))
     return ""
 
 
@@ -320,6 +322,7 @@ class Device:
             str(data_dir / "engine"), self.space, keys_from_json(cfg["keys"])
         )
         self.device_id = self.engine.device_id()
+        self.key_stored = bytes.fromhex(cfg["keys"]["app_key"]) != bytes(32)
         self.now_ms = now_ms or (lambda: time.time_ns() // 1_000_000)
         self.crash_point: Callable[[str], None] = crash_point or _no_crash
         self.db = sqlite3.connect(data_dir / "app.sqlite3", isolation_level=None)
@@ -451,12 +454,16 @@ class Device:
         checks the enrollment checkpoint ([ENR-9]). The app keeps it in its
         key store, as DESIGN.md "App integration" requires.
         """
+        if self.key_stored:
+            return
+        key = self.engine.app_key()
+        if key is None:
+            return
         path = self.dir / "keys.json"
         cfg = json.loads(path.read_text())
-        key = self.engine.app_key()
-        if key is not None and bytes.fromhex(cfg["keys"]["app_key"]) != key:
-            cfg["keys"]["app_key"] = key.hex()
-            write_private(path, json.dumps(cfg))
+        cfg["keys"]["app_key"] = key.hex()
+        write_private(path, json.dumps(cfg))
+        self.key_stored = True
 
     def pull(self) -> int:
         """Apply the changes after the applied position ([DLV-10], [DLV-11]).

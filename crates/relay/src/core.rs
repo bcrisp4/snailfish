@@ -332,11 +332,7 @@ impl Relay {
             params![handle],
         )
         .map_err(StoreError::from)?;
-        let mut d = store::open(
-            &self.cfg.data_dir.join("directory.db"),
-            Kind::Directory,
-            false,
-        )?;
+        let mut d = self.directory()?;
         let tx = d
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::from)?;
@@ -433,15 +429,19 @@ impl Relay {
         Ok(())
     }
 
+    fn directory(&self) -> Result<rusqlite::Connection, StoreError> {
+        store::open(
+            &self.cfg.data_dir.join("directory.db"),
+            Kind::Directory,
+            false,
+        )
+    }
+
     fn tenant(&self, handle: &str) -> ApiResult<Tenant> {
         if !valid_handle(handle) {
             return Err(api(404, "unknown_tenant", "no tenant has this handle"));
         }
-        let d = store::open(
-            &self.cfg.data_dir.join("directory.db"),
-            Kind::Directory,
-            false,
-        )?;
+        let d = self.directory()?;
         let id: Option<String> = d
             .query_row(
                 "SELECT tenant_id FROM tenants WHERE handle = ?1",

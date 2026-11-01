@@ -215,6 +215,7 @@ pub(crate) fn grant_answer(
         AppendResult::Refused(code) if code == "bad_base" => {}
         AppendResult::Refused(code) => {
             state::drop_grant(&e.db, id)?;
+            e.grant_refusals.insert(*id, code.clone());
             e.status = Status::Degraded {
                 cause: format!("grant refused: {code}"),
             };
@@ -669,10 +670,10 @@ impl TrustedEnrollment {
         match row {
             None => self.fail(format!(
                 "the relay refused the grant: {}",
-                match engine.status() {
-                    Status::Degraded { cause } => cause,
-                    other => format!("{other:?}"),
-                }
+                engine
+                    .grant_refusals
+                    .remove(&id)
+                    .unwrap_or_else(|| "the grant left the outbox".into())
             )),
             Some(g) if g.state == GRANT_CONFIRM => self.state = EnrollState::ConfirmAgain,
             Some(_) if self.syncs >= MAX_GRANT_SYNCS => {

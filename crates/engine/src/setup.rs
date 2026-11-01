@@ -176,7 +176,9 @@ pub fn install_setup(
 /// Create the engine state of a new device after its enrollment
 /// ([`crate::enroll::NewEnrollment`]). The engine keeps the checkpoint, and
 /// its syncs upload nothing until the verified log passes the checkpoint
-/// check ([ENR-9]).
+/// check ([ENR-9]). Call it before the app stores the device keys: an app
+/// that opens the engine with stored keys and no state file creates a
+/// state file with no checkpoint.
 ///
 /// # Errors
 ///
@@ -195,14 +197,11 @@ pub fn install_enrollment(
     }
     let trusted = snailfish_protocol::encoding::decode_id::<32>(&joined.trusted, "d_")
         .map_err(|e| EngineError::Invalid(format!("trusted device: {e}")))?;
-    let e = crate::Engine::open(data_dir, space, keys)?;
-    crate::state::set_checkpoint(
-        &e.db,
-        &crate::state::PendingCheckpoint {
-            position: joined.position,
-            digest: joined.digest,
-            trusted,
-            device: joined.device.clone(),
-        },
-    )
+    let checkpoint = crate::state::PendingCheckpoint {
+        position: joined.position,
+        digest: joined.digest,
+        trusted,
+        device: joined.device.clone(),
+    };
+    crate::Engine::open_with(data_dir, space, keys, Some(&checkpoint)).map(|_| ())
 }

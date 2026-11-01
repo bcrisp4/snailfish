@@ -526,24 +526,22 @@ impl Sync {
                 state::clear_fresh(&tx).map_err(Answer::Engine)?;
             }
         }
-        tx.commit().map_err(|e| Answer::Engine(e.into()))?;
-        let enrolling = enrolling(engine).map_err(Answer::Engine)?;
         if checked {
             // [ENR-9]: the log up to the checkpoint verified, so open the
             // key set of the grant, then decrypt the changes stored without
-            // the key.
-            engine.app_key = Some(
-                engine
-                    .open_app_key()
-                    .map_err(|e| stop(e.to_string()))?
-                    .ok_or_else(|| {
-                        stop("the verified log holds no key set to this device".into())
-                    })?,
-            );
-            if let Some(p) = state::fill_content(engine).map_err(Answer::Engine)? {
+            // the key. Both happen before the commit that clears the
+            // checkpoint: a failure or a crash leaves the check to repeat.
+            let key = engine
+                .open_app_key()
+                .map_err(|e| stop(e.to_string()))?
+                .ok_or_else(|| stop("the verified log holds no key set to this device".into()))?;
+            engine.app_key = Some(key);
+            if let Some(p) = state::fill_content(&tx, engine).map_err(Answer::Engine)? {
                 degraded = Some(format!("a change at position {p} does not decrypt"));
             }
         }
+        tx.commit().map_err(|e| Answer::Engine(e.into()))?;
+        let enrolling = enrolling(engine).map_err(Answer::Engine)?;
         self.hold = f.hold;
         if let Some(cause) = degraded {
             engine.status = Status::Degraded { cause };

@@ -2786,6 +2786,58 @@ fn checkpoint_check_needs_the_hello_device_and_an_active_trusted_device() {
     assert_eq!(st, Status::Ok);
 }
 
+/// [ENR-9], `PROTOCOL.md` 7.3: a grant whose key set does not open to the
+/// key of the genesis commitment stops the new device, and the checkpoint
+/// stays. So the engine opens again and the next sync stops again.
+#[test]
+fn bad_key_set_keeps_the_checkpoint_and_the_engine_opens() {
+    let (mut w, mut ea) = world_with_new_b();
+    let base = ea.base().unwrap();
+    let env = grant_envelope(&ea.log_id, &w.keys[0], &base, &w.keys[1], "B");
+    let d = crate::enroll::grant_device(&env).unwrap();
+    state::put_grant(
+        &ea.db,
+        &state::GrantRow {
+            device_id: d.id,
+            device: snailfish_protocol::write::device(&d),
+            confirmed: state::device_list(&ea.db).unwrap(),
+            by_recovery: false,
+            envelope: Some(env),
+            state: state::GRANT_SEND.into(),
+        },
+    )
+    .unwrap();
+    w.exchange(&mut ea);
+    let head = ea.base().unwrap();
+    assert_eq!(head.position, 2);
+    let j = crate::enroll::Joined {
+        tenant: ea.space.tenant.clone(),
+        log_id: ea.space.log_id.clone(),
+        position: head.position,
+        digest: head.digest,
+        trusted: ea.device_id(),
+        device: snailfish_protocol::write::device(&d),
+    };
+    install_enrollment(
+        &w.root.join("b"),
+        crate::enroll::space_of(&j, URL, APP),
+        &w.keys[1],
+        &j,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let mut eb = w.engine(&w.dev("b"));
+        w.exchange(&mut eb);
+        assert!(
+            matches!(eb.status(), Status::Fork { ref cause } if cause.contains("commitment")),
+            "{:?}",
+            eb.status()
+        );
+        assert_eq!(eb.app_key(), None);
+        assert!(state::checkpoint(&eb.db).unwrap().is_some());
+    }
+}
+
 /// [ENR-9]: a new device whose verified log is longer than the relay log
 /// before its checkpoint check sends no repair (`PROTOCOL.md` 11.2).
 #[test]

@@ -264,6 +264,9 @@ pub struct Engine {
     status: Status,
     // Seconds to add to the device clock: relay time - device time ([WIR-7]).
     clock_offset: i64,
+    // The refusal code of each grant that the relay refused for ever in
+    // this process, by device ID, for the enrollment that waits for it.
+    grant_refusals: std::collections::BTreeMap<snailfish_protocol::encoding::Hash32, String>,
     clock: fn() -> u64,
     // Held for the life of the engine. The OS releases the lock when the
     // file closes, also after a crash.
@@ -310,6 +313,18 @@ impl Engine {
     /// [`EngineError::Invalid`] for a relay URL with a path, or a log ID or
     /// keys that do not match the file, and [`EngineError::Storage`].
     pub fn open(data_dir: &Path, space: SpaceRef, keys: &DeviceKeys) -> Result<Self, EngineError> {
+        Self::open_with(data_dir, space, keys, None)
+    }
+
+    /// [`Engine::open`]. A new state file gets `checkpoint` in the same
+    /// transaction that binds it, so no state file of an enrolled device
+    /// exists without its checkpoint ([ENR-9]).
+    pub(crate) fn open_with(
+        data_dir: &Path,
+        space: SpaceRef,
+        keys: &DeviceKeys,
+        checkpoint: Option<&state::PendingCheckpoint>,
+    ) -> Result<Self, EngineError> {
         std::fs::create_dir_all(data_dir)?;
         let lock = File::options()
             .create(true)
@@ -328,7 +343,7 @@ impl Engine {
         let sign = SecretKey::from_seed(&keys.sign_seed);
         let device_id = keys::device_id(&sign.public(), &keys::seal_public(&keys.seal_seed));
         let db = Connection::open(data_dir.join(STATE_FILE))?;
-        state::open(&db, &log_id, &device_id)?;
+        state::open(&db, &log_id, &device_id, checkpoint)?;
         let mut space = space;
         space.relay_url = relay_base(&space.relay_url)?;
         let mut e = Self {
@@ -341,6 +356,7 @@ impl Engine {
             app_key: (keys.app_key != [0; 32]).then_some(keys.app_key),
             status: Status::Ok,
             clock_offset: 0,
+            grant_refusals: std::collections::BTreeMap::new(),
             clock: system_time,
             _lock: lock,
         };
