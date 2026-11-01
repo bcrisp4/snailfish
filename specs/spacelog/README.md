@@ -114,6 +114,17 @@ S1 (fixed). Four mutants (`noBaseRule`, `relayNoBaseRule`, `grantFromRemoved`, `
 
 Lesson: a mutant baseline must be large enough for the bug to change a verdict.
 
+## Rust conformance (M4)
+
+Each row names the model scenario and the Rust test that runs it through the public API (specs/conformance.md). The model results do not verify these tests.
+
+| Scenario in `test.qnt` | Rules | Rust and demo tests |
+| --- | --- | --- |
+| `grantWithCheckpointTest` | [ENR-8] [ENR-9] | `crates/engine/src/tests.rs::enrollment_in_both_directions`, `new_device_uploads_nothing_before_the_checkpoint_check`, `demo/tests/test_enrollment.py::test_new_device_joins_and_the_relay_refuses_an_unknown_key` |
+| `resignReconfirmTest` | [LOG-7] | `crates/engine/src/tests.rs::stale_grant_after_another_grant_needs_a_new_confirmation` |
+| `retryChecksStateTest` | [LOG-7] | `crates/engine/src/tests.rs::grant_of_a_device_that_became_active_is_dropped` |
+| `recoveryGrantTest` | [LOG-8], M4 decision 1 | `crates/engine/src/tests.rs::recovery_key_signs_the_grant`, `crates/protocol/tests/space.rs::current_recovery_key_signs_a_grant` |
+
 ## Not covered
 
 - Recovery record replacement, protocol levels, the device record and the level record. A grant by the recovery key is covered.

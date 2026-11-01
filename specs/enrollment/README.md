@@ -85,6 +85,18 @@ No finding E1: no query is false for the design as written in `DESIGN.md`.
 - The "reachable" results show that one honest run exists. They do not show that every interleaving works.
 - ProVerif proves the queries for an unbounded number of sessions. It can say "cannot be proved" for a true query. `expect.toml` has no such entry for the design.
 
+## Rust conformance (M4)
+
+The model results do not verify the Rust code. These tests check the same cases through the public API.
+
+| Model case | Rust and demo tests |
+| --- | --- |
+| Honest run in both directions | `crates/engine/src/tests.rs::enrollment_in_both_directions`, `demo/tests/test_enrollment.py::test_new_device_shows_the_code_and_the_user_confirms_at_prompts` |
+| `user_blind.pv`, `no_commit.pv`: a relay that substitutes keys | `demo/tests/test_enrollment.py::test_relay_that_substitutes_keys_causes_a_code_mismatch`, `crates/engine/src/tests.rs::code_mismatch_appends_no_grant` |
+| `conf_unsigned.pv`, `conf_no_meta.pv`: the confirmation checks | `crates/protocol/tests/enroll.rs::confirmations_match_go` (Go vectors) |
+| `cp_unsigned.pv`: the checkpoint check | `crates/protocol/src/enroll.rs::tests::checkpoint_check_refuses_other_signers_and_types`, `crates/engine/src/tests.rs::new_device_uploads_nothing_before_the_checkpoint_check` |
+| `early_upload.pv`: no upload before the checks | `crates/engine/src/tests.rs::new_device_uploads_nothing_before_the_checkpoint_check` |
+
 ## Run
 
 1. Run `eval $(opam env)` once in the shell. It puts ProVerif on `PATH`.

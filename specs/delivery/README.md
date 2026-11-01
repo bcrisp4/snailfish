@@ -140,6 +140,12 @@ Each Rust test above fails with the corresponding fault in the Rust or Python co
 
 `make rust-mutants-diff` checks these tests by mutation. Scenarios `resetRequiredTest` and `refusedSplitTest` have no Rust test yet.
 
+## Rust conformance (M4)
+
+| Scenario in `test.qnt` | Rules | Rust and demo tests |
+| --- | --- | --- |
+| `lateDeviceRepairTest`, `lateRepairBlockedTest` | [LOG-12] | `crates/engine/src/tests.rs::device_with_a_lost_grant_repairs_from_the_position_before_it`, `demo/tests/test_enrollment.py::test_device_with_a_lost_grant_repairs_the_log` |
+
 ## When to update
 
 If a delivery rule in `DESIGN.md` changes, change `model.qnt` first and run `make verify MODEL=delivery`. Then change the design text.
