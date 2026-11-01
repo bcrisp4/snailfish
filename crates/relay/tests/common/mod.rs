@@ -119,6 +119,18 @@ impl Fx {
         Relay::open(cfg)
     }
 
+    /// The same data directory and clock with a relay whose configuration
+    /// `f` changes.
+    pub fn reopen_with(&mut self, f: impl FnOnce(&mut Config)) {
+        let n = Arc::clone(&self.now);
+        let mut cfg = Config::new(self.dir.path(), &self.authority);
+        cfg.secrets_dir = self.dir.path().join("secrets");
+        cfg.limits = limits_of(&self.h);
+        cfg.clock = Arc::new(move || n.load(Ordering::SeqCst));
+        f(&mut cfg);
+        self.relay = Relay::open(cfg).unwrap();
+    }
+
     /// The same data directory with a new relay value, as after a restart.
     pub fn restart(&mut self, limits: Limits) {
         self.relay = Self::open(&self.dir, &self.authority, limits, &self.now).unwrap();

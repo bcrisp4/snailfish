@@ -229,7 +229,10 @@ pub async fn run(relay: Relay) {
     if relay.config().webhook_hosts.is_empty() {
         return;
     }
-    let mut alerts = tokio::time::Instant::now();
+    // The first pass checks the alert cases, so a restart does not delay
+    // them by one interval.
+    let start = tokio::time::Instant::now();
+    let mut alerts = start.checked_sub(ALERTS_EVERY).unwrap_or(start);
     loop {
         let r = relay.clone();
         let check = alerts.elapsed() >= ALERTS_EVERY;

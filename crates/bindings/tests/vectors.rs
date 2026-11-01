@@ -730,3 +730,55 @@ fn drive_until_append(
     }
     panic!("no append");
 }
+
+/// [USR-6] through the binding: a setup token of another device stops the
+/// engine with `stopped: setup failed`. A malformed new token is refused,
+/// and a new token of this device creates the space.
+#[test]
+fn setup_failure_and_new_token_cross_the_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = snailfish_relay::core::Config::new(dir.path().join("relay"), "sync.example.net");
+    cfg.secrets_dir = dir.path().join("secrets");
+    let relay = snailfish_relay::core::Relay::open(cfg).unwrap();
+    let tenant = relay.add_user("sam").unwrap();
+    let mut ka = snailfish::new_device_keys().unwrap();
+    let other = snailfish::new_device_keys().unwrap();
+    let setup = snailfish::create_space(
+        "com.example.tasks",
+        &snailfish::NewDevice {
+            keys: ka.clone(),
+            name: "A".into(),
+        },
+    )
+    .unwrap();
+    ka.app_key.clone_from(&setup.app_key);
+    let sp = space(&setup.log_id, &tenant);
+    let pa = dir.path().join("a");
+    let pa = pa.to_str().unwrap();
+    snailfish::install_setup(
+        pa,
+        sp.clone(),
+        &ka,
+        &setup.envelopes,
+        &sign_in(&relay, &other),
+    )
+    .unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
+    exchange(&relay, &a);
+    let status = a.status().unwrap();
+    assert_eq!(
+        status,
+        snailfish::Status::SetupFailed {
+            cause: "bad_setup".into()
+        }
+    );
+    assert_eq!(snailfish::status_text(&status), "stopped: setup failed");
+    assert_eq!(
+        snailfish::status_text(&snailfish::Status::Quota),
+        "paused: quota"
+    );
+    assert!(a.set_setup_token("st_00").is_err());
+    a.set_setup_token(&sign_in(&relay, &ka)).unwrap();
+    exchange(&relay, &a);
+    assert_eq!(a.status().unwrap(), snailfish::Status::Ok);
+}

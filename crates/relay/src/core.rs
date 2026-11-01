@@ -75,6 +75,8 @@ pub struct Config {
     /// The default quotas of each tenant ([QTA-1], [QTA-5]).
     pub quotas: Quotas,
     /// The webhook host allowlist. Empty turns webhooks off ([USR-8]).
+    /// [`Relay::open`] drops empty entries, which a comma list such as
+    /// `SNAILFISH_WEBHOOK_HOSTS=""` gives.
     pub webhook_hosts: Vec<String>,
 }
 
@@ -331,7 +333,8 @@ impl Relay {
     /// [`OpenError::Authority`] if the authority is empty or not in the
     /// form of `PROTOCOL.md` 8.3, and [`OpenError::Store`] for a storage
     /// failure, also a database file with a newer schema ([VER-15]).
-    pub fn open(cfg: Config) -> Result<Self, OpenError> {
+    pub fn open(mut cfg: Config) -> Result<Self, OpenError> {
+        cfg.webhook_hosts.retain(|h| !h.is_empty());
         let a = &cfg.authority;
         if a.is_empty() {
             return Err(OpenError::Authority("the relay needs an authority"));

@@ -703,3 +703,476 @@ fn webhook_needs_an_allowed_host_and_address() {
         );
     }
 }
+
+// ---------------------------------------------------- secrets and origin
+
+/// [STO-9]: `session.key` is 32 random bytes with mode 0600 in a 0700
+/// directory, and a restart keeps it, so a restart keeps each session. A
+/// relay with other secrets refuses the cookie.
+#[test]
+fn session_key_is_random_private_and_kept() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut fx = Fx::new();
+    let cookie = signed_in(&fx).0.cookie;
+    let secrets = fx.dir.path().join("secrets");
+    let key = std::fs::read(secrets.join("session.key")).unwrap();
+    assert_eq!(key.len(), 32);
+    assert!(key.iter().any(|&x| x != key[0]), "not random: {key:?}");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&secrets.join("session.key")), 0o600);
+    assert_eq!(mode(&secrets), 0o700);
+    fx.restart(common::limits_of(&fx.h));
+    let mut b = Browser {
+        fx: &fx,
+        cookie: cookie.clone(),
+    };
+    assert!(b.home().contains("Signed in as <b>sam</b>"));
+    let other = fx.dir.path().join("other-secrets");
+    fx.reopen_with(|c| c.secrets_dir = other);
+    let mut b = Browser { fx: &fx, cookie };
+    assert!(b.home().contains("Sign in with a passkey"));
+}
+
+/// 12.4: the origin is a scheme and a domain name with no path, query or
+/// trailing `/`. The cookie is `Secure` only for an `https` origin.
+#[test]
+fn origin_is_a_bare_domain_and_sets_secure() {
+    let mut fx = Fx::new();
+    for bad in [
+        "https://sync.example.net/",
+        "https://sync.example.net/u",
+        "https://sync.example.net?x=1",
+        "https://127.0.0.1",
+        "not a url",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = snailfish_relay::core::Config::new(dir.path().join("d"), "sync.example.net");
+        cfg.secrets_dir = dir.path().join("s");
+        cfg.origin = bad.into();
+        assert!(
+            matches!(
+                snailfish_relay::core::Relay::open(cfg),
+                Err(snailfish_relay::core::OpenError::Origin(_))
+            ),
+            "{bad}"
+        );
+    }
+    let (b, _) = signed_in(&fx);
+    drop(b);
+    let link = fx.relay.invite("sam").unwrap();
+    let mut https = Browser::new(&fx);
+    let r = https.json("/u/invite/start", &json!({ "token": invite_token(&link) }));
+    let start: Value = serde_json::from_slice(&r.body).unwrap();
+    let cred = key().create(&start);
+    let r = https.json(
+        "/u/invite/finish",
+        &json!({ "ceremony": start["ceremony"], "credential": cred }),
+    );
+    assert!(r.header("set-cookie").unwrap().ends_with("; Secure"));
+    // A plain http origin, as on a local test relay.
+    let plain = "http://sync.example.net";
+    fx.reopen_with(|c| c.origin = plain.into());
+    let link = fx.relay.invite("sam").unwrap();
+    let post = |path: &str, body: &Value| {
+        fx.relay.handle(&Request {
+            method: "POST".into(),
+            path: path.into(),
+            query: String::new(),
+            headers: vec![
+                ("origin".into(), plain.into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+            body: body.to_string().into_bytes(),
+        })
+    };
+    let r = post("/u/invite/start", &json!({ "token": invite_token(&link) }));
+    let start: Value = serde_json::from_slice(&r.body).unwrap();
+    let cred = SoftPasskey::new(plain, "sync.example.net").create(&start);
+    let r = post(
+        "/u/invite/finish",
+        &json!({ "ceremony": start["ceremony"], "credential": cred }),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert!(!r.header("set-cookie").unwrap().contains("Secure"));
+}
+
+// ------------------------------------------------------------ ceremonies
+
+/// 12.4: a ceremony lasts 300 seconds. Other starts do not remove a live
+/// ceremony.
+#[test]
+fn ceremony_lasts_300_seconds() {
+    let fx = Fx::new();
+    let (_, mut k) = signed_in(&fx);
+    for (late, ok) in [(299, true), (300, false)] {
+        let mut b = Browser::new(&fx);
+        let r = b.json("/u/signin/start", &json!({ "name": "sam" }));
+        let start: Value = serde_json::from_slice(&r.body).unwrap();
+        fx.now.fetch_add(late, Ordering::SeqCst);
+        // Another start runs the expiry sweep of the store.
+        assert_eq!(
+            Browser::new(&fx)
+                .json("/u/signin/start", &json!({ "name": "sam" }))
+                .status,
+            200
+        );
+        let cred = k.get(&start);
+        let r = b.json(
+            "/u/signin/finish",
+            &json!({ "ceremony": start["ceremony"], "credential": cred }),
+        );
+        assert_eq!(r.status == 200, ok, "{late}");
+        fx.now.fetch_sub(late, Ordering::SeqCst);
+    }
+}
+
+/// Two browsers of one user hold separate sessions: a sign-out of one
+/// does not end the other.
+#[test]
+fn sessions_of_one_user_are_separate() {
+    let fx = Fx::new();
+    let (mut a, mut k) = signed_in(&fx);
+    let mut b = Browser::new(&fx);
+    assert_eq!(b.sign_in("sam", &mut k).status, 200);
+    assert_eq!(a.form("/u/signout", &[]).status, 303);
+    assert!(a.home().contains("Sign in with a passkey"));
+    assert!(b.home().contains("Signed in as <b>sam</b>"));
+}
+
+/// The `WebAuthn` user handle is the user ID, so two users on one device
+/// hold two passkeys, not one that the second registration replaces.
+#[test]
+fn user_handle_is_the_user_id() {
+    let fx = Fx::new();
+    fx.relay.add_user("kim").unwrap();
+    let handle = |name: &str| {
+        let link = fx.relay.invite(name).unwrap();
+        let r = Browser::new(&fx).json("/u/invite/start", &json!({ "token": invite_token(&link) }));
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        v["options"]["publicKey"]["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (sam, kim) = (handle("sam"), handle("kim"));
+    assert_ne!(sam, kim);
+    assert_ne!(sam, "A".repeat(sam.len()));
+}
+
+/// 12.4: a JSON route takes exactly its fields, and no device signature
+/// header. A body above `max_request_bytes` gets `too_large`.
+#[test]
+fn user_routes_check_fields_signatures_and_size() {
+    let fx = Fx::new();
+    let mut b = Browser::new(&fx);
+    for body in [json!({ "name": "sam", "x": 1 }), json!({})] {
+        let r = b.json("/u/signin/start", &body);
+        assert_eq!(
+            (r.status, error_code(&r).as_str()),
+            (400, "bad_request"),
+            "{body}"
+        );
+    }
+    for h in ["signature", "signature-input"] {
+        let r = b.send(
+            "POST",
+            "/u/signin/start",
+            "",
+            br#"{"name":"sam"}"#,
+            &[("origin", ORIGIN), (h, "sig=x")],
+        );
+        assert_eq!(
+            (r.status, error_code(&r).as_str()),
+            (400, "bad_request"),
+            "{h}"
+        );
+    }
+    let max = usize::try_from(common::limits_of(&fx.h).max_request_bytes).unwrap();
+    for (n, code) in [(max, "bad_request"), (max + 1, "too_large")] {
+        let r = b.send(
+            "POST",
+            "/u/signin/start",
+            "",
+            &vec![b' '; n],
+            &[("origin", ORIGIN)],
+        );
+        assert_eq!(error_code(&r), code, "{n}");
+    }
+}
+
+/// The pages and the script of 12.4.
+#[test]
+fn user_page_serves_its_pages_and_script() {
+    let fx = Fx::new();
+    let mut b = Browser::new(&fx);
+    let text = |r: Response| String::from_utf8(r.body).unwrap();
+    assert!(text(b.send("GET", "/u/signin", "", b"", &[])).contains("Sign in with a passkey"));
+    assert!(text(b.send("GET", "/u/invite", "", b"", &[])).contains("Register a passkey"));
+    let js = b.send("GET", "/u/app.js", "", b"", &[]);
+    assert_eq!(js.content_type, "text/javascript; charset=utf-8");
+    assert!(text(js).contains("navigator.credentials.get"));
+    let q = setup::authorize_query(&setup::Authorize {
+        challenge: setup::challenge(VERIFIER),
+        redirect_uri: REDIRECT.into(),
+        state: "s1".into(),
+    });
+    assert!(
+        text(b.send("GET", "/u/authorize", &q, b"", &[])).contains("An app asks to set up sync")
+    );
+    let (mut b, _) = signed_in(&fx);
+    let page = text(b.send("GET", "/u/authorize", &q, b"", &[]));
+    assert!(page.contains("Allow") && page.contains(REDIRECT), "{page}");
+}
+
+/// 12.4: a signed-in user adds a passkey. The options exclude the passkeys
+/// that the user has. Only the session that started the ceremony can
+/// finish it.
+#[test]
+fn signed_in_user_adds_a_passkey() {
+    let fx = Fx::new();
+    let (mut b, k) = signed_in(&fx);
+    let r = b.json("/u/passkeys/start", &json!({}));
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let start: Value = serde_json::from_slice(&r.body).unwrap();
+    let excluded = start["options"]["publicKey"]["excludeCredentials"].to_string();
+    assert!(
+        excluded.contains(&data_encoding::BASE64URL_NOPAD.encode(&k.cred_id)),
+        "{excluded}"
+    );
+    let mut second = key();
+    let cred = second.create(&start);
+    let finish = json!({ "ceremony": start["ceremony"], "credential": cred });
+    // Another user's session, and the invite route, cannot finish it.
+    fx.relay.add_user("kim").unwrap();
+    let link = fx.relay.invite("kim").unwrap();
+    let mut kim = Browser::new(&fx);
+    assert_eq!(kim.register(invite_token(&link), &mut key()).status, 200);
+    let r = kim.json("/u/passkeys/finish", &finish);
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_passkey"));
+    let r = b.json("/u/passkeys/start", &json!({}));
+    let start: Value = serde_json::from_slice(&r.body).unwrap();
+    let cred = second.create(&start);
+    let finish = json!({ "ceremony": start["ceremony"], "credential": cred });
+    let r = Browser::new(&fx).json("/u/invite/finish", &finish);
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_passkey"));
+    let r = b.json("/u/passkeys/start", &json!({}));
+    let start: Value = serde_json::from_slice(&r.body).unwrap();
+    let cred = second.create(&start);
+    let r = b.json(
+        "/u/passkeys/finish",
+        &json!({ "ceremony": start["ceremony"], "credential": cred }),
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(b.home().matches(", added ").count(), 2);
+    assert_eq!(Browser::new(&fx).sign_in("sam", &mut second).status, 200);
+    // An invite registration excludes nothing: the invite removed the keys.
+    let link = fx.relay.invite("sam").unwrap();
+    let r = Browser::new(&fx).json("/u/invite/start", &json!({ "token": invite_token(&link) }));
+    let v: Value = serde_json::from_slice(&r.body).unwrap();
+    assert!(
+        v["options"]["publicKey"]["excludeCredentials"].is_null(),
+        "{v}"
+    );
+}
+
+// ------------------------------------------------------------ user page
+
+/// The user page shows device names, group member names, passkeys, the
+/// usage without a warning below 80%, and the webhook form only when the
+/// operator allows webhooks. A group deletes, and a hold releases without
+/// force.
+#[test]
+fn user_page_shows_names_and_deletes_groups() {
+    let mut fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let (mut b, k) = signed_in(&fx);
+    let page = b.home();
+    let device_b = fx.key("B").2;
+    // The genesis record names A, and the grant names B.
+    assert!(page.contains("<tr><td>Laptop</td>"), "{page}");
+    assert!(page.contains("<tr><td>Phone</td>"), "{page}");
+    assert!(page.contains(&hex::encode(&k.cred_id[..8])));
+    assert!(!page.contains("class=\"warn\""));
+    assert!(!page.contains("<h2>Webhook</h2>"));
+    assert_eq!(b.form("/u/groups", &[("name", "phone")]).status, 303);
+    let r = b.form(
+        "/u/groups/members",
+        &[("group", "1"), ("device", &device_b), ("op", "add")],
+    );
+    assert_eq!(r.status, 303);
+    let page = b.home();
+    let li = page.split("<li>").nth(1).unwrap();
+    assert!(li.starts_with("Phone "), "the member shows no name: {li}");
+    assert_eq!(b.form("/u/groups/delete", &[("group", "1")]).status, 303);
+    assert!(!b.home().contains("<h3>phone"));
+    fx.set_hold(fx.tenant(), true);
+    let r = b.form("/u/hold/release", &[("log", fx.log()), ("force", "maybe")]);
+    assert_eq!(r.status, 400);
+    let r = b.form("/u/hold/release", &[("log", fx.log()), ("force", "no")]);
+    assert_ne!(r.status, 400, "{}", String::from_utf8_lossy(&r.body));
+    let cookie = b.cookie.clone();
+    fx.reopen_with(|c| c.webhook_hosts = vec![String::new()]);
+    let mut b = Browser {
+        fx: &fx,
+        cookie: cookie.clone(),
+    };
+    assert!(
+        !b.home().contains("<h2>Webhook</h2>"),
+        "an empty host turns webhooks on"
+    );
+    fx.reopen_with(|c| c.webhook_hosts = vec!["hooks.example.net".into()]);
+    let mut b = Browser { fx: &fx, cookie };
+    assert!(b.home().contains("<h2>Webhook</h2>"));
+}
+
+/// DESIGN.md "Monitoring and alerting" item 7: an applied position behind
+/// the head for 7 days marks the device as stalled. An applied position at
+/// the head does not.
+#[test]
+fn applied_position_behind_for_7_days_is_stalled() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let head = wire::parse_fetch(&fx.fetch(fx.tenant(), 0, 1).body)
+        .unwrap()
+        .head
+        .position;
+    let path = format!("{}/device-status", fx.space_path(fx.tenant(), fx.log()));
+    for (applied, behind) in [(head - 1, true), (head, false)] {
+        for _ in 0..2 {
+            let body = format!(
+                r#"{{"state":"ok","outbox":0,"oldest":null,"applied":{applied},"epoch":1}}"#
+            );
+            let r = fx
+                .relay
+                .handle(&fx.signed("POST", &path, "", body.as_bytes(), "B"));
+            assert_eq!(r.status, 200);
+            fx.now.fetch_add(7 * 86_400, Ordering::SeqCst);
+        }
+        fx.now.fetch_sub(7 * 86_400, Ordering::SeqCst);
+        let (mut b, _) = signed_in(&fx);
+        let page = b.home();
+        assert_eq!(
+            page.contains("the app is behind the log for 7 days"),
+            behind,
+            "{applied}: {page}"
+        );
+    }
+}
+
+/// 8.6: a refused token exchange keeps its nonce, so a replay of the same
+/// request gets `nonce_reused`.
+#[test]
+fn refused_exchange_keeps_the_nonce() {
+    let fx = Fx::new();
+    let body = setup::token_request_body(&TokenRequest {
+        code: [7; 32],
+        verifier: VERIFIER.into(),
+        redirect_uri: REDIRECT.into(),
+        device: common::keys_of("A"),
+    });
+    let req = fx.signed("POST", "/v1/setup/token", "", &body, "A");
+    let r = fx.relay.handle(&req);
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_setup"));
+    let r = fx.relay.handle(&req);
+    assert_eq!((r.status, error_code(&r).as_str()), (401, "nonce_reused"));
+}
+
+// -------------------------------------------------------------- webhook
+
+/// Allow webhooks to 127.0.0.1, set `url` on the user page, and return the
+/// tenant ID.
+fn with_webhook(fx: &mut Fx, url: &str) -> String {
+    fx.reopen_with(|c| c.webhook_hosts = vec!["127.0.0.1".into()]);
+    let (mut b, _) = signed_in(fx);
+    assert_eq!(b.form("/u/webhook", &[("url", url)]).status, 303);
+    let t = fx.relay.tenant_ids().unwrap();
+    assert_eq!(t.len(), 1);
+    t[0].clone()
+}
+
+/// 12.5: each alert case queues one message until it ends. A case that
+/// ends and comes back queues again. A sent message leaves the outbox and
+/// its result shows on the user page.
+#[test]
+fn alerts_queue_once_per_case() {
+    let mut fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let used = fx.usage(fx.tenant());
+    let t = with_webhook(&mut fx, "http://127.0.0.1:9/h");
+    let now = fx.now.load(Ordering::SeqCst);
+    assert_eq!(fx.relay.queue_alerts(&t, now).unwrap(), 0);
+    assert_eq!(fx.relay.next_webhook(&t).unwrap(), None);
+    fx.relay.set_quotas("sam", None, Some(used)).unwrap();
+    assert_eq!(fx.relay.queue_alerts(&t, now).unwrap(), 1);
+    assert_eq!(fx.relay.queue_alerts(&t, now).unwrap(), 0);
+    let q = fx.relay.next_webhook(&t).unwrap().unwrap();
+    assert_eq!(q.url, "http://127.0.0.1:9/h");
+    assert!(q.text.contains("100% of its storage quota"), "{}", q.text);
+    fx.relay.webhook_sent(&t, q.seq, "HTTP 204").unwrap();
+    assert_eq!(fx.relay.next_webhook(&t).unwrap(), None);
+    let (mut b, _) = signed_in(&fx);
+    assert!(b.home().contains("HTTP 204"));
+    fx.relay.set_quotas("sam", None, None).unwrap();
+    assert_eq!(fx.relay.queue_alerts(&t, now).unwrap(), 0);
+    fx.relay.set_quotas("sam", None, Some(used)).unwrap();
+    assert_eq!(fx.relay.queue_alerts(&t, now).unwrap(), 1);
+    // A stalled device is a second case.
+    let path = format!("{}/device-status", fx.space_path(fx.tenant(), fx.log()));
+    let body = br#"{"state":"ok","outbox":0,"oldest":null,"applied":1,"epoch":1}"#;
+    assert_eq!(
+        fx.relay
+            .handle(&fx.signed("POST", &path, "", body, "B"))
+            .status,
+        200
+    );
+    assert_eq!(fx.relay.queue_alerts(&t, now + 7 * 86_400).unwrap(), 1);
+    // Without allowed hosts, the relay queues nothing.
+    fx.relay.set_quotas("sam", None, None).unwrap();
+    fx.reopen_with(|_| {});
+    fx.relay.set_quotas("sam", None, Some(used)).unwrap();
+    assert_eq!(fx.relay.queue_alerts(&t, now).unwrap(), 0);
+    assert!(fx.relay.queue_alerts("../x", now).is_err());
+}
+
+/// 12.5: the send loop delivers a queued message, and checks the alert
+/// cases on its first pass.
+#[test]
+fn send_loop_delivers_messages_and_alerts() {
+    use std::io::{Read as _, Write as _};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/h", l.local_addr().unwrap().port());
+    let mut fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let used = fx.usage(fx.tenant());
+    let t = with_webhook(&mut fx, &url);
+    fx.relay.set_quotas("sam", None, Some(used)).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let relay = fx.relay.clone();
+    rt.spawn(snailfish_relay::webhook::run(relay));
+    l.set_nonblocking(false).unwrap();
+    let (mut s, _) = l.accept().unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.ends_with(b"}") {
+        let n = s.read(&mut buf).unwrap();
+        assert!(n > 0);
+        got.extend_from_slice(&buf[..n]);
+    }
+    s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+        .unwrap();
+    let got = String::from_utf8(got).unwrap();
+    assert!(got.contains("storage quota"), "{got}");
+    drop(s);
+    // The loop records the result after the answer, then removes the message.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fx.relay.next_webhook(&t).unwrap().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the message stays queued"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(rt);
+}

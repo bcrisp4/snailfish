@@ -226,6 +226,31 @@ mod tests {
     }
 
     #[test]
+    fn full_map_drops_only_full_buckets() {
+        // Memory stays bounded: at MAX_BUCKETS addresses, the limiter drops
+        // each bucket that is full again, and keeps each partly used one.
+        let l = RateLimit::default();
+        let t0 = Instant::now();
+        let ip = |n: u32| IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n));
+        for (n, take) in [(0, 120), (1, 3), (2, 2)] {
+            for _ in 0..take {
+                assert!(l.allow(ip(n), t0));
+            }
+        }
+        for n in 3..u32::try_from(MAX_BUCKETS).unwrap() {
+            assert!(l.allow(ip(n), t0));
+        }
+        // One second later: 0 + 2, 117 + 2 and 118 + 2 tokens, and 119 + 2
+        // for each other address.
+        let late = ip(u32::try_from(MAX_BUCKETS).unwrap());
+        assert!(l.allow(late, t0 + Duration::from_secs(1)));
+        let m = l.buckets.lock().unwrap();
+        let mut kept: Vec<IpAddr> = m.keys().copied().collect();
+        kept.sort();
+        assert_eq!(kept, vec![ip(0), ip(1), late]);
+    }
+
+    #[test]
     fn limited_routes() {
         for (m, p) in [
             ("GET", "/v1/e/e_00"),

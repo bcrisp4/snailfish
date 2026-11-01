@@ -757,6 +757,15 @@ mod tests {
         let loc = redirect_location(&a.redirect_uri, &[7; 32], &a.state);
         let (_, query) = loc.split_once('?').unwrap();
         assert_eq!(parse_redirect_query(query), Ok(([7; 32], "s1".into())));
+        // [USR-4]: a state outside 12.2 is no state, so the app refuses the
+        // redirect instead of comparing a malformed value.
+        let code = token_text(TokenKind::Code, &[7; 32]);
+        for bad in ["", "a%20b", "a b", &"s".repeat(129)] {
+            assert!(
+                parse_redirect_query(&format!("code={code}&state={bad}")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -230,10 +230,7 @@ async fn main() -> ExitCode {
                 max_spaces,
                 space_bytes,
             };
-            c.webhook_hosts = webhook_hosts
-                .into_iter()
-                .filter(|h| !h.is_empty())
-                .collect();
+            c.webhook_hosts = webhook_hosts;
             serve(c, &listen).await
         }
     }

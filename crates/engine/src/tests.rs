@@ -1644,6 +1644,45 @@ fn engine_without_a_setup_token_asks_for_a_sign_in() {
     assert_eq!(ea.verified_head().unwrap().position, 1);
 }
 
+/// [USR-6]: a setup token of another device gets `bad_setup` on the create
+/// request, and the engine reports `stopped: setup failed` with that code.
+/// The same `bad_request` code on another request is not a setup failure.
+#[test]
+fn refused_create_is_a_setup_failure_and_other_refusals_are_not() {
+    let mut w = World::with_a();
+    let mut ea = w.engine(&w.dev("a"));
+    let other = crate::setup::new_device_keys().unwrap();
+    ea.set_setup_token(&w.sign_in(&other).token).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(
+        ea.status(),
+        Status::SetupFailed {
+            cause: "bad_setup".into()
+        }
+    );
+    let mut sync = ea.start_sync();
+    let req = sync.next_request(&mut ea).unwrap().unwrap();
+    assert!(req.url.ends_with("/v1/info"));
+    sync.handle_response(
+        &mut ea,
+        400,
+        &[],
+        br#"{"error":"bad_request","message":"x"}"#,
+    )
+    .unwrap();
+    assert_eq!(ea.status(), Status::RelayUnavailable);
+}
+
+/// The debug form of a sign-in leaves out the PKCE verifier, which is a
+/// secret until the exchange ([USR-4]).
+#[test]
+fn sign_in_debug_hides_the_verifier() {
+    let si = crate::signin::SignIn::new(URL, "com.example.tasks:/cb").unwrap();
+    let text = format!("{si:?}");
+    assert!(text.contains(URL), "{text}");
+    assert!(!text.contains("verifier"), "{text}");
+}
+
 /// [VER-15]: a version 1 state file (M1) migrates forward to the current
 /// schema and keeps its relay info.
 #[test]

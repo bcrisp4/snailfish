@@ -62,6 +62,14 @@ exclude_re = [
   "replace write_level -> u64 with 0",
   "replace write_level -> u64 with 1",
   "replace < with > in TrustedEnrollment::on_session",
+  # Only a storage fault inside the token exchange returns an error other
+  # than `bad_setup`, and a test cannot make one portably. With `true`, that
+  # fault commits the claimed nonce, which the refusal keeps anyway.
+  "replace match guard e.code == \"bad_setup\" with true in Relay::setup_token",
+  # Equivalent mutant: with `<=`, the expiry sweep keeps a ceremony whose
+  # expiry is exactly now until the next sweep. `Auth::take` refuses it at
+  # that time, so no finish can use it, and the next sweep drops it.
+  "replace < with <= in Auth::keep",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`

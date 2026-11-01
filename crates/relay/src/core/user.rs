@@ -1774,3 +1774,49 @@ impl Relay {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_of_quota() {
+        // 12.4: a quota of 0 is full, and the percent rounds down.
+        assert_eq!(percent(80, 100), 80);
+        assert_eq!(percent(799, 1000), 79);
+        assert_eq!(percent(1, 0), 100);
+        assert_eq!(percent(0, 0), 100);
+    }
+
+    fn row(applied: u64, head: u64, behind_since: Option<u64>) -> StatusRow {
+        StatusRow {
+            state: "ok".into(),
+            outbox: 0,
+            oldest: None,
+            applied,
+            time: 1_000_000,
+            behind_since,
+            head,
+        }
+    }
+
+    #[test]
+    fn stalled_boundaries() {
+        // DESIGN.md "Monitoring and alerting" item 7.
+        const DAY: u64 = 86_400;
+        let t = 1_000_000;
+        let behind = |applied, head, now| stalled(&row(applied, head, Some(t)), now);
+        assert_eq!(behind(4, 5, t + 7 * DAY - 1), None);
+        assert_eq!(behind(4, 5, t + 7 * DAY), Some("no sync for 7 days"));
+        // A report at the same time as the check: only the behind case.
+        let fresh = |applied, head, since: u64| {
+            let mut r = row(applied, head, Some(since));
+            r.time = t + 7 * DAY;
+            stalled(&r, t + 7 * DAY)
+        };
+        assert_eq!(fresh(4, 5, t), Some("the app is behind the log for 7 days"));
+        assert_eq!(fresh(5, 5, t), None);
+        assert_eq!(fresh(6, 5, t), None);
+        assert_eq!(fresh(4, 5, t + 1), None);
+    }
+}
