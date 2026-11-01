@@ -414,7 +414,10 @@ fn passkeys_of(c: &Connection, user_id: &str) -> Result<Vec<Passkey>, ApiError> 
         .collect()
 }
 
-/// A JSON body of a user route: strict, as the JSON routes of section 10.
+/// A JSON body of a user route: strict, as the JSON routes of section 10,
+/// with no field outside `names`. Each route reads its fields with
+/// [`str_field`] or a typed parse, so a missing field also gets
+/// `bad_request`.
 fn json_body(
     body: &[u8],
     names: &[&str],
@@ -422,15 +425,11 @@ fn json_body(
     snailfish_protocol::strict::parse_envelope_json(body)
         .map_err(|e| api(400, "bad_request", e.to_string()))?;
     match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(serde_json::Value::Object(m))
-            if m.keys().all(|k| names.contains(&k.as_str())) && m.len() == names.len() =>
-        {
-            Ok(m)
-        }
+        Ok(serde_json::Value::Object(m)) if m.keys().all(|k| names.contains(&k.as_str())) => Ok(m),
         _ => Err(api(
             400,
             "bad_request",
-            format!("the body must hold exactly {}", names.join(", ")),
+            format!("the body may hold only {}", names.join(", ")),
         )),
     }
 }

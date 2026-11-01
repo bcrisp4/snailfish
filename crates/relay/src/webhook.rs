@@ -47,12 +47,9 @@ pub fn restricted(ip: IpAddr) -> bool {
             if let Some(v4) = embedded_v4(v6) {
                 return restricted(IpAddr::V4(v4));
             }
+            // `::` and `::1` are in `::/96`, so embedded_v4 handled them.
             let s = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (s & 0xfe00) == 0xfc00
-                || (s & 0xffc0) == 0xfe80
-                || (s & 0xff00) == 0xff00
+            (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80 || (s & 0xff00) == 0xff00
         }
     }
 }

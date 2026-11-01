@@ -817,18 +817,17 @@ fn origin_is_a_bare_domain_and_sets_secure() {
 fn ceremony_lasts_300_seconds() {
     let fx = Fx::new();
     let (_, mut k) = signed_in(&fx);
+    // At 299 seconds, another start runs the expiry sweep first. At 300
+    // seconds, no sweep runs, so only the finish checks the expiry.
     for (late, ok) in [(299, true), (300, false)] {
         let mut b = Browser::new(&fx);
         let r = b.json("/u/signin/start", &json!({ "name": "sam" }));
         let start: Value = serde_json::from_slice(&r.body).unwrap();
         fx.now.fetch_add(late, Ordering::SeqCst);
-        // Another start runs the expiry sweep of the store.
-        assert_eq!(
-            Browser::new(&fx)
-                .json("/u/signin/start", &json!({ "name": "sam" }))
-                .status,
-            200
-        );
+        if ok {
+            let r = Browser::new(&fx).json("/u/signin/start", &json!({ "name": "sam" }));
+            assert_eq!(r.status, 200);
+        }
         let cred = k.get(&start);
         let r = b.json(
             "/u/signin/finish",
