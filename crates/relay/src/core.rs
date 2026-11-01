@@ -456,9 +456,14 @@ impl Relay {
             return self.user_route(req, now);
         }
         // [USR-7]: the sync and setup routes take no browser session. This
-        // check runs before every other check (PROTOCOL.md 10).
-        if header(req, "cookie").is_some() {
-            return Err(api(400, "bad_request", "this route takes no cookie"));
+        // check runs before every other check (PROTOCOL.md 10). Other cookies,
+        // for example of a proxy, pass.
+        if user::session_cookie(req).is_some() {
+            return Err(api(
+                400,
+                "bad_request",
+                "this route takes no session cookie",
+            ));
         }
         self.device_route(req, now).map(Reply::json)
     }
@@ -544,8 +549,14 @@ impl Relay {
             )
             .optional()?;
         let id = id.ok_or_else(|| api(404, "unknown_tenant", "no tenant has this handle"))?;
+        Ok(self.tenant_by_id(id)?)
+    }
+
+    /// The files of a tenant ID from the directory. The name check keeps a
+    /// corrupt directory row from naming a path outside `tenants`.
+    fn tenant_by_id(&self, id: String) -> Result<Tenant, StoreError> {
         if !safe_name(&id, 32) {
-            return Err(StoreError::Corrupt("a tenant ID is malformed").into());
+            return Err(StoreError::Corrupt("a tenant ID is malformed"));
         }
         Ok(Tenant {
             dir: self.cfg.data_dir.join("tenants").join(&id),

@@ -141,7 +141,7 @@ User sign-in uses passkeys (WebAuthn) that the relay serves, with the `webauthn-
 
 - The relay operator creates each user with a command, for example `snailfish-relay user add sam`. The command prints a one-time invite link. Only an invite link registers a passkey, and there is no public signup route. A link works once and expires after 7 days. The relay stores only a SHA-256 hash of the link token. [USR-1]
 - The user opens the link and registers a passkey. The user can register more passkeys later on the user page.
-- If the user loses every passkey, the relay operator makes a new invite link with `snailfish-relay user invite sam`. The new link removes the old passkeys and the browser sessions of that user, and it replaces an unused older link. [USR-2]
+- If the user loses every passkey, the relay operator makes a new invite link with `snailfish-relay user invite sam`. The new link removes the old passkeys, the browser sessions, the authorization codes and the setup tokens of that user, and it replaces an unused older link. [USR-2]
 - The relay assigns each user a random user ID. The user directory maps the user ID to the tenant and to the passkey credentials. The relay selects a tenant only from the user ID of the passkey session or of the setup token. [USR-3]
 - The WebAuthn relying party ID is the relay domain. The relay needs a stable HTTPS domain, for example a Tailscale `ts.net` name, because a passkey works only on its domain.
 
@@ -150,7 +150,7 @@ The native app gets a setup token through the system browser (`ASWebAuthenticati
 - The flow uses an authorization code with PKCE (S256), as RFC 8252 requires for native apps. The relay issues a code only after a signed-in user approves the request. It binds the code to the user, the code challenge and the redirect URI, accepts it once, and lets it expire after 60 seconds. [USR-4]
 - The app exchanges the code and its verifier for a setup token, in a request that the device key signs. The relay binds the setup token to the device ID and the tenant of the user, and the token expires after 10 minutes. [USR-5]
 - Space creation needs a setup token that names the device that signs the request and the tenant of the request path. [USR-6]
-- Every user write needs an exact Origin match and an anti-CSRF token bound to the session. Device and setup routes refuse a request with a cookie. User routes refuse a request with a device signature. [USR-7]
+- Every user write needs an exact Origin match and an anti-CSRF token bound to the session. Device and setup routes refuse a request with the session cookie. User routes refuse a request with a device signature. [USR-7]
 
 ### App integration
 
@@ -668,7 +668,7 @@ User signals:
 9. The user page shows usage against quota for each space, with a warning at 80%.
 10. The user page shows open security actions (from M7), for example a block that waits for a trusted device to remove the device, or a device that blocks a level raise.
 11. Each user can set a webhook URL. The relay sends a JSON message with a `text` field for a stalled device, a quota warning and an open security action. Slack incoming webhooks accept this format. Other services, for example ntfy, need an adapter.
-12. The relay operator sets an allowlist of webhook hosts. An empty allowlist turns webhooks off. The relay resolves the host and connects to the address that it checked. It refuses loopback, link-local and private addresses unless the allowlist names that address. It follows no redirects, waits at most 10 seconds and reads at most 4 KiB of the response. [USR-8]
+12. The relay operator sets an allowlist of webhook hosts. An empty allowlist turns webhooks off. The relay resolves the host and connects to the address that it checked. It refuses loopback, link-local, private, shared (CGNAT) and reserved addresses, also inside an IPv6 address, unless the allowlist names that address. It follows no redirects, waits at most 10 seconds and reads at most 4 KiB of the response. [USR-8]
 
 Client-detected failures:
 
@@ -703,7 +703,7 @@ T3. An attacker tries to get a user account, or to take over the account of a us
 T4. Cross-site request forgery against the user page.
 
 - Every user write requires an exact Origin match and an anti-CSRF token bound to the session (USR-7).
-- Device routes reject cookies and accept only device signatures.
+- Device routes reject the session cookie and accept only device signatures.
 
 T5. An attacker replays a captured device request.
 

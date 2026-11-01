@@ -8,7 +8,7 @@
 //! most 10 seconds and reads at most 4 KiB of the response.
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs as _};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use http_body_util::{BodyExt as _, Full, Limited};
@@ -25,30 +25,50 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_RESPONSE: usize = 4096;
 
 /// True for an address that a webhook must not reach unless the allowlist
-/// names it: loopback, link-local, private, unique local, unspecified and
-/// multicast (12.5). An IPv4-mapped IPv6 address follows the IPv4 rule.
+/// names it: the restricted ranges of 12.5. 100.64.0.0/10 is restricted
+/// because a relay on a Tailscale network reaches its peers there.
 #[must_use]
 pub fn restricted(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_broadcast()
+            let [a, b, c, _] = v4.octets();
+            a == 0
+                || a == 10
+                || (a == 100 && (b & 0xc0) == 64)
+                || a == 127
+                || (a == 169 && b == 254)
+                || (a == 172 && (b & 0xf0) == 16)
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 168)
+                || (a == 198 && (b & 0xfe) == 18)
+                || a >= 224
         }
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            if let Some(v4) = embedded_v4(v6) {
                 return restricted(IpAddr::V4(v4));
             }
             let s = v6.segments()[0];
             v6.is_loopback()
                 || v6.is_unspecified()
-                || v6.is_multicast()
                 || (s & 0xfe00) == 0xfc00
                 || (s & 0xffc0) == 0xfe80
+                || (s & 0xff00) == 0xff00
         }
+    }
+}
+
+/// The IPv4 address inside an IPv6 address of 12.5: mapped (`::ffff:0:0/96`),
+/// compatible (`::/96`), NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`). The
+/// gateway of each form forwards to that IPv4 address, so it must pass the
+/// IPv4 rule. `::` and `::1` are not compatible addresses.
+fn embedded_v4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let o = v6.octets();
+    let low = std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+    match v6.segments() {
+        [0, 0, 0, 0, 0, 0xffff, _, _] | [0x64, 0xff9b, 0, 0, 0, 0, _, _] => Some(low),
+        [0, 0, 0, 0, 0, 0, _, _] if !v6.is_loopback() && !v6.is_unspecified() => Some(low),
+        [0x2002, ..] => Some(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5])),
+        _ => None,
     }
 }
 
@@ -105,12 +125,18 @@ pub fn check_url(url: &str, allowlist: &[String]) -> Result<(WebhookUrl, Vec<Soc
 /// A text for the user page.
 pub async fn send(url: &str, text: &str, allowlist: Vec<String>) -> Result<u16, String> {
     let url_owned = url.to_owned();
-    let (u, addrs) = tokio::task::spawn_blocking(move || check_url(&url_owned, &allowlist))
-        .await
-        .map_err(|_| "the check failed".to_owned())??;
-    tokio::time::timeout(TIMEOUT, post(&u, &addrs, webhook_body(text)))
-        .await
-        .map_err(|_| "no answer within 10 seconds".to_owned())?
+    // The limit covers the DNS lookup too (12.5): a slow resolver must not
+    // hold the loop, which sends for each tenant in turn. A lookup that
+    // outlives the limit ends on its own blocking thread.
+    let body = webhook_body(text);
+    tokio::time::timeout(TIMEOUT, async move {
+        let (u, addrs) = tokio::task::spawn_blocking(move || check_url(&url_owned, &allowlist))
+            .await
+            .map_err(|_| "the check failed".to_owned())??;
+        post(&u, &addrs, body).await
+    })
+    .await
+    .map_err(|_| "no answer within 10 seconds".to_owned())?
 }
 
 async fn post(u: &WebhookUrl, addrs: &[SocketAddr], body: Vec<u8>) -> Result<u16, String> {
@@ -124,20 +150,33 @@ async fn post(u: &WebhookUrl, addrs: &[SocketAddr], body: Vec<u8>) -> Result<u16
     Err(last)
 }
 
+/// The TLS client configuration, built once: the root store copy and the
+/// provider setup are the same for each send.
+fn tls_config() -> Result<Arc<tokio_rustls::rustls::ClientConfig>, String> {
+    static CONFIG: OnceLock<Result<Arc<tokio_rustls::rustls::ClientConfig>, String>> =
+        OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("tls: {e}"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            Ok(Arc::new(config))
+        })
+        .clone()
+}
+
 async fn exchange(u: &WebhookUrl, tcp: TcpStream, body: Vec<u8>) -> Result<u16, String> {
     if u.https {
-        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(
-            tokio_rustls::rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("tls: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let config = tls_config()?;
         let name = tokio_rustls::rustls::pki_types::ServerName::try_from(u.host.clone())
             .map_err(|_| "tls: the host is not a valid server name".to_owned())?;
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+        let tls = tokio_rustls::TlsConnector::from(config)
             .connect(name, tcp)
             .await
             .map_err(|e| format!("tls: {e}"))?;
@@ -249,15 +288,37 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            // 12.5: shared address space (Tailscale), this network,
+            // benchmark, IETF protocol and reserved.
+            "100.64.0.1",
+            "100.127.255.254",
+            "0.1.2.3",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.0.8",
+            "240.0.0.1",
+            // IPv4 inside IPv6: compatible, NAT64 and 6to4.
+            "::127.0.0.1",
+            "::a00:1",
+            "64:ff9b::a00:1",
+            "64:ff9b::6440:1",
+            "2002:a00:1::1",
+            "2002:7f00:1::",
         ] {
             assert!(restricted(no.parse().unwrap()), "{no}");
         }
         for ok in [
             "8.8.8.8",
             "172.32.0.1",
-            "100.64.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "198.20.0.1",
+            "192.0.2.1",
+            "223.255.255.255",
             "2001:4860::8888",
             "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+            "2002:808:808::1",
             "fec0::1",
         ] {
             assert!(!restricted(ok.parse().unwrap()), "{ok}");

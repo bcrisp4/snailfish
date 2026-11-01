@@ -1098,6 +1098,20 @@ func headerValues(h [][2]string, name string) []string {
 	return out
 }
 
+// sendsSessionCookie is the cookie rule of PROTOCOL.md 10: a cookie named
+// sf_session in any cookie header. Other cookies do not count.
+func sendsSessionCookie(h [][2]string) bool {
+	for _, v := range headerValues(h, "cookie") {
+		for _, part := range strings.Split(v, ";") {
+			name, _, _ := strings.Cut(strings.TrimSpace(part), "=")
+			if name == "sf_session" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type parsedParams struct {
 	created, expires int64
 	nonce, keyid     string
@@ -1135,11 +1149,11 @@ func (rs *relayState) verifyRequest(rq request) string {
 	return rs.checkSignature(rq, pp, sig, key)
 }
 
-// checkHeaders is the cookie rule of PROTOCOL.md 10 and 8.6 steps 1 to 4.
+// checkHeaders is the session cookie rule of PROTOCOL.md 10 and 8.6 steps 1 to 4.
 // PROTOCOL.md gives no order for the cookie rule. The vectors hold no case
 // that depends on it.
 func (rs *relayState) checkHeaders(rq request) (*parsedParams, []byte, string) {
-	if len(headerValues(rq.headers, "cookie")) > 0 {
+	if sendsSessionCookie(rq.headers) {
 		return nil, nil, "bad_request"
 	}
 	// 1

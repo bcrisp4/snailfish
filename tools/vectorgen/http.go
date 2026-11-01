@@ -720,6 +720,8 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		// PROTOCOL.md 10: the sync routes take no cookie.
 		s = mk("cookie-header")
 		add(s, append(append([][2]string{}, s.Headers...), [2]string{"cookie", "sf_session=x"}), "bad_request")
+		s = mk("cookie-session-among-others")
+		add(s, append(append([][2]string{}, s.Headers...), [2]string{"cookie", "theme=dark; sf_session=x"}), "bad_request")
 		s = mk("wrong-authority")
 		add(s, withHdr(s.Headers, "snailfish-authority", otherAuth), "wrong_authority")
 		s = newSigned("signed-for-other-authority", w.A, "GET", otherAuth, entriesPath, "after=0&limit=2", "", now, now+300, nonceFor("other-auth"))

@@ -705,6 +705,37 @@
    "error": "bad_request"
   },
   {
+   "name": "cookie-session-among-others",
+   "signer": "A",
+   "method": "GET",
+   "path": "/v1/t/t_e1628070e99419b786f08ffd6253a561/s/l_5fe3f50351eefac530786a2fdb9bb34c/entries",
+   "query": "after=0&limit=2",
+   "body": "",
+   "headers": [
+    [
+     "content-digest",
+     "sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:"
+    ],
+    [
+     "signature-input",
+     "sf=(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\");created=1767225600;expires=1767225900;nonce=\"06cc917aca13ba7f825c2b40251d5391\";keyid=\"d_ab3d4a8d1bf3c6b80fdcd34fb3b71ad6a47d76df70b7a00305f6c8cc67af5744\";alg=\"ed25519\";tag=\"snailfish.request.v1\""
+    ],
+    [
+     "signature",
+     "sf=:ThE91WaSCS5WQ5r2610ojRQoE34VGP8bNAapf77S6XMUJjzEwHjd2JNiKHDyerczc/4Wy/lybrPygqxn/kJHBQ==:"
+    ],
+    [
+     "snailfish-authority",
+     "sync.example.net"
+    ],
+    [
+     "cookie",
+     "theme=dark; sf_session=x"
+    ]
+   ],
+   "error": "bad_request"
+  },
+  {
    "name": "wrong-authority",
    "signer": "A",
    "method": "GET",
@@ -6438,6 +6469,73 @@
    "status": 400,
    "response": null,
    "error": "bad_request"
+  },
+  {
+   "name": "cookie-session-among-others",
+   "signer": "C",
+   "body": "{\"code\":\"ac_3474b7f7494e26e60fb7077d8087152cf45976fa9398d0769c00ed539e7db043\",\"code_verifier\":\"KxunhwM-2Dr_l8WmuSrETWo-WQZoNnnZIY-umv0o2VY\",\"redirect_uri\":\"http://127.0.0.1:49152/callback\",\"device\":{\"sign\":\"SvyAoVYq/jmgn5Wi7fLpcgDZZjHvKlRF3niVJDdXhL8=\",\"seal\":\"C1U/KXIHoqEcyOBJLDsTn4OvT0Ch2Qy+ELd0vagpChljEuUbz/ueHPpCJhwflnekEDWoYZRJsptjmwxDjUcdyNgPBNUNSFQ346JF15q8edCFWNVrORkm6JQx7qCINDcgXQpP3CBFXkpA0QlKTQeclQdcnQetmNczvpRFHFI7DbWe9VWZPjEhcCQwFPKgOUOU+Cipm/yF5VgsCVF9wgpUR8yn+MqdPZcavuWlP+VE+tc2p/ROfUYflhiCfNc6Q5SDpet6QYygNrt8CagB8hYNv6peCMCqjzlcbzoQLkEbo1KT8PJuR8p2ChRfO0qvbieoLKO5BAdA5GQam4OlUJRFySGq+AYk1WwK63cQBnO5b0eCNfu8seUycDyxL4SXk5iA6quP7wtG6UfAREwK5yVK2sJFhAjGCRd+WsmO9ZkQNaNQDQeNTBCjP5Wq4cESE6lIGmtssgs0buMe8vUaXoalBQlX27QS9MmhY6kxBcKOV+Vj4JgmumevXjKaORNeQvjI+EyQ2cGkc2BJTwHC2eOeuvhUWTgXD9QW8AoIsEe8Kpxtpiy6NmMii8ye8Rq29lawQlWcKeak5CMLOlKXYxeMqIV9VMFc1ZQbksNaAJUPuIktKYzBvwBqFFelJ+V/kxGbwOI652o3D1WeWCEcTARtdJcDnwUsbWUYtTZEnSmNBfYwnjk4SzHFowSnC5dUxedZ/hpFUiGxZorMvcqEbqlPM3oQmcA0ddZQS7YBtFiGWDXCWtsd89GPTKWBZ1fC9ENL63sCvWHMZ1cnxhNczHYKlwZYcYdVfmBd8qNDjpBDgiG/p8GM8xKirDU0Q3XNitlXmZczQJhoEnwMAIALqHIMmTmn/wc4EfybHbBlFsEOxWo8ucRdYnZ5EZFUtyPLyhBn3bau3rpDN6lmp8dyoHSSlxkZP1xMBqVs4RNY1pqUiZkvJ6e7Zveyx3m+fRAZqrGL7uNK4xE19sETjRdd73av6DewvYZ6TeCdr/idfTslTDC75smMzSAYixes8CSzi/NJ9QYCMDlx7QRdJkqRcwIZdwKW6bmuUCEWHcmYpKN8V/A8AFw3+eAn36WNeeOiE7FUpLpEQdi3OEldloYx/qEKUesdo+CJUvIDgfMrWyeK+hZzTNmVpquGhcSM2sVeAHOU2PaivAMSp0bASAGeu4ezVHke0Cw0Xnk3Ajkr/gCecPhESWRRiGCfEOIhLGzLqzc0xHkT6jdr9RODAATJ8IAbhqtlnhrPmkEmaplPDwY5aByIhZPFhdp2aPO7nwMI3XaIN6wnG3ea/1SJfPtD2qBYrJK5c6LMNwZ5UmzKGeW2j8mCQFhTUPQOk7qWoYEwPsU5UhVX2uHN/ji9eeldHmSW+9xMhWo3aRFvKsFbKPNEy4t29haj0eOe7PUZhYaYf6JBf4uOSYkzXmsfiZbIEgnCM6QE7udj3vAUUuRbovi2h+ss9Hp0L5cEJeeV/SFcb4eQDYjBZ8gBLUZjR3Zp3LkD5jWR8eVdriBD50s3r8sTfZi9NVJroWeKK6vIjNCPs4zN24ComsvYqFP3SCDRnSCxDy9tTYNXOXPmN1M7gO92UW+Bvl0EgsQMFNHRtcBTWCLAKUe2pZclIbaUV4sEAa/jVg==\"}}",
+   "headers": [
+    [
+     "content-digest",
+     "sha-256=:RH3DlcAtk7ShFPNtzcVtfXyEe+arsg76x/p5VZOFUXI=:"
+    ],
+    [
+     "signature-input",
+     "sf=(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\");created=1767225600;expires=1767225900;nonce=\"54fa115770f57a6b2847cf52bf3b9674\";keyid=\"d_0cf90c0645debb8c6aa61a7fbe132a3cb9a26d4e0de19867a8e6b627f7e72fd0\";alg=\"ed25519\";tag=\"snailfish.request.v1\""
+    ],
+    [
+     "signature",
+     "sf=:RVs5FUayKimEIdNCXRJ29I2J5qRAXDuC293fEKMw6vciad1X4WS2P/ZQ85EFANGSQHPD4hAtjHaF7mYS1hKCCA==:"
+    ],
+    [
+     "snailfish-authority",
+     "sync.example.net"
+    ],
+    [
+     "cookie",
+     "__cf_bm=abc"
+    ],
+    [
+     "cookie",
+     "theme=dark;sf_session=x"
+    ]
+   ],
+   "status": 400,
+   "response": null,
+   "error": "bad_request"
+  },
+  {
+   "name": "foreign-cookie",
+   "signer": "C",
+   "body": "{\"code\":\"ac_3474b7f7494e26e60fb7077d8087152cf45976fa9398d0769c00ed539e7db043\",\"code_verifier\":\"KxunhwM-2Dr_l8WmuSrETWo-WQZoNnnZIY-umv0o2VY\",\"redirect_uri\":\"http://127.0.0.1:49152/callback\",\"device\":{\"sign\":\"SvyAoVYq/jmgn5Wi7fLpcgDZZjHvKlRF3niVJDdXhL8=\",\"seal\":\"C1U/KXIHoqEcyOBJLDsTn4OvT0Ch2Qy+ELd0vagpChljEuUbz/ueHPpCJhwflnekEDWoYZRJsptjmwxDjUcdyNgPBNUNSFQ346JF15q8edCFWNVrORkm6JQx7qCINDcgXQpP3CBFXkpA0QlKTQeclQdcnQetmNczvpRFHFI7DbWe9VWZPjEhcCQwFPKgOUOU+Cipm/yF5VgsCVF9wgpUR8yn+MqdPZcavuWlP+VE+tc2p/ROfUYflhiCfNc6Q5SDpet6QYygNrt8CagB8hYNv6peCMCqjzlcbzoQLkEbo1KT8PJuR8p2ChRfO0qvbieoLKO5BAdA5GQam4OlUJRFySGq+AYk1WwK63cQBnO5b0eCNfu8seUycDyxL4SXk5iA6quP7wtG6UfAREwK5yVK2sJFhAjGCRd+WsmO9ZkQNaNQDQeNTBCjP5Wq4cESE6lIGmtssgs0buMe8vUaXoalBQlX27QS9MmhY6kxBcKOV+Vj4JgmumevXjKaORNeQvjI+EyQ2cGkc2BJTwHC2eOeuvhUWTgXD9QW8AoIsEe8Kpxtpiy6NmMii8ye8Rq29lawQlWcKeak5CMLOlKXYxeMqIV9VMFc1ZQbksNaAJUPuIktKYzBvwBqFFelJ+V/kxGbwOI652o3D1WeWCEcTARtdJcDnwUsbWUYtTZEnSmNBfYwnjk4SzHFowSnC5dUxedZ/hpFUiGxZorMvcqEbqlPM3oQmcA0ddZQS7YBtFiGWDXCWtsd89GPTKWBZ1fC9ENL63sCvWHMZ1cnxhNczHYKlwZYcYdVfmBd8qNDjpBDgiG/p8GM8xKirDU0Q3XNitlXmZczQJhoEnwMAIALqHIMmTmn/wc4EfybHbBlFsEOxWo8ucRdYnZ5EZFUtyPLyhBn3bau3rpDN6lmp8dyoHSSlxkZP1xMBqVs4RNY1pqUiZkvJ6e7Zveyx3m+fRAZqrGL7uNK4xE19sETjRdd73av6DewvYZ6TeCdr/idfTslTDC75smMzSAYixes8CSzi/NJ9QYCMDlx7QRdJkqRcwIZdwKW6bmuUCEWHcmYpKN8V/A8AFw3+eAn36WNeeOiE7FUpLpEQdi3OEldloYx/qEKUesdo+CJUvIDgfMrWyeK+hZzTNmVpquGhcSM2sVeAHOU2PaivAMSp0bASAGeu4ezVHke0Cw0Xnk3Ajkr/gCecPhESWRRiGCfEOIhLGzLqzc0xHkT6jdr9RODAATJ8IAbhqtlnhrPmkEmaplPDwY5aByIhZPFhdp2aPO7nwMI3XaIN6wnG3ea/1SJfPtD2qBYrJK5c6LMNwZ5UmzKGeW2j8mCQFhTUPQOk7qWoYEwPsU5UhVX2uHN/ji9eeldHmSW+9xMhWo3aRFvKsFbKPNEy4t29haj0eOe7PUZhYaYf6JBf4uOSYkzXmsfiZbIEgnCM6QE7udj3vAUUuRbovi2h+ss9Hp0L5cEJeeV/SFcb4eQDYjBZ8gBLUZjR3Zp3LkD5jWR8eVdriBD50s3r8sTfZi9NVJroWeKK6vIjNCPs4zN24ComsvYqFP3SCDRnSCxDy9tTYNXOXPmN1M7gO92UW+Bvl0EgsQMFNHRtcBTWCLAKUe2pZclIbaUV4sEAa/jVg==\"}}",
+   "headers": [
+    [
+     "content-digest",
+     "sha-256=:RH3DlcAtk7ShFPNtzcVtfXyEe+arsg76x/p5VZOFUXI=:"
+    ],
+    [
+     "signature-input",
+     "sf=(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\");created=1767225600;expires=1767225900;nonce=\"304fed41da27908ecf08a77fb514f623\";keyid=\"d_0cf90c0645debb8c6aa61a7fbe132a3cb9a26d4e0de19867a8e6b627f7e72fd0\";alg=\"ed25519\";tag=\"snailfish.request.v1\""
+    ],
+    [
+     "signature",
+     "sf=:aTBbahznX8JUstaAYamcJfHleDZfqEGzRU9pfqSbfUd3qWQPUdNCWwhYxiRraLA6K3wJC+UAXIlkXkAqhFmECQ==:"
+    ],
+    [
+     "snailfish-authority",
+     "sync.example.net"
+    ],
+    [
+     "cookie",
+     "__cf_bm=abc; sf_session_x=1"
+    ]
+   ],
+   "status": 200,
+   "response": {
+    "tenant": "t_e1628070e99419b786f08ffd6253a561",
+    "expires": 1767226200
+   },
+   "error": null
   },
   {
    "name": "unknown-code",

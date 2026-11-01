@@ -129,7 +129,7 @@ fn token_request_bodies() {
         }
         let got = setup::parse_token_request(s(c, "body").as_bytes());
         // A body error is `bad_request`. Each other case has a valid body.
-        let body_error = c["error"] == "bad_request" && s(c, "name") != "cookie-header";
+        let body_error = c["error"] == "bad_request" && !s(c, "name").starts_with("cookie-");
         assert_eq!(got.is_err(), body_error, "{}", s(c, "name"));
     }
 }

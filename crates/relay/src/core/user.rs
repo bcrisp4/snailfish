@@ -81,8 +81,11 @@ pub const CODE_SECONDS: u64 = 60;
 pub const SESSION_SECONDS: u64 = 43_200;
 /// A `WebAuthn` ceremony lasts this many seconds.
 pub const CEREMONY_SECONDS: u64 = 300;
-/// The most ceremonies that the relay keeps at once.
-const MAX_CEREMONIES: usize = 1024;
+/// The most ceremonies that the relay keeps at once (12.4). When full, a
+/// new ceremony replaces the oldest, so a flood of starts cannot refuse
+/// the sign-in of the user: it must outpace the rate limit of 12.6 for the
+/// whole time that the user takes to answer the passkey prompt.
+pub const MAX_CEREMONIES: usize = 16_384;
 /// The session cookie name.
 pub const COOKIE: &str = "sf_session";
 /// The HTML content type.
@@ -216,11 +219,11 @@ impl Auth {
         let mut m = self.ceremonies.lock().map_err(|_| internal())?;
         m.retain(|_, (_, exp)| now < *exp);
         if m.len() >= MAX_CEREMONIES {
-            return Err(api(
-                503,
-                "busy",
-                "too many sign-ins at once: try again later",
-            ));
+            // Each ceremony lasts the same time, so the oldest expires first.
+            let oldest = m.iter().min_by_key(|(_, (_, exp))| *exp).map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                m.remove(&k);
+            }
         }
         m.insert(id, (c, now.saturating_add(CEREMONY_SECONDS)));
         Ok(id)
@@ -235,6 +238,17 @@ impl Auth {
             _ => Err(bad()),
         }
     }
+}
+
+/// The value of the first `sf_session` cookie of the request (12.4).
+pub(super) fn session_cookie(req: &Request) -> Option<&str> {
+    req.headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
+        .map(|c| c.trim().split_once('=').unwrap_or((c.trim(), "")))
+        .find(|(k, _)| *k == COOKIE)
+        .map(|(_, v)| v)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -497,15 +511,7 @@ impl Relay {
     }
 
     fn session(&self, req: &Request, now: u64) -> ApiResult<Option<Session>> {
-        let Some(value) = req
-            .headers
-            .iter()
-            .filter(|(n, _)| n.eq_ignore_ascii_case("cookie"))
-            .flat_map(|(_, v)| v.split(';'))
-            .filter_map(|c| c.trim().split_once('='))
-            .find(|(k, _)| *k == COOKIE)
-            .map(|(_, v)| v)
-        else {
+        let Some(value) = session_cookie(req) else {
             return Ok(None);
         };
         let Some(id) = self.auth.cookie_id(value) else {
@@ -818,12 +824,9 @@ impl Relay {
         let dir = self.directory()?;
         let user = user_row(&dir, &session.user_id)?
             .ok_or_else(|| api(401, "signed_out", "sign in first"))?;
-        if !safe_name(&user.tenant_id, 32) {
-            return Err(StoreError::Corrupt("a tenant ID is malformed").into());
-        }
         let ctx = Form {
             session,
-            tdir: self.cfg.data_dir.join("tenants").join(&user.tenant_id),
+            tdir: self.tenant_by_id(user.tenant_id.clone())?.dir,
             user,
             fields: form,
             now,
@@ -896,8 +899,14 @@ impl Relay {
     }
 
     fn delete_tenant(&self, user_id: &str, user: &UserRow, tdir: &Path) -> ApiResult<Reply> {
-        let tc = store::open(&tdir.join("tenant.db"), Kind::Tenant, false)?;
-        let spaces: i64 = tc.query_row(
+        // [STO-8]: no tenant directory disappears while a backup copies it.
+        let _backup = self.backup_shared()?;
+        // Space creation holds this lock from its space count to its commit.
+        // So a creation either comes first and this check sees its space, or
+        // it waits and then finds no setup token (10.5 step 3).
+        let mut tc = store::open(&tdir.join("tenant.db"), Kind::Tenant, false)?;
+        let ttx = tc.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let spaces: i64 = ttx.query_row(
             "SELECT count(*) FROM spaces WHERE status = 'active'",
             [],
             |r| r.get(0),
@@ -905,7 +914,6 @@ impl Relay {
         if spaces > 0 {
             return Err(api(409, "not_empty", "the tenant has a space"));
         }
-        drop(tc);
         let mut d = self.directory()?;
         let tx = d.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for table in ["passkeys", "invites", "sessions", "codes", "setup_tokens"] {
@@ -923,6 +931,7 @@ impl Relay {
         // The directory no longer names the tenant, so nothing reaches its
         // files. Best effort: a failed removal leaves an unused directory.
         let _ = std::fs::remove_dir_all(tdir);
+        drop(ttx);
         let mut r = page("Deleted", "<p>The account and its tenant are deleted.</p>");
         r.headers.push(self.auth.set_cookie("", 0));
         Ok(r)
@@ -957,15 +966,12 @@ impl Relay {
         let dir = self.directory()?;
         let user = user_row(&dir, &session.user_id)?
             .ok_or_else(|| api(401, "signed_out", "sign in first"))?;
-        if !safe_name(&user.tenant_id, 32) {
-            return Err(StoreError::Corrupt("a tenant ID is malformed").into());
-        }
         let csrf = self.auth.csrf(&session.id);
-        let tdir = self.cfg.data_dir.join("tenants").join(&user.tenant_id);
-        let tc = store::open(&tdir.join("tenant.db"), Kind::Tenant, false)?;
+        let tenant = self.tenant_by_id(user.tenant_id.clone())?;
+        let tc = store::open(&tenant.db(), Kind::Tenant, false)?;
         let quota = limits(&tc, &self.cfg.quotas)?;
-        let spaces = tenant_spaces(&tdir)?;
-        let devices = tenant_devices(&tdir)?;
+        let spaces = tenant_spaces(&tc, &tenant.dir)?;
+        let devices = tenant_devices(&tc, &tenant.dir, &spaces)?;
         let hidden = format!("<input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">");
         let mut html = format!(
             "<meta name=\"csrf\" content=\"{csrf}\"><p>Signed in as <b>{}</b>. \
@@ -997,23 +1003,16 @@ impl Relay {
     ///
     /// A storage failure.
     pub fn queue_alerts(&self, tenant_id: &str, now: u64) -> Result<usize, StoreError> {
-        if !safe_name(tenant_id, 32) {
-            return Err(StoreError::Corrupt("a tenant ID is malformed"));
-        }
-        let tdir = self.cfg.data_dir.join("tenants").join(tenant_id);
-        let api_store = |e: ApiError| {
-            let _ = e;
-            StoreError::Corrupt("the tenant could not be read")
-        };
-        let spaces = tenant_spaces(&tdir).map_err(api_store)?;
-        let devices = tenant_devices(&tdir).map_err(api_store)?;
-        let mut c = store::open(&tdir.join("tenant.db"), Kind::Tenant, false)?;
+        let tenant = self.tenant_by_id(tenant_id.to_owned())?;
+        let mut c = store::open(&tenant.db(), Kind::Tenant, false)?;
         let has_hook: Option<i64> = c
             .query_row("SELECT 1 FROM webhook WHERE id = 1", [], |r| r.get(0))
             .optional()?;
         if has_hook.is_none() || self.cfg.webhook_hosts.is_empty() {
             return Ok(0);
         }
+        let spaces = tenant_spaces(&c, &tenant.dir)?;
+        let devices = tenant_devices(&c, &tenant.dir, &spaces)?;
         let quota = limits(&c, &self.cfg.quotas)?;
         let mut cases: Vec<(String, String)> = Vec::new();
         for sp in &spaces {
@@ -1065,9 +1064,8 @@ impl Relay {
     }
 }
 
-/// The active spaces of a tenant with their usage.
-fn tenant_spaces(tdir: &Path) -> ApiResult<Vec<SpaceRow>> {
-    let tc = store::open(&tdir.join("tenant.db"), Kind::Tenant, false)?;
+/// The active spaces of a tenant with their usage. `tc` is its `tenant.db`.
+fn tenant_spaces(tc: &Connection, tdir: &Path) -> Result<Vec<SpaceRow>, StoreError> {
     let mut st = tc.prepare(
         "SELECT s.log_id, s.file_name, s.app_id, h.since IS NOT NULL FROM spaces s
          LEFT JOIN holds h ON h.log_id = s.log_id WHERE s.status = 'active' ORDER BY s.app_id",
@@ -1078,7 +1076,7 @@ fn tenant_spaces(tdir: &Path) -> ApiResult<Vec<SpaceRow>> {
     let mut out = Vec::new();
     for (log, file, app, hold) in rows {
         if !safe_name(&file, 26) {
-            return Err(StoreError::Corrupt("a space file name is malformed").into());
+            return Err(StoreError::Corrupt("a space file name is malformed"));
         }
         let sc = store::open(
             &tdir.join("spaces").join(format!("{file}.db")),
@@ -1102,12 +1100,15 @@ fn tenant_spaces(tdir: &Path) -> ApiResult<Vec<SpaceRow>> {
     Ok(out)
 }
 
-/// The active devices of each space of a tenant, with their names and
+/// The active devices of each space of `spaces`, with their names and
 /// their last status reports.
-fn tenant_devices(tdir: &Path) -> ApiResult<Vec<DeviceRow>> {
-    let tc = store::open(&tdir.join("tenant.db"), Kind::Tenant, false)?;
+fn tenant_devices(
+    tc: &Connection,
+    tdir: &Path,
+    spaces: &[SpaceRow],
+) -> Result<Vec<DeviceRow>, StoreError> {
     let mut out = Vec::new();
-    for sp in tenant_spaces(tdir)? {
+    for sp in spaces {
         let sc = store::open(
             &tdir.join("spaces").join(format!("{}.db", sp.file)),
             Kind::Space,
@@ -1123,7 +1124,7 @@ fn tenant_devices(tdir: &Path) -> ApiResult<Vec<DeviceRow>> {
         for (id, ptype, env) in rows {
             let id = encode_id("d_", &id);
             let name = device_name(&ptype, &env, &id).unwrap_or_else(|| "?".to_owned());
-            let status = read_status(&tc, &sp.log, &id, sp.head)?;
+            let status = read_status(tc, &sp.log, &id, sp.head)?;
             out.push(DeviceRow {
                 id,
                 name,
@@ -1385,7 +1386,11 @@ fn group_write(ctx: &Form<'_>, path: &str) -> ApiResult<Reply> {
             let device = ctx.field("device");
             // A group member is a device that is active in a space of
             // the tenant (12.4).
-            if !tenant_devices(&ctx.tdir)?.iter().any(|d| d.id == device) {
+            let spaces = tenant_spaces(&c, &ctx.tdir)?;
+            if !tenant_devices(&c, &ctx.tdir, &spaces)?
+                .iter()
+                .any(|d| d.id == device)
+            {
                 return Err(api(
                     400,
                     "bad_request",
@@ -1566,8 +1571,10 @@ fn invite_page() -> Reply {
 
 impl Relay {
     /// Make a new invite link for a user (12.1): replace the old invite and
-    /// remove every passkey and every session of the user, in one
-    /// transaction ([USR-1], [USR-2]). Returns the link.
+    /// remove every passkey, session, authorization code and setup token of
+    /// the user, in one transaction ([USR-1], [USR-2]). The operator uses it
+    /// to lock out a party with a stolen passkey or session, so no grant of
+    /// that party may outlive it. Returns the link.
     ///
     /// # Errors
     ///
@@ -1589,7 +1596,7 @@ impl Relay {
             .optional()
             .map_err(StoreError::from)?;
         let user_id = user_id.ok_or(OpenError::UnknownUser)?;
-        for table in ["invites", "passkeys", "sessions"] {
+        for table in ["invites", "passkeys", "sessions", "codes", "setup_tokens"] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE user_id = ?1"),
                 params![user_id],
@@ -1633,20 +1640,8 @@ impl Relay {
             )
             .optional()
             .map_err(StoreError::from)?;
-        let tenant = tenant.ok_or(OpenError::UnknownUser)?;
-        if !safe_name(&tenant, 32) {
-            return Err(StoreError::Corrupt("a tenant ID is malformed").into());
-        }
-        let c = store::open(
-            &self
-                .cfg
-                .data_dir
-                .join("tenants")
-                .join(tenant)
-                .join("tenant.db"),
-            Kind::Tenant,
-            false,
-        )?;
+        let tenant = self.tenant_by_id(tenant.ok_or(OpenError::UnknownUser)?)?;
+        let c = store::open(&tenant.db(), Kind::Tenant, false)?;
         c.execute(
             "INSERT INTO limits (id, max_spaces, space_bytes) VALUES (1, ?1, ?2)
              ON CONFLICT (id) DO UPDATE SET max_spaces = excluded.max_spaces, space_bytes = excluded.space_bytes",
@@ -1729,16 +1724,8 @@ impl Relay {
     ///
     /// A storage failure.
     pub fn next_webhook(&self, tenant_id: &str) -> Result<Option<Queued>, StoreError> {
-        if !safe_name(tenant_id, 32) {
-            return Err(StoreError::Corrupt("a tenant ID is malformed"));
-        }
         let c = store::open(
-            &self
-                .cfg
-                .data_dir
-                .join("tenants")
-                .join(tenant_id)
-                .join("tenant.db"),
+            &self.tenant_by_id(tenant_id.to_owned())?.db(),
             Kind::Tenant,
             false,
         )?;
@@ -1771,17 +1758,9 @@ impl Relay {
     ///
     /// A storage failure.
     pub fn webhook_sent(&self, tenant_id: &str, seq: i64, result: &str) -> Result<(), StoreError> {
-        if !safe_name(tenant_id, 32) {
-            return Err(StoreError::Corrupt("a tenant ID is malformed"));
-        }
         let now = (self.cfg.clock)();
         let mut c = store::open(
-            &self
-                .cfg
-                .data_dir
-                .join("tenants")
-                .join(tenant_id)
-                .join("tenant.db"),
+            &self.tenant_by_id(tenant_id.to_owned())?.db(),
             Kind::Tenant,
             false,
         )?;

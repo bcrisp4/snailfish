@@ -345,6 +345,8 @@ func buildSetup(h *httpJ, b *logBuilder, w *world) error {
 		{"bad-digest-before-body", C, `{"code":`, okBody, nil, "400 bad_digest"},
 		{"keyid-not-device", A, okBody, "", nil, "403 unknown_device"},
 		{"cookie-header", C, okBody, "", [][2]string{{"cookie", "sf_session=x"}}, "400 bad_request"},
+		{"cookie-session-among-others", C, okBody, "", [][2]string{{"cookie", "__cf_bm=abc"}, {"cookie", "theme=dark;sf_session=x"}}, "400 bad_request"},
+		{"foreign-cookie", C, okBody, "", [][2]string{{"cookie", "__cf_bm=abc; sf_session_x=1"}}, "200"},
 		{"unknown-code", C, tokBody(tokenText("code", "unknown"), verifier, signinURI, keysRaw(C)), "", nil, "403 bad_setup"},
 		{"used-code", C, tokBody(codeUsed, verifier, signinURI, keysRaw(C)), "", nil, "403 bad_setup"},
 		{"code-at-expiry", C, tokBody(codeExpired, verifier, signinURI, keysRaw(C)), "", nil, "403 bad_setup"},

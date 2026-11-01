@@ -184,7 +184,7 @@ def test_webhook_needs_an_allowed_host_and_a_public_address(relay: Relay) -> Non
 
 def test_user_write_needs_origin_and_csrf(relay: Relay) -> None:
     """T4, [USR-7]: the relay refuses a user write with a wrong Origin or
-    with no anti-CSRF token, and a device route with a cookie."""
+    with no anti-CSRF token, and a device route with the session cookie."""
     br = browser(relay)
     csrf = br.csrf()
     assert csrf

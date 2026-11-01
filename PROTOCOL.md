@@ -400,7 +400,8 @@ This section gives the sync and setup surface routes of M5. Later milestones add
 
 - The relay refuses a request body, or an object inside it, with a field that this section does not name (`bad_request`). The relay is upgraded before the engines ([VER-11]), so a newer engine never meets an older relay. The envelopes inside a body follow the looser rule of section 4.
 - The engine ignores unknown fields in a response body ([VER-13]).
-- The relay refuses a request on a route of this section that has a `cookie` header (`bad_request`, [USR-7]). These routes take no browser session. This check runs before every other check of the route.
+- The relay refuses a request on a route of this section that sends the session cookie `sf_session` of 12.4 (`bad_request`, [USR-7]). These routes take no browser session. This check runs before every other check of the route.
+- The relay splits each `cookie` header value at `;` and removes the spaces around each part. The cookie name is the text before the first `=`. The relay ignores each other cookie, for example a cookie that a proxy sets and an HTTP client sends back.
 - The bodies of 10.11 and 12.3 follow the strict JSON rules of section 3: no duplicate key, and integers only.
 
 ### 10.1 Routes
@@ -850,7 +851,7 @@ The relay serves the user page and the native sign-in under `/u/` (DESIGN.md "In
 
 - `<origin>` is the configured user page origin (12.4). The token is in the fragment, so a browser does not send it in a request line or a `Referer` header. The script of the invite page reads it.
 - The relay stores SHA-256 of the 32 token bytes, the user ID and the expiry time, the relay time of the command plus 604,800 seconds ([USR-1]).
-- A user has at most one invite. A new link replaces the old one. It also removes every passkey and every browser session of the user, in the same transaction ([USR-2]).
+- A user has at most one invite. A new link replaces the old one. It also removes every passkey, every browser session, every authorization code and every setup token of the user, in the same transaction ([USR-2]).
 - A link works once: the registration that uses it deletes it, in the transaction that stores the passkey.
 
 ### 12.2 Native sign-in: authorization code
@@ -949,7 +950,7 @@ Write rules ([USR-7]):
 4. If a route needs a session and the `csrf` form field, or the `snailfish-csrf` header of a JSON route, differs from the anti-CSRF token of the session, return `bad_csrf`.
 
 - A form body is `application/x-www-form-urlencoded`. Each field of the route occurs once, and the relay refuses another field (`bad_request`). The JSON routes follow the strict body rule of section 10.
-- The JSON of the WebAuthn routes is the JSON of the `webauthn-rs` crate, version 0.5, which the browser API takes and returns. A start response also holds `ceremony`, 16 random bytes as 32 hex digits, which the finish request names. The relay keeps a ceremony in memory for 300 seconds.
+- The JSON of the WebAuthn routes is the JSON of the `webauthn-rs` crate, version 0.5, which the browser API takes and returns. A start response also holds `ceremony`, 16 random bytes as 32 hex digits, which the finish request names. The relay keeps a ceremony in memory for 300 seconds. It keeps at most 16,384 ceremonies. If it holds that many, a new ceremony replaces the oldest one.
 - A `GET` of a page without a valid session shows the sign-in page.
 - Limit: a sign-in start tells the caller whether a user name has a passkey, because the options name its credentials. The rate limit of 12.6 slows a search for names.
 - A device in a machine group is a device ID that is active in a space of the tenant. A group name is 1 to 64 UTF-8 bytes.
@@ -973,7 +974,7 @@ A webhook URL is at most 512 bytes ([USR-8]): `https://` or `http://`, a host, a
 - The target is a path with an optional query. It holds only bytes from 0x21 to 0x7E, except `# " < > \ ^ ` { | }`. So the URL has no fragment. The host part has no `@`, so the URL has no user part.
 
 - The relay operator sets an allowlist of hosts. An empty allowlist turns webhooks off. The host of the URL must be in the allowlist, in the same form. An IPv6 entry of the allowlist has no brackets.
-- The relay resolves the host each time it sends, and connects only to an address that it checked. It refuses a loopback, link-local, private, unique local, unspecified or multicast address, unless the allowlist names that address as a literal.
+- The relay resolves the host each time it sends, and connects only to an address that it checked. It refuses a restricted address, unless the allowlist names that address as a literal. The restricted IPv4 ranges are `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (shared address space, also the Tailscale range), `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15` and `224.0.0.0/3` (multicast, reserved and broadcast). The restricted IPv6 ranges are `::/128`, `::1/128`, `fc00::/7`, `fe80::/10` and `ff00::/8`. An IPv6 address that holds an IPv4 address follows the IPv4 rule: `::ffff:0:0/96` (mapped), `::/96` (compatible), `64:ff9b::/96` (NAT64) and `2002::/16` (6to4, the IPv4 address in bits 16 to 47).
 - The relay checks a URL when the user sets it, and again at each send.
 
 The relay sends `POST` with `content-type: application/json` and this body:
@@ -985,7 +986,7 @@ The relay sends `POST` with `content-type: application/json` and this body:
 - The body holds only `text`, a string. Slack incoming webhooks accept this form.
 - The JSON writer keeps non-ASCII characters as UTF-8. It escapes `"`, `\`, LF as `\n`, CR as `\r`, TAB as `\t`, and each other control character as `\u` and 4 lowercase hex digits.
 - The relay sends a message for a stalled device and for a space at 80% of its quota (DESIGN.md "Monitoring and alerting" items 7 and 9), once for each case until the case ends.
-- The relay follows no redirect, waits at most 10 seconds, and reads at most 4 KiB of the response. A `2xx` status is a success.
+- The relay follows no redirect, waits at most 10 seconds for the DNS lookup and the exchange together, and reads at most 4 KiB of the response. A `2xx` status is a success.
 
 ### 12.6 Rate limit
 

@@ -52,7 +52,7 @@ These rules have no model. Real-path tests check them instead. `coverage.toml` l
 | Rule | Reason | Tests |
 | --- | --- | --- |
 | The WebAuthn ceremony (DESIGN.md "Interfaces") | The `webauthn-rs` crate does the registration and the assertion checks. A model of the ceremony would check that crate, not this design. `specs/signin` treats a passkey as an ideal signature. | `crates/relay/tests/user.rs` passkey tests with a software authenticator |
-| [USR-2] A new invite link removes the old passkeys and sessions | One storage transaction with no protocol state. | `crates/relay/tests/user.rs` |
+| [USR-2] A new invite link removes the old passkeys, sessions, codes and setup tokens | One storage transaction. ProVerif has no revocation of stored state. | `crates/relay/tests/user.rs` |
 | [USR-7] Origin, anti-CSRF token and cookie rules | Browser rules of the user page. The HTML and the browser are outside every model. | `crates/relay/tests/user.rs`, `demo/tests/test_users.py` |
 | [USR-8] Webhook host allowlist and address checks | A DNS and socket rule of the relay, with no shared state. | `crates/relay/src/webhook.rs` tests, `demo/tests/test_users.py` |
 | [QTA-5] The space count limit | One check in space creation. | `crates/relay/tests/user.rs` |

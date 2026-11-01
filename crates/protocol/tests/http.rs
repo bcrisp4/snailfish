@@ -87,8 +87,14 @@ fn relay_check(h: &Value, sp: &MemorySpace, c: &Value, authority: &str) -> Resul
         path: s(&c["path"]),
         query: s(&c["query"]),
     };
-    // PROTOCOL.md 10: a sync or setup route refuses a cookie first.
-    if hs.iter().any(|(n, _)| n.eq_ignore_ascii_case("cookie")) {
+    // PROTOCOL.md 10: a sync or setup route refuses the session cookie
+    // first, and ignores other cookies.
+    let session_cookie = hs
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
+        .any(|c| c.trim().split('=').next() == Some("sf_session"));
+    if session_cookie {
         return Err("bad_request".into());
     }
     // 12.3 step 3: the token route takes the key of the body only.

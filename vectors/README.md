@@ -192,7 +192,7 @@ All times are Unix seconds. Byte strings are lowercase hex, unless the field is 
 ```
 
 - Each `signed` case verifies with the `sign_seed` public key of its signer. `headers` are the exact header values.
-- Each `invalid` case breaks one check of `PROTOCOL.md` 8.6, or the `cookie` rule of section 10. The relay returns `error` for it.
+- Each `invalid` case breaks one check of `PROTOCOL.md` 8.6, or the session cookie rule of section 10 (also with other cookies in the header). The relay returns `error` for it.
 - The `signed` case `post-setup-token` is signed by C. C is not active in the space. Step 5 of 8.6 accepts the device of the `device` keys of the body (12.3). The space has the devices of `space.log` as active devices.
 - `space.log` is the log of the space before each `append` case: genesis (recovery key R1, first device A), a change by A, a grant to B by A, and a change by B. Each `append` case starts from this log, so the cases are independent.
 - `append` covers a new change, an exact retry (`known`), the same `change_id` with another record hash (`conflict`), a second copy in one request, a bad base, a base at or after the new position, an author that differs from the request signer (a record by C that A sends), another log ID, an unsupported type, a wrong epoch, a too large change, a grant of an active device, and one request with mixed results.
@@ -216,7 +216,7 @@ All times are Unix seconds. Byte strings are lowercase hex, unless the field is 
 - `pkce` computes `challenge` as `BASE64URL(SHA-256(ASCII(verifier)))` without padding. The first valid case is RFC 7636 appendix B.
 - `redirect_uris`, `states` and `authorize` cover one rule of 12.2 for each invalid case. A reader decodes each `authorize` name and value once, as `application/x-www-form-urlencoded`, so `+` is a space.
 - `setup_token` cases run against `setup_codes` at the relay time `now`, with no used nonce. The response also holds a `token` that the relay makes. A reader checks only that it is an `st_` text.
-- `setup_token` covers a valid exchange, malformed bodies, a duplicate key, a `keyid` that is not the device ID of `device` (`unknown_device`), a cookie header, and each `bad_setup` cause of 12.3 steps 4 and 5.
+- `setup_token` covers a valid exchange, malformed bodies, a duplicate key, a `keyid` that is not the device ID of `device` (`unknown_device`), the session cookie (alone and among other cookies), a foreign cookie that the relay ignores, and each `bad_setup` cause of 12.3 steps 4 and 5.
 - `put` cases run against `setup_tokens` at the relay time `now`, after 8.6 steps 1 to 4. They cover a create (`201`), exact retries with an unknown or expired token (`200`), another genesis record (`space_exists`), malformed `setup` values (`bad_request`), each `bad_setup` cause of 10.5 step 3, a signer that is not the genesis device and a genesis record of another log.
 - `device_status` covers valid bodies and one rule of 10.11 or section 3 for each invalid body.
 - `webhook.urls` uses `webhook.allowlist`. An IPv6 entry of the allowlist has no brackets. The cases cover a query, default and explicit ports, port limits, IPv6 literals in and not in their shortest form, and bytes that the target does not allow. `webhook.messages` escapes `"`, `\` and control characters, and writes each other character as UTF-8.

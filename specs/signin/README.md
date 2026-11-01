@@ -54,7 +54,7 @@ Result of `make verify-crypto`: all 30 query results of this directory match `ex
 - No one-use rule. A ProVerif table row cannot be removed, so the invite token and the code can be read more than once. Rust tests check one use (`specs/coverage.toml` `partial`).
 - The redirect URI binding is not modelled. PKCE alone stops the code interception in the model.
 - No browser. The Origin and anti-CSRF rules ([USR-7]) and the WebAuthn ceremony are outside the model (`specs/README.md` "Exclusions").
-- A new invite that removes the old passkeys ([USR-2]) is not modelled.
+- A new invite that removes the old passkeys, sessions, codes and setup tokens ([USR-2]) is not modelled. ProVerif has no revocation of stored state. `crates/relay/tests/user.rs` checks it.
 - ProVerif proves the queries for an unbounded number of sessions. It can say "cannot be proved" for a true query. `expect.toml` has no such entry.
 
 ## Rust conformance (M5)

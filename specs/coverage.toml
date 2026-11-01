@@ -92,7 +92,7 @@
 "STO-13" = "relay storage is not modelled"
 "STO-14" = "relay storage is not modelled"
 "STO-15" = "relay storage is not modelled"
-"USR-2" = "a new invite link removes passkeys and sessions: a storage rule, not a protocol state. Rust: crates/relay/tests/user.rs. specs/README.md lists the exclusion"
+"USR-2" = "a new invite link removes passkeys, sessions, authorization codes and setup tokens: a revocation of stored state, which the symbolic model cannot express. Rust: crates/relay/tests/user.rs. specs/README.md lists the exclusion"
 "USR-7" = "Origin, anti-CSRF and cookie rules of the browser surface: specs/README.md lists the exclusion. Rust: crates/relay/tests/user.rs, demo/tests/test_users.py"
 "USR-8" = "webhook host allowlist and address checks: specs/README.md lists the exclusion. Rust: crates/relay/src/webhook.rs tests, demo/tests/test_users.py"
 "QTA-5" = "the space count limit is one check in space creation with no interleaving. Rust: crates/relay/tests/user.rs"

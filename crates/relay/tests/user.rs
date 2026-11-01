@@ -260,18 +260,43 @@ fn invite_expires_after_7_days() {
     }
 }
 
-/// [USR-2]: a new link removes the old passkeys and the sessions.
+/// [USR-2]: a new link removes the old passkeys, the sessions, the open
+/// authorization codes and the setup tokens, so a party with a stolen
+/// session cannot create a space after the operator locks it out.
 #[test]
 fn new_invite_removes_old_passkeys_and_sessions() {
     let fx = Fx::new();
     let (mut b, mut k) = signed_in(&fx);
+    let code = b.approve(&setup::challenge(VERIFIER));
+    let held = b.approve(&setup::challenge(VERIFIER));
+    let r = exchange(&fx, &held, VERIFIER, "A");
+    let t = setup::parse_token_response(&r.body).unwrap();
     let _new = fx.relay.invite("sam").unwrap();
+    let r = exchange(&fx, &code, VERIFIER, "A");
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_setup"));
+    let r = put(&fx, &t.tenant, &t.token, "A");
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_setup"));
     assert!(
         b.home().contains("Sign in with a passkey"),
         "the old session still works"
     );
     let r = Browser::new(&fx).sign_in("sam", &mut k);
     assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_passkey"));
+}
+
+/// PROTOCOL.md 12.4: a flood of sign-in starts that fills the ceremony
+/// store does not refuse the sign-in of the user, which starts after it.
+#[test]
+fn ceremony_flood_does_not_refuse_a_sign_in() {
+    let fx = Fx::new();
+    let (_, mut k) = signed_in(&fx);
+    let mut flood = Browser::new(&fx);
+    for _ in 0..snailfish_relay::core::user::MAX_CEREMONIES {
+        let r = flood.json("/u/signin/start", &json!({ "name": "sam" }));
+        assert_eq!(r.status, 200);
+    }
+    let r = Browser::new(&fx).sign_in("sam", &mut k);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
 }
 
 /// [USR-1], `specs/signin/plain_invite.pv`: the directory holds a hash of
@@ -346,17 +371,23 @@ fn user_writes_need_origin_and_csrf() {
     assert_eq!((r.status, error_code(&r).as_str()), (401, "signed_out"));
 }
 
-/// [USR-7]: device routes refuse a cookie, and user routes refuse a device
-/// signature.
+/// [USR-7]: device routes refuse the session cookie, and user routes refuse
+/// a device signature. A cookie of a proxy, which an HTTP client with a
+/// shared cookie store sends back, does not stop sync.
 #[test]
 fn device_routes_refuse_cookies_and_user_routes_refuse_signatures() {
     let fx = Fx::new();
     fx.setup_space(fx.tenant());
     let path = format!("{}/entries", fx.space_path(fx.tenant(), fx.log()));
     let mut req = fx.signed("GET", &path, "after=0&limit=5", b"", "A");
-    req.headers.push(("cookie".into(), "sf_session=x".into()));
+    req.headers
+        .push(("cookie".into(), "__cf_bm=abc; sf_session=x".into()));
     let r = fx.relay.handle(&req);
     assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_request"));
+    let mut req = fx.signed("GET", &path, "after=0&limit=5", b"", "A");
+    req.headers
+        .push(("cookie".into(), "__cf_bm=abc; AWSALB=x".into()));
+    assert_eq!(fx.relay.handle(&req).status, 200);
     let mut req = fx.signed("POST", "/u/groups", "", b"name=x", "A");
     req.headers.push(("origin".into(), ORIGIN.into()));
     let r = fx.relay.handle(&req);
@@ -619,13 +650,26 @@ fn user_page_releases_a_restore_hold() {
     assert!(!f.hold);
 }
 
-/// A tenant with no space deletes with its user.
+/// A tenant with no space deletes with its user. A delete waits for a
+/// running backup ([STO-8]), and a setup token of the tenant creates no
+/// space after the delete.
 #[test]
 fn empty_tenant_deletes_with_its_user() {
     let fx = Fx::new();
     let (mut b, mut k) = signed_in(&fx);
+    let code = b.approve(&setup::challenge(VERIFIER));
+    let t = setup::parse_token_response(&exchange(&fx, &code, VERIFIER, "A").body).unwrap();
+    {
+        let lock =
+            std::fs::File::create(fx.dir.path().join(snailfish_relay::core::BACKUP_LOCK)).unwrap();
+        lock.lock().unwrap();
+        let r = b.form("/u/tenant/delete", &[]);
+        assert_eq!((r.status, error_code(&r).as_str()), (503, "backup_running"));
+        assert_eq!(fx.relay.tenant_ids().unwrap().len(), 1);
+    }
     let r = b.form("/u/tenant/delete", &[]);
     assert_eq!(r.status, 200);
+    assert_ne!(put(&fx, &t.tenant, &t.token, "A").status, 201);
     let r = Browser::new(&fx).sign_in("sam", &mut k);
     assert_eq!(r.status, 403);
     assert_eq!(fx.relay.tenant_ids().unwrap(), Vec::<String>::new());
