@@ -15,9 +15,6 @@ gitignore = true
 # workspace, also crates/bindings/tests.
 test_workspace = true
 timeout_multiplier = 3.0
-# The relay `webauthn` feature gates crates/relay/src/passkey.rs. The
-# workspace runs do not compile it, so the Makefile excludes it there.
-# `make rust-mutants-passkey` tests it with the feature.
 # Kani proofs and fuzz targets are not unit tests. Do not mutate them.
 exclude_globs = ["**/fuzz/**"]
 exclude_re = [

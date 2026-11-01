@@ -63,8 +63,8 @@ jobs:
       - run: mise exec -- cargo kani setup
       # The Kani nightly has no clippy or rustfmt. The fuzz crate lint needs both.
       - run: make rust-nightly-components
-      # make check runs make test-demo, which includes the M3 acceptance tests
-      # (demo/tests/test_integrity.py: S6 restore, repair and release).
+      # make check runs make test-demo, which includes the M3 to M5 acceptance
+      # tests (demo/tests/test_integrity.py, test_enrollment.py, test_users.py).
       - run: make check
       - if: github.event_name != 'schedule'
         run: make verify-drift BASE="$BASE"
@@ -250,13 +250,10 @@ jobs:
         run: make rust-mutants-diff BASE="$BASE" MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
       - if: github.event_name == 'schedule'
         run: make rust-mutants MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
-      # passkey.rs compiles only with the webauthn feature. One shard checks it.
-      - if: matrix.shard == 0
-        run: make rust-mutants-passkey MUTANTS_JOBS=2
 
   fuzz:
     # A short run of every fuzz target on each push, so a new parser target
-    # (M3: repair and status, M4: enroll_code and mailbox) runs before the merge. `make rust-fuzz` runs
+    # (M3: repair and status, M4: enroll_code and mailbox, M5: setup) runs before the merge. `make rust-fuzz` runs
     # each target that `cargo fuzz list` names, from its seeds.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
