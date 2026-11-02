@@ -19,6 +19,13 @@ on:
   schedule:
     - cron: "17 3 * * *"
 
+# A new push to a pull request cancels the run for the previous push. Its
+# results are out of date, and its jobs hold runners that the new run needs.
+# A push to main and the nightly run are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # The commit that the drift and mutants-diff gates compare with.
@@ -37,6 +44,20 @@ jobs:
       # rust-toolchain.toml pins the stable toolchain. Install it explicitly.
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
+      # Cache the dependency builds. cargo-mutants copies the tree without
+      # target/, so the mutants job gets no gain from this cache. The fuzz
+      # crate builds with the Kani nightly, so its name is part of the key.
+      # Only main saves a cache, so pull request caches do not fill the 10 GB
+      # repository quota and evict the mise and QEMU caches.
+      - id: nightly
+        run: echo "name=$(sed -n 's/^NIGHTLY_NAME := //p' Makefile)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.nightly.outputs.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            crates/protocol/fuzz -> target
       # cargo kani setup installs the nightly that fuzz and the fuzz lint need.
       # A restored mise cache skips the postinstall hook, so run it here.
       - run: mise exec -- cargo kani setup
@@ -58,6 +79,9 @@ jobs:
       - run: rustup toolchain install --profile minimal
       - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
       - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The runner image chooses the simulator models. Use an iPhone on the
       # newest iOS runtime, because Package.swift needs iOS 17 or later.
       - id: sim
@@ -240,6 +264,13 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
+      - id: nightly
+        run: echo "name=$(sed -n 's/^NIGHTLY_NAME := //p' Makefile)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ steps.nightly.outputs.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: crates/protocol/fuzz -> target
       - run: mise exec -- cargo kani setup
       - run: make rust-fuzz FUZZ_SECONDS=30
 

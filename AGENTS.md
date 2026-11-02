@@ -29,7 +29,8 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | Before a merge with a tagged design-rule change | `make verify-drift BASE=<base>` | A changed rule requires a model, scenario, manifest, or coverage change. |
 | Before a merge with shared-tool or CI changes | `make verify` and `make verify-deep` | Shared tools can invalidate results for every model and backend. |
 | Before a merge with enrollment model changes | `make verify-crypto` | Every design and broken-variant query must match its expectation. |
-| Before a merge with Rust changes | `make rust-kani` and `make rust-mutants-diff BASE=<base>` | Bounded harnesses and fault-sensitive tests check the implementation. |
+| Before each push with Rust changes | `make rust-mutants-diff BASE=@{push}` (`BASE=main` for a branch with no push) | This tests only the new commits, in minutes. A survivor found in CI costs a 30 to 60 minute round. |
+| Before a merge with Rust changes | `make rust-kani` and the CI `mutants` job | Bounded harnesses and fault-sensitive tests check the implementation. The CI job tests every mutant in the branch diff, so a local branch-wide run repeats it. |
 | Before a merge with parser changes | `make rust-fuzz` | Arbitrary bytes exercise parser failure paths. |
 | Before a merge with format, vector or binding changes | `make test-swift` on macOS | Linux has no Xcode, so `make check` skips the Swift binding. CI runs it in the `swift` job. |
 | Before a merge with engine, relay storage or demo changes | `make test-powerloss` | A SIGKILL of a VM finds a missing fsync that a process crash cannot find. `make check` runs only the process crash tests (`make test-demo`). |
@@ -39,6 +40,19 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 `BASE` is the target branch for a pull request, or the previous commit for a direct push. The default is `main`.
 
 Each model README states its scope and exclusions. `specs/README.md` describes the verification tiers and their limits.
+
+### Verification speed
+
+Each Rust test runs once for each mutant, and a branch can have 700 or more mutants. One added second in the test suite adds about 12 minutes of total test time to such a run.
+
+| Rule | Reason |
+| --- | --- |
+| On macOS, run `make mutants-ramdisk` once before a mutants run. | Each SQLite commit in the tests waits for an `F_FULLFSYNC`. On a RAM disk the workspace tests take 6 s, not 45 s. |
+| Start a branch-wide mutants run only after the code stops changing. | A new push makes a running run out of date. |
+| A Rust test must not sleep, poll a wall clock or start a `cargo` build. If a test must, exclude it in the nextest `mutants` profile (`.config/nextest.toml`) and exclude the mutants that only it catches. | The mutants run repeats the cost for each mutant. |
+| A loop over independent items (fuzz targets, models, harnesses) runs the items in parallel, up to the core or memory limit. | A serial loop uses one core of many. |
+| A new CI job that builds Rust uses `Swatinem/rust-cache`. A new CI job must not take longer than the `mutants` job. | The slowest job sets the time to a result. |
+| Do not make a check faster by a reduction of its coverage (cases, bounds, configs or mutants) unless the user approves it. | A faster check that finds fewer faults is a weaker check. |
 
 ### Result requirements
 

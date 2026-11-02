@@ -42,3 +42,9 @@ module_name_repetitions = "allow"
 
 [profile.release]
 overflow-checks = true
+
+# cargo-mutants builds with this profile (.cargo/mutants.toml). A mutant build
+# needs no debug info, and without it each link is faster.
+[profile.mutants]
+inherits = "test"
+debug = "none"
