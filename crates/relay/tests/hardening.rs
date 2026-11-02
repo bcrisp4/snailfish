@@ -62,8 +62,8 @@ fn genesis_at_level(fx: &Fx, level: u64) -> Envelope {
 }
 
 /// The grant to B of `http.json`, with device level `level`, by A on top of
-/// position 1 with `digest`.
-fn grant_b(fx: &Fx, level: u64, digest: [u8; 32]) -> String {
+/// `base`.
+fn grant_b(fx: &Fx, level: u64, base: Position) -> String {
     let old = Envelope::parse(s(&fx.log_entry(3)["envelope"]).as_bytes()).unwrap();
     let r = parse_payload(&old.payload_type, &old.payload).unwrap();
     let Body::Grant { device, keys } = &r.body else {
@@ -72,16 +72,7 @@ fn grant_b(fx: &Fx, level: u64, digest: [u8; 32]) -> String {
     let mut device = device.clone();
     device.level = level;
     let (ka, a, a_text) = fx.key("A");
-    let payload = write::grant(
-        &r.log,
-        &Author::Device(a),
-        &Position {
-            position: 1,
-            digest,
-        },
-        &device,
-        &keys[0],
-    );
+    let payload = write::grant(&r.log, &Author::Device(a), &base, &device, &keys[0]);
     let sig = ka.sign_record(&old.payload_type, &payload);
     Envelope {
         payload_type: old.payload_type,
@@ -129,15 +120,84 @@ fn write_level_is_stored_and_refuses_a_lower_device_level() {
         .query_row("SELECT write_level FROM space", [], |r| r.get(0))
         .unwrap();
     assert_eq!(level, 2);
-    let low = grant_b(&fx, 1, acc.digest);
+    let at1 = Position {
+        position: 1,
+        digest: acc.digest,
+    };
+    let low = grant_b(&fx, 1, at1);
     assert_eq!(
         fx.append(fx.tenant(), "A", &[low]).1,
         [AppendResult::Refused("invalid_record".into())]
     );
-    let ok = grant_b(&fx, 2, acc.digest);
+    let ok = grant_b(&fx, 2, at1);
     assert_eq!(
         fx.append(fx.tenant(), "A", &[ok]).1,
         [AppendResult::Stored(2)]
+    );
+}
+
+/// A `snailfish.device.v1` or `snailfish.level.v1` record by device `by`
+/// on `base`.
+fn level_record(fx: &Fx, by: &str, ptype: &str, base: &Position, level: u64) -> String {
+    let (k, id, id_text) = fx.key(by);
+    let payload = write::level(&fx.log_id(), &id, base, level);
+    let sig = k.sign_record(ptype, &payload);
+    Envelope {
+        payload_type: ptype.to_owned(),
+        payload,
+        sig,
+    }
+    .to_json(&id_text)
+}
+
+/// [VER-7], [VER-8], `specs/levels/test.qnt::raiseAfterUpdatesTest`: a level
+/// record needs every active device at the new level, and a second record of
+/// the same level is not a raise. Each record goes in its own request, so each
+/// check reads the levels that the space file stores. Without this, the relay
+/// would raise past a device that cannot read the new formats, or forget a
+/// raise at the next request.
+#[test]
+fn level_raise_is_stored_between_requests() {
+    let mut fx = Fx::new();
+    // D5: a synthetic level 2 with the types of level 1.
+    fx.reopen_with(|c| {
+        c.levels = snailfish_protocol::space::Levels {
+            max: 2,
+            retired: &[],
+        };
+    });
+    let genesis = genesis_at_level(&fx, 1);
+    let acc = check_genesis(&genesis, &fx.log_id(), None).unwrap();
+    assert_eq!(put_genesis(&fx, &genesis).status, 201);
+    let at = |h: wire::Head| Position {
+        position: h.position,
+        digest: h.digest,
+    };
+    let grant = grant_b(
+        &fx,
+        1,
+        Position {
+            position: 1,
+            digest: acc.digest,
+        },
+    );
+    let (_, got, head) = fx.append(fx.tenant(), "A", &[grant]);
+    assert_eq!(got, [AppendResult::Stored(2)]);
+    let early = level_record(&fx, "A", "snailfish.level.v1", &at(head), 2);
+    assert_eq!(
+        fx.append(fx.tenant(), "A", &[early]).1,
+        [AppendResult::Refused("invalid_record".into())]
+    );
+    let device = level_record(&fx, "B", "snailfish.device.v1", &at(head), 2);
+    let (_, got, head) = fx.append(fx.tenant(), "B", &[device]);
+    assert_eq!(got, [AppendResult::Stored(3)]);
+    let raise = level_record(&fx, "A", "snailfish.level.v1", &at(head), 2);
+    let (_, got, head) = fx.append(fx.tenant(), "A", &[raise]);
+    assert_eq!(got, [AppendResult::Stored(4)]);
+    let again = level_record(&fx, "A", "snailfish.level.v1", &at(head), 2);
+    assert_eq!(
+        fx.append(fx.tenant(), "A", &[again]).1,
+        [AppendResult::Refused("invalid_record".into())]
     );
 }
 

@@ -921,6 +921,7 @@ impl Relay {
             .optional()?
             .unwrap_or(0),
         )?;
+        let earlier = today;
         let reserve = self.cfg.security_reserve;
         {
             let base = SqlView::new(&tx, log_id, false);
@@ -982,7 +983,7 @@ impl Relay {
             "UPDATE usage SET bytes = ?1 WHERE id = 1",
             params![to_i64(used)?],
         )?;
-        if today > 0 {
+        if today != earlier {
             tx.execute(
                 "INSERT INTO security_counts (signer, day, n) VALUES (?1, ?2, ?3)
                  ON CONFLICT (signer, day) DO UPDATE SET n = excluded.n",

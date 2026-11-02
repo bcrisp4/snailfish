@@ -3496,6 +3496,132 @@ fn removal_rotates_the_key_and_stops_the_removed_device() {
     assert!(ea.epoch_key(2).unwrap().is_some());
 }
 
+/// Serve `env` to `e` as the next entry of the relay log, after its verified
+/// head, and return the status of the sync. The page head has a wrong digest,
+/// so a record that passes the space check stops the sync with a digest
+/// cause, not with the cause of the space check.
+fn serve_next(w: &World, e: &mut Engine, env: String) -> Status {
+    let next = e.verified_head().unwrap().position.checked_add(1).unwrap();
+    let body = snailfish_protocol::wire::fetch_response(
+        &[(next, env)],
+        &snailfish_protocol::wire::Head {
+            position: next,
+            digest: [0; 32],
+        },
+        false,
+        false,
+    )
+    .unwrap();
+    let mut s = e.start_sync();
+    steps(w, e, &mut s, 1);
+    s.next_request(e).unwrap().unwrap();
+    s.handle_response(e, 200, &[], &body).unwrap();
+    e.status()
+}
+
+/// 10.6 step 13, `specs/spacelog` removal: a relay serves a grant by A that
+/// adds the removed device B again. A refuses it as an invalid record and
+/// stops. Without this, a relay and one stolen device key could restore a
+/// removed device in the verified log.
+#[test]
+fn grant_of_a_removed_device_from_the_relay_stops() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let b_id = w.engine(&b).device_id();
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.current_epoch().unwrap(), 2);
+    let base = ea.base().unwrap();
+    let env = grant_envelope(&ea.log_id, &w.keys[0], &base, &w.keys[1], "B");
+    let st = serve_next(&w, &mut ea, env);
+    assert!(
+        matches!(st, Status::Fork { ref cause } if cause.contains("removed the device")),
+        "{st:?}"
+    );
+}
+
+/// [VER-7], `specs/levels/test.qnt::downgradeRefusedTest`: a relay serves a
+/// device record of A that states the level A already has. A refuses it and
+/// stops. Without this, a device record could state a level that the device
+/// does not support.
+#[test]
+fn device_record_without_a_raise_from_the_relay_stops() {
+    let (mut w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let sk = snailfish_protocol::sig::SecretKey::from_seed(&w.keys[0].sign_seed);
+    let id = keys::device_id(&sk.public(), &keys::seal_public(&w.keys[0].seal_seed));
+    let t = "snailfish.device.v1";
+    let payload = snailfish_protocol::write::level(&ea.log_id, &id, &ea.base().unwrap(), MAX_LEVEL);
+    let sig = sk.sign_record(t, &payload);
+    let env = snailfish_protocol::envelope::write_json(t, &payload, &sig, "d_");
+    let st = serve_next(&w, &mut ea, env);
+    assert!(
+        matches!(st, Status::Fork { ref cause } if cause.contains("not above the device level")),
+        "{st:?}"
+    );
+}
+
+/// 10.6 step 13, `specs/spacelog` `retiredRecoveryIsolation`: after a
+/// recovery key replacement, a relay serves a recovery record that makes the
+/// retired key current again. A refuses it and stops. Without this, the
+/// holder of the old paper key could get its authority back.
+#[test]
+fn recovery_record_of_a_retired_key_from_the_relay_stops() {
+    let (mut w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let old = w.recovery_key.clone();
+    let new = Engine::new_recovery_key().unwrap();
+    ea.replace_recovery_key(&old, &new).unwrap();
+    w.exchange(&mut ea);
+    w.exchange(&mut ea);
+    let cur = crate::removal::RecoverySigner::new(&new, "").unwrap();
+    let back = crate::removal::RecoverySigner::new(&old, "").unwrap();
+    let back_keys = snailfish_protocol::records::Keys {
+        sign: back.sign.public(),
+        seal: Box::new(keys::seal_public(&back.seal_seed)),
+    };
+    let epochs = [1, ea.current_epoch().unwrap()];
+    let sealed = keys::seal_key_set(
+        &back_keys.seal[..],
+        &ea.log_id,
+        &back.id,
+        &epochs,
+        &[[7; 32], [8; 32]],
+    )
+    .unwrap();
+    let set = snailfish_protocol::records::KeySet {
+        to: snailfish_protocol::records::Author::Recovery(back.id),
+        epochs: epochs.to_vec(),
+        sealed,
+    };
+    let proof = back
+        .sign
+        .sign_raw(&snailfish_protocol::recovery::proof_message(
+            &ea.log_id,
+            &back_keys.sign,
+            &back_keys.seal[..],
+        ));
+    let payload = snailfish_protocol::write::recovery(
+        &ea.log_id,
+        &snailfish_protocol::records::Author::Recovery(cur.id),
+        &ea.base().unwrap(),
+        &back_keys,
+        &proof,
+        &set,
+    );
+    let t = "snailfish.recovery.v1";
+    let sig = cur.sign.sign_record(t, &payload);
+    let env = snailfish_protocol::envelope::write_json(t, &payload, &sig, "r_");
+    let st = serve_next(&w, &mut ea, env);
+    assert!(
+        matches!(st, Status::Fork { ref cause } if cause.contains("not new")),
+        "{st:?}"
+    );
+}
+
 /// `specs/spacelog/test.qnt::resignEpochReconfirmTest`, [LOG-7], T8: A
 /// queues the removal of B. Before A syncs, B enrolls D. The active devices
 /// changed, so A signs nothing and asks the user again. After the new
@@ -3860,6 +3986,44 @@ fn stale_epoch_row_at_the_current_epoch_is_sent_again() {
     w.exchange(&mut ea);
     assert_eq!(ea.outbox_len().unwrap(), 0);
     assert_eq!(change_epochs(&w), vec![1]);
+}
+
+/// [LOG-7], `PROTOCOL.md` 13.2: A queues the removal of B. Before A syncs,
+/// N removes D. The active devices changed, so A signs nothing and asks the
+/// user again. Without this, A would sign on a device list that the user
+/// did not confirm.
+#[test]
+fn removal_after_another_removal_needs_a_new_confirmation() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut eb);
+    let kd = new_device_keys().unwrap();
+    let mut tb = TrustedEnrollment::new(&eb, None, None).unwrap();
+    w.open(&mut eb, &mut tb);
+    let mut nd = NewEnrollment::new(URL, &kd, "D", tb.payload()).unwrap();
+    w.drive(&mut eb, &mut tb, &mut nd, (true, true));
+    assert_eq!(tb.state(), EnrollState::Done);
+    let kn = new_device_keys().unwrap();
+    let key = w.recovery_key.clone();
+    let mut en = Engine::open_recovery(&w.root.join("n"), w.space(), &kn, &key, "N").unwrap();
+    w.exchange(&mut en);
+    w.exchange(&mut ea);
+    let b_id = eb.device_id();
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    let d_id = en
+        .active_devices()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "D")
+        .unwrap()
+        .id;
+    en.remove_devices(std::slice::from_ref(&d_id)).unwrap();
+    w.exchange(&mut en);
+    w.exchange(&mut ea);
+    assert_eq!(ea.removal_to_confirm().unwrap(), Some(vec![b_id]));
+    assert_eq!(relay_types(&w, &ea).last().unwrap(), "snailfish.epoch.v1");
+    assert_eq!(ea.current_epoch().unwrap(), 2, "only the record of N");
 }
 
 /// [LOG-7], `PROTOCOL.md` 13.2: A queues the removal of B, but N removes B

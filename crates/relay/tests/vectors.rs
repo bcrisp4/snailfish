@@ -137,7 +137,56 @@ fn run_append_cases(section: &str, hold: bool) {
         let page = wire::parse_fetch(&fx.fetch(fx.tenant(), 0, 500).body).unwrap();
         assert_eq!(page.head, head, "{name}");
         assert_eq!(page.entries.len() as u64, head.position, "{name}");
+        // The stored state gives each record the verdict that the in-request
+        // state gives it (`Overlay`, 10.6 step 13).
+        let envs = split_body(s(&c["body"]));
+        if envs.len() > 1 {
+            let fx = fresh(&h, s(&h["authority"]), true);
+            fx.set_hold(fx.tenant(), hold);
+            assert_one_per_request(&fx, s(&c["signer"]), &envs, &want, name);
+        }
     }
+}
+
+/// Send each envelope in its own request, and compare each result with the
+/// result of the same envelope in one request. A request that the relay
+/// refuses as a whole (8.6, for example a signer that an earlier record
+/// removed) stores nothing, so the record must have a refusal there too.
+fn assert_one_per_request(
+    fx: &Fx,
+    signer: &str,
+    envs: &[String],
+    want: &[AppendResult],
+    name: &str,
+) {
+    assert_eq!(envs.len(), want.len(), "{name}");
+    for (i, (e, w)) in envs.iter().zip(want).enumerate() {
+        let (status, got, _) = fx.append(fx.tenant(), signer, std::slice::from_ref(e));
+        if status == 200 {
+            assert_eq!(
+                got,
+                std::slice::from_ref(w),
+                "{name}: record {i} in its own request"
+            );
+        } else {
+            assert!(
+                matches!(w, AppendResult::Refused(_)),
+                "{name}: record {i} got {status}"
+            );
+        }
+    }
+}
+
+/// The envelopes of an append body, each as its JSON text. A body that is
+/// not a JSON object with an `envelopes` array gives no envelopes.
+fn split_body(body: &str) -> Vec<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v["envelopes"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(Value::to_string)
+        .collect()
 }
 
 /// 10.6, with the base rule for security records ([LOG-7],
@@ -571,20 +620,7 @@ fn append_reserve_cases() {
         let mut fx = fresh(&h, s(&h["authority"]), true);
         let reserve = c["reserve"].as_u64().unwrap();
         fx.reopen_with(|cfg| cfg.security_reserve = reserve);
-        let (_, _, keyid) = fx.key(s(&c["signer"]));
-        let day = fx.now.load(std::sync::atomic::Ordering::SeqCst) / 86_400;
-        Connection::open(fx.space_file(fx.tenant()))
-            .unwrap()
-            .execute(
-                "INSERT INTO security_counts (signer, day, n) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (signer, day) DO UPDATE SET n = excluded.n",
-                rusqlite::params![
-                    keyid,
-                    i64::try_from(day).unwrap(),
-                    c["security_today"].as_i64().unwrap()
-                ],
-            )
-            .unwrap();
+        seed_security_today(&fx, c);
         let path = format!("{}/append", fx.space_path(fx.tenant(), fx.log()));
         let r = fx.relay.handle(&fx.signed(
             "POST",
@@ -601,7 +637,34 @@ fn append_reserve_cases() {
             c["head"]["position"].as_u64().unwrap(),
             "{name}"
         );
+        // The space file keeps the daily count for the next request.
+        let envs = split_body(s(&c["body"]));
+        if envs.len() > 1 {
+            let mut fx = fresh(&h, s(&h["authority"]), true);
+            fx.reopen_with(|cfg| cfg.security_reserve = reserve);
+            seed_security_today(&fx, c);
+            assert_one_per_request(&fx, s(&c["signer"]), &envs, &append_results(c), name);
+        }
     }
+}
+
+/// Store the `security_today` count of case `c` for its signer, as earlier
+/// requests on the same relay day leave it.
+fn seed_security_today(fx: &Fx, c: &Value) {
+    let (_, _, keyid) = fx.key(s(&c["signer"]));
+    let day = fx.now.load(std::sync::atomic::Ordering::SeqCst) / 86_400;
+    Connection::open(fx.space_file(fx.tenant()))
+        .unwrap()
+        .execute(
+            "INSERT INTO security_counts (signer, day, n) VALUES (?1, ?2, ?3)
+             ON CONFLICT (signer, day) DO UPDATE SET n = excluded.n",
+            rusqlite::params![
+                keyid,
+                i64::try_from(day).unwrap(),
+                c["security_today"].as_i64().unwrap()
+            ],
+        )
+        .unwrap();
 }
 
 /// 8.6 steps 5 to 7 on the relay ([STO-12], `PROTOCOL.md` 13.4): a blocked

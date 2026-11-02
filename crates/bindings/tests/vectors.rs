@@ -923,10 +923,11 @@ fn recovery_race(
     by_b
 }
 
-/// S4, S5 and T9 through the binding (`PROTOCOL.md` 13.2 to 13.4): A removes
-/// B, B stops, A replaces the recovery key, and a new device N recovers the
-/// space with the new key and the sign-in that names the space. A
-/// marshalling fault in an M7 record, status or method fails here.
+/// S4, S5 and T9 through the binding (`PROTOCOL.md` 13.2 to 13.4): A replaces
+/// the recovery key and queues the removal of B. A new device N recovers the
+/// space with the new key and the sign-in that names the space. A confirms
+/// the removal again, and B stops. A marshalling fault in an M7 record,
+/// status or method fails here.
 #[test]
 fn removal_and_recovery_cross_the_binding() {
     let dir = tempfile::tempdir().unwrap();
@@ -995,21 +996,8 @@ fn removal_and_recovery_cross_the_binding() {
     assert_eq!(other.name, "B");
     a.remove_devices(std::slice::from_ref(&other.id)).unwrap();
     assert!(a.removal_pending().unwrap());
-    exchange(&relay, &a);
-    assert!(!a.removal_pending().unwrap());
-    assert_eq!(a.removal_to_confirm().unwrap(), None);
-    assert_eq!(a.active_devices().unwrap().len(), 1);
-    exchange(&relay, &b);
-    assert_eq!(b.status().unwrap(), snailfish::Status::Removed);
-    assert_eq!(
-        snailfish::status_text(&snailfish::Status::Removed),
-        "stopped: removed"
-    );
-    assert_eq!(
-        snailfish::status_text(&snailfish::Status::Blocked),
-        "paused: blocked"
-    );
 
+    // N recovers before A sends the removal, so A must ask again ([LOG-7]).
     let kn = snailfish::new_device_keys().unwrap();
     let token = sign_in_with(&relay, |si, back| {
         si.token_request(back, &kn, snailfish_relay::core::system_time())
@@ -1024,6 +1012,27 @@ fn removal_and_recovery_cross_the_binding() {
     );
     exchange(&relay, &n);
     assert_eq!(n.status().unwrap(), snailfish::Status::Ok);
-    assert_eq!(n.active_devices().unwrap().len(), 2);
+    assert_eq!(n.active_devices().unwrap().len(), 3);
     assert_eq!(sn.app_key(&setup.log_id), Some(setup.app_key));
+
+    exchange(&relay, &a);
+    assert_eq!(
+        a.removal_to_confirm().unwrap(),
+        Some(vec![other.id.clone()])
+    );
+    a.remove_devices(std::slice::from_ref(&other.id)).unwrap();
+    exchange(&relay, &a);
+    assert!(!a.removal_pending().unwrap());
+    assert_eq!(a.removal_to_confirm().unwrap(), None);
+    assert_eq!(a.active_devices().unwrap().len(), 2);
+    exchange(&relay, &b);
+    assert_eq!(b.status().unwrap(), snailfish::Status::Removed);
+    assert_eq!(
+        snailfish::status_text(&snailfish::Status::Removed),
+        "stopped: removed"
+    );
+    assert_eq!(
+        snailfish::status_text(&snailfish::Status::Blocked),
+        "paused: blocked"
+    );
 }

@@ -728,7 +728,7 @@ impl Sync {
             Phase::Done
         } else if engine.recovering()? {
             // PROTOCOL.md 13.4 step 6: the recovery key grants this device.
-            match engine.queue_recovery_grant(false) {
+            match engine.queue_recovery_grant() {
                 Ok(()) => Phase::Grants,
                 Err(EngineError::Invalid(cause)) => {
                     engine.status = Status::Degraded { cause };
@@ -1014,7 +1014,7 @@ fn verify_entry(
         degraded = Some("refused: conflict".into());
     }
     view.state.apply(&accepted.record);
-    crate::removal::verified(tx, &accepted.record, &engine.device_id).map_err(Answer::Engine)?;
+    crate::removal::verified(tx, &accepted.record).map_err(Answer::Engine)?;
     // PROTOCOL.md 13.1, T8: an epoch record that removes this device ends
     // its sync. The relay refuses its requests from now on.
     if let snailfish_protocol::records::Body::Epoch { removed, .. } = &accepted.record.body

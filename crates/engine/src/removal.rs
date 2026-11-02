@@ -365,9 +365,13 @@ pub(crate) fn answer(e: &mut Engine, item: &Item, r: &AppendResult) -> Result<()
 
 /// Drop the pending record that the verified log now holds. The caller
 /// runs it in the fetch transaction, after it stores the record.
-pub(crate) fn verified(tx: &Connection, record: &Record, own: &Hash32) -> Result<(), EngineError> {
+pub(crate) fn verified(tx: &Connection, record: &Record) -> Result<(), EngineError> {
     match &record.body {
-        Body::Epoch { removed, .. } if record.author == Author::Device(*own) => {
+        // An epoch record of another device that removes the same devices
+        // ends this removal too. A rotation of another device before the
+        // recovery record of this device lands makes that record stale
+        // (13.3 step 6), which drops its rotation in any case.
+        Body::Epoch { removed, .. } => {
             if let Some(row) = removal_row(tx)?
                 && parse_ids(&row.removed)? == *removed
             {
@@ -673,19 +677,12 @@ impl Engine {
 
     /// Queue the grant of a full recovery (13.4 step 6): the recovery key
     /// signs a grant for this device on the verified head, with each epoch
-    /// key that the log seals to the recovery ID. A grant that is already
-    /// queued stays as it is, unless `again` (after `stale_base`).
-    pub(crate) fn queue_recovery_grant(&mut self, again: bool) -> Result<(), EngineError> {
+    /// key that the log seals to the recovery ID. Each sync signs it again
+    /// after its fetch, so a grant that got `stale_base` names the new head.
+    pub(crate) fn queue_recovery_grant(&mut self) -> Result<(), EngineError> {
         let Some(r) = self.recovery.as_ref() else {
             return Ok(());
         };
-        if !again
-            && state::grants(&self.db)?
-                .iter()
-                .any(|g| g.device_id == self.device_id)
-        {
-            return Ok(());
-        }
         let view = state::security_state(&self.db)?;
         if view.devices.contains_key(&self.device_id) {
             return Ok(());

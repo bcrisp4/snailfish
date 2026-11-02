@@ -170,17 +170,6 @@ pub(crate) fn grants_to_send(e: &mut Engine) -> Result<Vec<(Item, String)>, Engi
             state::drop_grant(&e.db, &g.device_id)?;
             continue;
         }
-        // PROTOCOL.md 13.4 step 6: a full recovery holds the recovery key,
-        // so it signs its own grant again with no question.
-        if g.state == GRANT_STALE && g.device_id == e.device_id && e.recovery.is_some() {
-            e.queue_recovery_grant(true)?;
-            if let Some(again) = state::grants(&e.db)?
-                .into_iter()
-                .find(|x| x.device_id == g.device_id)
-            {
-                g = again;
-            }
-        }
         if g.state == GRANT_STALE {
             if !g.by_recovery && g.confirmed == list {
                 let d = parse_device_json(g.device.as_bytes())
