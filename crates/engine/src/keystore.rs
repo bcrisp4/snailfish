@@ -116,8 +116,9 @@ pub fn install_setup(
 /// [`crate::setup::install_enrollment`], then write the keys to `store`.
 ///
 /// The engine state comes first, so no stored keys exist without the
-/// checkpoint ([ENR-9]). The app key is all zero: the engine opens it from
-/// the grant after the checkpoint check, and then writes it to the store.
+/// checkpoint ([ENR-9]). The keys of a new device have an all-zero app
+/// key: the engine opens it from the grant after the checkpoint check, and
+/// then writes it to the store.
 ///
 /// # Errors
 ///
@@ -131,11 +132,7 @@ pub fn install_enrollment(
 ) -> Result<(), EngineError> {
     let account = space.log_id.clone();
     crate::setup::install_enrollment(data_dir, space, keys, joined)?;
-    let keys = DeviceKeys {
-        app_key: [0; 32],
-        ..keys.clone()
-    };
-    put(store, &account, &keys)
+    put(store, &account, keys)
 }
 
 impl Engine {

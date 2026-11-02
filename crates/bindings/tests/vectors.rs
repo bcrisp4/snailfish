@@ -401,6 +401,18 @@ fn engine_object_syncs_two_devices() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
+    // A store failure crosses the binding with its cause (C62).
+    let failing = std::sync::Arc::new(MemStore {
+        fail: true,
+        ..MemStore::default()
+    });
+    let err = snailfish::Engine::open(pa, sp.clone(), failing)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, snailfish::SnailfishError::KeyStore { message } if message.contains("errSecMissingEntitlement")),
+        "{err:?}"
+    );
     let sa = MemStore::shared();
     snailfish::install_setup(
         pa,
