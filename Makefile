@@ -53,6 +53,7 @@ $(MUTANTS_TARGETS): export TMPDIR := $(MUTANTS_TMPDIR)
 endif
 
 .PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-browser test-powerloss \
+        app-project test-app test-app-signed app-ios-device \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
         rust-nightly-check rust-nightly-components mutants-ramdisk mutants-tmpdir verify-crypto
@@ -271,6 +272,47 @@ test-swift: bindings-swift
 	  -destination '$(IOS_SIM)' -derivedDataPath ../../target/swift-dd
 	cd bindings/swift && DEVELOPER_DIR=$(DEVELOPER_DIR) xcodebuild test -scheme Snailfish \
 	  -destination 'platform=macOS,arch=arm64' -derivedDataPath ../../target/swift-dd
+
+## ---------------------------------------------------------------- Swift app
+
+APP_DIR := apps/apple
+APP_DD := $(CURDIR)/target/app-dd
+APP_BUILD = cd $(APP_DIR) && DEVELOPER_DIR=$(DEVELOPER_DIR) xcodebuild -project Tasks.xcodeproj -scheme Tasks
+# The physical iPhone of `make app-ios-device`: a UDID or a name from
+# `xcrun devicectl list devices`.
+DEVICE ?=
+
+## Generate apps/apple/Tasks.xcodeproj from project.yml with the pinned XcodeGen.
+app-project:
+	cd $(APP_DIR) && mise exec -- xcodegen generate --quiet
+
+## The Swift sample app: build and run its tests on an iOS simulator and on
+## macOS, with no signing, against a relay process. The approver of
+## apps/apple/tools/approver.py does the passkey step of the sign-in, because
+## the simulator cannot make a passkey. On macOS the keychain tests check the
+## fail-closed path, because an unsigned build has no keychain entitlement (C62).
+test-app: bindings-swift app-project
+	$(CARGO) build -p snailfish-relay
+	cd demo && mise exec -- uv sync --locked --quiet
+	DEVELOPER_DIR=$(DEVELOPER_DIR) SNAILFISH_RELAY_BIN=target/debug/snailfish-relay bindings/scripts/with-relay.sh \
+	  $(APP_DIR)/tools/with-approver.sh $(APP_DIR)/tools/test.sh '$(IOS_SIM)' $(APP_DD)
+
+## The macOS tests with the team of Config/Local.xcconfig: the keychain tests
+## then use the data protection keychain. Needs a team and a signed-in Xcode.
+test-app-signed: bindings-swift app-project
+	@test -f $(APP_DIR)/Config/Local.xcconfig || { echo "FAIL: copy $(APP_DIR)/Config/Local.xcconfig.example to Local.xcconfig"; exit 1; }
+	$(CARGO) build -p snailfish-relay
+	cd demo && mise exec -- uv sync --locked --quiet
+	DEVELOPER_DIR=$(DEVELOPER_DIR) SNAILFISH_RELAY_BIN=target/debug/snailfish-relay bindings/scripts/with-relay.sh \
+	  $(APP_DIR)/tools/with-approver.sh sh -c "cd $(APP_DIR) && xcodebuild test -project Tasks.xcodeproj -scheme Tasks \
+	  -destination 'platform=macOS,arch=arm64' -derivedDataPath $(APP_DD)-signed -allowProvisioningUpdates"
+
+## Build the app for a physical iPhone with Config/Local.xcconfig, and
+## install it. Pass DEVICE=<UDID or name>.
+app-ios-device: bindings-swift app-project
+	@test -n "$(DEVICE)" || { echo "FAIL: pass DEVICE=<UDID or name> (xcrun devicectl list devices)"; exit 1; }
+	$(APP_BUILD) build -destination 'generic/platform=iOS' -derivedDataPath $(APP_DD)-device -allowProvisioningUpdates
+	xcrun devicectl device install app --device '$(DEVICE)' $(APP_DD)-device/Build/Products/Debug-iphoneos/Tasks.app
 
 ## ---------------------------------------------------------------- ProVerif
 

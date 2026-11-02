@@ -1,0 +1,6 @@
+# `make app-project` generates the project from project.yml.
+Tasks.xcodeproj/
+# The team and bundle ID of one developer (Config/Local.xcconfig.example).
+Config/Local.xcconfig
+# XcodeGen writes it from the info properties of project.yml.
+Tasks/Info.plist

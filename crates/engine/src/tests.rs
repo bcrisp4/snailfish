@@ -3271,3 +3271,143 @@ fn install_enrollment_refuses_another_space() {
         assert!(matches!(r, Err(EngineError::Invalid(_))), "{r:?}");
     }
 }
+
+/// A host key store in memory. A cleared flag makes each read or write
+/// fail, as the keychain does without its entitlement (C62) or before the
+/// first unlock.
+struct MemStore {
+    items: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    readable: std::sync::atomic::AtomicBool,
+    writable: std::sync::atomic::AtomicBool,
+}
+
+impl MemStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            items: std::sync::Mutex::default(),
+            readable: true.into(),
+            writable: true.into(),
+        })
+    }
+
+    fn item(&self, account: &str) -> Option<Vec<u8>> {
+        self.items.lock().unwrap().get(account).cloned()
+    }
+}
+
+impl crate::keystore::KeyStore for MemStore {
+    fn load(&self, account: &str) -> Result<Option<Vec<u8>>, String> {
+        if !self.readable.load(Ordering::SeqCst) {
+            return Err("errSecMissingEntitlement".into());
+        }
+        Ok(self.item(account))
+    }
+
+    fn store(&self, account: &str, secret: &[u8]) -> Result<(), String> {
+        if !self.writable.load(Ordering::SeqCst) {
+            return Err("errSecMissingEntitlement".into());
+        }
+        self.items
+            .lock()
+            .unwrap()
+            .insert(account.to_owned(), secret.to_vec());
+        Ok(())
+    }
+}
+
+/// C62, T14: the engine does not open or install without the key store. A
+/// store failure, a missing item and a damaged item each stop the call, and
+/// a failed open writes no state file.
+#[test]
+fn key_store_failure_stops_open_and_install() {
+    let w = World::with_a();
+    let store = MemStore::new();
+    let fresh = w.root.join("fresh");
+    store.readable.store(false, Ordering::SeqCst);
+    let e = crate::keystore::open(&fresh, w.space(), store.clone()).err();
+    assert!(
+        matches!(e, Some(EngineError::KeyStore(ref m)) if m.contains("errSecMissingEntitlement")),
+        "{e:?}"
+    );
+    assert!(!fresh.join(STATE_FILE).exists());
+    store.readable.store(true, Ordering::SeqCst);
+    let e = crate::keystore::open(&fresh, w.space(), store.clone()).err();
+    assert!(matches!(e, Some(EngineError::KeyStore(_))), "{e:?}");
+    assert!(!fresh.join(STATE_FILE).exists());
+    crate::keystore::KeyStore::store(store.as_ref(), &w.log_id, &[0; 95]).unwrap();
+    let e = crate::keystore::open(&fresh, w.space(), store.clone()).err();
+    assert!(matches!(e, Some(EngineError::KeyStore(_))), "{e:?}");
+
+    let s = create_space(
+        APP,
+        &NewDevice {
+            keys: w.keys[0].clone(),
+            name: "A".into(),
+        },
+    )
+    .unwrap();
+    let mut space = w.space();
+    space.log_id = s.log_id.clone();
+    store.writable.store(false, Ordering::SeqCst);
+    let e = crate::keystore::install_setup(
+        &w.root.join("c"),
+        space,
+        &w.keys[0],
+        &s.envelopes,
+        &w.sign_in(&w.keys[0]).token,
+        store.as_ref(),
+    )
+    .err();
+    assert!(matches!(e, Some(EngineError::KeyStore(_))), "{e:?}");
+    assert_eq!(store.item(&s.log_id), None);
+}
+
+/// [ENR-9], T14: a new device stores keys with no app key at its install.
+/// Its first sync opens the app key from the grant and writes it to the key
+/// store. If that write fails, the next open writes it. An open of a
+/// complete item writes nothing, so a store that refuses writes still
+/// opens it.
+#[test]
+fn enrolled_device_writes_its_app_key_to_the_key_store() {
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    let j = ne.joined().unwrap();
+    let space = crate::enroll::space_of(&j, URL, APP);
+    let store = MemStore::new();
+    let pb = w.root.join("b");
+    crate::keystore::install_enrollment(&pb, space.clone(), &w.keys[1], &j, store.as_ref())
+        .unwrap();
+    let mut want = [&w.keys[1].sign_seed[..], &w.keys[1].seal_seed[..], &[0; 32]].concat();
+    assert_eq!(store.item(&w.log_id), Some(want.clone()));
+
+    let mut eb = crate::keystore::open(&pb, space.clone(), store.clone()).unwrap();
+    store.writable.store(false, Ordering::SeqCst);
+    let mut s = eb.start_sync();
+    let mut failed = None;
+    while let Some(req) = s.next_request(&mut eb).unwrap() {
+        let resp = w.relay.handle(&to_relay(&req));
+        if let Err(e) = s.handle_response(&mut eb, resp.status, &time(&resp), &resp.body) {
+            failed = Some(e);
+            break;
+        }
+    }
+    assert!(
+        matches!(failed, Some(EngineError::KeyStore(_))),
+        "{failed:?}"
+    );
+    assert_eq!(store.item(&w.log_id), Some(want.clone()));
+    drop(eb);
+
+    store.writable.store(true, Ordering::SeqCst);
+    drop(crate::keystore::open(&pb, space.clone(), store.clone()).unwrap());
+    want.truncate(64);
+    want.extend_from_slice(&w.keys[0].app_key);
+    assert_eq!(store.item(&w.log_id), Some(want.clone()));
+
+    store.writable.store(false, Ordering::SeqCst);
+    let eb = crate::keystore::open(&pb, space, store.clone()).unwrap();
+    assert_eq!(eb.app_key(), Some(w.keys[0].app_key));
+}

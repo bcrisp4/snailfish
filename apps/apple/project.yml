@@ -1,0 +1,73 @@
+# The Snailfish sample task app for iOS and macOS (DESIGN.md M6).
+# `make app-project` generates Tasks.xcodeproj from this file with the
+# XcodeGen version that mise.toml pins. Do not commit the .xcodeproj.
+name: Tasks
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "17.0"
+    macOS: "14.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
+packages:
+  Snailfish:
+    path: ../../bindings/swift
+targets:
+  Tasks:
+    type: application
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - path: Tasks
+    dependencies:
+      - package: Snailfish
+    info:
+      path: Tasks/Info.plist
+      properties:
+        CFBundleDisplayName: Tasks
+        CFBundleShortVersionString: "0.0.0"
+        CFBundleVersion: "1"
+        NSCameraUsageDescription: Scan the enrollment QR code of your other device.
+        # The relay of a test runs on http://localhost. A release build uses
+        # an https relay.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # [iOS] BGAppRefreshTask (DESIGN.md M6, background sync delay).
+        BGTaskSchedulerPermittedIdentifiers: [$(PRODUCT_BUNDLE_IDENTIFIER).refresh]
+        UIBackgroundModes: [fetch]
+        UILaunchScreen: {}
+        # Ben copies the measurement log off an iPhone in Finder or with
+        # `xcrun devicectl device copy from`.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).tasks
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "5.0"
+        ENABLE_HARDENED_RUNTIME[sdk=macosx*]: YES
+  TasksTests:
+    type: bundle.unit-test
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - path: TasksTests
+    dependencies:
+      - target: Tasks
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).tasks.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        TEST_HOST[sdk=iphonesimulator*]: $(BUILT_PRODUCTS_DIR)/Tasks.app/Tasks
+        TEST_HOST[sdk=macosx*]: $(BUILT_PRODUCTS_DIR)/Tasks.app/Contents/MacOS/Tasks
+        BUNDLE_LOADER: $(TEST_HOST)
+schemes:
+  Tasks:
+    build:
+      targets:
+        Tasks: all
+        TasksTests: [test]
+    test:
+      targets: [TasksTests]
+      gatherCoverageData: false

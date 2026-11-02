@@ -211,6 +211,47 @@ fn frames_statements_and_recovery_display() {
     }
 }
 
+/// A key store in memory, as a host app implements it. `fail` makes each
+/// call fail, as the keychain does without its entitlement.
+#[derive(Default)]
+struct MemStore {
+    items: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    fail: bool,
+}
+
+impl MemStore {
+    fn shared() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// The stored app key: the last 32 bytes of the item.
+    fn app_key(&self, account: &str) -> Option<Vec<u8>> {
+        let items = self.items.lock().unwrap();
+        items.get(account).map(|b| b[64..].to_vec())
+    }
+}
+
+impl snailfish::KeyStore for MemStore {
+    fn load(&self, account: String) -> Result<Option<Vec<u8>>, snailfish::KeyStoreError> {
+        if self.fail {
+            return Err(snailfish::KeyStoreError::Failed {
+                message: "errSecMissingEntitlement".into(),
+            });
+        }
+        Ok(self.items.lock().unwrap().get(&account).cloned())
+    }
+
+    fn store(&self, account: String, secret: Vec<u8>) -> Result<(), snailfish::KeyStoreError> {
+        if self.fail {
+            return Err(snailfish::KeyStoreError::Failed {
+                message: "errSecMissingEntitlement".into(),
+            });
+        }
+        self.items.lock().unwrap().insert(account, secret);
+        Ok(())
+    }
+}
+
 fn space(log_id: &str, tenant: &str) -> snailfish::SpaceRef {
     snailfish::SpaceRef {
         relay_url: "https://sync.example.net".into(),
@@ -360,9 +401,32 @@ fn engine_object_syncs_two_devices() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
-    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), &ka).unwrap());
-    let locked = snailfish::Engine::open(pa, sp.clone(), &ka).err().unwrap();
+    // A store failure crosses the binding with its cause (C62).
+    let failing = std::sync::Arc::new(MemStore {
+        fail: true,
+        ..MemStore::default()
+    });
+    let err = snailfish::Engine::open(pa, sp.clone(), failing)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, snailfish::SnailfishError::KeyStore { message } if message.contains("errSecMissingEntitlement")),
+        "{err:?}"
+    );
+    let sa = MemStore::shared();
+    snailfish::install_setup(
+        pa,
+        sp.clone(),
+        &ka,
+        &setup.envelopes,
+        &sign_in(&relay, &ka),
+        sa.clone(),
+    )
+    .unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), sa.clone()).unwrap());
+    let locked = snailfish::Engine::open(pa, sp.clone(), sa.clone())
+        .err()
+        .unwrap();
     assert!(matches!(locked, snailfish::SnailfishError::Locked));
     assert_eq!(
         locked.to_string(),
@@ -370,7 +434,7 @@ fn engine_object_syncs_two_devices() {
     );
     exchange(&relay, &a);
     assert_eq!(a.status().unwrap(), snailfish::Status::Ok);
-    assert_eq!(a.app_key().unwrap(), Some(setup.app_key.clone()));
+    assert_eq!(sa.app_key(&setup.log_id), Some(setup.app_key.clone()));
 
     let ne = snailfish::NewEnrollment::new("https://sync.example.net", &kb, "B", None).unwrap();
     let payload = ne.payload().unwrap().unwrap();
@@ -397,17 +461,20 @@ fn engine_object_syncs_two_devices() {
     assert_eq!(joined.digest, a.verified_head().unwrap().digest);
     let pb = dir.path().join("b");
     let pb = pb.to_str().unwrap();
+    let sb = MemStore::shared();
     let mut bad = joined.clone();
     bad.digest = vec![0; 31];
     assert!(matches!(
-        snailfish::install_enrollment(pb, sp.clone(), &kb, &bad),
+        snailfish::install_enrollment(pb, sp.clone(), &kb, &bad, sb.clone()),
         Err(snailfish::SnailfishError::Invalid { .. })
     ));
-    snailfish::install_enrollment(pb, sp.clone(), &kb, &joined).unwrap();
-    let b = std::sync::Arc::new(snailfish::Engine::open(pb, sp, &kb).unwrap());
-    assert_eq!(b.app_key().unwrap(), None);
+    snailfish::install_enrollment(pb, sp.clone(), &kb, &joined, sb.clone()).unwrap();
+    let b = std::sync::Arc::new(snailfish::Engine::open(pb, sp, sb.clone()).unwrap());
+    // B gets the app key from its grant after the checkpoint check, and the
+    // engine writes it to B's key store.
+    assert_eq!(sb.app_key(&setup.log_id), Some(vec![0; 32]));
     exchange(&relay, &b);
-    assert_eq!(b.app_key().unwrap(), Some(setup.app_key.clone()));
+    assert_eq!(sb.app_key(&setup.log_id), Some(setup.app_key.clone()));
     change_reaches_b(&relay, &a, &b);
 }
 
@@ -477,8 +544,17 @@ fn enrollment_mismatch_through_the_binding() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
-    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
+    let sa = MemStore::shared();
+    snailfish::install_setup(
+        pa,
+        sp.clone(),
+        &ka,
+        &setup.envelopes,
+        &sign_in(&relay, &ka),
+        sa.clone(),
+    )
+    .unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, sa.clone()).unwrap());
     exchange(&relay, &a);
     let te = snailfish::TrustedEnrollment::new(a.clone(), None, None).unwrap();
     assert_eq!(te.payload().unwrap(), None, "no payload before the open");
@@ -583,8 +659,17 @@ fn engine_object_reports_a_repair() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
-    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
+    let sa = MemStore::shared();
+    snailfish::install_setup(
+        pa,
+        sp.clone(),
+        &ka,
+        &setup.envelopes,
+        &sign_in(&relay, &ka),
+        sa.clone(),
+    )
+    .unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, sa.clone()).unwrap());
     exchange(&relay, &a);
     let backup = dir.path().join("backup");
     snailfish_relay::ops::backup(&data, &backup).unwrap();
@@ -633,8 +718,17 @@ fn confirm_again_crosses_the_binding() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
-    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), &ka).unwrap());
+    let sa = MemStore::shared();
+    snailfish::install_setup(
+        pa,
+        sp.clone(),
+        &ka,
+        &setup.envelopes,
+        &sign_in(&relay, &ka),
+        sa.clone(),
+    )
+    .unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), sa.clone()).unwrap());
     exchange(&relay, &a);
     let open = |t: &snailfish::TrustedEnrollment| {
         let (st, h, b) = send(&relay, t.next_request().unwrap().unwrap());
@@ -650,8 +744,16 @@ fn confirm_again_crosses_the_binding() {
     drive(&relay, &tb, &nb, (true, true));
     let pb = dir.path().join("b");
     let pb = pb.to_str().unwrap();
-    snailfish::install_enrollment(pb, sp.clone(), &kb, &nb.joined().unwrap().unwrap()).unwrap();
-    let b = std::sync::Arc::new(snailfish::Engine::open(pb, sp, &kb).unwrap());
+    let sb = MemStore::shared();
+    snailfish::install_enrollment(
+        pb,
+        sp.clone(),
+        &kb,
+        &nb.joined().unwrap().unwrap(),
+        sb.clone(),
+    )
+    .unwrap();
+    let b = std::sync::Arc::new(snailfish::Engine::open(pb, sp, sb.clone()).unwrap());
     exchange(&relay, &b);
     exchange(&relay, &a);
 
@@ -755,15 +857,17 @@ fn setup_failure_and_new_token_cross_the_binding() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
+    let sa = MemStore::shared();
     snailfish::install_setup(
         pa,
         sp.clone(),
         &ka,
         &setup.envelopes,
         &sign_in(&relay, &other),
+        sa.clone(),
     )
     .unwrap();
-    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, sa.clone()).unwrap());
     exchange(&relay, &a);
     let status = a.status().unwrap();
     assert_eq!(

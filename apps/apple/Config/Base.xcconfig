@@ -1,0 +1,16 @@
+// Build settings for every build of the Tasks app.
+//
+// A build with no Local.xcconfig has no team and no entitlements. The iOS
+// simulator runs it. On macOS it runs, but the data protection keychain
+// refuses it with errSecMissingEntitlement, and the app fails closed (C62).
+//
+// For a signed build, copy Local.xcconfig.example to Local.xcconfig and
+// fill it in. Git ignores Local.xcconfig.
+
+BUNDLE_ID_PREFIX = com.example
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
+CODE_SIGN_ENTITLEMENTS =
+
+#include? "Local.xcconfig"
