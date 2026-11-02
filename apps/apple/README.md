@@ -10,7 +10,7 @@ Tasks is the SwiftUI version of the demo task app (DESIGN.md M6). It runs on iOS
 | `Tasks/SignInFlow.swift` | The native sign-in with `ASWebAuthenticationSession` and the first-device setup (S1). |
 | `Tasks/EnrollmentFlow.swift`, `Tasks/QRCode.swift` | QR enrollment in both directions (S2). |
 | `Tasks/Measurements.swift` | The sync delay log and the durable commit benchmark. |
-| `tools/approver.py` | The passkey step of the sign-in for the tests. The simulator cannot make a passkey. |
+| `tools/approver.py` | The passkey step of the sign-in for the tests, because the simulator cannot make a passkey. It also drives a Python demo device, so a test can share a space with the demo. |
 
 ## Build and test
 

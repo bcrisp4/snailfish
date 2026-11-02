@@ -291,7 +291,7 @@ app-project:
 ## apps/apple/tools/approver.py does the passkey step of the sign-in, because
 ## the simulator cannot make a passkey. On macOS the keychain tests check the
 ## fail-closed path, because an unsigned build has no keychain entitlement (C62).
-test-app: bindings-swift app-project
+test-app: bindings-swift bindings-python app-project
 	$(CARGO) build -p snailfish-relay
 	cd demo && mise exec -- uv sync --locked --quiet
 	DEVELOPER_DIR=$(DEVELOPER_DIR) SNAILFISH_RELAY_BIN=target/debug/snailfish-relay bindings/scripts/with-relay.sh \
@@ -299,7 +299,7 @@ test-app: bindings-swift app-project
 
 ## The macOS tests with the team of Config/Local.xcconfig: the keychain tests
 ## then use the data protection keychain. Needs a team and a signed-in Xcode.
-test-app-signed: bindings-swift app-project
+test-app-signed: bindings-swift bindings-python app-project
 	@test -f $(APP_DIR)/Config/Local.xcconfig || { echo "FAIL: copy $(APP_DIR)/Config/Local.xcconfig.example to Local.xcconfig"; exit 1; }
 	$(CARGO) build -p snailfish-relay
 	cd demo && mise exec -- uv sync --locked --quiet

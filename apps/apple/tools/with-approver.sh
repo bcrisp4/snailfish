@@ -9,7 +9,9 @@ set -euo pipefail
 : "${SNAILFISH_INVITE:?run inside bindings/scripts/with-relay.sh}"
 tmp=$(mktemp -d)
 log="$tmp/approver.log"
-(cd demo && exec mise exec -- uv run --locked python ../apps/apple/tools/approver.py \
+# The approver drives a demo device, so it needs the Python binding of
+# `make bindings-python`.
+(cd demo && PYTHONPATH=../bindings/python/build exec mise exec -- uv run --locked python ../apps/apple/tools/approver.py \
   "$SNAILFISH_RELAY_URL" "$SNAILFISH_INVITE" sam "$tmp/port") 2> "$log" &
 pid=$!
 stop() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -rf "$tmp"; }

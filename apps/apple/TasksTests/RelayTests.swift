@@ -59,6 +59,43 @@ final class SideUI: EnrollmentUI, @unchecked Sendable {
     func confirmAgain() async -> Bool { false }
 }
 
+/// One device of the Python demo, driven through the `/py/` requests of
+/// apps/apple/tools/approver.py.
+struct PythonDevice: Sendable {
+    let base: String
+
+    @discardableResult
+    func call(_ method: String, _ path: String, _ query: [String: String] = [:]) async throws -> String {
+        var c = URLComponents(string: base + "/py/" + path)!
+        if !query.isEmpty { c.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) } }
+        var r = URLRequest(url: c.url!)
+        r.httpMethod = method
+        r.timeoutInterval = 90
+        let (data, resp) = try await URLSession.shared.data(for: r)
+        let text = String(decoding: data, as: UTF8.self)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw SetupError.message("python device \(method) \(path): \(text)")
+        }
+        return text
+    }
+}
+
+/// The new device side of an enrollment with a Python demo device. Each side
+/// gets the code of the other, and says yes only if the codes match ([ENR-7]).
+final class PythonCompareUI: EnrollmentUI, @unchecked Sendable {
+    let py: PythonDevice
+
+    init(_ py: PythonDevice) { self.py = py }
+
+    func show(payload: String, code: String) async {}
+
+    func compare(code: String) async -> Bool {
+        (try? await py.call("POST", "compare", ["code": code])) == code
+    }
+
+    func confirmAgain() async -> Bool { false }
+}
+
 /// The app flows against a relay process (S1, S2): the native sign-in, the
 /// space creation, QR enrollment in both directions, and sync both ways.
 ///
@@ -217,5 +254,62 @@ final class RelayTests: XCTestCase {
         let v11 = try await a.sync(transport)
         XCTAssertEqual(v11, .ok)
         XCTAssertEqual(try engineA.verifiedHead().position, head, "no grant")
+    }
+
+    /// The Swift app and the Python demo share one space: the app uses the
+    /// app ID and the change format of the demo. The titles hold non-ASCII
+    /// text, because the JSON encoders of the two apps write it as different
+    /// bytes.
+    func testSwiftAppAndPythonDemoShareASpace() async throws {
+        let relay = try env("SNAILFISH_RELAY_URL")
+        let py = PythonDevice(base: try env("SNAILFISH_APPROVER"))
+        let transport = transport
+
+        try await py.call("POST", "setup")
+        try await py.call("POST", "edit", ["task": "p1", "field": "title", "value": #""café from python""#])
+        let v1 = try await py.call("POST", "sync")
+        XCTAssertEqual(v1, "Status.OK()")
+
+        // S2 with the Python device as the trusted device. It shows the
+        // session, and the app reads the payload. The app has an edit from
+        // before sync ([MRG-5]).
+        let s = try device("s")
+        try await s.edit(task: "s1", field: "title", value: .string("naïve from swift ✓"))
+        let payload = try await py.call("POST", "invite")
+        let joined = try await join(
+            device: s, relayURL: relay, name: "S", scanned: payload, transport: transport, ui: PythonCompareUI(py))
+        let invited = try await py.call("GET", "invite/result")
+        XCTAssertEqual([invited, joined], ["", ""])
+
+        // The first sync opens the app key and queues the edit from before
+        // sync. The second sync uploads it.
+        for _ in 0..<2 {
+            let v = try await s.sync(transport)
+            XCTAssertEqual(v, .ok)
+        }
+        let v2 = try await py.call("POST", "sync")
+        XCTAssertEqual(v2, "Status.OK()")
+
+        // Edits both ways: Swift edits a Python task, and Python edits a
+        // Swift task.
+        try await s.edit(task: "p1", field: "done", value: .bool(true))
+        _ = try await s.sync(transport)
+        try await py.call("POST", "edit", ["task": "s1", "field": "title", "value": #""naïve, renamed in python""#])
+        _ = try await py.call("POST", "sync")
+        let v3 = try await s.sync(transport)
+        XCTAssertEqual(v3, .ok)
+
+        let want = [
+            TaskItem(id: "p1", title: "café from python", done: true),
+            TaskItem(id: "s1", title: "naïve, renamed in python", done: false),
+        ]
+        let gotSwift = try await s.tasks()
+        XCTAssertEqual(gotSwift, want)
+        let data = Data(try await py.call("GET", "tasks").utf8)
+        let gotPy = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: [String: Any]])
+        XCTAssertEqual(Set(gotPy.keys), ["p1", "s1"])
+        XCTAssertEqual(gotPy["p1"]?["title"] as? String, "café from python")
+        XCTAssertEqual(gotPy["p1"]?["done"] as? Bool, true)
+        XCTAssertEqual(gotPy["s1"]?["title"] as? String, "naïve, renamed in python")
     }
 }
