@@ -180,4 +180,23 @@ def test_user_page_works_in_chrome(relay: Relay, chrome: Chrome, tmp_path: Path)
     sync_ok(a)
     page.goto(f"{relay.url}/u/")
     assert app.APP_ID in page.content()
+
+    # S4 in Chrome ([STO-12], PROTOCOL.md 12.4): the Block button of the
+    # machine group is a form POST under the Origin and anti-CSRF rules. A
+    # blocked device shows as an open security action, and Unblock ends it.
+    dev_id = app.Device(a).device_id
+    page.select_option("select[name=device]", dev_id)
+    with page.expect_response("**/u/groups/members") as resp:
+        page.click("form:has(select[name=device]) button:has-text('Add')")
+    assert resp.value.status == 303
+    with page.expect_response("**/u/block") as resp:
+        page.click("h3:has-text('phone') button:has-text('Block')")
+    assert resp.value.status == 303
+    page.wait_for_selector("text=Open security actions", timeout=5_000)
+    assert "is blocked" in page.content()
+    with page.expect_response("**/u/unblock") as resp:
+        page.click("h3:has-text('phone') button:has-text('Unblock')")
+    assert resp.value.status == 303
+    page.wait_for_load_state("load")
+    assert "Open security actions" not in page.content()
     assert chrome.errors == [], chrome.errors

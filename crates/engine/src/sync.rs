@@ -39,6 +39,10 @@ pub(crate) enum Item {
     Change([u8; 16]),
     /// A grant of the grant outbox, by the device ID it grants.
     Grant(snailfish_protocol::encoding::Hash32),
+    /// The pending epoch record of a removal or a rotation (13.2).
+    Epoch,
+    /// The pending recovery record (13.3).
+    Recovery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +218,9 @@ impl Sync {
 
     fn queue(&mut self, engine: &mut Engine) -> Result<(), EngineError> {
         let items: Vec<(Item, String)> = if self.phase == Phase::Grants {
-            crate::enroll::grants_to_send(engine)?
+            let mut items = crate::enroll::grants_to_send(engine)?;
+            items.extend(crate::removal::security_to_send(engine)?);
+            items
         } else {
             state::pending(engine, usize::MAX)?
                 .into_iter()
@@ -357,12 +363,19 @@ impl Sync {
         }
         if signed {
             let now = engine.now();
+            // PROTOCOL.md 13.4: until its grant is in the verified log, a
+            // device of a full recovery signs with the recovery key.
+            let recovering = engine.recovering()?;
+            let (keyid, key) = match (&engine.recovery, recovering) {
+                (Some(r), true) => (r.id, &r.sign),
+                _ => (engine.device_id, &engine.sign),
+            };
             let p = Params {
                 created: now,
                 expires: now.saturating_add(request::MAX_LIFETIME),
                 nonce: snailfish_protocol::keys::random_bytes().map_err(|_| EngineError::Random)?,
-                keyid: engine.device_id,
-                recovery: false,
+                keyid,
+                recovery: recovering,
             };
             let t = Target {
                 method,
@@ -370,7 +383,7 @@ impl Sync {
                 path: &path,
                 query: &query,
             };
-            for (name, value) in request::sign(&engine.sign, &t, &body, &p).pairs() {
+            for (name, value) in request::sign(key, &t, &body, &p).pairs() {
                 headers.push(Header {
                     name: name.into(),
                     value: value.into(),
@@ -470,6 +483,15 @@ impl Sync {
         {
             self.repair = Some(run);
             self.phase = Phase::Repair;
+            return Ok(());
+        }
+        // PROTOCOL.md 13.4 step 4: the relay knows only the current
+        // recovery ID.
+        if code.as_deref() == Some("unknown_device") && engine.recovering()? {
+            engine.status = Status::Degraded {
+                cause: "the recovery key is not the current recovery key of the space".into(),
+            };
+            self.phase = Phase::Done;
             return Ok(());
         }
         // A refused status report changes no status: the report is for the
@@ -608,6 +630,10 @@ impl Sync {
             }
         }
         let checked = check_checkpoint(engine, &tx)?;
+        // PROTOCOL.md 13.4 step 7: the grant of a full recovery is in the
+        // verified log, so the device is active and opens its keys.
+        let recovered = engine.recovery.is_some()
+            && state::is_active(&tx, &engine.device_id).map_err(Answer::Engine)?;
         if at_head {
             state::set_caught_up(&tx, true).map_err(Answer::Engine)?;
             // PROTOCOL.md 10.8: the fresh flag ends at a fetch that reaches
@@ -616,7 +642,7 @@ impl Sync {
                 state::clear_fresh(&tx).map_err(Answer::Engine)?;
             }
         }
-        if checked {
+        if checked || recovered {
             // [ENR-9]: the log up to the checkpoint verified, so open the
             // key set of the grant, then decrypt the changes stored without
             // the key. Both happen before the commit that clears the
@@ -631,6 +657,9 @@ impl Sync {
             }
         }
         tx.commit().map_err(|e| Answer::Engine(e.into()))?;
+        if recovered {
+            engine.recovery = None;
+        }
         // After the commit: a key store failure here leaves the key to
         // `keystore::open`, which opens it from the grant again.
         engine.keep_app_key().map_err(Answer::Engine)?;
@@ -698,9 +727,19 @@ impl Sync {
     /// during a hold ([LOG-14]), then the append requests. A new device
     /// that has not checked its enrollment checkpoint uploads nothing
     /// ([ENR-9]).
-    fn after_first_fetch(&self, engine: &Engine) -> Result<Phase, EngineError> {
+    fn after_first_fetch(&self, engine: &mut Engine) -> Result<Phase, EngineError> {
         Ok(if enrolling(engine)? {
             Phase::Done
+        } else if engine.recovering()? {
+            // PROTOCOL.md 13.4 step 6: the recovery key grants this device.
+            match engine.queue_recovery_grant() {
+                Ok(()) => Phase::Grants,
+                Err(EngineError::Invalid(cause)) => {
+                    engine.status = Status::Degraded { cause };
+                    Phase::Done
+                }
+                Err(e) => return Err(e),
+            }
         } else if self.hold {
             Phase::Report
         } else {
@@ -761,6 +800,10 @@ impl Sync {
                 Item::Change(cid) => cid,
                 Item::Grant(id) => {
                     crate::enroll::grant_answer(engine, id, &r).map_err(Answer::Engine)?;
+                    continue;
+                }
+                Item::Epoch | Item::Recovery => {
+                    crate::removal::answer(engine, item, &r).map_err(Answer::Engine)?;
                     continue;
                 }
             };
@@ -960,6 +1003,7 @@ fn verify_entry(
         degraded = Some("refused: conflict".into());
     }
     view.state.apply(&accepted.record);
+    crate::removal::verified(tx, &accepted.record, &engine.device_id).map_err(Answer::Engine)?;
     state::drop_setup(tx, &accepted.record_hash).map_err(Answer::Engine)?;
     if let Some((id, _)) = accepted.new_device {
         // [LOG-7]: the verified log holds a grant for this device, so the

@@ -158,6 +158,7 @@ struct SyncSettings: View {
     @Environment(\.dismiss) private var dismiss
     // Read once when the sheet opens: the log grows without a bound.
     @State private var summary = ""
+    @State private var recoveryKey = ""
 
     private func then(_ action: @escaping () -> Void) {
         later(action)
@@ -192,6 +193,19 @@ struct SyncSettings: View {
                         }
                         .accessibilityIdentifier("join-show")
                     }
+                    Section("All my devices are lost") {
+                        TextField("Recovery key from your paper", text: $recoveryKey)
+                            .autocorrectionDisabled()
+                            .noAutocapitalization()
+                            .accessibilityIdentifier("recover-key")
+                        Button("Recover with the recovery key") {
+                            let w = web.web
+                            let key = recoveryKey
+                            then { model.recover(recoveryKey: key) { try await w.redirect(for: $0) } }
+                        }
+                        .disabled(recoveryKey.isEmpty)
+                        .accessibilityIdentifier("recover")
+                    }
                 } else {
                     Section("Add a device") {
                         Button("Show a code for the new device") {
@@ -201,6 +215,18 @@ struct SyncSettings: View {
                         Button("Scan the code of the new device") {
                             then { model.addDevice(scan: true) }
                         }
+                    }
+                    Section("Lost or stolen device") {
+                        Button("Remove a device") {
+                            then { model.showRemoval() }
+                        }
+                        .accessibilityIdentifier("remove-devices")
+                    }
+                    Section("Recovery key") {
+                        Button("Replace the recovery key") {
+                            then { model.startKeyReplacement() }
+                        }
+                        .accessibilityIdentifier("replace-recovery-key")
                     }
                     if model.status.hasPrefix("stopped: setup failed") {
                         Section {
@@ -283,6 +309,10 @@ struct FlowSheet: View {
                 }
             case .recoveryKey(let key):
                 RecoveryKeyView(key: key) { model.step = .none }
+            case .removal(let devices):
+                RemovalView(devices: devices) { model.remove(ids: $0) }
+            case .newRecoveryKey(let key):
+                ReplaceKeyView(key: key) { model.replaceRecoveryKey(current: $0, new: key) }
             }
             if !isRecovery {
                 Button("Cancel", role: .cancel) { model.cancelFlow() }
@@ -298,8 +328,77 @@ struct FlowSheet: View {
     }
 
     private var isRecovery: Bool {
-        if case .recoveryKey = model.step { return true }
-        return false
+        switch model.step {
+        case .recoveryKey, .newRecoveryKey: return true
+        default: return false
+        }
+    }
+}
+
+/// The user picks the lost devices. The view lists the devices that stay,
+/// and the user confirms that list (S4, T8): a device that a thief added
+/// before the block must not stay.
+struct RemovalView: View {
+    let devices: [ActiveDevice]
+    let remove: ([String]) -> Void
+    @State private var picked: Set<String> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Remove a lost device").font(.headline)
+            ForEach(devices, id: \.id) { d in
+                Toggle(isOn: Binding(
+                    get: { picked.contains(d.id) },
+                    set: { if $0 { picked.insert(d.id) } else { picked.remove(d.id) } }
+                )) {
+                    Text(d.thisDevice ? "\(d.name) (this device)" : d.name)
+                }
+                .disabled(d.thisDevice)
+                .accessibilityIdentifier("remove-\(d.name)")
+            }
+            Text("These devices stay:").font(.subheadline)
+            ForEach(devices.filter { !picked.contains($0.id) }, id: \.id) { d in
+                Text("• \(d.name)")
+            }
+            Button("Remove and make a new key", role: .destructive) { remove(Array(picked)) }
+                .disabled(picked.isEmpty)
+                .accessibilityIdentifier("remove-confirm")
+        }
+    }
+}
+
+/// A replacement recovery key: shown once, typed back, then the current key
+/// signs the replacement (T9, PROTOCOL.md 13.3).
+struct ReplaceKeyView: View {
+    let key: String
+    let replace: (String) -> Void
+    @State private var typed = ""
+    @State private var current = ""
+    @State private var wrong = false
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("New recovery key").font(.headline)
+            Text("Write this key on paper. The app shows it only once.")
+            Text(key)
+                .font(.system(.body, design: .monospaced))
+                .textSelection(.enabled)
+                .accessibilityIdentifier("new-recovery-key")
+            TextField("Type the new key from your paper", text: $typed)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                .noAutocapitalization()
+            TextField("Your current recovery key", text: $current)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                .noAutocapitalization()
+            if wrong { Text("The new key does not match. Check your paper.").foregroundStyle(.red) }
+            Button("Replace the key") {
+                if RecoveryCheck.matches(typed: typed, shown: key) { replace(current) } else { wrong = true }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(current.isEmpty)
+        }
     }
 }
 

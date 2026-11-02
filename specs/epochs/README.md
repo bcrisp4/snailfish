@@ -73,6 +73,13 @@ The initial trusted prefix, device keys, and envelope-ID counter survive relay r
 
 This model checks safety, not eventual delivery. It does not establish equivalence with the delivery or spacelog model, or with Rust code.
 
+## Rust conformance (M7)
+
+| Scenario in `test.qnt` | Rust tests |
+| --- | --- |
+| `unknownRetryAfterRotationTest`, `knownRetryAfterRotationTest` | `crates/engine/src/tests.rs::change_refused_for_an_old_epoch_is_encrypted_again` |
+| `removedAuthorRefusedTest` | `vectors/http.json` append case `removed-author-after-epoch` (`crates/protocol/tests/http.rs`, `crates/relay/tests/vectors.rs`) |
+
 ## Commands
 
 1. Run `make verify-fast MODEL=epochs` after each model edit.

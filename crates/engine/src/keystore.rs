@@ -91,6 +91,30 @@ pub fn open(
     Ok(e)
 }
 
+/// [`Engine::open_recovery`] for a full recovery (`PROTOCOL.md` 13.4), then
+/// write the keys of the new device to `store`. The keys have an all-zero
+/// app key: the engine opens it from its grant, and then writes it to the
+/// store.
+///
+/// # Errors
+///
+/// As [`Engine::open_recovery`], and [`EngineError::KeyStore`].
+pub fn open_recovery(
+    data_dir: &Path,
+    space: SpaceRef,
+    keys: &DeviceKeys,
+    recovery_key: &str,
+    name: &str,
+    store: Arc<dyn KeyStore>,
+) -> Result<Engine, EngineError> {
+    let account = space.log_id.clone();
+    let mut e = Engine::open_recovery(data_dir, space, keys, recovery_key, name)?;
+    put(store.as_ref(), &account, keys)?;
+    e.key_store = Some(store);
+    e.app_key_stored = false;
+    Ok(e)
+}
+
 /// [`crate::setup::install_setup`], then write the keys to `store`.
 ///
 /// The engine state comes first. A crash between the two steps leaves a

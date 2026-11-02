@@ -7,6 +7,11 @@ Usage:
     snailfish-demo --dir DIR edit TASK FIELD VALUE
     snailfish-demo --dir DIR sync
     snailfish-demo --dir DIR list
+    snailfish-demo --dir DIR devices
+    snailfish-demo --dir DIR remove [--confirm ask|yes|no] DEVICE_ID...
+    snailfish-demo --dir DIR replace-recovery-key [--current KEY] [--new KEY]
+    snailfish-demo recover --relay URL --recovery-key KEY
+        [--browser STATE --user NAME] [--name NAME] DIR
 
 `invite` runs on a device of the space and `join` on the new device. The
 device that shows the session prints its QR payload as a text line and
@@ -19,6 +24,13 @@ with no input, for tests.
 It prints the sign-in URL and waits for the browser to return to a loopback
 address. `--browser STATE --user NAME` uses the software browser of
 `softbrowser.py` with the state file STATE instead, for tests.
+
+`remove` shows the devices that stay and asks the user to confirm them,
+then removes the named devices and rotates the key (S4). `replace-recovery-key`
+prints a new recovery key, asks the user to type it back, and asks for the
+current key (`--current` and `--new` answer with no input, for tests).
+`recover` signs in on a new device, finds the space of the app and recovers
+it with the paper recovery key (S5).
 
 `SNAILFISH_DEMO_CRASH_AT=N` makes the process exit at the Nth crash point
 of the run, with no cleanup, as a kill does. The crash points are before
@@ -206,6 +218,20 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("sync")
     sub.add_parser("list")
     sub.add_parser("dump")
+    sub.add_parser("devices")
+    r = sub.add_parser("remove")
+    r.add_argument("--confirm", choices=("ask", "yes", "no"), default="ask")
+    r.add_argument("device_ids", nargs="+")
+    k = sub.add_parser("replace-recovery-key")
+    k.add_argument("--current")
+    k.add_argument("--new")
+    v = sub.add_parser("recover")
+    v.add_argument("--relay", required=True)
+    v.add_argument("--recovery-key", required=True)
+    v.add_argument("--browser", type=Path)
+    v.add_argument("--user")
+    v.add_argument("--name", default="new device")
+    v.add_argument("dir_new", type=Path)
     args = p.parse_args(argv)
 
     if args.cmd == "setup":
@@ -224,6 +250,37 @@ def main(argv: list[str] | None = None) -> int:
                 with Loopback() as lb:
                     key = app.create_space(args.relay, args.dir_a, lb.uri, lb.wait, send)
         print(f"recovery key (write it down): {key}")
+        return 0
+    if args.cmd == "recover":
+        with httpx.Client(timeout=30) as client:
+            send = http_transport(client, Crasher())
+            try:
+                if args.browser is not None:
+                    soft = softbrowser.SoftBrowser(args.browser, args.relay)
+                    dev = app.recover(
+                        args.relay,
+                        args.dir_new,
+                        args.name,
+                        args.recovery_key,
+                        SOFT_REDIRECT,
+                        lambda authorize_url: soft.approve(authorize_url, args.user or ""),
+                        send,
+                    )
+                else:
+                    with Loopback() as lb:
+                        dev = app.recover(
+                            args.relay,
+                            args.dir_new,
+                            args.name,
+                            args.recovery_key,
+                            lb.uri,
+                            lb.wait,
+                            send,
+                        )
+            except app.RecoveryError as e:
+                return finish(str(e))
+        dev.close()
+        print("recovered: remove the lost devices with `remove`")
         return 0
     if args.cmd == "join":
         with httpx.Client(timeout=30) as client:
@@ -270,6 +327,38 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "list":
             for line in app.iter_tasks(dev.tasks()):
                 print(line)
+        elif args.cmd == "devices":
+            for d in dev.engine.active_devices():
+                print(f"{d.id} {d.name}{' (this device)' if d.this_device else ''}")
+        elif args.cmd == "remove":
+            mode = args.confirm
+
+            def confirm(stay: str) -> bool:
+                say(f"devices that stay: {stay}")
+                if mode != "ask":
+                    return mode == "yes"
+                reply = input("Keep only these devices? [y/N] ")
+                return reply.strip().lower() in ("y", "yes")
+
+            with httpx.Client(timeout=30) as client:
+                status = app.remove(dev, args.device_ids, http_transport(client, crasher), confirm)
+            print(f"status: {status}")
+            return 0 if status.is_ok() else 1
+        elif args.cmd == "replace-recovery-key":
+            new = args.new or sf.new_recovery_key()
+            if args.new is None:
+                print(f"new recovery key (write it down): {new}")
+                if input("type the new key back: ").strip().upper() != new:
+                    return finish("the typed key differs")
+            current = args.current or input("current recovery key: ")
+            dev.engine.replace_recovery_key(current, new)
+            with httpx.Client(timeout=30) as client:
+                send = http_transport(client, crasher)
+                # The recovery record, then the rotation after it (13.3).
+                dev.sync(send)
+                status = dev.sync(send)
+            print(f"status: {status}")
+            return 0 if status.is_ok() else 1
         elif args.cmd == "dump":
             print(
                 json.dumps(

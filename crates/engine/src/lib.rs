@@ -12,6 +12,7 @@
 pub mod codec;
 pub mod enroll;
 pub mod keystore;
+mod removal;
 pub mod setup;
 pub mod signin;
 mod state;
@@ -27,10 +28,11 @@ use snailfish_protocol::keys;
 use snailfish_protocol::records::Position;
 use snailfish_protocol::sig::SecretKey;
 
+pub use removal::ActiveDevice;
 pub use sync::Sync;
 
 /// The schema version of the engine state file ([VER-14]).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The protocol levels that this engine can write ([VER-6]).
 pub const MAX_LEVEL: u64 = 1;
@@ -312,6 +314,9 @@ pub struct Engine {
     // The keys of the epochs after 1 that the engine opened from the log
     // (`PROTOCOL.md` 13.1). Each one passed its commitment check.
     epoch_keys: std::cell::RefCell<std::collections::BTreeMap<u64, [u8; 32]>>,
+    // The recovery key of a full recovery, in memory only, until the
+    // verified log holds the grant of this device (`PROTOCOL.md` 13.4).
+    recovery: Option<removal::RecoverySigner>,
     // The host key store, if `keystore::open` opened the engine, and
     // whether its item holds the app key.
     key_store: Option<std::sync::Arc<dyn keystore::KeyStore>>,
@@ -410,6 +415,7 @@ impl Engine {
             seal_seed: keys.seal_seed,
             app_key: (keys.app_key != [0; 32]).then_some(keys.app_key),
             epoch_keys: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+            recovery: None,
             key_store: None,
             app_key_stored: false,
             status: Status::Ok,

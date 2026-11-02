@@ -258,6 +258,50 @@ actor SyncDevice {
         }
     }
 
+    /// Recover a space onto this device with the paper recovery key (S5,
+    /// PROTOCOL.md 13.4). The engine keeps the key in memory until the
+    /// verified log holds the grant of this device. The tasks of the device
+    /// before sync get outbox rows ([MRG-5]), and the engine takes them after
+    /// the grant opens the app key.
+    func recover(space sp: SpaceRef, keys: DeviceKeys, recoveryKey: String, name: String) throws {
+        try clearUncommitted()
+        try openEngine(sp, open: {
+            try Engine.openRecovery(
+                dataDir: engineDir.path, space: sp, keys: keys, recoveryKey: recoveryKey, name: name,
+                keyStore: keyStore)
+        }) { e in
+            try store.db.transaction {
+                try store.db.exec("DELETE FROM outbox; DELETE FROM applied;")
+                try store.outboxEveryField { try e.newChangeId() }
+            }
+        }
+    }
+
+    // MARK: Removal (S4, PROTOCOL.md 13.2) and key replacement (13.3)
+
+    func activeDevices() throws -> [ActiveDevice] {
+        guard let engine else { throw SetupError.syncOff }
+        return try engine.activeDevices()
+    }
+
+    /// Remove the devices after the user confirmed the devices that stay.
+    /// The next sync signs the epoch record and rotates the key.
+    func removeDevices(_ ids: [String]) throws {
+        guard let engine else { throw SetupError.syncOff }
+        try engine.removeDevices(removed: ids)
+    }
+
+    /// The devices of a removal that waits for a new confirmation ([LOG-7]).
+    func removalToConfirm() throws -> [String]? {
+        try engine?.removalToConfirm()
+    }
+
+    /// Replace the recovery key after the user typed the new key back.
+    func replaceRecoveryKey(current: String, new: String) throws {
+        guard let engine else { throw SetupError.syncOff }
+        try engine.replaceRecoveryKey(current: current, new: new)
+    }
+
     /// Delete the engine state of a setup or a join that stopped before it
     /// wrote `space.json`, so the next install starts in an empty directory.
     /// The key item of that attempt stays, because no file names its space.
@@ -270,8 +314,10 @@ actor SyncDevice {
     /// Open the engine, run `prepare`, then write `space.json`. The file is
     /// the commit point: a crash before it leaves sync off, so the [MRG-5]
     /// rows of `prepare` exist whenever sync is on.
-    private func openEngine(_ sp: SpaceRef, prepare: (Engine) throws -> Void) throws {
-        let e = try Engine.open(dataDir: engineDir.path, space: sp, keyStore: keyStore)
+    private func openEngine(
+        _ sp: SpaceRef, open: (() throws -> Engine)? = nil, prepare: (Engine) throws -> Void
+    ) throws {
+        let e = try open?() ?? Engine.open(dataDir: engineDir.path, space: sp, keyStore: keyStore)
         try prepare(e)
         try JSONEncoder().encode(SpaceFile(sp)).write(to: spaceFile, options: .atomic)
         // The atomic write makes a new file, so set the exclusion each time.
@@ -305,12 +351,15 @@ actor SyncDevice {
 enum SetupError: Error, CustomStringConvertible {
     case syncOff
     case cancelled
+    case spaceExists
     case message(String)
 
     var description: String {
         switch self {
         case .syncOff: return "sync is off"
         case .cancelled: return "cancelled"
+        case .spaceExists:
+            return "your account already has a space of this app: recover it with your recovery key"
         case .message(let m): return m
         }
     }

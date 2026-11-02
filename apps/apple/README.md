@@ -9,6 +9,7 @@ Tasks is the SwiftUI version of the demo task app (DESIGN.md M6). It runs on iOS
 | `Tasks/KeychainKeyStore.swift` | The `key_store` of the app: the data protection keychain, fail-closed (C62). |
 | `Tasks/SignInFlow.swift` | The native sign-in with `ASWebAuthenticationSession` and the first-device setup (S1). |
 | `Tasks/EnrollmentFlow.swift`, `Tasks/QRCode.swift` | QR enrollment in both directions (S2). |
+| `Tasks/AppModel.swift`, `Tasks/ContentView.swift` | Removal of a lost device (S4), recovery key replacement (T9) and full recovery with the paper recovery key (S5), `PROTOCOL.md` section 13. |
 | `Tasks/Measurements.swift` | The sync delay log and the durable commit benchmark. |
 | `tools/approver.py` | The passkey step of the sign-in for the tests, because the simulator cannot make a passkey. It also drives a Python demo device, so a test can share a space with the demo. |
 
@@ -48,6 +49,24 @@ The iPhone must reach the relay. Use an HTTPS relay URL, for example a Tailscale
 7. On the iPhone, select "Scan the code of my other device", and scan the QR code.
 8. If both devices show the same 6-digit code, select "Yes, they match" on each device.
 9. Add a task on each device, and check that it appears on the other device.
+
+## Run the demo: a stolen phone (S4)
+
+1. On the user page, create the machine group "Sam's phone" and add the iPhone device to it.
+2. Select "Block" on the group. The iPhone shows `paused: blocked` at its next sync.
+3. On the Mac, open the sync settings and select "Remove a device".
+4. Select the iPhone. Check the list of the devices that stay, and select "Remove and make a new key".
+5. On the user page, select "Unblock". The iPhone shows `stopped: removed`.
+
+## Run the demo: all devices lost (S5)
+
+1. Delete the app on every device, or use a new device with a new data directory.
+2. Open Tasks, open the sync settings, and type the recovery key from your paper under "All my devices are lost".
+3. Select "Recover with the recovery key", and sign in with the passkey.
+4. The app shows the old devices. Select each one, and select "Remove and make a new key".
+5. Check that the tasks are on the device.
+
+If the passkey is lost too, the relay operator runs `snailfish-relay user invite <user>` and sends the new invite link.
 
 ## Measurements
 

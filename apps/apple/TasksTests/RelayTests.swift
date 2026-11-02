@@ -152,6 +152,8 @@ final class RelayTests: XCTestCase {
         let relay = try env("SNAILFISH_RELAY_URL")
         let approver = try env("SNAILFISH_APPROVER")
         let transport = transport
+        // A tenant holds one space of the app (PROTOCOL.md 13.4).
+        try await PythonDevice(base: approver).call("POST", "user")
 
         // S1: an edit before sync, then the sign-in creates the space.
         let a = try device("a")
@@ -232,6 +234,8 @@ final class RelayTests: XCTestCase {
         let relay = try env("SNAILFISH_RELAY_URL")
         let approver = try env("SNAILFISH_APPROVER")
         let transport = transport
+        // A tenant holds one space of the app (PROTOCOL.md 13.4).
+        try await PythonDevice(base: approver).call("POST", "user")
         let a = try device("a")
         _ = try await createSpace(device: a, relayURL: relay, name: "A", transport: transport, browser: browser(approver))
         let v10 = try await a.sync(transport)
@@ -268,6 +272,7 @@ final class RelayTests: XCTestCase {
         let py = PythonDevice(base: try env("SNAILFISH_APPROVER"))
         let transport = transport
 
+        try await py.call("POST", "user")
         try await py.call("POST", "setup")
         try await py.call("POST", "edit", ["task": "p1", "field": "title", "value": #""café from python""#])
         let v1 = try await py.call("POST", "sync")
@@ -314,5 +319,108 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(gotPy["p1"]?["title"] as? String, "café from python")
         XCTAssertEqual(gotPy["p1"]?["done"] as? Bool, true)
         XCTAssertEqual(gotPy["s1"]?["title"] as? String, "naïve, renamed in python")
+    }
+
+    /// A Python device creates the space and enrolls the Swift app.
+    private func pythonSpaceWithSwift(_ py: PythonDevice, relay: String) async throws -> SyncDevice {
+        try await py.call("POST", "user")
+        try await py.call("POST", "setup")
+        try await py.call("POST", "edit", ["task": "p1", "field": "title", "value": #""from python""#])
+        _ = try await py.call("POST", "sync")
+        let s = try device("s")
+        let payload = try await py.call("POST", "invite")
+        let joined = try await join(
+            device: s, relayURL: relay, name: "S", scanned: payload, transport: transport, ui: PythonCompareUI(py))
+        let invited = try await py.call("GET", "invite/result")
+        XCTAssertEqual([invited, joined], ["", ""])
+        let v = try await s.sync(transport)
+        XCTAssertEqual(v, .ok)
+        return s
+    }
+
+    /// T9 and S4 across the two implementations (PROTOCOL.md 13.2, 13.3):
+    /// the Swift app replaces the recovery key and rotates the key. The
+    /// Python device opens the key set that Swift sealed to it, and Swift
+    /// reads the change that Python encrypts with the new key. The Python
+    /// device then removes the Swift app, and the relay refuses it.
+    func testKeyReplacementAndRemovalAcrossImplementations() async throws {
+        let relay = try env("SNAILFISH_RELAY_URL")
+        let py = PythonDevice(base: try env("SNAILFISH_APPROVER"))
+        let s = try await pythonSpaceWithSwift(py, relay: relay)
+        let old = try await py.call("GET", "recovery-key")
+        let new = try newRecoveryKey()
+        try await s.replaceRecoveryKey(current: old, new: new)
+        _ = try await s.sync(transport)
+        let v1 = try await s.sync(transport)
+        XCTAssertEqual(v1, .ok)
+        let pending = try await s.removalToConfirm()
+        XCTAssertNil(pending)
+        let v2 = try await py.call("POST", "sync")
+        XCTAssertEqual(v2, "ok")
+        try await py.call("POST", "edit", ["task": "p2", "field": "title", "value": #""epoch 2 from python""#])
+        let v3 = try await py.call("POST", "sync")
+        XCTAssertEqual(v3, "ok")
+        _ = try await s.sync(transport)
+        let titles = try await s.tasks().map(\.title)
+        XCTAssertTrue(titles.contains("epoch 2 from python"), "\(titles)")
+
+        let devices = try JSONSerialization.jsonObject(with: Data(try await py.call("GET", "devices").utf8)) as? [[Any]]
+        let swiftID = try XCTUnwrap(devices?.first { ($0[2] as? Bool) == false }?[0] as? String)
+        let removed = try await py.call("POST", "remove", ["ids": swiftID])
+        XCTAssertEqual(removed, "ok")
+        let v4 = try await s.sync(transport)
+        XCTAssertEqual(v4, .removed)
+    }
+
+    /// S5 across the two implementations (PROTOCOL.md 13.4): the Swift app
+    /// recovers the space of a Python device with the paper recovery key,
+    /// reads its tasks, and removes it. Then a new Python device recovers the
+    /// space again and reads the edit of the Swift app under the key that
+    /// Swift made.
+    func testFullRecoveryAcrossImplementations() async throws {
+        let relay = try env("SNAILFISH_RELAY_URL")
+        let approver = try env("SNAILFISH_APPROVER")
+        let py = PythonDevice(base: approver)
+        try await py.call("POST", "user")
+        try await py.call("POST", "setup")
+        try await py.call("POST", "edit", ["task": "p1", "field": "title", "value": #""before the fire""#])
+        _ = try await py.call("POST", "sync")
+        let key = try await py.call("GET", "recovery-key")
+
+        // A second setup finds the space and refuses to make another.
+        let other = try device("other")
+        do {
+            _ = try await createSpace(
+                device: other, relayURL: relay, name: "X", transport: transport, browser: browser(approver))
+            XCTFail("a second space of the app")
+        } catch SetupError.spaceExists {}
+
+        let s = try device("s")
+        try await recoverSpace(
+            device: s, relayURL: relay, name: "S", recoveryKey: key, transport: transport,
+            browser: browser(approver))
+        let v1 = try await s.sync(transport)
+        XCTAssertEqual(v1, .ok)
+        let titles = try await s.tasks().map(\.title)
+        XCTAssertEqual(titles, ["before the fire"])
+        let lost = try await s.activeDevices().filter { !$0.thisDevice }.map(\.id)
+        XCTAssertEqual(lost.count, 1)
+        try await s.removeDevices(lost)
+        let v2 = try await s.sync(transport)
+        XCTAssertEqual(v2, .ok)
+        let left = try await s.activeDevices().count
+        XCTAssertEqual(left, 1)
+        let v3 = try await py.call("POST", "sync")
+        XCTAssertTrue(v3.contains("REMOVED"), v3)
+        try await s.edit(task: "s1", field: "title", value: .string("after the fire"))
+        _ = try await s.sync(transport)
+
+        try await py.call("POST", "recover", ["key": key])
+        let v4 = try await py.call("POST", "sync")
+        XCTAssertEqual(v4, "ok")
+        let data = Data(try await py.call("GET", "tasks").utf8)
+        let got = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: [String: Any]])
+        XCTAssertEqual(got["s1"]?["title"] as? String, "after the fire")
+        XCTAssertEqual(got["p1"]?["title"] as? String, "before the fire")
     }
 }

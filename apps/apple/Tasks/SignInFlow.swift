@@ -79,9 +79,29 @@ func createSpace(
 ) async throws -> String {
     var keys = try newDeviceKeys()
     let token = try await signIn(relayURL: relayURL, keys: keys, transport: transport, browser: browser)
+    // PROTOCOL.md 13.4: a space of this app exists, so the user recovers it
+    // with the recovery key and makes no second space.
+    if token.spaces.contains(where: { $0.appId == appID }) { throw SetupError.spaceExists }
     let setup = try Snailfish.createSpace(appId: appID, first: NewDevice(keys: keys, name: name))
     keys.appKey = setup.appKey
     let space = SpaceRef(relayUrl: relayURL, tenant: token.tenant, logId: setup.logId, appId: appID)
     try await device.turnOnSync(space: space, keys: keys, envelopes: setup.envelopes, setupToken: token.token)
     return setup.recoveryKey
+}
+
+/// Full recovery onto this device (S5, PROTOCOL.md 13.4): sign in, find the
+/// space of the app, and open the engine with the paper recovery key. The
+/// next sync verifies the log and grants this device. It follows `recover`
+/// in demo/src/snailfish_demo/app.py.
+func recoverSpace(
+    device: SyncDevice, relayURL: String, name: String, recoveryKey: String, transport: Transport,
+    browser: (URL) async throws -> URL
+) async throws {
+    let keys = try newDeviceKeys()
+    let token = try await signIn(relayURL: relayURL, keys: keys, transport: transport, browser: browser)
+    guard let found = token.spaces.first(where: { $0.appId == appID }) else {
+        throw SetupError.message("your account has no space of this app")
+    }
+    let space = SpaceRef(relayUrl: relayURL, tenant: token.tenant, logId: found.logId, appId: appID)
+    try await device.recover(space: space, keys: keys, recoveryKey: recoveryKey, name: name)
 }

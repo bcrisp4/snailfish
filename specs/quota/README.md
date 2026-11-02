@@ -52,3 +52,4 @@ The six witnesses are a thief at its daily limit, a removal after a flood, a quo
 | `fetchAtFullQuotaTest` | `crates/relay/tests/user.rs::full_quota_refuses_changes_and_serves_fetches` |
 | `securityAtFullQuotaTest` | `crates/relay/tests/user.rs::full_quota_stores_a_grant` |
 | `knownBeforeQuotaTest` | `crates/relay/tests/user.rs::full_quota_answers_known_for_a_retry` |
+| `thiefLimitedTest` (M7) | `crates/relay/tests/vectors.rs::append_reserve_cases` (`vectors/http.json` `append_reserve`), `crates/relay/tests/user.rs::block_of_a_group_refuses_its_devices_until_unblock_and_removal_is_final`, `crates/engine/src/tests.rs::blocked_device_pauses_until_the_unblock` |

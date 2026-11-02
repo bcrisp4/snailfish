@@ -181,7 +181,35 @@ fn migrate(db: &Connection) -> Result<(), EngineError> {
              COMMIT;",
         )?;
     }
-    const { assert!(SCHEMA_VERSION == 5) };
+    if found < 6 {
+        migrate_m7(db)?;
+    }
+    const { assert!(SCHEMA_VERSION == 6) };
+    Ok(())
+}
+
+/// M7: the pending epoch record of a removal or a rotation, and the
+/// pending recovery record (`PROTOCOL.md` 13.2 and 13.3).
+fn migrate_m7(db: &Connection) -> Result<(), EngineError> {
+    db.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE removal (
+           id INTEGER PRIMARY KEY CHECK (id = 1),
+           removed TEXT NOT NULL,
+           confirmed TEXT NOT NULL,
+           after_recovery BLOB,
+           envelope TEXT,
+           state TEXT NOT NULL
+         );
+         CREATE TABLE recovery_record (
+           id INTEGER PRIMARY KEY CHECK (id = 1),
+           new_id BLOB NOT NULL,
+           envelope TEXT,
+           state TEXT NOT NULL
+         );
+         PRAGMA user_version = 6;
+         COMMIT;",
+    )?;
     Ok(())
 }
 

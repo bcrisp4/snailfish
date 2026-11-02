@@ -17,6 +17,12 @@ final class AppModel: ObservableObject {
         case confirmAgain
         /// The recovery key of a new space, shown once (S1).
         case recoveryKey(String)
+        /// The user picks the devices to remove and confirms the devices
+        /// that stay (S4, PROTOCOL.md 13.2).
+        case removal([ActiveDevice])
+        /// A replacement recovery key, shown once, then typed back, then the
+        /// current key (T9, PROTOCOL.md 13.3).
+        case newRecoveryKey(String)
         case working(String)
     }
 
@@ -171,6 +177,72 @@ final class AppModel: ObservableObject {
             let key = try await createSpace(
                 device: device, relayURL: relay, name: deviceName(), transport: transport, browser: browser)
             step = .recoveryKey(key)
+        }
+    }
+
+    /// Recover the space of this app onto this device with the paper
+    /// recovery key (S5). After the sync grants this device, the user
+    /// removes the lost devices.
+    func recover(recoveryKey: String, browser: @escaping (URL) async throws -> URL) {
+        let relay = relayURL
+        run("recover") { [self] in
+            step = .working("Signing in")
+            try await recoverSpace(
+                device: device, relayURL: relay, name: deviceName(), recoveryKey: recoveryKey,
+                transport: transport, browser: browser)
+            step = .working("Checking the log")
+            _ = try await device.sync(transport, background: false)
+            let devices = try await device.activeDevices()
+            guard devices.contains(where: \.thisDevice) else {
+                throw SetupError.message("the relay did not grant this device: \(status)")
+            }
+            step = .removal(devices)
+        }
+    }
+
+    /// Show the active devices, so the user picks the lost ones (S4).
+    func showRemoval() {
+        run("remove devices") { [self] in
+            step = .removal(try await device.activeDevices())
+        }
+    }
+
+    /// Remove `ids` after the user confirmed the devices that stay, and sync
+    /// so the epoch record goes to the relay. If a device joined first, the
+    /// list shows again ([LOG-7]).
+    func remove(ids: [String]) {
+        run("remove devices") { [self] in
+            step = .working("Removing")
+            try await device.removeDevices(ids)
+            _ = try await device.sync(transport, background: false)
+            if try await device.removalToConfirm() != nil {
+                message = "The device list changed. Confirm the devices that stay again."
+                step = .removal(try await device.activeDevices())
+            } else {
+                step = .none
+                message = "The devices are removed, and the key is new."
+            }
+        }
+    }
+
+    /// Show a new recovery key for a replacement (T9).
+    func startKeyReplacement() {
+        run("replace the recovery key") { [self] in
+            step = .newRecoveryKey(try newRecoveryKey())
+        }
+    }
+
+    /// Replace the recovery key after the user typed the new key back and
+    /// gave the current key. Two syncs: the recovery record, then the
+    /// rotation after it.
+    func replaceRecoveryKey(current: String, new: String) {
+        run("replace the recovery key") { [self] in
+            step = .working("Replacing the recovery key")
+            try await device.replaceRecoveryKey(current: current, new: new)
+            _ = try await device.sync(transport, background: false)
+            _ = try await device.sync(transport, background: false)
+            step = .none
+            message = "The recovery key is replaced. Keep the new paper and destroy the old one."
         }
     }
 

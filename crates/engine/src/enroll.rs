@@ -122,27 +122,19 @@ pub(crate) enum Signer<'a> {
     Recovery(&'a [u8; 16]),
 }
 
-/// Sign a grant for `device` on the verified head, with the app key sealed
-/// to it (`PROTOCOL.md` 6.2 and 7.3).
+/// Sign a grant for `device` on the verified head, with the key of each
+/// epoch sealed to it (`PROTOCOL.md` 6.2, 7.3 and 13.1).
 pub(crate) fn sign_grant(
     e: &Engine,
     device: &Device,
     signer: &Signer<'_>,
 ) -> Result<String, EngineError> {
-    let app_key = e
-        .app_key
-        .ok_or_else(|| EngineError::Invalid("the engine has no app key".into()))?;
-    let sealed = keys::seal_key_set(
-        &device.keys.seal[..],
-        &e.log_id,
-        &device.id,
-        &[1],
-        &[app_key],
-    )
-    .map_err(|err| EngineError::Invalid(format!("seal: {err}")))?;
+    let (epochs, all) = crate::removal::all_keys(e)?;
+    let sealed = keys::seal_key_set(&device.keys.seal[..], &e.log_id, &device.id, &epochs, &all)
+        .map_err(|err| EngineError::Invalid(format!("seal: {err}")))?;
     let set = KeySet {
         to: Author::Device(device.id),
-        epochs: vec![1],
+        epochs,
         sealed,
     };
     let base = e.base()?;
@@ -177,6 +169,17 @@ pub(crate) fn grants_to_send(e: &mut Engine) -> Result<Vec<(Item, String)>, Engi
         if state::is_active(&e.db, &g.device_id)? {
             state::drop_grant(&e.db, &g.device_id)?;
             continue;
+        }
+        // PROTOCOL.md 13.4 step 6: a full recovery holds the recovery key,
+        // so it signs its own grant again with no question.
+        if g.state == GRANT_STALE && g.device_id == e.device_id && e.recovery.is_some() {
+            e.queue_recovery_grant()?;
+            if let Some(again) = state::grants(&e.db)?
+                .into_iter()
+                .find(|x| x.device_id == g.device_id)
+            {
+                g = again;
+            }
         }
         if g.state == GRANT_STALE {
             if !g.by_recovery && g.confirmed == list {

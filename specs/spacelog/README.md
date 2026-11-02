@@ -130,6 +130,18 @@ Each row names the model scenario and the Rust test that runs it through the pub
 | `retryChecksStateTest` | [LOG-7] | `crates/engine/src/tests.rs::grant_of_a_device_that_became_active_is_dropped` |
 | `recoveryGrantTest` | [LOG-8], M4 decision 1 | `crates/engine/src/tests.rs::recovery_key_signs_the_grant`, `crates/protocol/tests/space.rs::current_recovery_key_signs_a_grant` |
 
+## Rust conformance (M7)
+
+| Scenario in `test.qnt` | Rules | Rust and demo tests |
+| --- | --- | --- |
+| `removalTest` | [LOG-8], T8 | `crates/protocol/tests/removal.rs::removal_seals_the_new_key_only_to_the_devices_that_stay`, `crates/engine/src/tests.rs::removal_rotates_the_key_and_stops_the_removed_device`, `demo/tests/test_removal.py::test_stolen_phone_is_blocked_then_removed` |
+| `resignEpochReconfirmTest` | [LOG-7], T8 | `crates/protocol/tests/removal.rs::removal_with_an_old_list_of_devices_that_stay_is_refused`, `crates/engine/src/tests.rs::removal_after_a_new_grant_needs_a_new_confirmation` |
+| `resignTest` | [LOG-7] [LOG-8] | `crates/engine/src/tests.rs::stale_removal_is_signed_again_with_a_new_key` |
+| `recoveryReplaceTest`, `oldRecoveryRefusedTest` | T9 | `crates/protocol/tests/removal.rs::recovery_record_replaces_the_recovery_key`, `crates/engine/src/tests.rs::recovery_key_replacement_rotates_the_key`, `demo/tests/test_removal.py::test_recovery_key_replacement`, `apps/apple/TasksTests/RelayTests.swift::testKeyReplacementAndRemovalAcrossImplementations` |
+| `fullRecoveryTest` | S5 | `crates/protocol/tests/removal.rs::full_recovery_grants_a_new_device_that_removes_the_old_ones`, `crates/engine/src/tests.rs::full_recovery_grants_a_new_device_that_removes_the_old_ones`, `demo/tests/test_removal.py::test_all_devices_lost_full_recovery`, `apps/apple/TasksTests/RelayTests.swift::testFullRecoveryAcrossImplementations` |
+
+The access vectors (`vectors/http.json` `access`) check the request side of a removal and of a recovery ID on the relay and in Go.
+
 ## Not covered
 
 - Protocol levels, the device record and the level record (specs/levels).

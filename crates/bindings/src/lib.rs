@@ -10,8 +10,10 @@ use std::sync::Mutex;
 use snailfish_engine::codec;
 pub use snailfish_engine::codec::{EnrollPayload, Envelope, KeySetInfo, PayloadClass, PayloadInfo};
 pub use snailfish_engine::enroll::EnrollState;
-pub use snailfish_engine::signin::SetupToken;
-pub use snailfish_engine::{EnqueueResult, Header, OutboxRow, Repair, Request, SpaceRef, Status};
+pub use snailfish_engine::signin::{SetupToken, TenantSpace};
+pub use snailfish_engine::{
+    ActiveDevice, EnqueueResult, Header, OutboxRow, Repair, Request, SpaceRef, Status,
+};
 
 uniffi::setup_scaffolding!("snailfish");
 
@@ -212,6 +214,33 @@ pub struct SetupToken {
     pub token: String,
     pub tenant: String,
     pub expires: u64,
+    pub spaces: Vec<TenantSpace>,
+}
+
+/// One space of the tenant in a sign-in result (`PROTOCOL.md` 12.3).
+#[uniffi::remote(Record)]
+pub struct TenantSpace {
+    pub log_id: String,
+    pub app_id: String,
+}
+
+/// An active device of the space (`PROTOCOL.md` 13.2).
+#[uniffi::remote(Record)]
+pub struct ActiveDevice {
+    pub id: String,
+    pub name: String,
+    pub this_device: bool,
+}
+
+/// Make a new recovery key for a replacement and return its display form
+/// (`PROTOCOL.md` 13.3). The engine keeps no copy.
+///
+/// # Errors
+///
+/// [`SnailfishError::Engine`].
+#[uniffi::export]
+pub fn new_recovery_key() -> Result<String> {
+    Ok(snailfish_engine::Engine::new_recovery_key()?)
 }
 
 /// A QR payload of an enrollment (`PROTOCOL.md` 11.1).
@@ -916,6 +945,37 @@ impl Engine {
         })
     }
 
+    /// Open the engine of a new device for a full recovery with the paper
+    /// recovery key, and write its keys to `key_store` (`PROTOCOL.md`
+    /// 13.4). The sync grants the device. Until then, the app must open it
+    /// with this constructor after each restart.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Locked`], [`SnailfishError::KeyStore`] or
+    /// [`SnailfishError::Engine`].
+    #[uniffi::constructor]
+    pub fn open_recovery(
+        data_dir: &str,
+        space: SpaceRef,
+        keys: &DeviceKeys,
+        recovery_key: &str,
+        name: &str,
+        key_store: std::sync::Arc<dyn KeyStore>,
+    ) -> Result<Self> {
+        let inner = snailfish_engine::keystore::open_recovery(
+            &PathBuf::from(data_dir),
+            space,
+            &keys.to_engine()?,
+            recovery_key,
+            name,
+            std::sync::Arc::new(HostKeyStore(key_store)),
+        )?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
     /// A new change ID: 128 random bits.
     ///
     /// # Errors
@@ -1064,6 +1124,88 @@ impl Engine {
             .lock()
             .map_err(|_| poisoned())?
             .confirm_grant(device_id, recovery_key)?)
+    }
+
+    /// The active devices with their names: the list that the user
+    /// confirms for a removal (`PROTOCOL.md` 13.2).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn active_devices(&self) -> Result<Vec<ActiveDevice>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .active_devices()?)
+    }
+
+    /// Remove the devices `removed`. The other active devices stay, and the
+    /// next sync rotates the key (`PROTOCOL.md` 13.2).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn remove_devices(&self, removed: &[String]) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .remove_devices(removed)?)
+    }
+
+    /// The devices of a removal that waits for a new confirmation, because
+    /// the active devices changed ([LOG-7]).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn removal_to_confirm(&self) -> Result<Option<Vec<String>>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .removal_to_confirm()?)
+    }
+
+    /// True while a removal or a rotation waits for the verified log.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn removal_pending(&self) -> Result<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .removal_pending()?)
+    }
+
+    /// Replace the recovery key after the user typed `new` back
+    /// (`PROTOCOL.md` 13.3).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn replace_recovery_key(&self, current: &str, new: &str) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .replace_recovery_key(current, new)?)
+    }
+
+    /// True if a recovery key replacement needs the current key again.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn recovery_key_needed(&self) -> Result<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .recovery_key_needed()?)
     }
 
     /// Start one exchange with the relay.

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Run a command with a snailfish-relay process on a free local port.
 # It sets SNAILFISH_RELAY_URL and SNAILFISH_INVITE (the invite link of the
-# user "sam") for the command, and stops the relay at the end. The authority
+# user "sam") for the command, and SNAILFISH_RELAY_ADMIN, the relay command
+# line for operator commands such as `user add`. It stops the relay at the
+# end. The authority
 # is localhost, because the WebAuthn relying party needs a domain name. Run
 # it from the repo root.
 set -euo pipefail
@@ -22,5 +24,6 @@ for _ in $(seq 100); do
 done
 curl -fsS "http://127.0.0.1:$port/v1/health" > /dev/null || { echo "FAIL: the relay did not start"; cat "$log"; exit 1; }
 rc=0
-SNAILFISH_RELAY_URL="http://localhost:$port" SNAILFISH_INVITE="$invite" "$@" || rc=$?
+SNAILFISH_RELAY_URL="http://localhost:$port" SNAILFISH_INVITE="$invite" \
+  SNAILFISH_RELAY_ADMIN="$relay ${args[*]}" "$@" || rc=$?
 exit "$rc"

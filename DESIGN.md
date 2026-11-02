@@ -940,6 +940,14 @@ Licence, 2026-10-24:
 
 - C67. One licence for the whole project? Yes: MIT OR Apache-2.0 for every crate. It supersedes C11. A closed hosted fork of a relay for one to five users is an unlikely threat. The AGPL relay cost two licences, a licence-graph check, a source-link rule and some users who refuse AGPL code. The cost is that a party can run a modified relay as a closed service.
 
+M7, 2026-11-02:
+
+- C68. How does a new device read the log in a full recovery, with no active device key? A request that the current recovery ID signs is valid on the fetch and append routes, and the sign-in names the spaces of the tenant. A full recovery then needs both the sign-in, for the 128-bit tenant handle, and the recovery key. A setup token as the credential would let a stolen sign-in read the log.
+- C69. Does a removed device get `unknown_device`? No. It gets `removed`, and the engine stops with `stopped: removed`. The relay refuses its fetch, so the device cannot read its own removal, and only a distinct code tells it why.
+- C70. Do the relay and the engine keep the space state in new columns? No. Each one replays its stored security records into the shared `protocol` state for each append, repair or fetch page. Security records are few (C65), and one replay keeps one implementation of the state rules.
+- C71. Does the engine write device and level records while level 1 is the only level? No. With one level, no device record or level record is valid. The protocol crate, the relay and each engine check them, and the engine writes them with the first real level 2.
+- C72. How does the rate limit count clients behind a reverse proxy? By peer address, unless `--trusted-proxy` lists the peer: then the last `X-Forwarded-For` entry counts. A client sets that header itself, so the relay reads it only from a listed proxy.
+
 ## Alternatives considered
 
 Products and approaches that do not fit the threat model:

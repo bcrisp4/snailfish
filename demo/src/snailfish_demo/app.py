@@ -206,6 +206,10 @@ def create_space(
     """
     ka = sf.new_device_keys()
     token = sign_in(relay_url, ka, redirect_uri, browser, send)
+    # PROTOCOL.md 13.4: a space of this app exists, so the user recovers it
+    # with the recovery key and makes no second space.
+    if any(s.app_id == APP_ID for s in token.spaces):
+        raise SpaceExistsError(APP_ID)
     setup = sf.create_space(APP_ID, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
     space = {
@@ -225,6 +229,91 @@ def create_space(
     )
     write_private(dir_a / "space.json", json.dumps(space))
     return setup.recovery_key
+
+
+class SpaceExistsError(Exception):
+    """The tenant has a space of this app: recover it, do not make another."""
+
+
+def recover(
+    relay_url: str,
+    data_dir: Path,
+    name: str,
+    recovery_key: str,
+    redirect_uri: str,
+    browser: Browser,
+    send: Transport,
+) -> Device:
+    """Full recovery onto a new device (S5, PROTOCOL.md 13.4).
+
+    The user signs in, and the sign-in names the space of the app. The
+    engine verifies the log from the genesis record, and the recovery key
+    signs a grant for this device. The function syncs until the verified
+    log holds the grant. The device can then remove the lost devices.
+
+    Raises:
+        RecoveryError: The space does not exist, or the sync did not grant
+            this device, for example after a wrong recovery key.
+    """
+    keys = sf.new_device_keys()
+    token = sign_in(relay_url, keys, redirect_uri, browser, send)
+    found = [s for s in token.spaces if s.app_id == APP_ID]
+    if not found:
+        raise RecoveryError("the account has no space of this app")
+    space = {
+        "relay_url": relay_url,
+        "tenant": token.tenant,
+        "log_id": found[0].log_id,
+        "app_id": APP_ID,
+    }
+    data_dir.mkdir(parents=True, exist_ok=True)
+    write_private(data_dir / "space.json", json.dumps(space))
+    engine = sf.Engine.open_recovery(
+        str(data_dir / "engine"),
+        sf.SpaceRef(**space),
+        keys,
+        recovery_key,
+        name,
+        key_store(data_dir),
+    )
+    dev = Device(data_dir, engine=engine)
+    status = dev.sync(send)
+    if not any(d.this_device for d in dev.engine.active_devices()):
+        dev.close()
+        raise RecoveryError(f"no grant for this device: {status}")
+    return dev
+
+
+class RecoveryError(Exception):
+    """A full recovery did not grant this device."""
+
+
+class ConfirmStay(Protocol):
+    """Shows the devices that stay and asks the user to confirm the list."""
+
+    def __call__(self, stay: str) -> bool:
+        """Return True if the user confirms that only `stay` stays."""
+        ...
+
+
+def remove(dev: Device, removed: list[str], send: Transport, confirm: ConfirmStay) -> sf.Status:
+    """Remove devices and rotate the key (S4, PROTOCOL.md 13.2).
+
+    `confirm` gets the list of the devices that stay and returns True if
+    the user confirms it. If another device joined first, the engine asks
+    again ([LOG-7]), and `confirm` gets the new list.
+
+    Returns:
+        The engine status after the sync.
+    """
+    while True:
+        stay = [d for d in dev.engine.active_devices() if d.id not in removed]
+        if not confirm(", ".join(f"{d.name} ({d.id})" for d in stay)):
+            return dev.engine.status()
+        dev.engine.remove_devices(removed)
+        status = dev.sync(send)
+        if dev.engine.removal_to_confirm() is None:
+            return status
 
 
 # How long an enrollment waits between two reads of the session. The relay
@@ -368,8 +457,12 @@ class Device:
         data_dir: Path,
         now_ms: Callable[[], int] | None = None,
         crash_point: Callable[[str], None] | None = None,
+        engine: sf.Engine | None = None,
     ) -> None:
         """Open the device in `data_dir`.
+
+        `engine` is an engine that the caller opened, for example for a full
+        recovery. Without it, the device opens the engine from its key store.
 
         `crash_point` runs before each app transaction, before each commit
         and after each commit. The crash tests use it to stop the process.
@@ -380,7 +473,9 @@ class Device:
         """
         self.dir = data_dir
         self.space = sf.SpaceRef(**json.loads((data_dir / "space.json").read_text()))
-        self.engine = sf.Engine.open(str(data_dir / "engine"), self.space, key_store(data_dir))
+        self.engine = engine or sf.Engine.open(
+            str(data_dir / "engine"), self.space, key_store(data_dir)
+        )
         self.device_id = self.engine.device_id()
         self.now_ms = now_ms or (lambda: time.time_ns() // 1_000_000)
         self.crash_point: Callable[[str], None] = crash_point or _no_crash

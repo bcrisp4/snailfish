@@ -33,6 +33,18 @@ pub struct SetupToken {
     pub tenant: String,
     /// The relay time at which the token expires.
     pub expires: u64,
+    /// The spaces of the tenant. A device of an app with a space here
+    /// recovers that space and makes no new one (`PROTOCOL.md` 13.4).
+    pub spaces: Vec<TenantSpace>,
+}
+
+/// One space of a tenant (`PROTOCOL.md` 12.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantSpace {
+    /// The log ID text.
+    pub log_id: String,
+    /// The app ID of its genesis record.
+    pub app_id: String,
 }
 
 /// One native sign-in. It holds the PKCE verifier, so the app keeps it until
@@ -216,6 +228,14 @@ impl SignIn {
             token: setup::token_text(TokenKind::Setup, &r.token),
             tenant: r.tenant,
             expires: r.expires,
+            spaces: r
+                .spaces
+                .iter()
+                .map(|s| TenantSpace {
+                    log_id: snailfish_protocol::encoding::encode_id("l_", &s.log),
+                    app_id: s.app.clone(),
+                })
+                .collect(),
         })
     }
 }

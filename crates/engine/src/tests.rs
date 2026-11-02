@@ -3405,3 +3405,334 @@ fn enrolled_device_writes_its_app_key_to_the_key_store() {
     let eb = crate::keystore::open(&pb, space, store.clone()).unwrap();
     assert_eq!(eb.app_key(), Some(w.keys[0].app_key));
 }
+
+// ---------------------------------------------------------------- M7
+
+/// The epoch of each change in the relay log, in log order.
+fn change_epochs(w: &World) -> Vec<u64> {
+    fetch_all(w)
+        .into_iter()
+        .filter_map(|(_, json)| {
+            let env = snailfish_protocol::envelope::Envelope::parse(json.as_bytes()).unwrap();
+            match snailfish_protocol::records::parse_payload(&env.payload_type, &env.payload)
+                .unwrap()
+                .body
+            {
+                snailfish_protocol::records::Body::Change { epoch, .. } => Some(epoch),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn relay_types(w: &World, e: &Engine) -> Vec<String> {
+    relay_log(w, e).into_iter().map(|(t, _)| t).collect()
+}
+
+/// `specs/spacelog/test.qnt::removalTest`, [LOG-8], T8, `PROTOCOL.md` 13.1
+/// and 13.2: A shows the active devices, removes B, and writes the next
+/// change with the key of epoch 2. The relay refuses B with `removed`, so
+/// B stops. B never receives the new key.
+#[test]
+fn removal_rotates_the_key_and_stops_the_removed_device() {
+    let (mut w, mut a, mut b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    let list = ea.active_devices().unwrap();
+    assert_eq!(list.len(), 2);
+    let me = list.iter().find(|d| d.this_device).unwrap();
+    let other = list.iter().find(|d| !d.this_device).unwrap();
+    assert_eq!((me.name.as_str(), other.name.as_str()), ("A", "B"));
+    assert!(matches!(
+        ea.remove_devices(std::slice::from_ref(&me.id)),
+        Err(EngineError::Invalid(_))
+    ));
+    ea.remove_devices(std::slice::from_ref(&other.id)).unwrap();
+    assert!(ea.removal_pending().unwrap());
+    w.exchange(&mut ea);
+    assert!(!ea.removal_pending().unwrap(), "the verified log holds it");
+    assert_eq!(ea.current_epoch().unwrap(), 2);
+    assert_eq!(ea.active_devices().unwrap().len(), 1);
+    a.edit(&ea, b"after removal");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(change_epochs(&w), vec![2]);
+    assert_eq!(ea.status(), Status::Ok);
+    // B holds an edit under the old key. The relay refuses B for ever.
+    b.edit(&eb, b"too late");
+    b.enqueue(&mut eb);
+    w.exchange(&mut eb);
+    assert_eq!(eb.status(), Status::Removed);
+    assert_eq!(change_epochs(&w), vec![2]);
+    // B cannot open the key of epoch 2: the record seals it to A and R only.
+    assert_eq!(eb.epoch_key(2).unwrap(), None);
+    assert!(ea.epoch_key(2).unwrap().is_some());
+}
+
+/// `specs/spacelog/test.qnt::resignEpochReconfirmTest`, [LOG-7], T8: A
+/// queues the removal of B. Before A syncs, B enrolls D. The active devices
+/// changed, so A signs nothing and asks the user again. After the new
+/// confirmation, D stays.
+#[test]
+fn removal_after_a_new_grant_needs_a_new_confirmation() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    let b_id = eb.device_id();
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    let kd = new_device_keys().unwrap();
+    let mut tb = TrustedEnrollment::new(&eb, None, None).unwrap();
+    w.open(&mut eb, &mut tb);
+    let mut nd = NewEnrollment::new(URL, &kd, "D", tb.payload()).unwrap();
+    w.drive(&mut eb, &mut tb, &mut nd, (true, true));
+    assert_eq!(tb.state(), EnrollState::Done);
+    w.exchange(&mut ea);
+    assert_eq!(ea.removal_to_confirm().unwrap(), Some(vec![b_id.clone()]));
+    assert_eq!(relay_types(&w, &ea).last().unwrap(), "snailfish.grant.v1");
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.removal_to_confirm().unwrap(), None);
+    assert!(!ea.removal_pending().unwrap());
+    let names: Vec<String> = ea
+        .active_devices()
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"D".to_owned()) && !names.contains(&"B".to_owned()));
+}
+
+/// `specs/spacelog/test.qnt::resignTest` ([LOG-7] [LOG-8]): A sends the
+/// epoch record that removes C. B appends a recovery record first, so the
+/// relay refuses the record of A with `stale_base`. The device list did not
+/// change, so A signs again on the new tip with a new key, sealed to the new
+/// recovery key, and asks the user nothing.
+#[test]
+fn stale_removal_is_signed_again_with_a_new_key() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    let kc = queue_grant(&ea, "C");
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    let c_id = keys::device_id(
+        &snailfish_protocol::sig::SecretKey::from_seed(&kc.sign_seed).public(),
+        &keys::seal_public(&kc.seal_seed),
+    );
+    ea.remove_devices(&[encode_id("d_", &c_id)]).unwrap();
+    let mut sync = ea.start_sync();
+    let mut held = None;
+    for _ in 0..20 {
+        let Some(req) = sync.next_request(&mut ea).unwrap() else {
+            break;
+        };
+        if req.url.ends_with("/append") {
+            held = Some(req);
+            break;
+        }
+        let (st, h, body) = w.send(&req);
+        sync.handle_response(&mut ea, st, &h, &body).unwrap();
+    }
+    let held = held.expect("A sends the epoch record");
+    let first = held.body.clone();
+    // B appends a recovery record before the request of A arrives.
+    let new = Engine::new_recovery_key().unwrap();
+    eb.replace_recovery_key(&w.recovery_key.clone(), &new)
+        .unwrap();
+    w.exchange(&mut eb);
+    let (st, h, body) = w.send(&held);
+    assert!(String::from_utf8_lossy(&body).contains("stale_base"));
+    sync.handle_response(&mut ea, st, &h, &body).unwrap();
+    drop(sync);
+    w.exchange(&mut ea);
+    assert_eq!(ea.removal_to_confirm().unwrap(), None, "no question");
+    assert!(!ea.removal_pending().unwrap());
+    let records: Vec<String> = fetch_all(&w)
+        .into_iter()
+        .map(|(_, json)| json)
+        .filter(|json| json.contains("snailfish.epoch.v1"))
+        .collect();
+    assert_eq!(records.len(), 1, "one epoch record of A");
+    assert!(!String::from_utf8_lossy(&first).contains(&records[0]));
+    // The new key reaches A and B, not C, and is sealed to the new recovery key.
+    assert_eq!(ea.current_epoch().unwrap(), 2);
+    assert!(ea.epoch_key(2).unwrap().is_some());
+    w.recovery_key = new;
+}
+
+/// `specs/epochs/test.qnt::unknownRetryAfterRotationTest` and
+/// `knownRetryAfterRotationTest`, [DLV-7]: B holds a change under epoch 1.
+/// A replaces the recovery key, which rotates the key. B sends its change:
+/// the relay refuses it with `wrong_epoch`, and B encrypts it again with the
+/// key of epoch 2 and the same `change_id`. A reads the same bytes.
+#[test]
+fn change_refused_for_an_old_epoch_is_encrypted_again() {
+    let (mut w, mut a, mut b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    let id = b.edit(&eb, b"written under epoch 1");
+    b.enqueue(&mut eb);
+    let new = Engine::new_recovery_key().unwrap();
+    let old = w.recovery_key.clone();
+    ea.replace_recovery_key(&old, &new).unwrap();
+    w.exchange(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.current_epoch().unwrap(), 2);
+    assert!(!ea.removal_pending().unwrap());
+    // The first sync gets wrong_epoch, then the next one sends it again.
+    w.exchange(&mut eb);
+    w.exchange(&mut eb);
+    assert_eq!(change_epochs(&w), vec![2]);
+    assert_eq!(eb.outbox_len().unwrap(), 0);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    assert!(a.state.contains(&b"written under epoch 1".to_vec()));
+    b.pull(&eb).unwrap();
+    assert!(
+        b.outbox.iter().all(|r| r.change_id != id),
+        "B sees its own change"
+    );
+}
+
+/// `specs/spacelog/test.qnt::recoveryReplaceTest`, T9, `PROTOCOL.md` 13.3:
+/// the recovery record that the old key signs, then a rotation by A. The
+/// old key no longer works, and the new key does.
+#[test]
+fn recovery_key_replacement_rotates_the_key() {
+    let (mut w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let old = w.recovery_key.clone();
+    let new = Engine::new_recovery_key().unwrap();
+    assert!(matches!(
+        ea.replace_recovery_key(&new, &old),
+        Err(EngineError::Invalid(_))
+    ));
+    assert!(matches!(
+        ea.replace_recovery_key(&old, &old),
+        Err(EngineError::Invalid(_))
+    ));
+    ea.replace_recovery_key(&old, &new).unwrap();
+    w.exchange(&mut ea);
+    w.exchange(&mut ea);
+    let types = relay_types(&w, &ea);
+    assert_eq!(
+        types[types.len() - 2..],
+        ["snailfish.recovery.v1", "snailfish.epoch.v1"]
+    );
+    assert!(!ea.removal_pending().unwrap() && !ea.recovery_key_needed().unwrap());
+    // The old key is retired: it cannot replace the key again.
+    assert!(matches!(
+        ea.replace_recovery_key(&old, &Engine::new_recovery_key().unwrap()),
+        Err(EngineError::Invalid(_))
+    ));
+    w.recovery_key = new;
+}
+
+/// `specs/spacelog/test.qnt::fullRecoveryTest`, S5, `PROTOCOL.md` 13.4: A
+/// and B are lost. A new device N signs in, finds the space in the token
+/// response, and opens the engine with the paper recovery key. Its sync
+/// verifies the log, the recovery key grants N, and N reads every change.
+/// N then removes A and B. A wrong recovery key gets no grant.
+#[test]
+fn full_recovery_grants_a_new_device_that_removes_the_old_ones() {
+    let (mut w, mut a, mut b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    a.edit(&ea, b"from A");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    b.edit(&eb, b"from B");
+    b.enqueue(&mut eb);
+    w.exchange(&mut eb);
+    let kn = new_device_keys().unwrap();
+    let token = w.sign_in(&kn);
+    assert_eq!(token.spaces.len(), 1);
+    assert_eq!(token.spaces[0].log_id, w.log_id);
+    assert_eq!(token.spaces[0].app_id, APP);
+    let wrong = Engine::new_recovery_key().unwrap();
+    let mut bad = Engine::open_recovery(&w.root.join("x"), w.space(), &kn, &wrong, "X").unwrap();
+    w.exchange(&mut bad);
+    assert!(matches!(bad.status(), Status::Degraded { .. }));
+    drop(bad);
+    let mut n = w.dev("n");
+    let mut en =
+        Engine::open_recovery(&n.dir, w.space(), &kn, &w.recovery_key.clone(), "N").unwrap();
+    w.exchange(&mut en);
+    assert_eq!(en.status(), Status::Ok);
+    assert_eq!(en.active_devices().unwrap().len(), 3);
+    n.pull(&en).unwrap();
+    assert_eq!(n.state.len(), 2, "N reads the changes of A and B");
+    let old: Vec<String> = en
+        .active_devices()
+        .unwrap()
+        .into_iter()
+        .filter(|d| !d.this_device)
+        .map(|d| d.id)
+        .collect();
+    en.remove_devices(&old).unwrap();
+    w.exchange(&mut en);
+    assert_eq!(en.active_devices().unwrap().len(), 1);
+    assert_eq!(en.current_epoch().unwrap(), 2);
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Removed);
+    n.edit(&en, b"from N");
+    n.enqueue(&mut en);
+    w.exchange(&mut en);
+    // fetch_all signs as A, which the relay now refuses: read the log of N.
+    let head = en.verified_head().unwrap().position;
+    let epochs: Vec<u64> = state::log_range(&en.db, 1, head)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, json)| {
+            let env = snailfish_protocol::envelope::Envelope::parse(json.as_bytes()).unwrap();
+            match snailfish_protocol::records::parse_payload(&env.payload_type, &env.payload)
+                .unwrap()
+                .body
+            {
+                snailfish_protocol::records::Body::Change { epoch, .. } => Some(epoch),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(epochs, vec![1, 1, 2]);
+}
+
+/// [STO-12], `PROTOCOL.md` 10.3: the user blocks B on the user page. The
+/// relay refuses B with `blocked`, B reports `paused: blocked`, and B syncs
+/// again after the unblock.
+#[test]
+fn blocked_device_pauses_until_the_unblock() {
+    let (mut w, _, b) = World::new();
+    let mut eb = w.engine(&b);
+    w.exchange(&mut eb);
+    let tenants = w.relay_data().join("tenants");
+    let tdir = std::fs::read_dir(&tenants)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let tc = Connection::open(tdir.join("tenant.db")).unwrap();
+    tc.execute(
+        "INSERT INTO blocks (kind, id) VALUES ('device', ?1)",
+        [eb.device_id()],
+    )
+    .unwrap();
+    w.exchange(&mut eb);
+    assert_eq!(eb.status(), Status::Blocked);
+    assert_eq!(Status::Blocked.text(), "paused: blocked");
+    tc.execute("DELETE FROM blocks", []).unwrap();
+    w.exchange(&mut eb);
+    assert_eq!(eb.status(), Status::Ok);
+}

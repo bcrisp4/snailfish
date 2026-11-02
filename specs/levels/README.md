@@ -35,7 +35,7 @@ The reference function `refLevel` reads the relay log only. It does not call `va
 | --- | --- |
 | Fast | Scenario tests and 2,000 sampled traces of up to 30 steps on `bounded`. |
 | Full | 20,000 sampled traces per check, up to 50 steps, on `bounded` (3 devices, `TOP` 2, 7 records) and `tiny`. Four mutants and six witnesses. |
-| Apalache | Both invariants on `tiny` up to 8 steps. |
+| Apalache | Both invariants on `tiny` up to 4 steps. At 8 steps, one Apalache run did not end in 68 minutes. |
 | TLC | Both invariants on every reachable state of `tiny` (2 devices, 5 records). Three mutants must produce a counterexample. |
 
 `grantBelowLevel` needs a third device, so TLC on `tiny` does not list it. The sampled tier catches it on `bounded`.
@@ -48,6 +48,16 @@ The reference function `refLevel` reads the relay log only. It does not call `va
 - [VER-11] (relay too old). It is an engine check of `GET /v1/info`.
 - A malicious relay, signatures and bases (`specs/spacelog`).
 - Liveness.
+
+## Rust conformance (M7)
+
+| Scenario in `test.qnt` | Rust tests |
+| --- | --- |
+| `raiseAfterUpdatesTest`, `removalThenRaiseTest`, `downgradeRefusedTest` | `crates/protocol/tests/removal.rs::level_raise_needs_every_active_device` (synthetic level 2) |
+| `lowLevelRefusedTest` | `crates/protocol/tests/removal.rs::a_type_that_the_write_level_drops_is_unsupported` |
+| `grantRaceTest` | `crates/protocol/tests/space.rs::grant_below_the_genesis_write_level_is_refused`, `crates/relay/tests/hardening.rs::write_level_is_stored_and_refuses_a_lower_device_level` |
+
+The engine writes no device or level record while level 1 is the only level (DESIGN.md C71).
 
 ## Commands
 
