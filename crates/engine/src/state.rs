@@ -164,13 +164,16 @@ fn migrate(db: &Connection) -> Result<(), EngineError> {
     }
     if found < 5 {
         // M5: the setup token of the first device (PROTOCOL.md 12.3), and
-        // the fields of the device status report (10.11).
+        // the fields of the device status report (10.11). An old outbox row
+        // keeps a NULL queue time: the migration has no relay clock offset,
+        // so report_fields stamps it with the corrected time.
         db.execute_batch(
             "BEGIN IMMEDIATE;
              CREATE TABLE setup_token (id INTEGER PRIMARY KEY CHECK (id = 1), token BLOB NOT NULL);
              ALTER TABLE meta ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE meta ADD COLUMN report BLOB;
+             ALTER TABLE meta ADD COLUMN report_time INTEGER;
              ALTER TABLE outbox ADD COLUMN queued INTEGER;
-             UPDATE outbox SET queued = CAST(strftime('%s', 'now') AS INTEGER);
              PRAGMA user_version = 5;
              COMMIT;",
         )?;
@@ -752,11 +755,19 @@ pub(crate) fn set_applied(db: &Connection, position: u64) -> Result<(), EngineEr
 }
 
 /// The fields of the device status report (10.11): the applied position,
-/// the pending outbox rows and the queue time of the oldest one.
-pub(crate) fn report_fields(db: &Connection) -> Result<(u64, u64, Option<u64>), EngineError> {
+/// the pending outbox rows and the queue time of the oldest one. A row from
+/// before schema 5 gets `now`, the corrected time, as its queue time.
+pub(crate) fn report_fields(
+    db: &Connection,
+    now: u64,
+) -> Result<(u64, u64, Option<u64>), EngineError> {
+    db.execute(
+        "UPDATE outbox SET queued = ?1 WHERE queued IS NULL",
+        [to_i64(now)?],
+    )?;
     let applied: i64 = db.query_row("SELECT applied FROM meta", [], |r| r.get(0))?;
     let (n, oldest): (i64, Option<i64>) = db.query_row(
-        "SELECT count(*), MIN(COALESCE(queued, 0)) FROM outbox WHERE state = ?1",
+        "SELECT count(*), MIN(queued) FROM outbox WHERE state = ?1",
         [PENDING],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -767,6 +778,28 @@ pub(crate) fn report_fields(db: &Connection) -> Result<(u64, u64, Option<u64>), 
         oldest.map(to_u64).transpose()?
     };
     Ok((to_u64(applied)?, n, oldest))
+}
+
+/// The last device status report that the relay accepted, and its corrected
+/// time.
+pub(crate) fn last_report(db: &Connection) -> Result<Option<(Vec<u8>, u64)>, EngineError> {
+    let (body, time): (Option<Vec<u8>>, Option<i64>) =
+        db.query_row("SELECT report, report_time FROM meta", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    match (body, time) {
+        (Some(b), Some(t)) => Ok(Some((b, to_u64(t)?))),
+        _ => Ok(None),
+    }
+}
+
+/// Keep the device status report that the relay accepted (10.11).
+pub(crate) fn set_last_report(db: &Connection, body: &[u8], time: u64) -> Result<(), EngineError> {
+    db.execute(
+        "UPDATE meta SET report = ?1, report_time = ?2",
+        params![body, to_i64(time)?],
+    )?;
+    Ok(())
 }
 
 /// The genesis record of the setup, if the verified log does not hold it.

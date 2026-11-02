@@ -194,10 +194,7 @@ impl Response {
     /// The value of the first header with this name, if any.
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        header(&self.headers, name)
     }
 }
 
@@ -1123,9 +1120,9 @@ struct OpenSpace {
     space_bytes: u64,
 }
 
-/// The value of the first header with this name.
-fn header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
-    req.headers
+/// The value of the first header with this name, in any case.
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())

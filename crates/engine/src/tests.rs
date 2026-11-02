@@ -1583,6 +1583,105 @@ fn device_status_report_holds_the_applied_position() {
     assert_eq!(w.device_applied(&ea), Some(3));
 }
 
+/// The request URLs of one exchange, as the host app sends them.
+fn exchange_urls(w: &World, e: &mut Engine) -> Vec<String> {
+    let mut s = e.start_sync();
+    let mut out = Vec::new();
+    while let Some(req) = s.next_request(e).unwrap() {
+        out.push(req.url.clone());
+        assert!(out.len() < 100, "the exchange does not end");
+        let (status, headers, body) = w.send(&req);
+        s.handle_response(e, status, &headers, &body).unwrap();
+    }
+    out
+}
+
+fn reports(urls: &[String]) -> usize {
+    urls.iter()
+        .filter(|u| u.ends_with("/device-status"))
+        .count()
+}
+
+/// `PROTOCOL.md` 10.11: a report that equals the last accepted one goes at
+/// most once an hour, so an idle device does not write the tenant file on
+/// each sync. A changed report goes at once.
+#[test]
+fn unchanged_device_status_goes_once_an_hour() {
+    let (mut w, mut a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    assert_eq!(reports(&exchange_urls(&w, &mut ea)), 0, "unchanged");
+    a.pull(&ea).unwrap();
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    assert_eq!(
+        reports(&exchange_urls(&w, &mut ea)),
+        1,
+        "a new applied position"
+    );
+    assert_eq!(reports(&exchange_urls(&w, &mut ea)), 0, "unchanged");
+    ea.db
+        .execute("UPDATE meta SET report_time = report_time - 3600", [])
+        .unwrap();
+    assert_eq!(reports(&exchange_urls(&w, &mut ea)), 1, "an hour later");
+}
+
+/// A change from before schema 5 has no queue time. The first report gives
+/// it the corrected time, not the raw device clock of the migration, and
+/// keeps that time for later reports.
+#[test]
+fn pre_schema_5_outbox_row_gets_the_corrected_time() {
+    let (mut w, mut a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    ea.db
+        .execute("UPDATE outbox SET queued = NULL", [])
+        .unwrap();
+    assert_eq!(
+        state::report_fields(&ea.db, 1_767_300_000).unwrap(),
+        (0, 1, Some(1_767_300_000))
+    );
+    assert_eq!(
+        state::report_fields(&ea.db, 1_767_400_000).unwrap().2,
+        Some(1_767_300_000)
+    );
+}
+
+/// DESIGN.md "Monitoring and alerting" item 6: a refusal that stops this
+/// device, while it stays active in the space, still reaches the user page.
+#[test]
+fn refused_fetch_still_reports_the_stopped_status() {
+    let (mut w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let mut s = ea.start_sync();
+    let info = s.next_request(&mut ea).unwrap().unwrap();
+    let (status, headers, body) = w.send(&info);
+    s.handle_response(&mut ea, status, &headers, &body).unwrap();
+    let fetch = s.next_request(&mut ea).unwrap().unwrap();
+    assert!(fetch.url.contains("/entries"), "{}", fetch.url);
+    s.handle_response(
+        &mut ea,
+        422,
+        &[],
+        br#"{"error":"invalid_record","message":"x"}"#,
+    )
+    .unwrap();
+    assert!(matches!(ea.status(), Status::Fork { .. }));
+    let report = s.next_request(&mut ea).unwrap().unwrap();
+    assert!(report.url.ends_with("/device-status"), "{}", report.url);
+    let (status, headers, body) = w.send(&report);
+    s.handle_response(&mut ea, status, &headers, &body).unwrap();
+    assert_eq!(
+        w.status_row(&ea, "state, applied").map(|r| r.0).as_deref(),
+        Some("stopped: fork")
+    );
+}
+
 /// `PROTOCOL.md` 8.5 and 12.3: an app clock 10 minutes ahead gets
 /// `expired`, which leaves the code unused. The second request signs with
 /// the relay time of the answer and gets the token.
@@ -1671,6 +1770,29 @@ fn refused_create_is_a_setup_failure_and_other_refusals_are_not() {
     )
     .unwrap();
     assert_eq!(ea.status(), Status::RelayUnavailable);
+}
+
+/// A refused space creation sends no device status report: the space does
+/// not hold this device, so the relay would refuse it.
+#[test]
+fn refused_create_sends_no_report() {
+    let w = World::with_a();
+    let mut ea = w.engine(&w.dev("a"));
+    let mut s = ea.start_sync();
+    let info = s.next_request(&mut ea).unwrap().unwrap();
+    let (status, headers, body) = w.send(&info);
+    s.handle_response(&mut ea, status, &headers, &body).unwrap();
+    let create = s.next_request(&mut ea).unwrap().unwrap();
+    assert_eq!(create.method, "PUT");
+    s.handle_response(
+        &mut ea,
+        409,
+        &[],
+        br#"{"error":"space_exists","message":"x"}"#,
+    )
+    .unwrap();
+    assert!(matches!(ea.status(), Status::Fork { .. }));
+    assert!(s.next_request(&mut ea).unwrap().is_none());
 }
 
 /// The debug form of a sign-in leaves out the PKCE verifier, which is a
@@ -2951,6 +3073,42 @@ fn enroll_with_changed_checkpoint(
             .unwrap();
     }
     (eb.status(), methods)
+}
+
+/// A new device in its enrollment is not active in the space, so after a
+/// refusal it sends no device status report: the relay would refuse it.
+#[test]
+fn enrolling_device_sends_no_report_after_a_refusal() {
+    let (mut w, mut ea) = world_with_new_b();
+    let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
+    w.open(&mut ea, &mut te);
+    let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
+    w.drive(&mut ea, &mut te, &mut ne, (true, true));
+    let j = ne.joined().unwrap();
+    install_enrollment(
+        &w.root.join("b"),
+        crate::enroll::space_of(&j, URL, APP),
+        &w.keys[1],
+        &j,
+    )
+    .unwrap();
+    let mut eb = w.engine(&w.dev("b"));
+    let mut s = eb.start_sync();
+    let info = s.next_request(&mut eb).unwrap().unwrap();
+    let resp = w.relay.handle(&to_relay(&info));
+    s.handle_response(&mut eb, resp.status, &time(&resp), &resp.body)
+        .unwrap();
+    let fetch = s.next_request(&mut eb).unwrap().unwrap();
+    assert!(fetch.url.contains("/entries"), "{}", fetch.url);
+    s.handle_response(
+        &mut eb,
+        422,
+        &[],
+        br#"{"error":"invalid_record","message":"x"}"#,
+    )
+    .unwrap();
+    assert!(matches!(eb.status(), Status::Fork { .. }));
+    assert!(s.next_request(&mut eb).unwrap().is_none());
 }
 
 /// [ENR-9], `PROTOCOL.md` 11.2: the checkpoint check needs a grant for the

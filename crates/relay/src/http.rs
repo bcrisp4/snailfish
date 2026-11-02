@@ -93,6 +93,21 @@ impl RateLimit {
     }
 }
 
+/// The bucket of a peer address (12.6): an IPv4 address, or the /64 prefix of
+/// an IPv6 address. One IPv6 host usually has a whole /64, so a bucket for
+/// each address would let it pick a new bucket for each request.
+fn bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(std::net::Ipv6Addr::from(
+                u128::from(v6) & !u128::from(u64::MAX),
+            )),
+        },
+    }
+}
+
 /// True for a route of `PROTOCOL.md` 12.6.
 fn limited(method: &str, path: &str) -> bool {
     matches!(
@@ -113,7 +128,7 @@ async fn handler(relay: Relay, limit: Arc<RateLimit>, req: HttpRequest<Body>) ->
         let ip = req
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
-            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |c| c.0.ip());
+            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |c| bucket(c.0.ip()));
         if !limit.allow(ip, Instant::now()) {
             return respond(Response::error(
                 429,
@@ -248,6 +263,28 @@ mod tests {
         let mut kept: Vec<IpAddr> = m.keys().copied().collect();
         kept.sort();
         assert_eq!(kept, vec![ip(0), ip(1), late]);
+    }
+
+    #[test]
+    fn ipv6_addresses_share_the_bucket_of_their_64() {
+        // 12.6: a host that rotates addresses inside its /64 gets no new
+        // bucket. A mapped IPv4 address is that IPv4 address.
+        let ip = |s: &str| bucket(s.parse().unwrap());
+        assert_eq!(
+            ip("2001:db8:1:2::1"),
+            ip("2001:db8:1:2:ffff:ffff:ffff:ffff")
+        );
+        assert_ne!(ip("2001:db8:1:2::1"), ip("2001:db8:1:3::1"));
+        assert_eq!(ip("::ffff:192.0.2.1"), ip("192.0.2.1"));
+        assert_ne!(ip("192.0.2.1"), ip("192.0.2.2"));
+        let l = RateLimit::default();
+        let t0 = Instant::now();
+        for n in 0..120_u16 {
+            let a = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, n);
+            assert!(l.allow(bucket(IpAddr::V6(a)), t0));
+        }
+        let next = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 9, 9, 9, 9);
+        assert!(!l.allow(bucket(IpAddr::V6(next)), t0));
     }
 
     #[test]

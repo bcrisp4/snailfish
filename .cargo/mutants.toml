@@ -75,6 +75,10 @@ exclude_re = [
   # check` runs it.
   "webhook.rs:.*: replace run with \\(\\)",
   "webhook.rs:.*: replace >= with < in run",
+  # Only sign_in_routes_are_rate_limited catches this. Its bucket refills
+  # from the wall clock, so the nextest `mutants` profile omits it, and
+  # `make check` runs it. full_map_drops_only_full_buckets covers the bucket.
+  "http.rs:.*: delete ! in handler",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`

@@ -136,6 +136,10 @@ fn port(p: &[u8]) -> Option<u16> {
     u16::try_from(n).ok()
 }
 
+/// The loopback forms of a 12.2 redirect URI: each prefix, then a port and a
+/// path. The relay builds the CSP source of the approval page from them.
+pub const LOOPBACK_REDIRECT_PREFIXES: [&str; 2] = ["http://127.0.0.1:", "http://[::1]:"];
+
 /// True if `uri` is a redirect URI of `PROTOCOL.md` 12.2 (RFC 8252
 /// section 7): a loopback URI with an IP literal and a port, or a
 /// private-use scheme with a `.` and no authority part ([USR-4]).
@@ -144,8 +148,8 @@ pub fn redirect_uri_ok(uri: &[u8]) -> bool {
     if uri.len() > MAX_URI {
         return false;
     }
-    for prefix in [&b"http://127.0.0.1:"[..], &b"http://[::1]:"[..]] {
-        if let Some(rest) = uri.strip_prefix(prefix) {
+    for prefix in LOOPBACK_REDIRECT_PREFIXES {
+        if let Some(rest) = uri.strip_prefix(prefix.as_bytes()) {
             let slash = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
             let (p, path) = rest.split_at(slash);
             return port(p).is_some() && path.first() == Some(&b'/') && path_ok(path);

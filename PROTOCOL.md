@@ -745,6 +745,9 @@ Limits:
 
 The engine sends its status after each sync, as the last request of the sync (DESIGN.md "Monitoring and alerting" item 6). The user page shows it (section 12.4).
 
+- A sync that a refusal stops also sends the report, if the device stays active in the space: a fork, or `too_large`. After any other refusal, the relay would refuse the report too.
+- The engine skips a report that equals its last accepted report, if that report is less than 3600 seconds old in corrected time (8.5). The stall rule (DESIGN.md "Monitoring and alerting" item 7) reads the report time, so an idle device still reports once an hour.
+
 Request body:
 
 ```json
@@ -995,4 +998,4 @@ The relay sends `POST` with `content-type: application/json` and this body:
 The relay limits the requests of each IP address to the routes `GET /v1/e/{session}`, `POST /v1/e/{session}`, `POST /v1/setup/token`, `POST /u/signin/start`, `POST /u/signin/finish`, `POST /u/invite/start` and `POST /u/invite/finish`.
 
 - The limit is a token bucket for each address: 120 requests, filled at 2 requests each second. A request with no token gets `rate_limited`.
-- The address is the peer address of the TCP connection. Behind a reverse proxy, all clients share the address of the proxy.
+- The address is the peer address of the TCP connection. An IPv6 address counts as its /64 prefix, because one host usually holds a whole /64. An IPv4-mapped IPv6 address counts as its IPv4 address. Behind a reverse proxy, all clients share the address of the proxy.

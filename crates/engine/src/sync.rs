@@ -51,7 +51,8 @@ enum Sent {
     RepairChunk(Vec<(u64, String)>),
     RepairFinish,
     Status,
-    DeviceStatus,
+    // The body of the device status report.
+    DeviceStatus(Vec<u8>),
 }
 
 /// A repair session in this exchange (`PROTOCOL.md` 10.9).
@@ -91,6 +92,9 @@ pub struct Sync {
 
 /// The most fetch pages with no new entry in one exchange.
 const MAX_EMPTY_PAGES: u32 = 3;
+/// An unchanged device status report goes at most once in this many
+/// seconds of corrected time (`PROTOCOL.md` 10.11).
+pub(crate) const REPORT_EVERY: u64 = 3600;
 
 /// A fault of the relay that stops sync (`stopped: fork`).
 struct Stop(String);
@@ -163,7 +167,26 @@ impl Sync {
                     next
                 }
                 Phase::Report => Some(Sent::Status),
-                Phase::DeviceReport => Some(Sent::DeviceStatus),
+                Phase::DeviceReport => {
+                    let now = engine.now();
+                    let (applied, outbox, oldest) = state::report_fields(&engine.db, now)?;
+                    let body = setup::device_status_body(&setup::DeviceStatus {
+                        state: engine.status.text().to_owned(),
+                        outbox,
+                        oldest,
+                        applied,
+                        epoch: 1,
+                    });
+                    // PROTOCOL.md 10.11: a report that equals the last
+                    // accepted one goes at most once in REPORT_EVERY.
+                    let unchanged = state::last_report(&engine.db)?
+                        .is_some_and(|(b, t)| b == body && now < t.saturating_add(REPORT_EVERY));
+                    if unchanged {
+                        self.phase = Phase::Done;
+                        continue;
+                    }
+                    Some(Sent::DeviceStatus(body))
+                }
                 Phase::Grants | Phase::Push => {
                     if !self.queued {
                         self.queue(engine)?;
@@ -308,23 +331,13 @@ impl Sync {
                     true,
                 )
             }
-            Sent::DeviceStatus => {
-                let (applied, outbox, oldest) = state::report_fields(&engine.db)?;
-                let body = setup::device_status_body(&setup::DeviceStatus {
-                    state: engine.status.text().to_owned(),
-                    outbox,
-                    oldest,
-                    applied,
-                    epoch: 1,
-                });
-                (
-                    "POST",
-                    format!("{space_path}/device-status"),
-                    String::new(),
-                    body,
-                    true,
-                )
-            }
+            Sent::DeviceStatus(body) => (
+                "POST",
+                format!("{space_path}/device-status"),
+                String::new(),
+                body.clone(),
+                true,
+            ),
         })
     }
 
@@ -412,9 +425,9 @@ impl Sync {
             Sent::RepairChunk(chunk) => self.repair_answer(&chunk, body, false),
             Sent::RepairFinish => self.repair_finished(engine, body),
             Sent::Status => self.status_answer(engine, body),
-            Sent::DeviceStatus => {
+            Sent::DeviceStatus(report) => {
                 self.phase = Phase::Done;
-                Ok(())
+                state::set_last_report(&engine.db, &report, engine.now()).map_err(Answer::Engine)
             }
         };
         match result {
@@ -426,7 +439,13 @@ impl Sync {
             }
             Err(Answer::Stop(Stop(cause))) => {
                 engine.status = Status::Fork { cause };
-                self.phase = Phase::Done;
+                // An active device reports the stop to the user page. A new
+                // device in its enrollment is not active, so it sends nothing.
+                self.phase = if enrolling(engine)? {
+                    Phase::Done
+                } else {
+                    Phase::DeviceReport
+                };
                 Ok(())
             }
             Err(Answer::Engine(e)) => Err(e),
@@ -449,7 +468,7 @@ impl Sync {
         }
         // A refused status report changes no status: the report is for the
         // user page only.
-        if matches!(sent, Sent::DeviceStatus) {
+        if matches!(sent, Sent::DeviceStatus(_)) {
             self.phase = Phase::Done;
             return Ok(());
         }
@@ -496,7 +515,16 @@ impl Sync {
             },
             _ => Status::RelayUnavailable,
         };
-        self.phase = Phase::Done;
+        // DESIGN.md "Monitoring and alerting" item 6: a refusal that leaves
+        // this device active in the space still reaches the user page. The
+        // other refusals would refuse the report too.
+        self.phase = match (&engine.status, &sent) {
+            (_, Sent::Create) => Phase::Done,
+            (Status::Fork { .. } | Status::Degraded { .. }, _) if !enrolling(engine)? => {
+                Phase::DeviceReport
+            }
+            _ => Phase::Done,
+        };
         Ok(())
     }
 

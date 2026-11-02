@@ -85,7 +85,7 @@ pub const CEREMONY_SECONDS: u64 = 300;
 /// new ceremony replaces the oldest, so a flood of starts cannot refuse
 /// the sign-in of the user: it must outpace the rate limit of 12.6 for the
 /// whole time that the user takes to answer the passkey prompt.
-pub const MAX_CEREMONIES: usize = 16_384;
+const MAX_CEREMONIES: usize = 16_384;
 /// The session cookie name.
 pub const COOKIE: &str = "sf_session";
 /// The HTML content type.
@@ -112,6 +112,8 @@ pub(crate) struct Auth {
     origin: String,
     secure: bool,
     ceremonies: Mutex<HashMap<[u8; 16], (Ceremony, u64)>>,
+    // MAX_CEREMONIES. A unit test sets a small capacity.
+    max_ceremonies: usize,
 }
 
 fn read_or_make_key(dir: &Path) -> Result<[u8; 32], OpenError> {
@@ -170,6 +172,7 @@ impl Auth {
             origin: cfg.origin.clone(),
             secure: origin.scheme() == "https",
             ceremonies: Mutex::new(HashMap::new()),
+            max_ceremonies: MAX_CEREMONIES,
         })
     }
 
@@ -218,7 +221,7 @@ impl Auth {
         let id: [u8; 16] = random()?;
         let mut m = self.ceremonies.lock().map_err(|_| internal())?;
         m.retain(|_, (_, exp)| now < *exp);
-        if m.len() >= MAX_CEREMONIES {
+        if m.len() >= self.max_ceremonies {
             // Each ceremony lasts the same time, so the oldest expires first.
             let oldest = m.iter().min_by_key(|(_, (_, exp))| *exp).map(|(k, _)| *k);
             if let Some(k) = oldest {
@@ -307,7 +310,7 @@ fn page(title: &str, body: &str) -> Reply {
 /// `http://[::1]:<port>`, or `<scheme>:` for a private-use scheme. The URI
 /// passed `redirect_uri_ok`, so the source holds no space, `;` or `,`.
 fn redirect_source(uri: &str) -> String {
-    for prefix in ["http://127.0.0.1:", "http://[::1]:"] {
+    for prefix in setup::LOOPBACK_REDIRECT_PREFIXES {
         if let Some(rest) = uri.strip_prefix(prefix) {
             let port = rest.split('/').next().unwrap_or_default();
             return format!("{prefix}{port}");
@@ -468,7 +471,9 @@ impl Relay {
     /// Each route under `/u/` (12.4).
     pub(super) fn user_route(&self, req: &Request, now: u64) -> ApiResult<Reply> {
         // Write rule 1.
-        if header(req, "signature").is_some() || header(req, "signature-input").is_some() {
+        if header(&req.headers, "signature").is_some()
+            || header(&req.headers, "signature-input").is_some()
+        {
             return Err(api(
                 400,
                 "bad_request",
@@ -477,7 +482,7 @@ impl Relay {
         }
         let post = req.method == "POST";
         // Write rule 2.
-        if post && header(req, "origin") != Some(self.auth.origin.as_str()) {
+        if post && header(&req.headers, "origin") != Some(self.auth.origin.as_str()) {
             return Err(api(
                 403,
                 "bad_origin",
@@ -806,7 +811,7 @@ impl Relay {
         let want = self.auth.csrf(&session.id);
         let bad_csrf = || api(403, "bad_csrf", "the anti-CSRF token is missing or wrong");
         if matches!(path, "/u/passkeys/start" | "/u/passkeys/finish") {
-            if header(req, "snailfish-csrf") != Some(want.as_str()) {
+            if header(&req.headers, "snailfish-csrf") != Some(want.as_str()) {
                 return Err(bad_csrf());
             }
             if path == "/u/passkeys/finish" {
@@ -1826,13 +1831,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::new(dir.path().join("data"), "sync.example.net");
         cfg.secrets_dir = dir.path().join("secrets");
-        let a = Auth::open(&cfg).unwrap();
+        let mut a = Auth::open(&cfg).unwrap();
+        assert_eq!(a.max_ceremonies, MAX_CEREMONIES);
+        a.max_ceremonies = 4;
         let first = a.keep(ceremony(&a), 100).unwrap();
-        for _ in 1..MAX_CEREMONIES {
+        for _ in 1..4 {
             a.keep(ceremony(&a), 101).unwrap();
         }
         let last = a.keep(ceremony(&a), 102).unwrap();
-        assert_eq!(a.ceremonies.lock().unwrap().len(), MAX_CEREMONIES);
+        assert_eq!(a.ceremonies.lock().unwrap().len(), 4);
         assert!(a.take(&hex(&first), 102).is_err(), "the oldest stays");
         assert!(a.take(&hex(&last), 102).is_ok(), "the newest went");
     }
