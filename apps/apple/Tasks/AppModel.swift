@@ -56,15 +56,16 @@ final class AppModel: ObservableObject {
         // One keychain service for each data directory: two devices of one
         // space on one Mac must not share a key item.
         let service = "snailfish." + (Bundle.main.bundleIdentifier ?? appID) + "." + root.lastPathComponent
-        let device = try SyncDevice(root: root, keyStore: KeychainKeyStore(service: service))
         #if os(iOS)
-            // Documents is visible in Finder file sharing, so Ben can copy
-            // the log off the iPhone.
+            // Documents is visible in Finder file sharing, so the log can be
+            // copied off the iPhone.
             let logDir = try fm.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         #else
             let logDir = root
         #endif
-        return AppModel(device: device, measurements: Measurements(file: logDir.appendingPathComponent("measure.jsonl")))
+        let log = Measurements(file: logDir.appendingPathComponent("measure.jsonl"))
+        let device = try SyncDevice(root: root, keyStore: KeychainKeyStore(service: service), measurements: log)
+        return AppModel(device: device, measurements: log)
     }
 
     func refresh() async {
