@@ -4,7 +4,7 @@
 # One failed test catches the mutant. Stop the other tests at once, because a
 # caught mutant otherwise waits for the slowest test that is running.
 fail-fast = { max-fail = 1, terminate = "immediate" }
-# This test runs a second `cargo build` of the bindings in the dev profile, so
-# it adds about 20 s to each mutant. It catches only the uniffi-bindgen `main`
+# This test binary runs a second `cargo build` of the bindings in the dev
+# profile, so it adds about 20 s to each mutant. It catches only the uniffi-bindgen `main`
 # mutant, which .cargo/mutants.toml excludes. `make check` still runs it.
-default-filter = "not test(=generates_python_module_for_the_binding_library)"
+default-filter = "not binary_id(snailfish-uniffi-bindgen::generate)"
