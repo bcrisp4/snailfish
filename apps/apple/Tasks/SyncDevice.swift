@@ -20,6 +20,9 @@ import Snailfish
 actor SyncDevice {
     let root: URL
     let keyStore: KeyStore
+    /// Deletes the key item of a space. The binding `KeyStore` has no
+    /// delete, so the owner of the store passes it.
+    let deleteKeys: (String) throws -> Void
     let store: TaskStore
     let measurements: Measurements
     private(set) var space: SpaceRef?
@@ -31,15 +34,21 @@ actor SyncDevice {
     nonisolated var engineDir: URL { root.appendingPathComponent("engine", isDirectory: true) }
     private nonisolated var spaceFile: URL { root.appendingPathComponent("space.json") }
 
-    init(root: URL, keyStore: KeyStore, measurements: Measurements? = nil) throws {
+    init(
+        root: URL, keyStore: KeyStore, deleteKeys: @escaping (String) throws -> Void,
+        measurements: Measurements? = nil
+    ) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         self.root = root
         self.keyStore = keyStore
+        self.deleteKeys = deleteKeys
         let db = try AppDatabase(path: root.appendingPathComponent("app.sqlite3").path)
         store = TaskStore(db: db, deviceID: try Self.localID(root))
         self.measurements = measurements ?? Measurements(file: root.appendingPathComponent("measure.jsonl"))
         if let data = try? Data(contentsOf: root.appendingPathComponent("space.json")) {
             let sp = try JSONDecoder().decode(SpaceFile.self, from: data).ref
+            // A file of an earlier build, or of a crash before the exclusion.
+            try Self.excludeFromBackup(spaceFile)
             space = sp
             let e = try Engine.open(dataDir: engineDir.path, space: sp, keyStore: keyStore)
             engine = e
@@ -220,6 +229,7 @@ actor SyncDevice {
     /// exists, in one transaction ([MRG-5]), and the next sync creates the
     /// space on the relay.
     func turnOnSync(space sp: SpaceRef, keys: DeviceKeys, envelopes: [String], setupToken: String) throws {
+        try clearUncommitted()
         try installSetup(
             dataDir: engineDir.path, space: sp, keys: keys, envelopes: envelopes, setupToken: setupToken,
             keyStore: keyStore)
@@ -238,6 +248,7 @@ actor SyncDevice {
     /// The tasks of the device before sync get outbox rows ([MRG-5]). The
     /// engine takes them after the first sync opens the app key.
     func finishJoin(space sp: SpaceRef, keys: DeviceKeys, joined: Joined) throws {
+        try clearUncommitted()
         try installEnrollment(dataDir: engineDir.path, space: sp, keys: keys, joined: joined, keyStore: keyStore)
         try openEngine(sp) { e in
             try store.db.transaction {
@@ -245,6 +256,15 @@ actor SyncDevice {
                 try store.outboxEveryField { try e.newChangeId() }
             }
         }
+    }
+
+    /// Delete the engine state of a setup or a join that stopped before it
+    /// wrote `space.json`, so the next install starts in an empty directory.
+    /// The key item of that attempt stays, because no file names its space.
+    private func clearUncommitted() throws {
+        guard !FileManager.default.fileExists(atPath: spaceFile.path) else { return }
+        try FileManager.default.removeItem(at: engineDir)
+        try excludeEngineFromBackup()
     }
 
     /// Open the engine, run `prepare`, then write `space.json`. The file is
@@ -268,14 +288,17 @@ actor SyncDevice {
     func leaveFailedSetup() throws {
         // A sync holds the engine, so its directory and lock stay in use.
         guard !syncing else { throw SetupError.message("a sync is running: try again") }
-        if let account = space?.logId, let keychain = keyStore as? KeychainKeyStore {
-            try keychain.delete(account: account)
-        }
+        let account = space?.logId
         engine = nil
         space = nil
-        try? FileManager.default.removeItem(at: spaceFile)
+        // `space.json` goes first and the keys last: a failure part way
+        // must not leave a `space.json` with no keys.
+        do {
+            try FileManager.default.removeItem(at: spaceFile)
+        } catch let e as CocoaError where e.code == .fileNoSuchFile {}
         try FileManager.default.removeItem(at: engineDir)
         try excludeEngineFromBackup()
+        if let account { try deleteKeys(account) }
     }
 }
 

@@ -37,7 +37,7 @@ final class AppModel: ObservableObject {
     private var syncing = false
     // The last error of a sync, for the status text. An alert on each
     // failure would return every 5 s while the device is offline.
-    private var syncError: String?
+    @Published private(set) var syncError: String?
     // A setup or an enrollment uses the engine. The sync loop waits, so two
     // state machines never drive one engine at the same time.
     private var flows = 0
@@ -73,7 +73,9 @@ final class AppModel: ObservableObject {
             let logDir = root
         #endif
         let log = Measurements(file: logDir.appendingPathComponent("measure.jsonl"))
-        let device = try SyncDevice(root: root, keyStore: KeychainKeyStore(service: service), measurements: log)
+        let keychain = KeychainKeyStore(service: service)
+        let device = try SyncDevice(
+            root: root, keyStore: keychain, deleteKeys: { try keychain.delete(account: $0) }, measurements: log)
         return AppModel(device: device, measurements: log)
     }
 
@@ -145,7 +147,7 @@ final class AppModel: ObservableObject {
         } catch {
             // A connection failure is the app's error. The engine status
             // shows a relay error.
-            syncError = error.localizedDescription
+            syncError = (error as? URLError)?.localizedDescription ?? "\(error)"
         }
         await refresh()
     }

@@ -10,6 +10,7 @@ final class MemKeyStore: KeyStore, @unchecked Sendable {
 
     func load(account: String) throws -> Data? { lock.withLock { items[account] } }
     func store(account: String, secret: Data) throws { lock.withLock { items[account] = secret } }
+    func delete(account: String) throws { _ = lock.withLock { items.removeValue(forKey: account) } }
 }
 
 /// The two sides of one enrollment. The device that shows the session puts
@@ -120,10 +121,12 @@ final class RelayTests: XCTestCase {
     private func device(_ name: String) throws -> SyncDevice {
         let d = FileManager.default.temporaryDirectory.appendingPathComponent("tasks-\(name)-\(UUID().uuidString)")
         dirs.append(d)
-        let store: KeyStore =
-            hasKeychainEntitlement()
-            ? KeychainKeyStore(service: "snailfish.tests." + UUID().uuidString) : MemKeyStore()
-        return try SyncDevice(root: d, keyStore: store)
+        if hasKeychainEntitlement() {
+            let store = KeychainKeyStore(service: "snailfish.tests." + UUID().uuidString)
+            return try SyncDevice(root: d, keyStore: store, deleteKeys: { try store.delete(account: $0) })
+        }
+        let store = MemKeyStore()
+        return try SyncDevice(root: d, keyStore: store, deleteKeys: { try store.delete(account: $0) })
     }
 
     /// The browser step: the approver signs in and allows the request, and
@@ -268,7 +271,7 @@ final class RelayTests: XCTestCase {
         try await py.call("POST", "setup")
         try await py.call("POST", "edit", ["task": "p1", "field": "title", "value": #""café from python""#])
         let v1 = try await py.call("POST", "sync")
-        XCTAssertEqual(v1, "Status.OK()")
+        XCTAssertEqual(v1, "ok")
 
         // S2 with the Python device as the trusted device. It shows the
         // session, and the app reads the payload. The app has an edit from
@@ -288,7 +291,7 @@ final class RelayTests: XCTestCase {
             XCTAssertEqual(v, .ok)
         }
         let v2 = try await py.call("POST", "sync")
-        XCTAssertEqual(v2, "Status.OK()")
+        XCTAssertEqual(v2, "ok")
 
         // Edits both ways: Swift edits a Python task, and Python edits a
         // Swift task.

@@ -142,9 +142,10 @@ struct StatusBar: View {
     }
 
     private var color: Color {
+        if model.status.hasPrefix("stopped") { return .red }
+        if model.syncError != nil { return .orange }
         if model.status.hasPrefix("ok") { return .green }
         if model.status.hasPrefix("paused") || model.status.hasPrefix("degraded") { return .orange }
-        if model.status.hasPrefix("stopped") { return .red }
         return .gray
     }
 }

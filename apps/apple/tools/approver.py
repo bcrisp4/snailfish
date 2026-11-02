@@ -19,7 +19,7 @@ reads the changes of the other:
 
 - `POST /py/setup`: create a space with a new demo device.
 - `POST /py/edit?task=T&field=F&value=JSON`: one edit.
-- `POST /py/sync`: one sync. The answer is the status.
+- `POST /py/sync`: one sync. The answer is `ok`, or the status.
 - `GET /py/tasks`: the tasks as JSON.
 - `POST /py/invite`: start an enrollment that shows the session. The
   answer is the QR payload.
@@ -95,6 +95,10 @@ class PyDevice:
     def invite(self) -> str:
         """Start an enrollment in a thread, and return its QR payload."""
         dev = self.device()
+        # New queues, so values of an earlier enrollment cannot feed this one.
+        self.payload = queue.Queue()
+        self.own_code = queue.Queue()
+        self.other_code = queue.Queue()
 
         def answer(code: str) -> bool:
             self.own_code.put(code)
@@ -156,7 +160,8 @@ def main() -> None:
                     py.device().edit(q["task"], q["field"], json.loads(q["value"]))
                     body = ""
                 elif method == "POST" and u.path == "/py/sync":
-                    body = str(py.device().sync(py.send))
+                    status = py.device().sync(py.send)
+                    body = "ok" if status.is_ok() else str(status)
                 elif method == "GET" and u.path == "/py/tasks":
                     body = json.dumps(py.device().tasks())
                 elif method == "POST" and u.path == "/py/invite":
