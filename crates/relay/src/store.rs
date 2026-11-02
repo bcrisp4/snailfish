@@ -22,7 +22,7 @@ pub enum Kind {
 }
 
 /// The schema version of every file kind.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The schema of `directory.db`.
 const DIRECTORY_DDL: &str = "CREATE TABLE IF NOT EXISTS users (
@@ -125,7 +125,11 @@ const TENANT_DDL: &str = "CREATE TABLE IF NOT EXISTS tenant (
                  ) WITHOUT ROWID;
                  CREATE TABLE IF NOT EXISTS webhook_outbox (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, queued INTEGER NOT NULL
-                 );";
+                 );
+                 CREATE TABLE IF NOT EXISTS blocks (
+                    kind TEXT NOT NULL CHECK (kind IN ('device', 'group')), id TEXT NOT NULL,
+                    PRIMARY KEY (kind, id)
+                 ) WITHOUT ROWID;";
 
 /// The schema of a space file.
 const SPACE_DDL: &str = "CREATE TABLE IF NOT EXISTS space (
@@ -179,7 +183,26 @@ const SPACE_DDL: &str = "CREATE TABLE IF NOT EXISTS space (
                  );
                  INSERT OR IGNORE INTO usage (id, bytes)
                     SELECT 1, COALESCE(SUM(length(CAST(envelope AS BLOB))), 0) FROM entries
-                    WHERE payload_type LIKE 'snailfish.change.%';";
+                    WHERE payload_type LIKE 'snailfish.change.%';
+                 CREATE TABLE IF NOT EXISTS removed (
+                    device_id BLOB PRIMARY KEY,
+                    position INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS security_usage (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    bytes INTEGER NOT NULL
+                 );
+                 INSERT OR IGNORE INTO security_usage (id, bytes)
+                    SELECT 1, COALESCE(SUM(length(CAST(envelope AS BLOB))), 0) FROM entries
+                    WHERE payload_type NOT LIKE 'snailfish.change.%'
+                      AND payload_type NOT LIKE 'snailfish.snapshot.%'
+                      AND payload_type NOT LIKE 'snailfish.accept.%';
+                 CREATE TABLE IF NOT EXISTS security_counts (
+                    signer TEXT NOT NULL,
+                    day INTEGER NOT NULL,
+                    n INTEGER NOT NULL,
+                    PRIMARY KEY (signer, day)
+                 ) WITHOUT ROWID;";
 
 impl Kind {
     fn ddl(self) -> &'static str {

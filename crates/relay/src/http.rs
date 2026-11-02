@@ -123,12 +123,40 @@ fn limited(method: &str, path: &str) -> bool {
     ) || (matches!(method, "GET" | "POST") && path.starts_with("/v1/e/"))
 }
 
+/// The client address of the rate limit (12.6). Only a peer that
+/// `--trusted-proxy` lists can name another address, in the last entry of
+/// its last `X-Forwarded-For` header, because a client can send the header
+/// itself.
+fn client_ip<'a>(
+    peer: IpAddr,
+    trusted: &[IpAddr],
+    forwarded: impl Iterator<Item = &'a str>,
+) -> IpAddr {
+    let peer = peer.to_canonical();
+    if !trusted.iter().any(|t| t.to_canonical() == peer) {
+        return peer;
+    }
+    forwarded
+        .last()
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(|a| a.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer)
+}
+
 async fn handler(relay: Relay, limit: Arc<RateLimit>, req: HttpRequest<Body>) -> HttpResponse {
     if limited(req.method().as_str(), req.uri().path()) {
-        let ip = req
+        let peer = req
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
-            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |c| bucket(c.0.ip()));
+            .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |c| c.0.ip());
+        let ip = bucket(client_ip(
+            peer,
+            &relay.config().trusted_proxies,
+            req.headers()
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        ));
         if !limit.allow(ip, Instant::now()) {
             return respond(Response::error(
                 429,
@@ -263,6 +291,24 @@ mod tests {
         let mut kept: Vec<IpAddr> = m.keys().copied().collect();
         kept.sort();
         assert_eq!(kept, vec![ip(0), ip(1), late]);
+    }
+
+    #[test]
+    fn forwarded_address_counts_only_from_a_trusted_proxy() {
+        // 12.6: behind `tailscale serve` every client connects from the
+        // proxy. A listed proxy names the client. Any other peer cannot,
+        // or a client would pick a new bucket for each request.
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let client: IpAddr = "100.64.1.2".parse().unwrap();
+        let other: IpAddr = "100.64.9.9".parse().unwrap();
+        let hdr = ["1.1.1.1, 100.64.1.2"];
+        assert_eq!(client_ip(proxy, &[proxy], hdr.into_iter()), client);
+        assert_eq!(client_ip(other, &[proxy], hdr.into_iter()), other);
+        assert_eq!(client_ip(proxy, &[], hdr.into_iter()), proxy);
+        assert_eq!(client_ip(proxy, &[proxy], ["junk"].into_iter()), proxy);
+        assert_eq!(client_ip(proxy, &[proxy], std::iter::empty()), proxy);
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(client_ip(mapped, &[proxy], hdr.into_iter()), client);
     }
 
     #[test]

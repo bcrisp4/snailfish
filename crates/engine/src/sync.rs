@@ -175,7 +175,7 @@ impl Sync {
                         outbox,
                         oldest,
                         applied,
-                        epoch: 1,
+                        epoch: engine.current_epoch()?,
                     });
                     // PROTOCOL.md 10.11: a report that equals the last
                     // accepted one goes at most once in REPORT_EVERY.
@@ -362,6 +362,7 @@ impl Sync {
                 expires: now.saturating_add(request::MAX_LIFETIME),
                 nonce: snailfish_protocol::keys::random_bytes().map_err(|_| EngineError::Random)?,
                 keyid: engine.device_id,
+                recovery: false,
             };
             let t = Target {
                 method,
@@ -448,6 +449,11 @@ impl Sync {
                 };
                 Ok(())
             }
+            Err(Answer::Removed) => {
+                engine.status = Status::Removed;
+                self.phase = Phase::Done;
+                Ok(())
+            }
             Err(Answer::Engine(e)) => Err(e),
         }
     }
@@ -475,6 +481,10 @@ impl Sync {
         let late = self.repair.as_ref().is_some_and(|r| r.late);
         engine.status = match code.as_deref() {
             Some("wrong_authority") => Status::RelayAuthority,
+            // [STO-12]: the user blocked this device on the user page.
+            Some("blocked") => Status::Blocked,
+            // T8: an epoch record removed this device.
+            Some("removed") => Status::Removed,
             Some("expired") if !self.retried => {
                 // The offset is now fresh from this answer. Send once more.
                 self.retried = true;
@@ -566,9 +576,12 @@ impl Sync {
         let tx = Transaction::new_unchecked(&engine.db, TransactionBehavior::Immediate)
             .map_err(|e| Answer::Engine(e.into()))?;
         let mut degraded = None;
-        for (pos, entry) in &f.entries {
-            if let Some(cause) = verify_entry(engine, &tx, *pos, entry)? {
-                degraded = Some(cause);
+        {
+            let mut view = DbSpace::new(&tx, log_id).map_err(Answer::Engine)?;
+            for (pos, entry) in &f.entries {
+                if let Some(cause) = verify_entry(engine, &mut view, *pos, entry)? {
+                    degraded = Some(cause);
+                }
             }
         }
         let (head, digest) = state::head(&tx, &log_id).map_err(Answer::Engine)?;
@@ -770,6 +783,12 @@ impl Sync {
                 AppendResult::Refused(code) if code == "quota" => {
                     engine.status = Status::Quota;
                 }
+                // [DLV-7]: the relay holds no copy, because it checks a
+                // known change_id first. The change goes again with the
+                // current key after the fetch shows the newer epoch.
+                AppendResult::Refused(code) if code == "wrong_epoch" => {
+                    state::stale_epoch(&engine.db, cid).map_err(Answer::Engine)?;
+                }
                 // [DLV-9]: a permanent refusal.
                 AppendResult::Refused(code) => {
                     state::refuse(&engine.db, cid, &code).map_err(Answer::Engine)?;
@@ -868,15 +887,15 @@ pub(crate) fn batch(items: Vec<(Item, String)>, limits: &Limits) -> (Batches, Ve
 /// signature before `store_entry` changes any state.
 fn verify_entry(
     engine: &Engine,
-    tx: &Transaction<'_>,
+    view: &mut DbSpace<'_>,
     pos: u64,
     entry: &FetchEntry,
 ) -> Result<Option<String>, Answer> {
     let log_id = engine.log_id;
+    let tx = view.tx;
     let pos = &pos;
     let mut degraded = None;
-    let view = DbSpace { tx, log_id };
-    let head = snailfish_protocol::space::SpaceView::head(&view);
+    let head = snailfish_protocol::space::SpaceView::head(view);
     if Some(*pos) != head.checked_add(1) {
         return Err(stop(format!("the relay sent position {pos} after {head}")));
     }
@@ -905,7 +924,7 @@ fn verify_entry(
         }
         a
     } else {
-        match space::check_append(&view, &raw.envelope, Mode::Verify) {
+        match space::check_append(view, &raw.envelope, Mode::Verify) {
             Verdict::Store(a) => *a,
             Verdict::Refused(r) => return Err(stop(format!("position {pos}: {r}"))),
             Verdict::Known(_) | Verdict::Conflict(_) => {
@@ -913,6 +932,13 @@ fn verify_entry(
             }
         }
     };
+    // PROTOCOL.md 13.1, T8: an epoch record that removes this device ends
+    // its sync. The relay refuses its requests from now on.
+    if let snailfish_protocol::records::Body::Epoch { removed, .. } = &accepted.record.body
+        && removed.contains(&engine.device_id)
+    {
+        return Err(Answer::Removed);
+    }
     let content = if accepted.record.change_id().is_some() {
         let c = state::decrypt_change(engine, &raw.envelope).map(|b| state::content_hash(&b));
         // A new device has no app key before its checkpoint check. It
@@ -933,6 +959,7 @@ fn verify_entry(
     if matches!(own, Own::Conflict) {
         degraded = Some("refused: conflict".into());
     }
+    view.state.apply(&accepted.record);
     state::drop_setup(tx, &accepted.record_hash).map_err(Answer::Engine)?;
     if let Some((id, _)) = accepted.new_device {
         // [LOG-7]: the verified log holds a grant for this device, so the
@@ -945,6 +972,7 @@ fn verify_entry(
 enum Answer {
     Unreadable,
     Stop(Stop),
+    Removed,
     Engine(EngineError),
 }
 

@@ -1183,16 +1183,13 @@ fn verified_log_keeps_the_genesis_write_level() {
     let mut ea = w.engine(&a);
     w.exchange(&mut ea);
     let tx = Transaction::new_unchecked(&ea.db, TransactionBehavior::Deferred).unwrap();
-    let view = state::DbSpace {
-        tx: &tx,
-        log_id: ea.log_id,
-    };
+    // The view replays the security records of the log (PROTOCOL.md 10.2),
+    // so the write level is the level of the genesis record.
+    let view = state::DbSpace::new(&tx, ea.log_id).unwrap();
     assert_eq!(
         snailfish_protocol::space::SpaceView::write_level(&view),
         MAX_LEVEL
     );
-    tx.execute("UPDATE space SET level = 7", []).unwrap();
-    assert_eq!(snailfish_protocol::space::SpaceView::write_level(&view), 7);
 }
 
 /// T7: the relay head has the same position as the verified log but
@@ -2324,10 +2321,7 @@ fn verified_log_knows_its_last_security_record() {
     w.exchange(&mut ea);
     assert_eq!(ea.verified_head().unwrap().position, 3);
     let tx = Transaction::new_unchecked(&ea.db, TransactionBehavior::Deferred).unwrap();
-    let view = state::DbSpace {
-        tx: &tx,
-        log_id: ea.log_id,
-    };
+    let view = state::DbSpace::new(&tx, ea.log_id).unwrap();
     assert_eq!(
         snailfish_protocol::space::SpaceView::last_security(&view),
         2

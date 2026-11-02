@@ -128,6 +128,76 @@ pub fn grant(
     .into_bytes()
 }
 
+fn id_list(ids: &[Hash32]) -> String {
+    let items: Vec<String> = ids
+        .iter()
+        .map(|id| format!(r#""{}""#, encode_id("d_", id)))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// The fields of an epoch record after the common fields.
+pub struct Epoch<'a> {
+    /// The new epoch.
+    pub epoch: u64,
+    /// The removed devices, sorted by ID.
+    pub removed: &'a [Hash32],
+    /// The devices that stay, sorted by ID.
+    pub stay: &'a [Hash32],
+    /// The key commitment of the new epoch.
+    pub commitment: &'a Hash32,
+    /// One key set to each device in `stay` and one to the current recovery
+    /// ID, sorted by ID.
+    pub keys: &'a [KeySet],
+}
+
+/// A `snailfish.epoch.v1` payload.
+#[must_use]
+pub fn epoch(log: &[u8; 16], author: &Author, base: &Position, e: &Epoch<'_>) -> Vec<u8> {
+    format!(
+        r#"{{{},"epoch":{},"removed":{},"stay":{},"commitment":"{}","keys":{}}}"#,
+        common(log, author, base),
+        e.epoch,
+        id_list(e.removed),
+        id_list(e.stay),
+        encode_b64(e.commitment),
+        key_sets(e.keys)
+    )
+    .into_bytes()
+}
+
+/// A `snailfish.recovery.v1` payload. `author` is the current recovery ID.
+#[must_use]
+pub fn recovery(
+    log: &[u8; 16],
+    author: &Author,
+    base: &Position,
+    new_keys: &Keys,
+    proof: &[u8; 64],
+    key_set: &KeySet,
+) -> Vec<u8> {
+    format!(
+        r#"{{{},"recovery":{{{}}},"proof":"{}","keys":{}}}"#,
+        common(log, author, base),
+        keys(new_keys),
+        encode_b64(proof),
+        key_sets(std::slice::from_ref(key_set))
+    )
+    .into_bytes()
+}
+
+/// A `snailfish.device.v1` or `snailfish.level.v1` payload: the common
+/// fields and `level`.
+#[must_use]
+pub fn level(log: &[u8; 16], author: &Hash32, base: &Position, level: u64) -> Vec<u8> {
+    format!(
+        r#"{{{},"level":{}}}"#,
+        common(log, &Author::Device(*author), base),
+        level
+    )
+    .into_bytes()
+}
+
 /// A `snailfish.change.v1` payload.
 #[must_use]
 pub fn change(

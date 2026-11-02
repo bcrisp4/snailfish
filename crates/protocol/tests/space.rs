@@ -10,7 +10,8 @@ use snailfish_protocol::encoding::decode_id;
 use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::sig::SecretKey;
 use snailfish_protocol::space::{
-    Accepted, MemorySpace, Mode, Refusal, SpaceView, Verdict, check_append, check_genesis,
+    Accepted, Levels, MemorySpace, Mode, Refusal, SpaceView, Verdict, check_append,
+    check_append_at, check_genesis,
 };
 
 fn vectors() -> Value {
@@ -94,7 +95,7 @@ fn go_log_gives_the_same_positions_and_digests() {
     let v = vectors();
     let s = setup(&v);
     let (b, _) = device(&v, "B");
-    assert!(s.devices.contains_key(&b), "the grant makes B active");
+    assert!(s.state.devices.contains_key(&b), "the grant makes B active");
 }
 
 /// [WIR-6]: an exact retry is Known, the same `change_id` with another
@@ -203,7 +204,7 @@ fn writer_gives_go_payload_bytes() {
     use snailfish_protocol::records::{Body, parse_payload};
     use snailfish_protocol::write;
     let v = vectors();
-    for n in [1, 2, 3, 10] {
+    for n in [1, 2, 3, 6, 7, 9, 10, 11] {
         let e = env(&v, n);
         let r = parse_payload(&e.payload_type, &e.payload).unwrap();
         let out = match &r.body {
@@ -230,6 +231,32 @@ fn writer_gives_go_payload_bytes() {
             ),
             Body::Grant { device, keys } => {
                 write::grant(&r.log, &r.author, &r.base, device, &keys[0])
+            }
+            Body::Epoch {
+                epoch,
+                removed,
+                stay,
+                commitment,
+                keys,
+            } => write::epoch(
+                &r.log,
+                &r.author,
+                &r.base,
+                &write::Epoch {
+                    epoch: *epoch,
+                    removed,
+                    stay,
+                    commitment,
+                    keys,
+                },
+            ),
+            Body::Recovery {
+                recovery,
+                proof,
+                keys,
+            } => write::recovery(&r.log, &r.author, &r.base, recovery, proof, &keys[0]),
+            Body::Device { level } | Body::Level { level } => {
+                write::level(&r.log, r.author.id(), &r.base, *level)
             }
             Body::Change {
                 epoch,
@@ -338,13 +365,24 @@ fn grant_below_the_genesis_write_level_is_refused() {
     let mut s = MemorySpace::new(log);
     let g = check_genesis(&genesis_at_level(&v, 2), &log, Some(&a)).unwrap();
     s.apply(&g);
-    assert_eq!(s.level, 2);
+    assert_eq!(s.state.level, 2);
     let head = (1, g.digest);
-    match check_append(&s, &grant_b(&v, 1, head), relay(a)) {
+    // D5: a synthetic level 2 with the types of level 1.
+    let two = Levels {
+        max: 2,
+        retired: &[],
+    };
+    match check_append_at(&s, &grant_b(&v, 1, head), relay(a), &two) {
         Verdict::Refused(Refusal::InvalidRecord(why)) => assert!(why.contains("write level")),
         other => panic!("expected invalid_record, got {other:?}"),
     }
-    stored(check_append(&s, &grant_b(&v, 2, head), relay(a)));
+    stored(check_append_at(&s, &grant_b(&v, 2, head), relay(a), &two));
+    // A verifier that knows only level 1 cannot judge a record at write
+    // level 2 ([VER-9]).
+    assert_eq!(
+        check_append(&s, &grant_b(&v, 2, head), relay(a)),
+        Verdict::Refused(Refusal::Unsupported)
+    );
 }
 
 /// [DLV-5] A change of exactly `max_change_bytes` is stored. One byte more is

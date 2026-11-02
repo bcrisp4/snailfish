@@ -449,12 +449,7 @@ fn recovery_record(f: &Fields<'_>, author: &Author, log: &[u8; 16]) -> Result<Bo
     let keys = key_sets(f, "keys")?;
     // PROTOCOL.md 6.2: the record holds every input of the proof, so the
     // parser checks it. keys_from already refused a weak or non-canonical key.
-    let msg = crate::encoding::frame(&[
-        b"snailfish.recovery-proof.v1",
-        log,
-        &recovery.sign,
-        &recovery.seal[..],
-    ]);
+    let msg = crate::recovery::proof_message(log, &recovery.sign, &recovery.seal[..]);
     crate::sig::PublicKey::from_bytes(&recovery.sign)
         .and_then(|pk| pk.verify_raw(&msg, &proof))
         .map_err(|e| bad(format!("recovery.proof: rule 6.2: {e}")))?;

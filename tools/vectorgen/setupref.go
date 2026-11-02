@@ -261,7 +261,11 @@ func (rs *relayState) setupToken(rq request, codes []setupCodeJ) (int, *setupRes
 		return fail("bad_setup")
 	}
 	// 6
-	return 200, &setupRespJ{held.Tenant, rs.now + setupTokenTTL}, ""
+	spaces := rs.spaces[held.Tenant]
+	if spaces == nil {
+		spaces = []spaceRefJ{}
+	}
+	return 200, &setupRespJ{held.Tenant, rs.now + setupTokenTTL, spaces}, ""
 }
 
 // verifySetupRequest is 12.3 steps 1 to 3, for a signed case on the setup route.

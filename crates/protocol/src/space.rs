@@ -1,11 +1,11 @@
-//! The space-state check of M3 (`PROTOCOL.md` 10.5, 10.6 and 10.9).
+//! The space-state check (`PROTOCOL.md` 10.2, 10.5, 10.6 and 10.9).
 //!
 //! The relay and the engine use the same functions ([LOG-9]). They check the
 //! signature, the strict parse, dense positions, the digest chain, the base
 //! rule ([LOG-6]), the base rule for security records ([LOG-7]) and the
-//! active devices from the genesis record and the grants ([LOG-8]). The
-//! relay also refuses changes during a restore hold ([LOG-14]). The current
-//! recovery key can sign a grant (M4). Removal comes in M7.
+//! space state of 10.2 ([LOG-8]): active and removed devices, the current
+//! epoch, the current recovery ID, device levels and the write level. The
+//! relay also refuses changes during a restore hold ([LOG-14]).
 //!
 //! The functions do no I/O. The caller gives the log state through
 //! [`SpaceView`], for example from SQLite.
@@ -16,8 +16,39 @@ use crate::hash::{digest_next, digest0, entry_hash};
 use crate::records::{self, Author, Body, Record};
 use crate::sig::PublicKey;
 
-/// The record types that M2 accepts after the genesis record.
-pub const M2_TYPES: [&str; 2] = ["snailfish.change.v1", "snailfish.grant.v1"];
+/// The protocol levels that a verifier knows (`PROTOCOL.md` 6.2, [VER-6]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Levels {
+    /// The highest level.
+    pub max: u64,
+    /// Each record type that a level after 1 drops, with the first level
+    /// without it. Level 1 holds every `v1` type.
+    pub retired: &'static [(&'static str, u64)],
+}
+
+impl Levels {
+    /// The levels of this crate: level 1 only.
+    pub const CURRENT: Self = Self {
+        max: 1,
+        retired: &[],
+    };
+
+    /// True if the set of `level` holds `payload_type` ([VER-9]). A level
+    /// above [`Levels::max`] holds nothing, because its set is unknown.
+    #[must_use]
+    pub fn holds(&self, level: u64, payload_type: &str) -> bool {
+        (1..=self.max).contains(&level)
+            && records::RECORD_TYPES.contains(&payload_type)
+            && !self
+                .retired
+                .iter()
+                .any(|(t, at)| *t == payload_type && level >= *at)
+    }
+}
+
+/// The record types that compaction adds (M8). The check refuses them as
+/// `unsupported` until then.
+const COMPACTION_TYPES: [&str; 2] = ["snailfish.snapshot.v1", "snailfish.accept.v1"];
 
 /// The log state that the check reads.
 pub trait SpaceView {
@@ -29,15 +60,23 @@ pub trait SpaceView {
     fn digest_at(&self, position: u64) -> Option<Hash32>;
     /// The Ed25519 public key of an active device ([LOG-8]).
     fn device_key(&self, id: &Hash32) -> Option<[u8; 32]>;
+    /// The active devices, in ID order.
+    fn active_devices(&self) -> Vec<Hash32>;
+    /// True if an epoch record removed the device.
+    fn is_removed(&self, id: &Hash32) -> bool;
+    /// The device level of an active or removed device (`PROTOCOL.md` 10.2).
+    fn device_level(&self, id: &Hash32) -> Option<u64>;
     /// The Ed25519 public key of the recovery ID `id`, if `id` is the
-    /// current recovery ID of the space (`PROTOCOL.md` 10.2). M4 has no
-    /// recovery record, so it is the recovery key of the genesis record.
+    /// current recovery ID of the space (`PROTOCOL.md` 10.2).
     fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]>;
+    /// True if `id` is the current recovery ID or a recovery ID that a
+    /// recovery record replaced.
+    fn recovery_known(&self, id: &Hash32) -> bool;
     /// The position and record hash of a change with this `change_id`.
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)>;
     /// The space write level ([VER-9]).
     fn write_level(&self) -> u64;
-    /// The current epoch. M3 has no epoch record, so it is 1.
+    /// The current epoch.
     fn epoch(&self) -> u64;
     /// The position of the last security record ([LOG-7]). 0 for an empty
     /// log.
@@ -191,6 +230,28 @@ pub fn security_base_ok(security: bool, base: u64, last_security: u64) -> bool {
     !security || base >= last_security
 }
 
+/// [`check_append_at`] with [`Levels::CURRENT`].
+#[must_use]
+pub fn check_append(view: &impl SpaceView, env: &Envelope, mode: Mode) -> Verdict {
+    check_append_at(view, env, mode, &Levels::CURRENT)
+}
+
+/// True if `epochs` is `1, 2, .., current`: a grant or a recovery record
+/// seals every epoch key (`PROTOCOL.md` 10.6 step 13).
+#[must_use]
+pub fn all_epochs(epochs: &[u64], current: u64) -> bool {
+    u64::try_from(epochs.len()).is_ok_and(|n| n == current)
+        && epochs.iter().zip(1u64..).all(|(e, want)| *e == want)
+}
+
+/// True if a level record to `level` is valid: above the write level, and
+/// no active device below it ([VER-8]). `lowest` is the lowest device
+/// level of the active devices.
+#[must_use]
+pub fn raise_ok(level: u64, write_level: u64, lowest: u64) -> bool {
+    level > write_level && lowest >= level
+}
+
 /// Check one record for the next position (`PROTOCOL.md` 10.6, in that
 /// order). The genesis record has its own check, [`check_genesis`].
 ///
@@ -198,7 +259,12 @@ pub fn security_base_ok(security: bool, base: u64, last_security: u64) -> bool {
 /// The function changes no state. The caller applies an [`Accepted`] only
 /// after it returns, so no state changes before the signature verifies.
 #[must_use]
-pub fn check_append(view: &impl SpaceView, env: &Envelope, mode: Mode) -> Verdict {
+pub fn check_append_at(
+    view: &impl SpaceView,
+    env: &Envelope,
+    mode: Mode,
+    levels: &Levels,
+) -> Verdict {
     let record = match records::parse_payload(&env.payload_type, &env.payload) {
         Ok(r) => r,
         Err(e) => return Verdict::Refused(invalid(e)),
@@ -224,7 +290,7 @@ pub fn check_append(view: &impl SpaceView, env: &Envelope, mode: Mode) -> Verdic
     {
         return Verdict::Refused(Refusal::OnHold);
     }
-    match judge(view, env, record, record_hash, mode) {
+    match judge(view, env, record, record_hash, mode, levels) {
         Ok(a) => Verdict::Store(Box::new(a)),
         Err(r) => Verdict::Refused(r),
     }
@@ -236,6 +302,7 @@ fn judge(
     record: Record,
     record_hash: Hash32,
     mode: Mode,
+    levels: &Levels,
 ) -> Result<Accepted, Refusal> {
     if let Mode::Relay {
         max_change_bytes, ..
@@ -277,30 +344,22 @@ fn judge(
     ) {
         return Err(Refusal::StaleBase);
     }
-    if !M2_TYPES.contains(&env.payload_type.as_str()) {
+    let ptype = env.payload_type.as_str();
+    let level_above =
+        matches!(record.body, Body::Device { level } | Body::Level { level } if level > levels.max);
+    if !levels.holds(view.write_level(), ptype) || COMPACTION_TYPES.contains(&ptype) || level_above
+    {
         return Err(Refusal::Unsupported);
     }
+    if let Body::Change { epoch, .. } = &record.body
+        && *epoch != view.epoch()
+    {
+        return Err(Refusal::WrongEpoch);
+    }
+    state_rule(view, &record)?;
     let new_device = match &record.body {
-        Body::Change { epoch, .. } => {
-            if *epoch != view.epoch() {
-                return Err(Refusal::WrongEpoch);
-            }
-            None
-        }
-        Body::Grant { device, keys } => {
-            if view.device_key(&device.id).is_some() {
-                return Err(invalid("grant: the device is already active"));
-            }
-            if device.level < view.write_level() {
-                return Err(invalid("grant: the device level is below the write level"));
-            }
-            let want: Vec<u64> = (1..=view.epoch()).collect();
-            if keys.iter().any(|k| k.epochs != want) {
-                return Err(invalid("grant: the key set must hold each epoch"));
-            }
-            Some((device.id, device.keys.sign))
-        }
-        _ => return Err(Refusal::Unsupported),
+        Body::Grant { device, .. } => Some((device.id, device.keys.sign)),
+        _ => None,
     };
     let position = head.checked_add(1).ok_or(Refusal::BadBase)?;
     let prev = view.digest_at(head).ok_or(Refusal::BadBase)?;
@@ -316,6 +375,91 @@ fn judge(
         digest,
         new_device,
     })
+}
+
+/// The state rule of each record type (`PROTOCOL.md` 10.6 step 13).
+fn state_rule(view: &impl SpaceView, record: &Record) -> Result<(), Refusal> {
+    let epoch = view.epoch();
+    match &record.body {
+        Body::Grant { device, keys } => {
+            if view.device_key(&device.id).is_some() {
+                return Err(invalid("grant: the device is already active"));
+            }
+            if view.is_removed(&device.id) {
+                return Err(invalid("grant: an epoch record removed the device"));
+            }
+            if device.level < view.write_level() {
+                return Err(invalid("grant: the device level is below the write level"));
+            }
+            if keys.iter().any(|k| !all_epochs(&k.epochs, epoch)) {
+                return Err(invalid("grant: the key set must hold each epoch"));
+            }
+        }
+        Body::Epoch {
+            epoch: e,
+            removed,
+            stay,
+            keys,
+            ..
+        } => {
+            if Some(*e) != epoch.checked_add(1) {
+                return Err(invalid("epoch: the epoch is not the current epoch plus 1"));
+            }
+            if removed.contains(record.author.id()) && matches!(record.author, Author::Device(_)) {
+                return Err(invalid("epoch: the record removes its author"));
+            }
+            if removed.iter().any(|d| view.device_key(d).is_none()) {
+                return Err(invalid("epoch: a removed device is not active"));
+            }
+            let want: Vec<Hash32> = view
+                .active_devices()
+                .into_iter()
+                .filter(|d| !removed.contains(d))
+                .collect();
+            if *stay != want {
+                return Err(invalid(
+                    "epoch: stay differs from the active devices that stay",
+                ));
+            }
+            let to_current = keys.iter().any(|k| match k.to {
+                Author::Recovery(r) => view.recovery_key(&r).is_some(),
+                Author::Device(_) => false,
+            });
+            if !to_current {
+                return Err(invalid("epoch: no key set to the current recovery ID"));
+            }
+        }
+        Body::Recovery { recovery, keys, .. } => {
+            let rid = crate::keys::recovery_id(&recovery.sign, &recovery.seal);
+            if view.recovery_known(&rid) {
+                return Err(invalid("recovery: the new recovery ID is not new"));
+            }
+            if keys.iter().any(|k| !all_epochs(&k.epochs, epoch)) {
+                return Err(invalid("recovery: the key set must hold each epoch"));
+            }
+        }
+        Body::Device { level } => {
+            let current = view.device_level(record.author.id()).unwrap_or(0);
+            if *level <= current {
+                return Err(invalid("device: the level is not above the device level"));
+            }
+        }
+        Body::Level { level } => {
+            let lowest = view
+                .active_devices()
+                .iter()
+                .filter_map(|d| view.device_level(d))
+                .min()
+                .unwrap_or(0);
+            if !raise_ok(*level, view.write_level(), lowest) {
+                return Err(invalid(
+                    "level: not above the write level, or an active device is below it",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Check a genesis record for a new space with log ID `log_id`
@@ -396,6 +540,162 @@ pub fn genesis_recovery_of(envelope_json: &str) -> Option<(Hash32, [u8; 32])> {
     genesis_recovery(&record)
 }
 
+/// The change that one accepted record makes to the space state
+/// (`PROTOCOL.md` 10.2), apart from the digest, the change IDs and the last
+/// security record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// No state change.
+    None,
+    /// A genesis record or a grant adds a device with its key and level.
+    Device {
+        /// The device ID.
+        id: Hash32,
+        /// The Ed25519 public key.
+        sign: [u8; 32],
+        /// The device level.
+        level: u64,
+    },
+    /// An epoch record removes devices and starts an epoch.
+    Epoch {
+        /// The new epoch.
+        epoch: u64,
+        /// The removed devices.
+        removed: Vec<Hash32>,
+    },
+    /// A recovery record makes a new current recovery ID.
+    Recovery {
+        /// The new recovery ID.
+        id: Hash32,
+        /// Its Ed25519 public key.
+        sign: [u8; 32],
+    },
+    /// A device record sets the level of its author.
+    DeviceLevel {
+        /// The device.
+        id: Hash32,
+        /// The new device level.
+        level: u64,
+    },
+    /// A level record sets the write level.
+    WriteLevel(u64),
+}
+
+/// The state change of a record that the check accepted.
+#[must_use]
+pub fn effect(record: &Record) -> Effect {
+    match &record.body {
+        Body::Genesis { device, .. } | Body::Grant { device, .. } => Effect::Device {
+            id: device.id,
+            sign: device.keys.sign,
+            level: device.level,
+        },
+        Body::Epoch { epoch, removed, .. } => Effect::Epoch {
+            epoch: *epoch,
+            removed: removed.clone(),
+        },
+        Body::Recovery { recovery, .. } => Effect::Recovery {
+            id: crate::keys::recovery_id(&recovery.sign, &recovery.seal),
+            sign: recovery.sign,
+        },
+        Body::Device { level } => Effect::DeviceLevel {
+            id: *record.author.id(),
+            level: *level,
+        },
+        Body::Level { level } => Effect::WriteLevel(*level),
+        _ => Effect::None,
+    }
+}
+
+/// The space state of `PROTOCOL.md` 10.2, apart from the positions, the
+/// digests and the change IDs. Each security record changes it, so a store
+/// can rebuild it from its security records alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct State {
+    /// The active devices and their Ed25519 keys.
+    pub devices: std::collections::BTreeMap<Hash32, [u8; 32]>,
+    /// The devices that an epoch record removed.
+    pub removed: std::collections::BTreeSet<Hash32>,
+    /// The device level of each active or removed device.
+    pub device_levels: std::collections::BTreeMap<Hash32, u64>,
+    /// The write level.
+    pub level: u64,
+    /// The current epoch. 0 before the genesis record.
+    pub epoch: u64,
+    /// The current recovery ID and its Ed25519 key.
+    pub recovery: Option<(Hash32, [u8; 32])>,
+    /// The recovery IDs that a recovery record replaced.
+    pub retired: std::collections::BTreeSet<Hash32>,
+}
+
+impl State {
+    /// Apply a record that the check accepted, or a stored record.
+    pub fn apply(&mut self, record: &Record) {
+        if let Some(level) = genesis_level(record) {
+            self.level = level;
+            self.epoch = 1;
+        }
+        if let Some(r) = genesis_recovery(record) {
+            self.recovery = Some(r);
+        }
+        match effect(record) {
+            Effect::Device { id, sign, level } => {
+                self.devices.insert(id, sign);
+                self.device_levels.insert(id, level);
+            }
+            Effect::Epoch { epoch, removed } => {
+                for d in removed {
+                    self.devices.remove(&d);
+                    self.removed.insert(d);
+                }
+                self.epoch = epoch;
+            }
+            Effect::Recovery { id, sign } => {
+                if let Some((old, _)) = self.recovery.replace((id, sign)) {
+                    self.retired.insert(old);
+                }
+            }
+            Effect::DeviceLevel { id, level } => {
+                self.device_levels.insert(id, level);
+            }
+            Effect::WriteLevel(level) => self.level = level,
+            Effect::None => {}
+        }
+    }
+
+    /// Apply a stored envelope. A store calls it for each security record
+    /// in position order. A record that does not parse is a corrupt store.
+    ///
+    /// # Errors
+    ///
+    /// The parse error of the envelope or the payload.
+    pub fn apply_envelope(&mut self, envelope_json: &str) -> Result<(), String> {
+        let env = Envelope::parse(envelope_json.as_bytes()).map_err(|e| e.to_string())?;
+        let record =
+            records::parse_payload(&env.payload_type, &env.payload).map_err(|e| e.to_string())?;
+        self.apply(&record);
+        Ok(())
+    }
+
+    /// See [`SpaceView::device_key`].
+    #[must_use]
+    pub fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.devices.get(id).copied()
+    }
+
+    /// See [`SpaceView::recovery_key`].
+    #[must_use]
+    pub fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.recovery.filter(|(r, _)| r == id).map(|(_, k)| k)
+    }
+
+    /// See [`SpaceView::recovery_known`].
+    #[must_use]
+    pub fn recovery_known(&self, id: &Hash32) -> bool {
+        self.recovery_key(id).is_some() || self.retired.contains(id)
+    }
+}
+
 /// An in-memory [`SpaceView`]: the engine and tests use it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemorySpace {
@@ -403,16 +703,12 @@ pub struct MemorySpace {
     pub log_id: [u8; 16],
     /// `digests[n]` is the digest at position n, from 0.
     pub digests: Vec<Hash32>,
-    /// The active devices and their Ed25519 keys.
-    pub devices: std::collections::BTreeMap<Hash32, [u8; 32]>,
     /// Each change: its position and record hash.
     pub changes: std::collections::BTreeMap<[u8; 16], (u64, Hash32)>,
-    /// The write level.
-    pub level: u64,
     /// The position of the last security record.
     pub last_security: u64,
-    /// The current recovery ID and its Ed25519 key.
-    pub recovery: Option<(Hash32, [u8; 32])>,
+    /// The space state of 10.2.
+    pub state: State,
 }
 
 impl MemorySpace {
@@ -426,28 +722,16 @@ impl MemorySpace {
         }
     }
 
-    /// Add an accepted record at the next position.
-    ///
-    /// # Panics
-    ///
-    /// Never: the check computed the position from this view.
+    /// Apply a record that the check accepted.
     pub fn apply(&mut self, a: &Accepted) {
         self.digests.push(a.digest);
-        if let Some((id, key)) = a.new_device {
-            self.devices.insert(id, key);
-        }
         if let Some(cid) = a.record.change_id() {
             self.changes.insert(*cid, (a.position, a.record_hash));
-        }
-        if let Some(level) = genesis_level(&a.record) {
-            self.level = level;
-        }
-        if let Some(r) = genesis_recovery(&a.record) {
-            self.recovery = Some(r);
         }
         if a.record.is_security() {
             self.last_security = a.position;
         }
+        self.state.apply(&a.record);
     }
 }
 
@@ -464,36 +748,48 @@ impl SpaceView for MemorySpace {
             .and_then(|p| self.digests.get(p))
             .copied()
     }
-    fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.devices.get(id).copied()
-    }
-    fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.recovery.filter(|(r, _)| r == id).map(|(_, k)| k)
-    }
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
         self.changes.get(change_id).copied()
-    }
-    fn write_level(&self) -> u64 {
-        self.level
-    }
-    fn epoch(&self) -> u64 {
-        1
     }
     fn last_security(&self) -> u64 {
         self.last_security
     }
+    fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.state.device_key(id)
+    }
+    fn active_devices(&self) -> Vec<Hash32> {
+        self.state.devices.keys().copied().collect()
+    }
+    fn is_removed(&self, id: &Hash32) -> bool {
+        self.state.removed.contains(id)
+    }
+    fn device_level(&self, id: &Hash32) -> Option<u64> {
+        self.state.device_levels.get(id).copied()
+    }
+    fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        self.state.recovery_key(id)
+    }
+    fn recovery_known(&self, id: &Hash32) -> bool {
+        self.state.recovery_known(id)
+    }
+    fn write_level(&self) -> u64 {
+        self.state.level
+    }
+    fn epoch(&self) -> u64 {
+        self.state.epoch
+    }
 }
 
-/// A [`SpaceView`] of a log and the accepted records after its head. The
-/// relay checks repair entries against the log and the entries before them
-/// (`PROTOCOL.md` 10.9), with no write to the log.
+/// A [`SpaceView`] with records of the current request on top of a stored
+/// view: the relay checks each envelope of one append request against the
+/// state after the earlier ones (`PROTOCOL.md` 10.6).
 pub struct Overlay<'a, V: SpaceView> {
     inner: &'a V,
     added: Vec<Accepted>,
 }
 
 impl<'a, V: SpaceView> Overlay<'a, V> {
-    /// An overlay with no added records.
+    /// An overlay with no records.
     pub fn new(inner: &'a V) -> Self {
         Self {
             inner,
@@ -501,15 +797,24 @@ impl<'a, V: SpaceView> Overlay<'a, V> {
         }
     }
 
-    /// Add an accepted record at the next position.
+    /// Add a record that the check accepted.
     pub fn apply(&mut self, a: Accepted) {
         self.added.push(a);
     }
 
-    /// The added records, in position order.
+    /// The added records, in order.
     #[must_use]
     pub fn into_added(self) -> Vec<Accepted> {
         self.added
+    }
+
+    fn effects(&self) -> impl DoubleEndedIterator<Item = Effect> + '_ {
+        self.added.iter().map(|a| effect(&a.record))
+    }
+
+    fn removed_here(&self, id: &Hash32) -> bool {
+        self.effects()
+            .any(|e| matches!(e, Effect::Epoch { removed, .. } if removed.contains(id)))
     }
 }
 
@@ -530,13 +835,62 @@ impl<V: SpaceView> SpaceView for Overlay<'_, V> {
             .or_else(|| self.inner.digest_at(position))
     }
     fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
+        if self.removed_here(id) {
+            return None;
+        }
         self.added
             .iter()
             .find_map(|a| a.new_device.filter(|(d, _)| d == id).map(|(_, k)| k))
             .or_else(|| self.inner.device_key(id))
     }
+    fn active_devices(&self) -> Vec<Hash32> {
+        let mut all: std::collections::BTreeSet<Hash32> =
+            self.inner.active_devices().into_iter().collect();
+        for e in self.effects() {
+            match e {
+                Effect::Device { id, .. } => {
+                    all.insert(id);
+                }
+                Effect::Epoch { removed, .. } => {
+                    for d in &removed {
+                        all.remove(d);
+                    }
+                }
+                _ => {}
+            }
+        }
+        all.into_iter().collect()
+    }
+    fn is_removed(&self, id: &Hash32) -> bool {
+        self.removed_here(id) || self.inner.is_removed(id)
+    }
+    fn device_level(&self, id: &Hash32) -> Option<u64> {
+        self.effects()
+            .rev()
+            .find_map(|e| match e {
+                Effect::Device { id: d, level, .. } | Effect::DeviceLevel { id: d, level }
+                    if &d == id =>
+                {
+                    Some(level)
+                }
+                _ => None,
+            })
+            .or_else(|| self.inner.device_level(id))
+    }
     fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.inner.recovery_key(id)
+        match self.effects().rev().find_map(|e| match e {
+            Effect::Recovery { id, sign } => Some((id, sign)),
+            _ => None,
+        }) {
+            Some((r, k)) => (&r == id).then_some(k),
+            None => self.inner.recovery_key(id),
+        }
+    }
+    fn recovery_known(&self, id: &Hash32) -> bool {
+        self.inner.recovery_known(id)
+            || self
+                .effects()
+                .any(|e| matches!(e, Effect::Recovery { id: r, .. } if &r == id))
     }
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
         self.added
@@ -546,10 +900,22 @@ impl<V: SpaceView> SpaceView for Overlay<'_, V> {
             .or_else(|| self.inner.change(change_id))
     }
     fn write_level(&self) -> u64 {
-        self.inner.write_level()
+        self.effects()
+            .rev()
+            .find_map(|e| match e {
+                Effect::WriteLevel(l) => Some(l),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.inner.write_level())
     }
     fn epoch(&self) -> u64 {
-        self.inner.epoch()
+        self.effects()
+            .rev()
+            .find_map(|e| match e {
+                Effect::Epoch { epoch, .. } => Some(epoch),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.inner.epoch())
     }
     fn last_security(&self) -> u64 {
         self.added
@@ -614,7 +980,7 @@ mod tests {
         assert_eq!(s.digest_at(0), Some(digest0(&[3; 16])));
         assert_eq!(s.digest_at(1), None);
         assert_eq!(s.digest_at(u64::MAX), None);
-        assert_eq!(s.epoch(), 1);
+        assert_eq!(s.epoch(), 0);
     }
 
     proptest! {
@@ -622,6 +988,35 @@ mod tests {
         #[test]
         fn base_range(base in 0u64..1000, head in 0u64..1000) {
             prop_assert_eq!(base_in_range(base, head), (1..=head).contains(&base));
+        }
+
+        /// `PROTOCOL.md` 10.6 step 13: a grant or a recovery record must seal
+        /// exactly the epochs 1 to the current epoch, in order.
+        #[test]
+        fn all_epochs_is_one_to_current(
+            epochs in proptest::collection::vec(0u64..6, 0..6),
+            current in 0u64..6,
+        ) {
+            let want: Vec<u64> = (1..=current).collect();
+            prop_assert_eq!(all_epochs(&epochs, current), epochs == want);
+        }
+
+        /// [VER-8]: a raise goes above the write level, and no active device
+        /// is below the new level.
+        #[test]
+        fn raise_needs_every_device(level in 0u64..10, write in 0u64..10, lowest in 0u64..10) {
+            prop_assert_eq!(raise_ok(level, write, lowest), level > write && lowest >= level);
+        }
+
+        /// [VER-6] [VER-9]: a level holds a known type only from level 1 to
+        /// the highest level, and not from the level that drops it.
+        #[test]
+        fn levels_hold(level in 0u64..5, max in 0u64..5, i in 0usize..9) {
+            let t = records::RECORD_TYPES[i];
+            let l = Levels { max, retired: &[("snailfish.device.v1", 3)] };
+            let dropped = t == "snailfish.device.v1" && level >= 3;
+            prop_assert_eq!(l.holds(level, t), (1..=max).contains(&level) && !dropped);
+            prop_assert!(!l.holds(level, "snailfish.unknown.v1"));
         }
 
         /// [LOG-7]: a change passes with any base. A security record passes
@@ -661,6 +1056,34 @@ mod proofs {
         let last: u64 = kani::any();
         assert!(security_base_ok(false, base, last));
         assert!(security_base_ok(true, base, last) == (base >= last));
+    }
+
+    /// `PROTOCOL.md` 10.6 step 13: for every list of up to 3 epochs and
+    /// every current epoch, `all_epochs` accepts exactly 1 to current.
+    /// Bound: 3 elements.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn all_epochs_exact() {
+        let xs: [u64; 3] = kani::any();
+        let len: usize = kani::any_where(|&n| n <= 3);
+        let current: u64 = kani::any();
+        let e = &xs[..len];
+        if all_epochs(e, current) {
+            assert!(len as u64 == current);
+            for (i, x) in e.iter().enumerate() {
+                assert!(*x == i as u64 + 1);
+            }
+        }
+    }
+
+    /// [VER-8]: for every 64-bit input, a valid raise is above the write
+    /// level and at or below the lowest active device level.
+    #[kani::proof]
+    fn raise_rule() {
+        let level: u64 = kani::any();
+        let write: u64 = kani::any();
+        let lowest: u64 = kani::any();
+        assert!(raise_ok(level, write, lowest) == (level > write && lowest >= level));
     }
 
     /// [WIR-6]: a stored `change_id` never gives a new append, and the

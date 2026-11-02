@@ -148,6 +148,14 @@ pub enum Status {
         /// The cause.
         cause: String,
     },
+    /// `paused: blocked`: the user blocked this device or its machine group
+    /// on the user page (`PROTOCOL.md` 10.3, [STO-12]). An unblock on the
+    /// user page ends it, and the engine tries again by itself.
+    Blocked,
+    /// `stopped: removed`: an epoch record removed this device (T8). The
+    /// relay refuses each request of the device, and the engine reads no
+    /// later record.
+    Removed,
     /// `stopped: setup failed`: the relay refused to create the space
     /// (`bad_setup` or `space_limit`, `PROTOCOL.md` 10.5). The app signs in
     /// again and gives the engine a new setup token.
@@ -174,6 +182,8 @@ impl Status {
             Self::ClockSkew => "stopped: clock skew",
             Self::Fork { .. } => "stopped: fork",
             Self::SetupFailed { .. } => "stopped: setup failed",
+            Self::Blocked => "paused: blocked",
+            Self::Removed => "stopped: removed",
         }
     }
 }
@@ -299,6 +309,9 @@ pub struct Engine {
     // `None` until the engine has the app key: a new device opens it from
     // its grant after the checkpoint check ([ENR-9]).
     app_key: Option<[u8; 32]>,
+    // The keys of the epochs after 1 that the engine opened from the log
+    // (`PROTOCOL.md` 13.1). Each one passed its commitment check.
+    epoch_keys: std::cell::RefCell<std::collections::BTreeMap<u64, [u8; 32]>>,
     // The host key store, if `keystore::open` opened the engine, and
     // whether its item holds the app key.
     key_store: Option<std::sync::Arc<dyn keystore::KeyStore>>,
@@ -396,6 +409,7 @@ impl Engine {
             sign,
             seal_seed: keys.seal_seed,
             app_key: (keys.app_key != [0; 32]).then_some(keys.app_key),
+            epoch_keys: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             key_store: None,
             app_key_stored: false,
             status: Status::Ok,
@@ -468,6 +482,35 @@ impl Engine {
             return Err(bad("the key does not match the commitment of epoch 1"));
         }
         Ok(Some(key))
+    }
+
+    /// The key of `epoch` (`PROTOCOL.md` 13.1): the app key for epoch 1,
+    /// else the key from the key set to this device in its own grant or in
+    /// the epoch record of `epoch`, after its commitment check. `None` if
+    /// the verified log seals no key of that epoch to this device.
+    pub(crate) fn epoch_key(&self, epoch: u64) -> Result<Option<[u8; 32]>, EngineError> {
+        if epoch == 1 {
+            return Ok(self.app_key);
+        }
+        if let Some(k) = self.epoch_keys.borrow().get(&epoch) {
+            return Ok(Some(*k));
+        }
+        let key = state::open_epoch_key(
+            &self.db,
+            &self.log_id,
+            &self.device_id,
+            &self.seal_seed,
+            epoch,
+        )?;
+        if let Some(k) = key {
+            self.epoch_keys.borrow_mut().insert(epoch, k);
+        }
+        Ok(key)
+    }
+
+    /// The current epoch of the verified log (`PROTOCOL.md` 10.2).
+    pub(crate) fn current_epoch(&self) -> Result<u64, EngineError> {
+        state::current_epoch(&self.db)
     }
 
     /// Replace the device clock, for tests of the clock correction.

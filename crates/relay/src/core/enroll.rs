@@ -130,7 +130,7 @@ impl Relay {
     /// body parse (10.10 write step 1). No key matches yet, so a request
     /// that passes them stops at step 5, which runs after the parse.
     fn enroll_steps_1_to_4(&self, req: &Request, now: u64) -> ApiResult<()> {
-        match self.verify(req, now, |_| None) {
+        match self.verify(req, now, super::no_signer) {
             Err(e) if e.code != "unknown_device" => Err(e),
             _ => Ok(()),
         }
@@ -140,7 +140,14 @@ impl Relay {
     /// device ID text of the signer.
     fn enroll_signer(&self, req: &Request, now: u64, sp: &super::OpenSpace) -> ApiResult<String> {
         let keys = super::load_devices(&sp.conn)?;
-        let v = self.verify(req, now, |id| keys.get(id).copied())?;
+        let removed = super::load_removed(&sp.conn)?;
+        let signers = super::Signers {
+            keys: &keys,
+            removed: &removed,
+            blocked: sp.blocked,
+            recovery: None,
+        };
+        let v = self.verify(req, now, |id, r| signers.key(id, r))?;
         Self::claim_nonce(&sp.tenant, &v, now)?;
         Ok(encode_id("d_", &v.keyid))
     }
@@ -154,7 +161,7 @@ impl Relay {
         log: &str,
     ) -> ApiResult<(u16, Vec<u8>)> {
         self.guard(req)?;
-        let sp = self.open_space(tenant, log)?;
+        let sp = self.open_space(tenant, log, super::peek_keyid(req).as_ref())?;
         self.enroll_steps_1_to_4(req, now)?;
         let session = mailbox::parse_open(&req.body).map_err(|e| api(400, "bad_request", e.0))?;
         let device = self.enroll_signer(req, now, &sp)?;
@@ -195,7 +202,7 @@ impl Relay {
         self.guard(req)?;
         let device = match space {
             Some((tenant, log)) => {
-                let sp = self.open_space(tenant, log)?;
+                let sp = self.open_space(tenant, log, super::peek_keyid(req).as_ref())?;
                 self.enroll_steps_1_to_4(req, now)?;
                 Some(self.enroll_signer(req, now, &sp)?)
             }
@@ -231,7 +238,7 @@ impl Relay {
         };
         let sp = match space {
             Some((tenant, log)) => {
-                let sp = self.open_space(tenant, log)?;
+                let sp = self.open_space(tenant, log, super::peek_keyid(req).as_ref())?;
                 self.enroll_steps_1_to_4(req, now)?;
                 Some(sp)
             }

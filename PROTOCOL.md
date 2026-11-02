@@ -1,6 +1,6 @@
 # Snailfish protocol
 
-Status: draft for M5. This file gives the exact bytes of the protocol (DESIGN.md "Wire format", [WIR-1] to [WIR-9]). DESIGN.md gives the rules and the reasons. If the two differ, change the Quint model first, then DESIGN.md, then this file, then `tools/vectorgen`, then the Rust code.
+Status: draft for M7. This file gives the exact bytes of the protocol (DESIGN.md "Wire format", [WIR-1] to [WIR-9]). DESIGN.md gives the rules and the reasons. If the two differ, change the Quint model first, then DESIGN.md, then this file, then `tools/vectorgen`, then the Rust code.
 
 Before the first public release, formats can change without notice, and the vectors are regenerated (DESIGN.md "Versioning").
 
@@ -15,9 +15,10 @@ Before the first public release, formats can change without notice, and the vect
 | 7. Signatures and keys | Done | `snailfish_protocol::sig`, `snailfish_protocol::keys` | `vectors/third_party/`, `vectors/protocol.json` |
 | 8. Request signatures | Done | `snailfish_protocol::request` | `vectors/http.json` |
 | 9. Recovery key encoding | Done | `snailfish_protocol::recovery` | `vectors/protocol.json`, `vectors/recovery-key.json` |
-| 10. HTTP API | Done (M5 routes) | `snailfish_protocol::wire`, `snailfish-relay` | `vectors/http.json` |
+| 10. HTTP API | Done (M7 routes) | `snailfish_protocol::wire`, `snailfish-relay` | `vectors/http.json` |
 | 11. Enrollment | Done | `snailfish_protocol::enroll`, `snailfish-engine` | `vectors/enroll.json`, `vectors/http.json` |
 | 12. User and setup surface | Done | `snailfish_protocol::setup`, `snailfish-relay`, `snailfish-engine` | `vectors/http.json` |
+| 13. Removal and recovery | Done | `snailfish_protocol::space`, `snailfish-engine`, `snailfish-relay` | `vectors/http.json` |
 
 `vectors/README.md` describes each vector file and the programs that make and check them.
 
@@ -188,8 +189,10 @@ The fields of each type follow the common fields, in this order.
 - In a genesis record, `author` must equal the recovery ID of `recovery`. A verifier can therefore find the author key in the record itself ([WIR-2]).
 - `proof` is an Ed25519 signature by the new recovery signing key over `frame("snailfish.recovery-proof.v1", log_id, new_sign_pk, new_seal_pk)`. A parser refuses a recovery record whose proof does not verify, because the record holds every input of the check.
 - In an epoch record, no device ID is in both `removed` and `stay`. The record has exactly one key set to a recovery ID. A parser cannot know the current recovery ID, so the space state check confirms it ([LOG-8]).
+- An epoch record with an empty `removed` list is a rotation with no removal. A recovery key replacement appends one (section 13.3).
 - `commitment` is `SHA-256(frame("snailfish.key-commitment.v1", log_id, u64be(epoch), key))` for the 32-byte app key of the epoch.
-- Level 1 is the set of the `v1` types of this file.
+- Level 1 is the set of the `v1` types of this file. A record type is valid at a write level if the set of that level holds it ([VER-6], [VER-9]).
+- A grant and a device record state the highest level of the device engine ([VER-7]).
 
 ### 6.3 Signed statements that are not log records
 
@@ -287,7 +290,7 @@ The signature parameters are one line in exactly this form, with no whitespace e
 | `created` | Unix time in seconds, from the corrected device clock (8.5). A decimal integer from 1 to 2^53 - 1 with no leading zero. |
 | `expires` | `created + 300` or less, and more than `created`. Same integer form. |
 | `nonce` | 16 random bytes from the operating system CSPRNG, as 32 lowercase hex digits |
-| `keyid` | The device ID text of the signer (section 2.2) |
+| `keyid` | The device ID text of the signer (section 2.2). On `GET .../entries` and `POST .../append`, also the current recovery ID of the space (10.2, section 13.4). |
 | `alg` | `ed25519` |
 | `tag` | `snailfish.request.v1`. It separates request signatures from other uses of a key. |
 
@@ -352,15 +355,18 @@ The relay checks a signed request in this order. It returns the first error (sec
 2. If a header of 8.1 is missing, occurs twice or breaks its form, return `bad_signature`. A `signature-input` whose `expires` is not after `created`, or is more than 300 seconds after it, breaks its form.
 3. If `expires` is before the relay time, or `created` is more than 60 seconds after the relay time, return `expired`.
 4. If `content-digest` differs from the digest of the body, return `bad_digest`.
-5. If `keyid` names no device that is active in the space (10.2), return `unknown_device`.
-6. If the signature does not verify over the signature base of 8.4, return `bad_signature`.
-7. If the tenant file holds the pair (`keyid`, `nonce`), return `nonce_reused`. Otherwise store the pair with `expires`.
+5. If the tenant file blocks the device of `keyid` (12.4), return `blocked`. The relay reads the tenant file before it opens the space file ([STO-12]).
+6. If `keyid` names a device that an epoch record removed from the space (10.2), return `removed`.
+7. If `keyid` names no device that is active in the space (10.2), and it is not the current recovery ID on a route that accepts it (8.2), return `unknown_device`.
+8. If the signature does not verify over the signature base of 8.4, return `bad_signature`.
+9. If the tenant file holds the pair (`keyid`, `nonce`), return `nonce_reused`. Otherwise store the pair with `expires`.
 
 - The relay keeps each nonce in the tenant file until its `expires` time, so a restart does not allow a replay (T5). It deletes expired nonces.
 - The relay stores a nonce only after the signature verifies, so a party without the key cannot use up nonces.
-- Steps 3 to 5 run before the signature check. The errors of steps 3 and 4 tell an unauthenticated caller only facts that the request itself holds. Step 5 tells a caller who knows the tenant handle and the log ID whether a device ID is active in the space. The tenant handle has 128 random bits ([STO-10]), so only a party that already holds it can ask.
-- For `PUT /v1/t/{tenant}/s/{log}`, step 5 takes the device key from the genesis record in the body. The relay therefore runs steps 1 to 4 before it parses the body (10.5).
-- For the repair routes, step 5 also accepts a device that the staged entries or the request entries make active (10.9, [LOG-12]). The relay therefore runs steps 1 to 4, parses the body and runs the chain check before step 5.
+- Steps 3 to 7 run before the signature check. The errors of steps 3 and 4 tell an unauthenticated caller only facts that the request itself holds. Steps 5 to 7 tell a caller who knows the tenant handle and the log ID whether a device ID is blocked, removed or active in the space. The tenant handle has 128 random bits ([STO-10]), so only a party that already holds it can ask.
+- For `PUT /v1/t/{tenant}/s/{log}`, step 7 takes the device key from the genesis record in the body. The relay therefore runs steps 1 to 4 before it parses the body (10.5).
+- For the repair routes, step 7 also accepts a device that the staged entries or the request entries make active (10.9, [LOG-12]). The relay therefore runs steps 1 to 4, parses the body and runs the chain check before steps 5 to 7.
+- A recovery ID is in no machine group, so step 5 never blocks it.
 - A request that fails a check changes no stored state, except the nonce of step 7.
 
 ## 9. Recovery key encoding
@@ -396,7 +402,7 @@ seal_seed = HKDF-Expand(prk, "snailfish.recovery.seal.v1", 32)
 
 ## 10. HTTP API
 
-This section gives the sync and setup surface routes of M5. Later milestones add routes under the same prefix ([VER-12]). Section 12 gives the user surface. Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
+This section gives the sync and setup surface routes of M7. Later milestones add routes under the same prefix ([VER-12]). Section 12 gives the user surface. Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
 
 - The relay refuses a request body, or an object inside it, with a field that this section does not name (`bad_request`). The relay is upgraded before the engines ([VER-11]), so a newer engine never meets an older relay. The envelopes inside a body follow the looser rule of section 4.
 - The engine ignores unknown fields in a response body ([VER-13]).
@@ -434,9 +440,20 @@ This section gives the sync and setup surface routes of M5. Later milestones add
 
 ### 10.2 Active devices
 
-A device is active in a space if the genesis record or a grant at a position in the log names it ([LOG-8]). M4 has no removal, so a device stays active. The current recovery ID of a space is the recovery ID of its genesis record. M4 has no recovery record. The device of a genesis record signs the `PUT` request that creates the space.
+The space state after a log entry has these parts ([LOG-8]). Each record is judged against the state after the entry before it.
 
-A security record is a record of a type outside the `snailfish.change`, `snailfish.snapshot` and `snailfish.accept` families ([VER-5]). The genesis record and each grant are security records.
+| Part | Rule |
+| --- | --- |
+| Active devices | The genesis record and each grant add a device. An epoch record removes each device in `removed`. A removed device never becomes active again. |
+| Removed devices | Each device that an epoch record names in `removed`. |
+| Current epoch | 1 after the genesis record. Each epoch record sets it to its `epoch`. |
+| Current recovery ID | The recovery ID of the genesis record. Each recovery record sets it to the recovery ID of its `recovery` keys. |
+| Device level | The `level` of the device object in the genesis record or the grant. A device record of that device sets it to its `level`. |
+| Write level | The `level` of the genesis record. Each level record sets it to its `level`. |
+
+The device of a genesis record signs the `PUT` request that creates the space.
+
+A security record is a record of a type outside the `snailfish.change`, `snailfish.snapshot` and `snailfish.accept` families ([VER-5]). The genesis record, each grant, epoch, recovery, device and level record are security records.
 
 ### 10.3 Errors
 
@@ -457,6 +474,8 @@ Each error response has an HTTP status and this body:
 | `nonce_reused` | 401 | The nonce was used before | `paused: relay unavailable` |
 | `timeout` | 408 | The request did not end within the relay time limit. An append can still commit after this answer. | `paused: relay unavailable` |
 | `bad_setup` | 403 | The authorization code is unknown, used, expired, or bound to another challenge or redirect URI (12.3), or the setup token is unknown, expired, or bound to another device or tenant (10.5) | Token exchange: the sign-in fails, and the app starts it again. Space creation: `stopped: setup failed`. The app signs in again and gives the engine the new setup token. |
+| `blocked` | 403 | The user blocked the device of `keyid`, or a machine group that holds it, on the user page (8.6 step 5) | `paused: blocked` |
+| `removed` | 403 | An epoch record removed the device of `keyid` (8.6 step 6) | `stopped: removed` |
 | `unknown_device` | 403 | `keyid` names no active device of the space | `paused: relay unavailable`. On a fetch, if the verified log holds the grant of the device, the engine starts a repair first ([LOG-12], 10.9). |
 | `unknown_tenant` | 404 | No tenant has the handle | `paused: relay unavailable` |
 | `unknown_space` | 404 | The tenant has no space with the log ID | `paused: relay unavailable` |
@@ -501,7 +520,7 @@ The append refusals of 10.6 are results inside a `200` response, not error respo
 
 Request body: `{"genesis":<envelope>,"setup":"st_..."}`. `setup` is the setup token of section 12.3. A body that is not this object, with a duplicate or unknown field or a malformed `setup`, gets `bad_request`. A `genesis` value that breaks section 4 or 6 gets `invalid_record`.
 
-The relay runs 8.6 steps 1 to 4, then parses the body. It checks the genesis record: the envelope (section 4), the payload (section 6), the signature by the recovery key of the record, and `log` equal to `{log}`. The request signer must be the device of the record (8.6 steps 5 to 7). Then:
+The relay runs 8.6 steps 1 to 4, then parses the body. It checks the genesis record: the envelope (section 4), the payload (section 6), the signature by the recovery key of the record, and `log` equal to `{log}`. The request signer must be the device of the record (8.6 steps 7 to 9). Then:
 
 1. If the space exists with the same genesis record hash, return `200`. This is an exact retry, and the relay does not check the setup token.
 2. If the space exists with another genesis record, return `space_exists`.
@@ -534,6 +553,8 @@ The relay checks and appends the envelopes in list order, in one transaction in 
 {"results":[{"status":"stored","position":7},{"status":"known","position":3},{"status":"conflict","position":4},{"status":"refused","error":"bad_base"},{"status":"refused","error":"quota"}],"head":{"position":7,"digest":"<base64>"}}
 ```
 
+The request `keyid` is an active device, or the current recovery ID of the space (section 13.4).
+
 The relay checks each envelope in this order:
 
 1. If the envelope or the payload breaks section 4 or 6, the result is `refused` with `invalid_record`.
@@ -542,26 +563,37 @@ The relay checks each envelope in this order:
 4. If the decoded payload of a change is larger than `max_change_bytes`, the result is `refused` with `too_large`.
 5. If `log` differs from `{log}`, the result is `refused` with `invalid_record`.
 6. If `author` is a device ID that differs from the request `keyid`, the result is `refused` with `not_author`.
-7. If `author` is a device ID that is not an active device, or a recovery ID that is not the current recovery ID of the space (10.2), the result is `refused` with `not_active`. For a device ID, step 6 and 8.6 step 5 make this step unreachable on the relay.
-8. If the signature does not verify with the signing key of `author` (section 7.1), the result is `refused` with `invalid_record`. The signing key of the current recovery ID is the `recovery.sign` key of the genesis record.
+7. If `author` is a device ID that is not an active device, or a recovery ID that is not the current recovery ID of the space (10.2), the result is `refused` with `not_active`. For a device ID, step 6 and 8.6 step 7 make this step unreachable on the relay, except for a request by the recovery ID.
+8. If the signature does not verify with the signing key of `author` (section 7.1), the result is `refused` with `invalid_record`. The signing key of the current recovery ID is the `recovery.sign` key of the genesis record or of the last recovery record.
 9. If the base is not position 1 or later, or not before the new position, or its digest differs from the log digest at that position, the result is `refused` with `bad_base` ([LOG-6]).
 10. If the record is a security record and the log holds a security record after its base, the result is `refused` with `stale_base` ([LOG-7]). Changes after the base do not cause this refusal.
-11. If the record type is not `snailfish.change.v1` or `snailfish.grant.v1`, the result is `refused` with `unsupported`. M4 accepts only these two types. A change has a device ID author (section 6.2), so a record by the recovery key is a grant.
-12. If a change names an epoch other than the current epoch (1 in M4), the result is `refused` with `wrong_epoch`.
-13. If a grant names a device that is already active, or a level below the space write level, the result is `refused` with `invalid_record`.
-14. If the record is a change, and the stored change bytes of the space plus the byte length of its envelope JSON exceed the space quota, the result is `refused` with `quota` ([QTA-1]). The byte length of an envelope is the length of its JSON text exactly as the request holds it, which is also the text that the relay stores (10.7). The stored change bytes are the sum of these lengths for every change in the log, also a change that an earlier envelope of the same request stored. Security records do not count, and this step never refuses one ([QTA-3]).
-15. Otherwise the relay appends the record at the next position. Positions are dense ([LOG-1]). The relay stores the log digest of the new entry (section 5). The result is `stored` with the position.
+11. If the set of the write level does not hold the record type (section 6.2), or the record type is `snailfish.snapshot.v1` or `snailfish.accept.v1`, the result is `refused` with `unsupported` ([VER-9]). Snapshots and accept records come with compaction (M8). A level record or a device record with a level above the highest level of the relay is also `unsupported`.
+12. If a change names an epoch other than the current epoch, the result is `refused` with `wrong_epoch`.
+13. If the record breaks the state rule of its type, the result is `refused` with `invalid_record`:
+    - A grant names a device that is active or removed, or a level below the write level, or its key set does not hold each epoch from 1 to the current epoch.
+    - An epoch record: `epoch` is not the current epoch plus 1, a device in `removed` is not active, `removed` holds the author, `stay` differs from the active devices without `removed`, or the key set to a recovery ID is not to the current recovery ID.
+    - A recovery record: the new recovery ID is the current recovery ID or an earlier one, or its key set does not hold each epoch from 1 to the current epoch.
+    - A device record: `level` is not above the device level of the author.
+    - A level record: `level` is not above the write level, or an active device has a device level below `level` ([VER-8]).
+14. If the record is a security record, and the stored security record bytes of the space plus the byte length of its envelope JSON exceed the security record reserve, the result is `refused` with `reserve` ([STO-15]). The reserve is 16 MiB (16,777,216 bytes) by default. The relay operator can raise it.
+15. If the record is a security record, and the request `keyid` sent 10 security records that the relay stored in this space in the current relay day, the result is `refused` with `security_limit` ([STO-15]). A relay day is the relay time divided by 86,400, rounded down.
+16. If the record is a change, and the stored change bytes of the space plus the byte length of its envelope JSON exceed the space quota, the result is `refused` with `quota` ([QTA-1]). The byte length of an envelope is the length of its JSON text exactly as the request holds it, which is also the text that the relay stores (10.7). The stored change bytes are the sum of these lengths for every change in the log, also a change that an earlier envelope of the same request stored. Security records do not count, and this step never refuses one ([QTA-3]).
+17. Otherwise the relay appends the record at the next position. Positions are dense ([LOG-1]). The relay stores the log digest of the new entry (section 5). The result is `stored` with the position.
 
 - `head` is the last position and its log digest after the transaction.
 - A known envelope earlier in the same request counts: a second copy in one request is `known`.
-- `bad_base`, `stale_base`, `on_hold` and `quota` are transient. Each other refusal is permanent for that envelope ([DLV-9]).
+- `bad_base`, `stale_base`, `on_hold`, `quota`, `reserve`, `security_limit` and `wrong_epoch` are transient. Each other refusal is permanent for that envelope ([DLV-9]).
+- After `reserve` or `security_limit`, the engine keeps the record and reports `paused: relay unavailable` (T10). It sends the record again at the next sync.
+- After `wrong_epoch` for an own change, the engine fetches. If the verified epoch is above the epoch of the change, the engine encrypts the change again with the current key and the same `change_id`, signs it on the verified head and sends it ([DLV-7]). Step 2 runs before step 12, so the relay does not hold the old envelope.
 - After `quota`, the engine keeps the envelope in its outbox, reports `paused: quota`, and sends it again at each later sync ([QTA-4]). The relay serves fetches at a full quota ([QTA-2]).
 - After `on_hold`, the engine keeps the envelope in its outbox and reports `paused: restore hold`. It sends the envelope again after the hold ends.
 - After `stale_base`, the engine fetches and checks the space state again ([LOG-7]). If the verified log holds a grant for the device of a refused grant, the engine drops the refused grant. Otherwise, if the active devices equal the list that the user confirmed, the engine signs the grant again with a new base. Otherwise it asks the user to confirm again. A grant that the recovery key signed needs the recovery key again, so the engine always asks for it.
-- The engine applies steps 5 and 7 to 13 to each fetched record. A fetched record that fails one of them stops the engine with `stopped: fork` ([FRK-1]). The engine verifies the signature (step 8) before it changes any state for the record ([WIR-2]).
+- The engine applies steps 5 and 7 to 13 to each fetched record, with the highest level of the engine in step 11. A fetched record that fails one of them stops the engine with `stopped: fork` ([FRK-1]). The engine verifies the signature (step 8) before it changes any state for the record ([WIR-2]).
 - The engine splits its envelopes into requests that fit `max_append_envelopes` and `max_request_bytes`. A change whose append body alone is larger than `max_request_bytes` is refused for ever with `too_large`, and the engine does not send it ([DLV-9]).
 
 ### 10.7 `GET /v1/t/{tenant}/s/{log}/entries`
+
+The request `keyid` is an active device, or the current recovery ID of the space (section 13.4).
 
 Query: `after` (integer from 0) and `limit` (integer from 1 to `max_fetch_entries`). Both are required, in this order, as decimal integers with no leading zero.
 
@@ -645,7 +677,7 @@ The relay checks the body size first, as for every route (10.3 `too_large`). The
 1. 8.6 steps 1 to 4.
 2. If the body breaks this section, return `bad_request`.
 3. If the base equals the relay head (position and digest), run the chain check, entry by entry, until the first failure. Otherwise no entry passes. Each entry must have the next position after the base or after the entry before it. An envelope must pass steps 1, 2, 5 and 7 to 13 of 10.6 against the log and the entries before it, with step 2 as for a fetched record: a known `change_id` fails the check. The size limit of step 4 and the hold of step 3 do not apply, because the record was in the log before. A stub fails the check with `uncovered_stub`, because M3 has no snapshot ([LOG-11]).
-4. 8.6 steps 5 to 7. Step 5 accepts a device that is active in the log or in the entries that passed step 3 ([LOG-12]).
+4. 8.6 steps 5 to 9. Step 7 accepts a device that is active in the log or in the entries that passed step 3 ([LOG-12]).
 5. If the base differs from the relay head (position or digest), return `bad_repair`.
 6. If another device holds a session that has not expired, return `repair_busy`.
 7. If an entry failed step 3, return the error of that entry: `invalid_record`, `uncovered_stub`, or `bad_repair` for a wrong position.
@@ -653,14 +685,14 @@ The relay checks the body size first, as for every route (10.3 `too_large`). The
 
 A chunk request uses the same order. In step 3, the chain continues the staged entries of the named session if the relay holds that session and the relay head did not change since its start. Otherwise no entry passes. Step 4 also accepts a device that the staged entries of the named session make active, also if the session expired or belongs to another device. Step 5 is: if the session is unknown or expired, if the request signer is not the device of the session, or if the relay head changed since the start, return `bad_repair`. Step 6 does not apply. The first entry must have the position `next`.
 
-A finish request runs 8.6 steps 1 to 4, returns `bad_request` for a body that breaks this section, and runs 8.6 steps 5 to 7 with the keys of the log and the staged entries of the named session. Then:
+A finish request runs 8.6 steps 1 to 4, returns `bad_request` for a body that breaks this section, and runs 8.6 steps 5 to 9 with the keys of the log and the staged entries of the named session. Then:
 
 1. If the session is unknown or expired, if the request signer is not the device of the session, or if the relay head changed since the start, return `bad_repair`.
 2. If `tip` differs from the last staged entry (position or digest), return `bad_repair`.
 3. If a staged stub is not covered by the usable snapshot of the staged range, return `uncovered_stub`. M3 stages no stub, so this step finds none.
 4. Move the staged entries into the log in one transaction, end the session and delete its staged entries. The response holds the new head.
 
-- A request that fails a check changes no stored state, except the nonce of 8.6 step 7.
+- A request that fails a check changes no stored state, except the nonce of 8.6 step 9.
 - The chain check runs before the request signature check, so a caller that knows the tenant handle and the log ID can make the relay verify up to `max_append_envelopes` record signatures for one request. The tenant handle has 128 random bits ([STO-10]).
 - A security record that a device appends during a hold moves the head and ends each repair session with `bad_repair`. The next fetch of the repairing device then finds an entry that conflicts with its verified log, and the engine stops with `stopped: fork` (DESIGN.md T7 limit, `specs/epochs/test.qnt::removalDuringHoldCanForkTest`).
 - The relay accepts repair sessions during a restore hold ([LOG-14]).
@@ -687,7 +719,7 @@ Open: `POST /v1/t/{tenant}/s/{log}/enroll`
 | The relay holds the session for the same device and space | 200 | `{"expires":1767226200}`, the stored value. This is an exact retry, also when the session is done or cancelled. |
 | The relay holds the session for another device or space | 409 | Error `session_exists` |
 
-The relay checks an open request in this order: 8.6 steps 1 to 4, `bad_request` for a body that breaks this section, 8.6 steps 5 to 7, then the session ID.
+The relay checks an open request in this order: 8.6 steps 1 to 4, `bad_request` for a body that breaks this section, 8.6 steps 5 to 9, then the session ID.
 
 - `expires` is the relay time of the open plus 600 seconds. At a relay time of `expires` or later, the session does not exist for any route, and each route returns `unknown_session`. The relay deletes expired sessions.
 - A session works once. A session ID cannot be opened again before it expires, and a session takes one message for each step.
@@ -714,7 +746,7 @@ The new device writes with `POST /v1/e/{session}`, and the trusted device with `
 
 1. For the trusted route: 8.6 steps 1 to 4.
 2. If the body breaks this section, return `bad_request`.
-3. For the trusted route: 8.6 steps 5 to 7.
+3. For the trusted route: 8.6 steps 5 to 9.
 4. If the relay holds no session with the ID that has not expired, return `unknown_session`. For the trusted route, also return `unknown_session` if the session belongs to another device or space.
 5. If the slot of the message holds the same JSON value, return `200` with the session object. This is an exact retry, also after the session is done or cancelled. A cancel by either writer when the session is cancelled is also an exact retry.
 6. If the session is done or cancelled, return `session_closed`.
@@ -738,7 +770,7 @@ Read: `GET /v1/e/{session}`, or the signed `GET /v1/t/{tenant}/s/{log}/enroll/{s
 
 Limits:
 
-- A party that knows the session ID can read the session until it expires, so it can learn the tenant handle and the log ID. It can then ask 8.6 step 5 whether a device ID is active. Each request still needs a device signature, so it can do nothing else with them (T11).
+- A party that knows the session ID can read the session until it expires, so it can learn the tenant handle and the log ID. It can then ask 8.6 step 7 whether a device ID is active. Each request still needs a device signature, so it can do nothing else with them (T11).
 - A party that knows the session ID can write a slot of the new device before the new device does, or cancel the session. A device that is active in another space on the relay can also open a scanned session ID first (`session_exists`). In each case the codes differ, or the session takes no more messages, and the enrollment fails. The user starts a new session.
 
 ### 10.11 `POST /v1/t/{tenant}/s/{log}/device-status`
@@ -764,7 +796,7 @@ Request body:
 
 The response is `200` with `{}`.
 
-- The relay runs 8.6 steps 1 to 4, returns `bad_request` for a body that breaks this section, and runs 8.6 steps 5 to 7.
+- The relay runs 8.6 steps 1 to 4, returns `bad_request` for a body that breaks this section, and runs 8.6 steps 5 to 9.
 - `oldest` is `null` exactly when `outbox` is 0. Otherwise the body breaks this section.
 - The relay stores the last report of each device in the tenant file, with the relay time of the report. A new report replaces the old one.
 - The relay also takes reports during a restore hold.
@@ -902,14 +934,16 @@ If the browser has no session, the page asks the user to sign in first (12.4). W
 `device` is a keys object (section 6.1). The response is `200`:
 
 ```json
-{"token":"st_...","tenant":"t_...","expires":1767226200}
+{"token":"st_...","tenant":"t_...","expires":1767226200,"spaces":[{"log":"l_...","app":"com.example.tasks"}]}
 ```
+
+`spaces` lists each space of the tenant with its log ID and app ID, in log ID order. A device uses it to find the space of its app before it makes a new space (section 13.4). The engine reads a missing `spaces` as an empty list ([VER-13]).
 
 The relay checks a token request in this order:
 
 1. 8.6 steps 1 to 4.
 2. If the body breaks this section, return `bad_request`. A `code_verifier` or a `redirect_uri` that breaks the form of 12.2 breaks this section.
-3. 8.6 steps 5 to 7. Step 5 accepts only the device ID of `device`. Step 7 keeps the nonce in `directory.db`, because the request names no tenant.
+3. 8.6 steps 7 to 9. Step 7 accepts only the device ID of `device`. Step 9 keeps the nonce in `directory.db`, because the request names no tenant.
 4. If the relay holds no code with the value of `code`, or the code is used or expired (relay time at or after its expiry), return `bad_setup`.
 5. If `redirect_uri` differs byte for byte from the decoded redirect URI that the relay stored for the code, or `BASE64URL(SHA-256(ASCII(code_verifier)))` differs from its challenge, return `bad_setup`.
 6. Mark the code as used, and store SHA-256 of the 32 setup token bytes with the user ID, the device ID and the expiry time, the relay time plus 600 seconds ([USR-5]). Both writes are one transaction.
@@ -924,7 +958,7 @@ The relay configuration sets the origin of the user page, for example `https://s
 
 | Method | Path | Session | Content |
 | --- | --- | --- | --- |
-| `GET` | `/u/` | Yes | Spaces, devices with their status, machine groups, usage against quota, passkeys, restore holds and the webhook |
+| `GET` | `/u/` | Yes | Spaces, devices with their status, machine groups, blocks, open security actions, usage against quota, passkeys, restore holds and the webhook |
 | `GET` | `/u/signin`, `/u/invite` | No | Pages |
 | `GET` | `/u/authorize` | Optional | Without a session, the sign-in page. With a session, the request and the "Allow" form with the anti-CSRF token (12.2). |
 | `GET` | `/u/app.js` | No | The script of the WebAuthn calls |
@@ -935,6 +969,7 @@ The relay configuration sets the origin of the user page, for example `https://s
 | `POST` | `/u/signout` | Yes | End the session |
 | `POST` | `/u/groups`, `/u/groups/delete`, `/u/groups/members` | Yes | Create a machine group, delete one, add or remove a device |
 | `POST` | `/u/hold/release` | Yes | Release the restore hold of a space |
+| `POST` | `/u/block`, `/u/unblock` | Yes | Block or unblock one device or one machine group: form fields `kind` (`device` or `group`) and `id` (the device ID text or the group number) |
 | `POST` | `/u/webhook`, `/u/webhook/test` | Yes | Set or clear the webhook URL, send a test message |
 | `POST` | `/u/tenant/delete` | Yes | Delete the tenant and the user, if the tenant has no space |
 
@@ -959,6 +994,8 @@ Write rules ([USR-7]):
 - A `GET` of a page without a valid session shows the sign-in page.
 - Limit: a sign-in start tells the caller whether a user name has a passkey, because the options name its credentials. The rate limit of 12.6 slows a search for names.
 - A device in a machine group is a device ID that is active in a space of the tenant. A group name is 1 to 64 UTF-8 bytes.
+- A block names a device ID that is active in a space of the tenant, or a machine group. A block of a group blocks each device that the group holds, also a device that the user adds later. A block stays after a removal. An unblock removes the row only ([STO-12]).
+- Open security actions (DESIGN.md "Monitoring and alerting" item 10): a blocked device that is still active in a space, a device with a device level below the highest relay level ([VER-10]), and, after an epoch record, each device that stays and whose last report names an older epoch. The relay sends one webhook message for each new action (12.5).
 
 | Code | HTTP status | Cause |
 | --- | --- | --- |
@@ -990,7 +1027,7 @@ The relay sends `POST` with `content-type: application/json` and this body:
 
 - The body holds only `text`, a string. Slack incoming webhooks accept this form.
 - The JSON writer keeps non-ASCII characters as UTF-8. It escapes `"`, `\`, LF as `\n`, CR as `\r`, TAB as `\t`, and each other control character as `\u` and 4 lowercase hex digits.
-- The relay sends a message for a stalled device and for a space at 80% of its quota (DESIGN.md "Monitoring and alerting" items 7 and 9), once for each case until the case ends.
+- The relay sends a message for a stalled device, for a space at 80% of its quota and for an open security action (DESIGN.md "Monitoring and alerting" items 7, 9 and 10), once for each case until the case ends.
 - The relay follows no redirect, waits at most 10 seconds for the DNS lookup and the exchange together, and reads at most 4 KiB of the response. A `2xx` status is a success.
 
 ### 12.6 Rate limit
@@ -998,4 +1035,51 @@ The relay sends `POST` with `content-type: application/json` and this body:
 The relay limits the requests of each IP address to the routes `GET /v1/e/{session}`, `POST /v1/e/{session}`, `POST /v1/setup/token`, `POST /u/signin/start`, `POST /u/signin/finish`, `POST /u/invite/start` and `POST /u/invite/finish`.
 
 - The limit is a token bucket for each address: 120 requests, filled at 2 requests each second. A request with no token gets `rate_limited`.
-- The address is the peer address of the TCP connection. An IPv6 address counts as its /64 prefix, because one host usually holds a whole /64. An IPv4-mapped IPv6 address counts as its IPv4 address. Behind a reverse proxy, all clients share the address of the proxy.
+- The address is the peer address of the TCP connection. An IPv6 address counts as its /64 prefix, because one host usually holds a whole /64. An IPv4-mapped IPv6 address counts as its IPv4 address.
+- If the peer address is an address that `--trusted-proxy` lists, the address is the last entry of the last `X-Forwarded-For` header. If that header is missing or its last entry is not an IP address, the relay uses the peer address. The relay ignores `X-Forwarded-For` from every other peer, because a client can set it.
+- Without `--trusted-proxy`, all clients behind a reverse proxy share the address of the proxy.
+
+## 13. Removal and recovery
+
+This section gives the engine procedures for a removal, a recovery key replacement and a full recovery (DESIGN.md S4, S5, T8, T9). They use only the records of section 6 and the routes of section 10.
+
+### 13.1 Epoch keys
+
+- The engine opens the key of each epoch from the key set to its own device: in the genesis record or its grant for the epochs up to its grant, and in each later epoch record. It checks each key against the commitment of the genesis or epoch record of that epoch (section 7.3).
+- An epoch record that removes the own device stops the engine with `stopped: removed`. The engine keeps the keys that it holds. It reads no later record.
+- A new change uses the key of the current epoch of the verified log.
+- A grant seals the keys of each epoch from 1 to the current epoch to the new device (10.6 step 13).
+
+### 13.2 Removal
+
+1. The engine shows the active devices with their names. The user selects the devices to remove. The other active devices stay.
+2. The engine stores the confirmed lists: `removed` and `stay`.
+3. At the next sync, if the active devices of the verified log equal `removed` plus `stay`, the engine makes a new 32-byte app key. It signs an epoch record on the verified head. The record seals the key to each device in `stay` and to the current recovery ID.
+4. If the active devices differ, the engine asks the user to confirm again ([LOG-7]). It signs nothing until the user confirms.
+5. After `stale_base`, the engine fetches and goes to step 3. It always makes a new key, because the refused record sealed the old key to its recipients.
+6. After the epoch record is in the verified log, the engine writes new changes with the new key.
+
+The engine signs the record with its own device key, or with the recovery key if the user types it. An epoch record by the recovery key needs the recovery key again after `stale_base`.
+
+### 13.3 Recovery key replacement
+
+1. The app asks the engine for a new recovery key. The engine makes 16 random bytes and returns the display form of section 9. The engine keeps no copy.
+2. The app shows the key. The user writes it down and types it back. The app compares the typed copy.
+3. The user types the current recovery key. The app gives the engine the current key and the new key.
+4. The engine derives both key pairs (section 9). It signs a recovery record with the current recovery key. The record holds the new recovery keys, the possession proof, and one key set to the new recovery ID with each epoch from 1 to the current epoch.
+5. After the recovery record is in the verified log, the engine signs a rotation: an epoch record with an empty `removed` list, by its own device key. T9 needs this rotation, because the holder of the old key can open each earlier key set.
+6. After `stale_base` for the recovery record, the engine drops it and asks for the current recovery key again.
+
+### 13.4 Full recovery
+
+A full recovery adds a device to a space that has no trusted device left (S5).
+
+1. The user signs in on the new device (12.2). The setup token response names the tenant handle and the spaces of the tenant (12.3).
+2. If a space has the app ID of the app, the app asks for the recovery key of that space. It does not make a new space.
+3. The engine derives the recovery keys. It fetches the log from position 0 with requests that the recovery ID signs (8.2). It verifies each record from the genesis record. It has no checkpoint, so it cannot detect a log that the relay cut short (T7).
+4. If the current recovery ID of the verified log differs from the derived recovery ID, the engine stops with an error that the app shows as a wrong recovery key. The relay refuses each request of a recovery ID that is not current with `unknown_device`.
+5. The engine opens the key of each epoch from the key sets to the recovery ID: in the genesis record, in each epoch record, and in the last recovery record.
+6. The engine signs a grant for its own device with the recovery key, on the verified head, and appends it in a request that the recovery ID signs. After `stale_base`, it fetches and signs again.
+7. After the grant is in the verified log, the device is active. The engine forgets the recovery key. The user removes the old devices with the procedure of 13.2.
+
+Edits that never reached the relay are lost (S5).

@@ -47,8 +47,16 @@ type space struct {
 	hold       bool              // restore hold ([LOG-14])
 	reports    map[string]report // device ID text to its last status report (10.8)
 	sess       *repairSession    // at most one repair session (10.9)
-	quota      int64             // space quota in bytes (10.6 step 14). 0 means no quota.
-	used       int64             // stored change bytes (10.6 step 14)
+	quota      int64             // space quota in bytes (10.6 step 16). 0 means no quota.
+	used       int64             // stored change bytes (10.6 step 16)
+	removed    map[string]bool   // devices that an epoch record removed (10.2)
+	retired    map[string]bool   // recovery IDs that a recovery record replaced (10.2)
+	epoch      int64             // the current epoch (10.2)
+	devLevel   map[string]int64  // the device level of each device (10.2)
+	maxLevel   int64             // the highest level of the relay (10.6 step 11)
+	reserve    int64             // the security record reserve in bytes (10.6 step 14)
+	secUsed    int64             // stored security record bytes (10.6 step 14)
+	secCount   map[string]int    // security records that each request keyid sent in the relay day (10.6 step 15)
 	// mut names a deliberate fault. Only the tests of http_test.go set it, to
 	// show that the vectors detect the fault. The generator keeps it "".
 	mut string
@@ -83,12 +91,24 @@ func (sp *space) clone() *space {
 	for k, v := range sp.reports {
 		c.reports[k] = v
 	}
+	c.removed = copyMap(sp.removed)
+	c.retired = copyMap(sp.retired)
+	c.devLevel = copyMap(sp.devLevel)
+	c.secCount = copyMap(sp.secCount)
 	if sp.sess != nil {
 		ss := *sp.sess
 		ss.staged = append([]*record{}, sp.sess.staged...)
 		c.sess = &ss
 	}
 	return &c
+}
+
+func copyMap[K comparable, V any](m map[K]V) map[K]V {
+	c := make(map[K]V, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
 }
 
 func (sp *space) digestAt(n int) []byte {
@@ -158,20 +178,96 @@ func (sp *space) push(r *record) int {
 	sp.entries = append(sp.entries, spEntry{r.rh, digestN(sp.digestAt(n-1), n, eh)})
 	if isSecurity(r.ptype) {
 		sp.lastSec = n
+		sp.secUsed += r.envLen
 	}
 	switch r.ptype {
 	case "snailfish.genesis.v1":
-		id, sg, _ := r.device()
+		id, sg, level := r.device()
 		sp.active[id] = sg
+		sp.devLevel[id] = level
 		sp.writeLevel, _ = r.m["level"].(int64)
+		sp.epoch = 1
 		rec, _ := r.m["recovery"].(map[string]any)
 		rk, _ := decodeB64(fmt.Sprint(rec["sign"]))
 		sp.recovery = map[string]ed25519.PublicKey{r.str("author"): rk}
 	case "snailfish.grant.v1":
-		id, sg, _ := r.device()
+		id, sg, level := r.device()
 		sp.active[id] = sg
+		sp.devLevel[id] = level
+	case "snailfish.epoch.v1":
+		for _, x := range r.list("removed") {
+			delete(sp.active, x)
+			sp.removed[x] = true
+		}
+		sp.epoch, _ = r.m["epoch"].(int64)
+	case "snailfish.recovery.v1":
+		for old := range sp.recovery {
+			sp.retired[old] = true
+		}
+		rid, rk := r.recoveryKeys()
+		sp.recovery = map[string]ed25519.PublicKey{rid: rk}
+	case "snailfish.device.v1":
+		sp.devLevel[r.str("author")], _ = r.m["level"].(int64)
+	case "snailfish.level.v1":
+		sp.writeLevel, _ = r.m["level"].(int64)
 	}
 	return n
+}
+
+// list is a list of strings of the payload.
+func (r *record) list(k string) []string {
+	var out []string
+	xs, _ := r.m[k].([]any)
+	for _, x := range xs {
+		out = append(out, fmt.Sprint(x))
+	}
+	return out
+}
+
+// recoveryKeys is the recovery ID text and the signing key of the `recovery`
+// keys of a recovery record.
+func (r *record) recoveryKeys() (string, ed25519.PublicKey) {
+	rec, _ := r.m["recovery"].(map[string]any)
+	sg, _ := decodeB64(fmt.Sprint(rec["sign"]))
+	se, _ := decodeB64(fmt.Sprint(rec["seal"]))
+	return "r_" + hx(sha(frame(s("snailfish.recovery-id.v1"), sg, se))), sg
+}
+
+// keySetEpochs is the `to` and `epochs` of each key set of the payload.
+func (r *record) keySetEpochs() (to []string, epochs [][]int64) {
+	xs, _ := r.m["keys"].([]any)
+	for _, x := range xs {
+		k, _ := x.(map[string]any)
+		to = append(to, fmt.Sprint(k["to"]))
+		var es []int64
+		ys, _ := k["epochs"].([]any)
+		for _, y := range ys {
+			e, _ := y.(int64)
+			es = append(es, e)
+		}
+		epochs = append(epochs, es)
+	}
+	return to, epochs
+}
+
+// allEpochs is true if es is 1 .. n.
+func allEpochs(es []int64, n int64) bool {
+	if int64(len(es)) != n {
+		return false
+	}
+	for i, e := range es {
+		if e != int64(i)+1 {
+			return false
+		}
+	}
+	return true
+}
+
+// level1 is the set of record types of level 1 (PROTOCOL.md 6.2): every v1 type.
+var level1 = map[string]bool{
+	"snailfish.genesis.v1": true, "snailfish.grant.v1": true, "snailfish.epoch.v1": true,
+	"snailfish.recovery.v1": true, "snailfish.device.v1": true, "snailfish.level.v1": true,
+	"snailfish.change.v1": true, "snailfish.snapshot.v1": true, "snailfish.accept.v1": true,
 }
 
 // newSpaceFromEnvelopes replays a log of genesis and grant and change records
@@ -182,7 +278,8 @@ func newSpaceFromEnvelopes(logText string, envs []string) (*space, error) {
 		return nil, err
 	}
 	sp := &space{logText: logText, logID: logID, active: map[string]ed25519.PublicKey{}, recovery: map[string]ed25519.PublicKey{},
-		changes: map[string]chgRef{}, reports: map[string]report{}}
+		changes: map[string]chgRef{}, reports: map[string]report{}, removed: map[string]bool{}, retired: map[string]bool{},
+		devLevel: map[string]int64{}, maxLevel: 1, reserve: defaultReserve, secCount: map[string]int{}}
 	for i, env := range envs {
 		n := i + 1
 		r, err := parseRecord(env)
@@ -275,13 +372,31 @@ func (sp *space) appendOne(keyid, env string, lim limitsJ) result {
 	if code := sp.checkRules(r, keyid); code != "" {
 		return refuse(code)
 	}
+	sec := isSecurity(r.ptype)
 	// 14
+	if sec && sp.secUsed+r.envLen > sp.reserve && sp.mut != "no-reserve" {
+		return refuse("reserve")
+	}
+	// 15
+	if sec && sp.secCount[keyid] >= securityPerDay && sp.mut != "no-security-limit" {
+		return refuse("security_limit")
+	}
+	// 16
 	if (r.ptype == "snailfish.change.v1" || sp.mut == "quota-checks-security") && sp.quota > 0 && sp.used+r.envLen > sp.quota && sp.mut != "no-quota" {
 		return refuse("quota")
 	}
-	// 15
+	// 17
+	if sec {
+		sp.secCount[keyid]++
+	}
 	return result{status: "stored", pos: sp.push(r)}
 }
+
+// defaultReserve is the security record reserve of PROTOCOL.md 10.6 step 14.
+const defaultReserve = 16 << 20
+
+// securityPerDay is the daily limit of PROTOCOL.md 10.6 step 15.
+const securityPerDay = 10
 
 // checkRules is PROTOCOL.md 10.6 steps 5 to 13 against the state of sp. If
 // keyid is "", it skips step 6, as for a fetched record or a repair entry.
@@ -320,23 +435,80 @@ func (sp *space) checkRules(r *record, keyid string) string {
 		return "stale_base"
 	}
 	// 11
-	if r.ptype != "snailfish.change.v1" && r.ptype != "snailfish.grant.v1" {
+	level, _ := r.m["level"].(int64)
+	if !level1[r.ptype] || r.ptype == "snailfish.snapshot.v1" || r.ptype == "snailfish.accept.v1" ||
+		((r.ptype == "snailfish.level.v1" || r.ptype == "snailfish.device.v1") && level > sp.maxLevel && sp.mut != "level-above-max") {
 		return "unsupported"
 	}
 	// 12
 	if r.ptype == "snailfish.change.v1" {
-		if e, _ := r.m["epoch"].(int64); e != 1 {
+		if e, _ := r.m["epoch"].(int64); e != sp.epoch && sp.mut != "any-epoch" {
 			return "wrong_epoch"
 		}
 	}
 	// 13
-	if r.ptype == "snailfish.grant.v1" {
-		id, _, level := r.device()
-		if sp.active[id] != nil || level < sp.writeLevel {
-			return "invalid_record"
-		}
+	if !sp.stateOK(r, author) {
+		return "invalid_record"
 	}
 	return ""
+}
+
+// stateOK is the state rule of each record type of PROTOCOL.md 10.6 step 13.
+func (sp *space) stateOK(r *record, author string) bool {
+	to, epochs := r.keySetEpochs()
+	switch r.ptype {
+	case "snailfish.grant.v1":
+		id, _, level := r.device()
+		return sp.active[id] == nil && (!sp.removed[id] || sp.mut == "regrant-removed") &&
+			level >= sp.writeLevel && len(epochs) == 1 && allEpochs(epochs[0], sp.epoch)
+	case "snailfish.epoch.v1":
+		e, _ := r.m["epoch"].(int64)
+		removed := map[string]bool{}
+		for _, x := range r.list("removed") {
+			if sp.active[x] == nil || x == author {
+				return false
+			}
+			removed[x] = true
+		}
+		stay := r.list("stay")
+		want := 0
+		for id := range sp.active {
+			if !removed[id] {
+				want++
+			}
+		}
+		if len(stay) != want {
+			return false
+		}
+		for _, x := range stay {
+			if sp.active[x] == nil || removed[x] {
+				return false
+			}
+		}
+		for _, t := range to {
+			if strings.HasPrefix(t, "r_") && sp.recovery[t] == nil && sp.mut != "epoch-old-recovery" {
+				return false
+			}
+		}
+		return e == sp.epoch+1
+	case "snailfish.recovery.v1":
+		rid, _ := r.recoveryKeys()
+		return sp.recovery[rid] == nil && !sp.retired[rid] && len(epochs) == 1 && allEpochs(epochs[0], sp.epoch)
+	case "snailfish.device.v1":
+		level, _ := r.m["level"].(int64)
+		return level > sp.devLevel[author]
+	case "snailfish.level.v1":
+		level, _ := r.m["level"].(int64)
+		if level <= sp.writeLevel {
+			return false
+		}
+		for id := range sp.active {
+			if sp.devLevel[id] < level {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // authorKey is the signing key of an author of 10.6 steps 7 and 8: an active
@@ -1081,10 +1253,12 @@ type relayState struct {
 	now       int64
 	space     *space
 	used      map[[2]string]bool
-	mut       string // a deliberate fault, as space.mut
+	blocked   map[string]bool        // device IDs that the tenant file blocks (8.6 step 5)
+	spaces    map[string][]spaceRefJ // the spaces of each tenant handle (12.3)
+	mut       string                 // a deliberate fault, as space.mut
 }
 
-var paramsRe = regexp.MustCompile(`^\("@method" "@authority" "@path" "@query" "content-digest"\);created=([1-9][0-9]*);expires=([1-9][0-9]*);nonce="([0-9a-f]{32})";keyid="(d_[0-9a-f]{64})";alg="ed25519";tag="snailfish\.request\.v1"$`)
+var paramsRe = regexp.MustCompile(`^\("@method" "@authority" "@path" "@query" "content-digest"\);created=([1-9][0-9]*);expires=([1-9][0-9]*);nonce="([0-9a-f]{32})";keyid="((?:d|r)_[0-9a-f]{64})";alg="ed25519";tag="snailfish\.request\.v1"$`)
 
 var digestRe = regexp.MustCompile(`^sha-256=:([A-Za-z0-9+/]{43}=):$`)
 
@@ -1141,12 +1315,38 @@ func (rs *relayState) verifyRequest(rq request) string {
 	if code != "" {
 		return code
 	}
-	// 5
-	key := rs.space.active[pp.keyid]
-	if key == nil {
-		return "unknown_device"
+	key, code := rs.signerKey(pp.keyid, recoveryRoute(rq))
+	if code != "" {
+		return code
 	}
 	return rs.checkSignature(rq, pp, sig, key)
+}
+
+// recoveryRoute is true for the routes that take a request by the current
+// recovery ID (PROTOCOL.md 8.2): GET .../entries and POST .../append.
+func recoveryRoute(rq request) bool {
+	return (rq.method == "GET" && strings.HasSuffix(rq.path, "/entries")) ||
+		(rq.method == "POST" && strings.HasSuffix(rq.path, "/append"))
+}
+
+// signerKey is 8.6 steps 5 to 7.
+func (rs *relayState) signerKey(keyid string, recovery bool) (ed25519.PublicKey, string) {
+	// 5
+	if rs.blocked[keyid] && rs.mut != "no-block" {
+		return nil, "blocked"
+	}
+	// 6
+	if rs.space.removed[keyid] && rs.mut != "removed-as-unknown" {
+		return nil, "removed"
+	}
+	// 7
+	if key := rs.space.active[keyid]; key != nil {
+		return key, ""
+	}
+	if key := rs.space.recovery[keyid]; key != nil && (recovery || rs.mut == "recovery-any-route") {
+		return key, ""
+	}
+	return nil, "unknown_device"
 }
 
 // checkHeaders is the session cookie rule of PROTOCOL.md 10 and 8.6 steps 1 to 4.

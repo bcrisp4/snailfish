@@ -394,7 +394,15 @@ fn handoff_creates_a_space() {
     let t = setup::parse_token_response(&r.body).unwrap();
     assert_eq!(t.tenant, fx.tenant());
     assert_eq!(t.expires, fx.now.load(Ordering::SeqCst) + 600);
+    assert_eq!(t.spaces, vec![]);
     assert_eq!(put(&fx, &t.tenant, &t.token, "A").status, 201);
+    // 12.3, 13.4: a later sign-in names the space, so a device of the app
+    // finds it and does not make a second space.
+    let code2 = b.approve(&setup::challenge(VERIFIER));
+    let t2 = setup::parse_token_response(&exchange(&fx, &code2, VERIFIER, "C").body).unwrap();
+    assert_eq!(t2.spaces.len(), 1);
+    assert_eq!(t2.spaces[0].log, fx.log_id());
+    assert_eq!(t2.spaces[0].app, "com.example.tasks");
     // [USR-4]: the code works once.
     let r = exchange(&fx, &code, VERIFIER, "A");
     assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_setup"));
@@ -1241,4 +1249,99 @@ fn send_loop_delivers_messages_and_alerts() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     drop(rt);
+}
+
+/// S4, [STO-12], `PROTOCOL.md` 12.4 and 8.6 steps 5 and 6: the user blocks
+/// the machine group of B on the user page. The relay refuses B at once, and
+/// A still syncs. The page shows the block as an open security action until
+/// a trusted device removes B. After the removal, an unblock does not bring
+/// B back: the relay refuses it as removed.
+#[test]
+fn block_of_a_group_refuses_its_devices_until_unblock_and_removal_is_final() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let (mut b, _) = signed_in(&fx);
+    let device_b = fx.key("B").2;
+    assert_eq!(b.form("/u/groups", &[("name", "phone")]).status, 303);
+    let r = b.form(
+        "/u/groups/members",
+        &[("group", "1"), ("device", &device_b), ("op", "add")],
+    );
+    assert_eq!(r.status, 303);
+    let fetch = |who: &str| {
+        let path = format!("{}/entries", fx.space_path(fx.tenant(), fx.log()));
+        fx.relay
+            .handle(&fx.signed("GET", &path, "after=0&limit=10", b"", who))
+    };
+    assert_eq!(fetch("B").status, 200);
+    assert_eq!(
+        b.form("/u/block", &[("kind", "group"), ("id", "1")]).status,
+        303
+    );
+    let r = fetch("B");
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "blocked"));
+    assert_eq!(fetch("A").status, 200);
+    let page = b.home();
+    assert!(page.contains("Open security actions"), "{page}");
+    assert!(
+        page.contains("is blocked. Remove it on a trusted device"),
+        "{page}"
+    );
+    // An unknown kind or group is refused, and a CSRF-less form is too.
+    assert_eq!(
+        b.form("/u/block", &[("kind", "x"), ("id", "1")]).status,
+        400
+    );
+    assert_eq!(
+        b.form("/u/block", &[("kind", "group"), ("id", "9")]).status,
+        400
+    );
+    assert_eq!(
+        b.form("/u/unblock", &[("kind", "group"), ("id", "1")])
+            .status,
+        303
+    );
+    assert_eq!(fetch("B").status, 200);
+    // A block of the device alone.
+    assert_eq!(
+        b.form("/u/block", &[("kind", "device"), ("id", &device_b)])
+            .status,
+        303
+    );
+    assert_eq!(error_code(&fetch("B")), "blocked");
+    // A removes B (the epoch record of the access vectors).
+    let removal = fx.h["access"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "removed-device")
+        .map(|c| s(&c["extra"][0]).to_owned())
+        .unwrap();
+    let path = format!("{}/append", fx.space_path(fx.tenant(), fx.log()));
+    let body = format!(r#"{{"envelopes":[{removal}]}}"#);
+    let r = fx
+        .relay
+        .handle(&fx.signed("POST", &path, "", body.as_bytes(), "A"));
+    let (got, _) = wire::parse_append_response(&r.body).unwrap();
+    assert!(matches!(got[..], [AppendResult::Stored(5)]), "{got:?}");
+    assert_eq!(
+        b.form("/u/unblock", &[("kind", "device"), ("id", &device_b)])
+            .status,
+        303
+    );
+    let r = fetch("B");
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "removed"));
+    // Item 8: A stays and has not reported epoch 2 yet.
+    let page = b.home();
+    assert!(!page.contains("is blocked"), "{page}");
+    assert!(page.contains("has not reported key epoch 2"), "{page}");
+    let status = format!("{}/device-status", fx.space_path(fx.tenant(), fx.log()));
+    let report = br#"{"state":"ok","outbox":0,"oldest":null,"applied":5,"epoch":2}"#;
+    assert_eq!(
+        fx.relay
+            .handle(&fx.signed("POST", &status, "", report, "A"))
+            .status,
+        200
+    );
+    assert!(!b.home().contains("Open security actions"));
 }

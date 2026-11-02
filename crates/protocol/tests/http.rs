@@ -10,7 +10,9 @@ use snailfish_protocol::encoding::decode_id;
 use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::request::{self, Params, Target};
 use snailfish_protocol::sig::SecretKey;
-use snailfish_protocol::space::{MemorySpace, Mode, Verdict, check_append, check_genesis};
+use snailfish_protocol::space::{
+    MemorySpace, Mode, SpaceView, Verdict, check_append, check_genesis,
+};
 use snailfish_protocol::wire;
 
 fn load() -> Value {
@@ -22,17 +24,29 @@ fn s(v: &Value) -> &str {
     v.as_str().unwrap()
 }
 
+/// The signing key, the ID and the recovery flag of a device or a recovery
+/// key of the vectors.
 fn key(h: &Value, name: &str) -> Option<(SecretKey, [u8; 32])> {
-    let d = h["devices"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|d| d["name"] == name)?;
-    let seed: [u8; 32] = hex::decode(s(&d["sign_seed"])).unwrap().try_into().unwrap();
-    Some((
-        SecretKey::from_seed(&seed),
-        decode_id::<32>(s(&d["id"]), "d_").unwrap(),
-    ))
+    key_of(h, name).map(|(sk, id, _)| (sk, id))
+}
+
+fn key_of(h: &Value, name: &str) -> Option<(SecretKey, [u8; 32], bool)> {
+    for (list, prefix) in [("devices", "d_"), ("recovery", "r_")] {
+        if let Some(d) = h[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == name)
+        {
+            let seed: [u8; 32] = hex::decode(s(&d["sign_seed"])).unwrap().try_into().unwrap();
+            return Some((
+                SecretKey::from_seed(&seed),
+                decode_id::<32>(s(&d["id"]), prefix).unwrap(),
+                prefix == "r_",
+            ));
+        }
+    }
+    None
 }
 
 fn headers(c: &Value) -> Vec<(String, String)> {
@@ -79,6 +93,17 @@ fn env_author(env: &Envelope) -> Option<[u8; 32]> {
 
 /// A relay check of 8.6, with the nonce store of the vectors (step 7).
 fn relay_check(h: &Value, sp: &MemorySpace, c: &Value, authority: &str) -> Result<(), String> {
+    relay_check_blocked(h, sp, c, authority, &[])
+}
+
+/// 8.6 with the devices that the tenant file blocks (steps 5 to 7).
+fn relay_check_blocked(
+    h: &Value,
+    sp: &MemorySpace,
+    c: &Value,
+    authority: &str,
+    blocked: &[[u8; 32]],
+) -> Result<(), String> {
     let hs = headers(c);
     let pairs: Vec<(&str, &str)> = hs.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
     let t = Target {
@@ -108,20 +133,23 @@ fn relay_check(h: &Value, sp: &MemorySpace, c: &Value, authority: &str) -> Resul
             )
         });
     let now = h["now"].as_u64().unwrap();
-    let v = request::check(
-        &pairs,
-        &t,
-        s(&c["body"]).as_bytes(),
-        now,
-        |id| match body_key {
-            Some((k, sign)) => (id == &k).then_some(sign),
-            None => sp.devices.get(id).copied(),
-        },
-    )
+    let v = request::check(&pairs, &t, s(&c["body"]).as_bytes(), now, |id, recovery| {
+        let found = match body_key {
+            Some((k, sign)) => (id == &k && !recovery).then_some(sign),
+            None if recovery => {
+                let route = (t.method == "GET" && t.path.ends_with("/entries"))
+                    || (t.method == "POST" && t.path.ends_with("/append"));
+                sp.recovery_key(id).filter(|_| route)
+            }
+            None if blocked.contains(id) => return Err(request::RequestError::Blocked),
+            None if sp.is_removed(id) => return Err(request::RequestError::Removed),
+            None => sp.state.devices.get(id).copied(),
+        };
+        found.ok_or(request::RequestError::UnknownDevice)
+    })
     .map_err(|e| e.code().to_owned())?;
     let used = h["used_nonces"].as_array().unwrap().iter().any(|p| {
-        s(&p[0]) == snailfish_protocol::encoding::encode_id("d_", &v.keyid)
-            && s(&p[1]) == hex::encode(v.nonce)
+        s(&p[0]) == request::keyid_text(&v.keyid, v.recovery) && s(&p[1]) == hex::encode(v.nonce)
     });
     if used {
         return Err("nonce_reused".into());
@@ -137,7 +165,7 @@ fn signed_requests_match_go_bytes_and_verify() {
     assert!(cases.len() >= 5);
     for c in cases {
         let name = s(&c["name"]);
-        let (sk, id) = key(&h, s(&c["signer"])).unwrap();
+        let (sk, id, recovery) = key_of(&h, s(&c["signer"])).unwrap();
         let t = Target {
             method: s(&c["method"]),
             authority: s(&c["authority"]),
@@ -149,6 +177,7 @@ fn signed_requests_match_go_bytes_and_verify() {
             expires: c["expires"].as_u64().unwrap(),
             nonce: hex::decode(s(&c["nonce"])).unwrap().try_into().unwrap(),
             keyid: id,
+            recovery,
         };
         let body = s(&c["body"]).as_bytes();
         assert_eq!(
@@ -193,6 +222,47 @@ fn invalid_requests_give_the_go_error() {
             "{}",
             s(&c["name"])
         );
+    }
+}
+
+/// 8.6 steps 5 to 7 ([STO-12], `PROTOCOL.md` 13.4): a blocked device, a
+/// removed device and a request by the current recovery ID.
+#[test]
+fn access_cases_give_the_go_error() {
+    let h = load();
+    let base = space(&h);
+    let cases = h["access"].as_array().unwrap();
+    assert!(cases.len() >= 10);
+    let mut codes = std::collections::BTreeSet::new();
+    for c in cases {
+        let name = s(&c["name"]);
+        let mut sp = base.clone();
+        for e in c["extra"].as_array().unwrap() {
+            let env = Envelope::parse(s(e).as_bytes()).unwrap();
+            match check_append(&sp, &env, Mode::Verify) {
+                Verdict::Store(a) => sp.apply(&a),
+                other => panic!("{name}: extra record: {other:?}"),
+            }
+        }
+        let blocked: Vec<[u8; 32]> = c["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| decode_id::<32>(s(b), "d_").unwrap())
+            .collect();
+        let want = match s(&c["error"]) {
+            "" => Ok(()),
+            e => Err(e.to_owned()),
+        };
+        codes.insert(s(&c["error"]).to_owned());
+        assert_eq!(
+            relay_check_blocked(&h, &sp, c, s(&h["authority"]), &blocked),
+            want,
+            "{name}"
+        );
+    }
+    for need in ["", "blocked", "removed", "unknown_device"] {
+        assert!(codes.contains(need), "no access case for {need:?}");
     }
 }
 

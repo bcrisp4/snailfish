@@ -148,18 +148,20 @@ impl Fx {
         decode_id::<16>(self.log(), "l_").unwrap()
     }
 
+    /// The key of a device or a recovery key of the vectors, with its ID
+    /// and its ID text (`d_` or `r_`).
     pub fn key(&self, name: &str) -> (SecretKey, [u8; 32], String) {
-        let d = self.h["devices"]
-            .as_array()
-            .unwrap()
+        let d = ["devices", "recovery"]
             .iter()
+            .flat_map(|l| self.h[*l].as_array().unwrap())
             .find(|d| d["name"] == name)
             .unwrap();
         let seed: [u8; 32] = hex::decode(s(&d["sign_seed"])).unwrap().try_into().unwrap();
+        let text = s(&d["id"]);
         (
             SecretKey::from_seed(&seed),
-            decode_id::<32>(s(&d["id"]), "d_").unwrap(),
-            s(&d["id"]).to_owned(),
+            decode_id::<32>(&text[2..], "").unwrap(),
+            text.to_owned(),
         )
     }
 
@@ -214,6 +216,7 @@ impl Fx {
             expires: created.saturating_add(300),
             nonce,
             keyid: id,
+            recovery: self.key(signer).2.starts_with("r_"),
         };
         let h = request::sign(&sk, &t, body, &p);
         Request {

@@ -134,6 +134,13 @@ pub(crate) fn symbols_read(text: &str) -> Result<[u8; 20], RecoveryKeyError> {
     Ok(raw)
 }
 
+/// The message that the new recovery signing key signs as the possession
+/// proof of a recovery record (`PROTOCOL.md` 6.2).
+#[must_use]
+pub fn proof_message(log_id: &[u8; 16], sign_pk: &[u8; 32], seal_pk: &[u8]) -> Vec<u8> {
+    crate::encoding::frame(&[b"snailfish.recovery-proof.v1", log_id, sign_pk, seal_pk])
+}
+
 /// The Ed25519 seed and the X-Wing seed of a recovery secret.
 #[must_use]
 pub fn derive(secret: &[u8; 16]) -> ([u8; 32], [u8; 32]) {

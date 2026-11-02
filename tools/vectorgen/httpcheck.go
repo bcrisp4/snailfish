@@ -57,7 +57,14 @@ func checkHTTPWith(h *httpJ, w *world, mut string) error {
 	for _, u := range h.UsedNonces {
 		used[u] = true
 	}
-	rs := &relayState{authority: h.Authority, now: h.Now, space: sp, used: used}
+	rs := &relayState{authority: h.Authority, now: h.Now, space: sp, used: used, mut: mut}
+	for _, r := range h.Recovery {
+		p := w.byName[r.Name]
+		if p == nil || !p.isRecovery || hx(p.signSeed) != r.SignSeed || p.idText != r.ID {
+			return fmt.Errorf("recovery %s differs from the world", r.Name)
+		}
+		keys[r.Name] = p
+	}
 
 	for _, c := range h.Signed {
 		sg := keys[c.Signer]
@@ -163,6 +170,28 @@ func checkHTTPWith(h *httpJ, w *world, mut string) error {
 			return err
 		}
 	}
+	for _, c := range h.AppendReserve {
+		sg := keys[c.Signer]
+		if sg == nil {
+			return fmt.Errorf("append_reserve %s: unknown signer", c.Name)
+		}
+		got, err := replayReserve(sp, c, sg.idText, h.Limits)
+		if err != nil {
+			return fmt.Errorf("append_reserve %s: %w", c.Name, err)
+		}
+		if err := compare("append_reserve "+c.Name, c, got); err != nil {
+			return err
+		}
+	}
+	for _, c := range h.Access {
+		got, err := replayAccess(*rs, c)
+		if err != nil {
+			return fmt.Errorf("access %s: %w", c.Name, err)
+		}
+		if got != c.Error {
+			return fmt.Errorf("access %s: reference relay returns %q, file says %q", c.Name, got, c.Error)
+		}
+	}
 	for _, c := range h.Fetch {
 		st := sp.clone()
 		st.hold = c.Hold
@@ -244,6 +273,18 @@ func checkHTTPCoverage(h *httpJ) error {
 	for _, c := range h.Fetch {
 		have[fmt.Sprintf("fetch hold %v", c.Hold)] = true
 	}
+	for _, c := range h.AppendReserve {
+		for _, r := range c.Results {
+			if r.Error != nil {
+				have["append_reserve "+*r.Error] = true
+			} else {
+				have["append_reserve "+r.Status] = true
+			}
+		}
+	}
+	for _, c := range h.Access {
+		have["access "+c.Error] = true
+	}
 	for _, c := range h.Status {
 		switch {
 		case c.Error != nil:
@@ -290,7 +331,9 @@ func checkHTTPCoverage(h *httpJ) error {
 		"enroll state open", "enroll state done", "enroll state cancelled",
 		"enroll bad_request", "enroll bad_digest", "enroll unknown_device",
 		"enroll unknown_session", "enroll session_exists", "enroll bad_step", "enroll session_closed",
-		"append stale_base",
+		"append stale_base", "append wrong_epoch", "append invalid_record",
+		"append_reserve reserve", "append_reserve security_limit", "append_reserve stored",
+		"access blocked", "access removed", "access unknown_device", "access ",
 		"append_quota quota", "append_quota stored", "append_quota known",
 		"append_hold on_hold", "append_hold known", "append_hold stored", "append_hold stale_base",
 		"fetch hold true", "fetch hold false",

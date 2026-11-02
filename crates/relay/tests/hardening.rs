@@ -114,7 +114,14 @@ fn space_conn(fx: &Fx) -> Connection {
 /// than the record names.
 #[test]
 fn write_level_is_stored_and_refuses_a_lower_device_level() {
-    let fx = Fx::new();
+    let mut fx = Fx::new();
+    // D5: a synthetic level 2 with the types of level 1.
+    fx.reopen_with(|c| {
+        c.levels = snailfish_protocol::space::Levels {
+            max: 2,
+            retired: &[],
+        };
+    });
     let genesis = genesis_at_level(&fx, 2);
     let acc = check_genesis(&genesis, &fx.log_id(), None).unwrap();
     assert_eq!(put_genesis(&fx, &genesis).status, 201);

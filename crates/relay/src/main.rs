@@ -33,26 +33,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the relay.
-    Serve {
-        /// The address to listen on.
-        #[arg(long, env = "SNAILFISH_LISTEN", default_value = "127.0.0.1:8080")]
-        listen: String,
-        /// The most spaces of each tenant ([QTA-5]).
-        #[arg(long, env = "SNAILFISH_MAX_SPACES", default_value_t = Quotas::default().max_spaces)]
-        max_spaces: u64,
-        /// The most stored change bytes of each space ([QTA-1]).
-        #[arg(long, env = "SNAILFISH_SPACE_BYTES", default_value_t = Quotas::default().space_bytes)]
-        space_bytes: u64,
-        /// The hosts that a user webhook may name, separated by commas.
-        /// Empty turns webhooks off ([USR-8]).
-        #[arg(
-            long,
-            env = "SNAILFISH_WEBHOOK_HOSTS",
-            value_delimiter = ',',
-            default_value = ""
-        )]
-        webhook_hosts: Vec<String>,
-    },
+    Serve(ServeArgs),
     /// Set the quotas of one user. A value that is not given goes back to
     /// the default of `serve`.
     Quota {
@@ -111,6 +92,56 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// The options of `serve`.
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// The address to listen on.
+    #[arg(long, env = "SNAILFISH_LISTEN", default_value = "127.0.0.1:8080")]
+    listen: String,
+    /// The most spaces of each tenant ([QTA-5]).
+    #[arg(long, env = "SNAILFISH_MAX_SPACES", default_value_t = Quotas::default().max_spaces)]
+    max_spaces: u64,
+    /// The most stored change bytes of each space ([QTA-1]).
+    #[arg(long, env = "SNAILFISH_SPACE_BYTES", default_value_t = Quotas::default().space_bytes)]
+    space_bytes: u64,
+    /// The hosts that a user webhook may name, separated by commas.
+    /// Empty turns webhooks off ([USR-8]).
+    #[arg(
+        long,
+        env = "SNAILFISH_WEBHOOK_HOSTS",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    webhook_hosts: Vec<String>,
+    /// The security record reserve of each space in bytes ([STO-15]).
+    #[arg(long, env = "SNAILFISH_SECURITY_RESERVE", default_value_t = snailfish_relay::core::SECURITY_RESERVE)]
+    security_reserve: u64,
+    /// The reverse proxy addresses whose `X-Forwarded-For` header names
+    /// the client address of the rate limit, separated by commas
+    /// (`PROTOCOL.md` 12.6).
+    #[arg(
+        long,
+        env = "SNAILFISH_TRUSTED_PROXY",
+        value_delimiter = ',',
+        default_value = ""
+    )]
+    trusted_proxy: Vec<String>,
+}
+
+impl ServeArgs {
+    /// Set the serve options in `c`.
+    fn apply(self, c: &mut Config) -> Result<(), String> {
+        c.quotas = Quotas {
+            max_spaces: self.max_spaces,
+            space_bytes: self.space_bytes,
+        };
+        c.webhook_hosts = self.webhook_hosts;
+        c.security_reserve = self.security_reserve;
+        c.trusted_proxies = parse_proxies(&self.trusted_proxy)?;
+        Ok(())
+    }
 }
 
 #[derive(Subcommand)]
@@ -216,24 +247,30 @@ async fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
-        Command::Serve {
-            listen,
-            max_spaces,
-            space_bytes,
-            webhook_hosts,
-        } => {
+        Command::Serve(args) => {
             let Some(a) = authority else {
                 return need_authority();
             };
             let mut c = config(&a);
-            c.quotas = Quotas {
-                max_spaces,
-                space_bytes,
-            };
-            c.webhook_hosts = webhook_hosts;
+            let listen = args.listen.clone();
+            if let Err(e) = args.apply(&mut c) {
+                return fail(&e);
+            }
             serve(c, &listen).await
         }
     }
+}
+
+/// The addresses of `--trusted-proxy`. Empty entries come from an empty
+/// comma list.
+fn parse_proxies(list: &[String]) -> Result<Vec<std::net::IpAddr>, String> {
+    list.iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            p.parse()
+                .map_err(|_| format!("--trusted-proxy: {p} is not an IP address"))
+        })
+        .collect()
 }
 
 /// `user add` and `user invite`: print the invite link.

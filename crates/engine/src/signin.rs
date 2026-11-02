@@ -151,6 +151,7 @@ impl SignIn {
             expires: created.saturating_add(request::MAX_LIFETIME),
             nonce: keys::random_bytes().map_err(|_| EngineError::Random)?,
             keyid: keys::device_id(&sk.public(), &seal),
+            recovery: false,
         };
         let t = Target {
             method: "POST",

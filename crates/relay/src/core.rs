@@ -16,11 +16,13 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use snailfish_protocol::encoding::{Hash32, decode_id, encode_id};
+use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::records::{self, Body};
 use snailfish_protocol::repair::{self as chain, ChainError, Item};
 use snailfish_protocol::request::{self, AUTHORITY_HEADER, RequestError, Target, Verified};
 use snailfish_protocol::space::{
-    Accepted, Mode, SpaceView, Verdict, check_append, check_genesis, genesis_level,
+    Accepted, Effect, Levels, Mode, SpaceView, State, Verdict, check_append_at, check_genesis,
+    effect, genesis_level,
 };
 use snailfish_protocol::wire::{self, AppendResult, Head, Limits, RepairItem};
 
@@ -32,8 +34,12 @@ pub mod user;
 
 pub use user::Quotas;
 
-/// The protocol levels that the relay accepts ([VER-6]).
-pub const LEVELS: [u64; 1] = [1];
+/// The security record reserve of each space by default ([STO-15]).
+pub const SECURITY_RESERVE: u64 = 16 << 20;
+
+/// The most security records that one request `keyid` can store in one
+/// space in one relay day ([STO-15], T10).
+pub const SECURITY_PER_DAY: u64 = 10;
 
 /// A repair session expires this many seconds after its start or its last
 /// chunk (`PROTOCOL.md` 10.9, [LOG-11]).
@@ -78,6 +84,14 @@ pub struct Config {
     /// [`Relay::open`] drops empty entries, which a comma list such as
     /// `SNAILFISH_WEBHOOK_HOSTS=""` gives.
     pub webhook_hosts: Vec<String>,
+    /// The security record reserve of each space in bytes ([STO-15]).
+    pub security_reserve: u64,
+    /// The protocol levels that the relay accepts ([VER-6]). Only tests
+    /// set another value than [`Levels::CURRENT`] (`PROTOCOL.md` 6.2).
+    pub levels: Levels,
+    /// The reverse proxies whose `X-Forwarded-For` header names the client
+    /// address of the rate limit (`PROTOCOL.md` 12.6).
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Config {
@@ -101,6 +115,9 @@ impl Config {
             secrets_dir,
             quotas: Quotas::default(),
             webhook_hosts: Vec::new(),
+            security_reserve: SECURITY_RESERVE,
+            levels: Levels::CURRENT,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -260,7 +277,7 @@ impl From<RequestError> for ApiError {
             RequestError::WrongAuthority => 421,
             RequestError::BadSignature(_) | RequestError::Expired => 401,
             RequestError::BadDigest => 400,
-            RequestError::UnknownDevice => 403,
+            RequestError::Blocked | RequestError::Removed | RequestError::UnknownDevice => 403,
         };
         api(status, e.code(), e.to_string())
     }
@@ -473,7 +490,8 @@ impl Relay {
         match (req.method.as_str(), segs.as_slice()) {
             ("GET", ["", "v1", "health"]) => Ok((200, br#"{"status":"ok"}"#.to_vec())),
             ("GET", ["", "v1", "info"]) => {
-                Ok((200, wire::info_body(&LEVELS, &self.cfg.limits, now)))
+                let levels: Vec<u64> = (1..=self.cfg.levels.max).collect();
+                Ok((200, wire::info_body(&levels, &self.cfg.limits, now)))
             }
             ("PUT", ["", "v1", "t", t, "s", l]) => self.put_space(req, now, t, l),
             ("POST", ["", "v1", "t", t, "s", l, "append"]) => self.append(req, now, t, l),
@@ -586,7 +604,7 @@ impl Relay {
         &self,
         req: &Request,
         now: u64,
-        keys: impl Fn(&Hash32) -> Option<[u8; 32]>,
+        keys: impl Fn(&Hash32, bool) -> Result<[u8; 32], RequestError>,
     ) -> ApiResult<Verified> {
         let headers: Vec<(&str, &str)> = req
             .headers
@@ -615,7 +633,7 @@ impl Relay {
             "INSERT INTO nonces (keyid, nonce, expires) VALUES (?1, ?2, ?3)
              ON CONFLICT DO NOTHING",
             params![
-                encode_id("d_", &v.keyid),
+                request::keyid_text(&v.keyid, v.recovery),
                 encode_id("", &v.nonce),
                 to_i64(v.expires)?
             ],
@@ -641,7 +659,7 @@ impl Relay {
         // 8.6 steps 1 to 4 run before the body parse. The device key comes
         // from the body, so no key matches yet, and a request that passes
         // steps 1 to 4 stops at step 5.
-        match self.verify(req, now, |_| None) {
+        match self.verify(req, now, no_signer) {
             Err(e) if e.code != "unknown_device" => return Err(e),
             _ => {}
         }
@@ -668,8 +686,7 @@ impl Relay {
                 "the first record must be a genesis record",
             ));
         };
-        let (dev_id, dev_key) = (device.id, device.keys.sign);
-        let v = self.verify(req, now, |id| (id == &dev_id).then_some(dev_key))?;
+        let v = self.verify(req, now, only_device(device.id, device.keys.sign))?;
         Self::claim_nonce(&tenant, &v, now)?;
         let acc = check_genesis(&raw.envelope, &log_id, Some(&v.keyid))
             .map_err(|r| api(422, "invalid_record", r.to_string()))?;
@@ -787,25 +804,48 @@ impl Relay {
     // ------------------------------------------------------------- append
 
     /// Open the space of a signed sync request and verify the request with
-    /// the active devices of the log.
+    /// the active devices of the log (8.6 steps 5 to 7). `recovery` is true
+    /// for the routes that take a request by the current recovery ID
+    /// (`PROTOCOL.md` 8.2).
     fn open_signed(
         &self,
         req: &Request,
         now: u64,
         tenant: &str,
         log: &str,
+        recovery: bool,
     ) -> ApiResult<(OpenSpace, Verified)> {
         self.guard(req)?;
-        let sp = self.open_space(tenant, log)?;
+        let signer = peek_keyid(req);
+        let sp = self.open_space(tenant, log, signer.as_ref())?;
         let keys = load_devices(&sp.conn)?;
-        let v = self.verify(req, now, |id| keys.get(id).copied())?;
+        let removed = load_removed(&sp.conn)?;
+        let current = if recovery {
+            current_recovery(&sp.conn)?
+        } else {
+            None
+        };
+        let signers = Signers {
+            keys: &keys,
+            removed: &removed,
+            blocked: sp.blocked,
+            recovery: current,
+        };
+        let v = self.verify(req, now, |id, r| signers.key(id, r))?;
         Self::claim_nonce(&sp.tenant, &v, now)?;
         Ok((sp, v))
     }
 
     /// Find the space of a request through the tenant handle and the space
-    /// index ([STO-3]), and read its restore hold.
-    fn open_space(&self, tenant: &str, log: &str) -> ApiResult<OpenSpace> {
+    /// index ([STO-3]), and read its restore hold and whether the tenant
+    /// file blocks the device `signer`. It reads the block before it opens
+    /// the space file ([STO-12]).
+    fn open_space(
+        &self,
+        tenant: &str,
+        log: &str,
+        signer: Option<&(Hash32, bool)>,
+    ) -> ApiResult<OpenSpace> {
         let tenant = self.tenant(tenant)?;
         let log_id = decode_id::<16>(log, "l_").map_err(|_| {
             api(
@@ -824,6 +864,10 @@ impl Relay {
         })?;
         let hold = hold_since(&tc, log)?.is_some();
         let space_bytes = user::limits(&tc, &self.cfg.quotas)?.space_bytes;
+        let blocked = match signer {
+            Some((id, false)) => user::is_blocked(&tc, &encode_id("d_", id))?,
+            _ => false,
+        };
         drop(tc);
         let sc = store::open(&path, Kind::Space, false)?;
         let stored: Vec<u8> =
@@ -838,6 +882,7 @@ impl Relay {
             log: log.to_owned(),
             hold,
             space_bytes,
+            blocked,
         })
     }
 
@@ -848,7 +893,7 @@ impl Relay {
         tenant: &str,
         log: &str,
     ) -> ApiResult<(u16, Vec<u8>)> {
-        let (sp, v) = self.open_signed(req, now, tenant, log)?;
+        let (sp, v) = self.open_signed(req, now, tenant, log, true)?;
         let (mut sc, log_id, hold, quota) = (sp.conn, sp.log_id, sp.hold, sp.space_bytes);
         let limits = &self.cfg.limits;
         let items = wire::parse_append(&req.body, limits.max_append_envelopes)
@@ -860,8 +905,26 @@ impl Relay {
         let mut results = Vec::with_capacity(items.len());
         let mut used: u64 =
             from_i64(tx.query_row("SELECT bytes FROM usage WHERE id = 1", [], |r| r.get(0))?)?;
+        let mut security: u64 = from_i64(tx.query_row(
+            "SELECT bytes FROM security_usage WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )?)?;
+        let signer = request::keyid_text(&v.keyid, v.recovery);
+        let day = to_i64(now / 86_400)?;
+        let mut today: u64 = from_i64(
+            tx.query_row(
+                "SELECT n FROM security_counts WHERE signer = ?1 AND day = ?2",
+                params![signer, day],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0),
+        )?;
+        let reserve = self.cfg.security_reserve;
         {
-            let view = SqlView::new(&tx, log_id, false)?;
+            let base = SqlView::new(&tx, log_id, false)?;
+            let mut view = snailfish_protocol::space::Overlay::new(&base);
             for item in items {
                 let Ok(raw) = item else {
                     results.push(AppendResult::Refused("invalid_record".into()));
@@ -872,23 +935,42 @@ impl Relay {
                     max_change_bytes,
                     hold,
                 };
-                let verdict = check_append(&view, &raw.envelope, mode);
-                view.take_error()?;
+                let verdict = check_append_at(&view, &raw.envelope, mode, &self.cfg.levels);
+                base.take_error()?;
+                let len = raw.json.len() as u64;
                 results.push(match verdict {
-                    // 10.6 step 14 ([QTA-1], [QTA-3]): only a change counts,
+                    // 10.6 step 14 ([STO-15]): the security record reserve.
+                    Verdict::Store(acc)
+                        if acc.record.is_security() && security.saturating_add(len) > reserve =>
+                    {
+                        AppendResult::Refused("reserve".into())
+                    }
+                    // 10.6 step 15 ([STO-15], T10): the daily limit of the
+                    // request keyid.
+                    Verdict::Store(acc)
+                        if acc.record.is_security() && today >= SECURITY_PER_DAY =>
+                    {
+                        AppendResult::Refused("security_limit".into())
+                    }
+                    // 10.6 step 16 ([QTA-1], [QTA-3]): only a change counts,
                     // with the length of its envelope text as stored.
                     Verdict::Store(acc)
-                        if acc.record.change_id().is_some()
-                            && used.saturating_add(raw.json.len() as u64) > quota =>
+                        if acc.record.change_id().is_some() && used.saturating_add(len) > quota =>
                     {
                         AppendResult::Refused("quota".into())
                     }
                     Verdict::Store(acc) => {
                         insert_entry(&tx, &acc, &raw.envelope.payload_type, &raw.json)?;
                         if acc.record.change_id().is_some() {
-                            used = used.saturating_add(raw.json.len() as u64);
+                            used = used.saturating_add(len);
                         }
-                        AppendResult::Stored(acc.position)
+                        if acc.record.is_security() {
+                            security = security.saturating_add(len);
+                            today = today.saturating_add(1);
+                        }
+                        let position = acc.position;
+                        view.apply(*acc);
+                        AppendResult::Stored(position)
                     }
                     Verdict::Known(p) => AppendResult::Known(p),
                     Verdict::Conflict(p) => AppendResult::Conflict(p),
@@ -900,6 +982,14 @@ impl Relay {
             "UPDATE usage SET bytes = ?1 WHERE id = 1",
             params![to_i64(used)?],
         )?;
+        if today > 0 {
+            tx.execute(
+                "INSERT INTO security_counts (signer, day, n) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (signer, day) DO UPDATE SET n = excluded.n",
+                params![signer, day, to_i64(today)?],
+            )?;
+            tx.execute("DELETE FROM security_counts WHERE day < ?1", params![day])?;
+        }
         let head = read_head(&tx)?;
         tx.commit()?;
         Ok((200, wire::append_response(&results, &head)))
@@ -914,7 +1004,7 @@ impl Relay {
         tenant: &str,
         log: &str,
     ) -> ApiResult<(u16, Vec<u8>)> {
-        let (sp, _v) = self.open_signed(req, now, tenant, log)?;
+        let (sp, _v) = self.open_signed(req, now, tenant, log, true)?;
         let (mut sc, hold) = (sp.conn, sp.hold);
         let (after, limit) = parse_fetch_query(&req.query, self.cfg.limits.max_fetch_entries)
             .ok_or_else(|| api(400, "bad_request", "the query is not after=N&limit=M"))?;
@@ -949,7 +1039,7 @@ impl Relay {
         tenant: &str,
         log: &str,
     ) -> ApiResult<(u16, Vec<u8>)> {
-        let (sp, v) = self.open_signed(req, now, tenant, log)?;
+        let (sp, v) = self.open_signed(req, now, tenant, log, false)?;
         let r = wire::parse_status(&req.body).map_err(|e| api(400, "bad_request", e.0))?;
         let mut tc = store::open(&sp.tenant.db(), Kind::Tenant, false)?;
         let tx = tc.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -997,16 +1087,16 @@ impl Relay {
             req,
             limits.max_request_bytes.saturating_add(REPAIR_ALLOWANCE),
         )?;
-        let sp = self.open_space(tenant, log)?;
+        let sp = self.open_space(tenant, log, peek_keyid(req).as_ref())?;
         // 8.6 steps 1 to 4 run before the body parse. The keys of step 5 can
         // come from the body ([LOG-12]), so no key matches yet.
-        match self.verify(req, now, |_| None) {
+        match self.verify(req, now, no_signer) {
             Err(e) if e.code != "unknown_device" => return Err(e),
             _ => {}
         }
         let body = parse_repair(&req.body, route, limits.max_append_envelopes)
             .map_err(|e| api(400, "bad_request", e.0))?;
-        let (tenant, mut sc, log_id) = (sp.tenant, sp.conn, sp.log_id);
+        let (tenant, mut sc, log_id, blocked) = (sp.tenant, sp.conn, sp.log_id, sp.blocked);
         let tx = sc.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let head = read_head(&tx)?;
         let session = read_session(&tx)?;
@@ -1028,7 +1118,14 @@ impl Relay {
         if let Some(c) = &chain {
             keys.extend(c.accepted.iter().filter_map(|a| a.new_device));
         }
-        let v = self.verify(req, now, |id| keys.get(id).copied())?;
+        let removed = load_removed(&tx)?;
+        let signers = Signers {
+            keys: &keys,
+            removed: &removed,
+            blocked,
+            recovery: None,
+        };
+        let v = self.verify(req, now, |id, r| signers.key(id, r))?;
         Self::claim_nonce(&tenant, &v, now)?;
         let live = |x: &Session| now < x.last.saturating_add(SESSION_SECONDS);
         let bad_repair = |why: &str| api(409, "bad_repair", why);
@@ -1118,6 +1215,74 @@ struct OpenSpace {
     hold: bool,
     /// The space quota in bytes ([QTA-1]).
     space_bytes: u64,
+    /// The tenant file blocks the request signer (8.6 step 5).
+    blocked: bool,
+}
+
+/// 8.6 steps 5 to 7 for a space: a blocked device, a removed device, then
+/// an active device or the current recovery ID of a route that takes it.
+pub(crate) struct Signers<'a> {
+    pub keys: &'a BTreeMap<Hash32, [u8; 32]>,
+    pub removed: &'a std::collections::BTreeSet<Hash32>,
+    /// The tenant file blocks the signer of this request.
+    pub blocked: bool,
+    /// The current recovery ID, if the route takes it (`PROTOCOL.md` 8.2).
+    pub recovery: Option<(Hash32, [u8; 32])>,
+}
+
+impl Signers<'_> {
+    pub(crate) fn key(&self, id: &Hash32, recovery: bool) -> Result<[u8; 32], RequestError> {
+        if recovery {
+            return self
+                .recovery
+                .filter(|(r, _)| r == id)
+                .map(|(_, k)| k)
+                .ok_or(RequestError::UnknownDevice);
+        }
+        if self.blocked {
+            return Err(RequestError::Blocked);
+        }
+        if self.removed.contains(id) {
+            return Err(RequestError::Removed);
+        }
+        self.keys
+            .get(id)
+            .copied()
+            .ok_or(RequestError::UnknownDevice)
+    }
+}
+
+/// 8.6 step 7 with one device key only, from the request body.
+pub(crate) fn only_device(
+    dev: Hash32,
+    key: [u8; 32],
+) -> impl Fn(&Hash32, bool) -> Result<[u8; 32], RequestError> {
+    move |id, recovery| {
+        (id == &dev && !recovery)
+            .then_some(key)
+            .ok_or(RequestError::UnknownDevice)
+    }
+}
+
+/// No key matches: 8.6 steps 1 to 4 only.
+pub(crate) fn no_signer(_: &Hash32, _: bool) -> Result<[u8; 32], RequestError> {
+    Err(RequestError::UnknownDevice)
+}
+
+/// The `keyid` of the `signature-input` header, if the header has the
+/// form of 8.2. The full check runs later, so a malformed header gives its
+/// own error there.
+fn peek_keyid(req: &Request) -> Option<(Hash32, bool)> {
+    let mut it = req
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("signature-input"));
+    match (it.next(), it.next()) {
+        (Some((_, v)), None) => request::parse_signature_input(v)
+            .ok()
+            .map(|(p, _)| (p.keyid, p.recovery)),
+        _ => None,
+    }
 }
 
 /// The value of the first header with this name, in any case.
@@ -1306,6 +1471,30 @@ fn move_staged(tx: &Connection, session: &[u8; 16], tip: u64, now: u64) -> Resul
          SELECT device_id, sign_key, position FROM staging WHERE device_id IS NOT NULL",
         [],
     )?;
+    // A staged epoch record removes devices, and a staged level record sets
+    // the write level ([LOG-10]: repair restores removal records too).
+    {
+        let mut st = tx.prepare(
+            "SELECT position, envelope FROM staging
+             WHERE payload_type IN ('snailfish.epoch.v1', 'snailfish.level.v1') ORDER BY position",
+        )?;
+        let mut q = st.query([])?;
+        while let Some(r) = q.next()? {
+            let position = from_i64(r.get(0)?)?;
+            let env = Envelope::parse(r.get::<_, String>(1)?.as_bytes())
+                .map_err(|_| StoreError::Corrupt("a staged record does not parse"))?;
+            let record = records::parse_payload(&env.payload_type, &env.payload)
+                .map_err(|_| StoreError::Corrupt("a staged record does not parse"))?;
+            apply_effect(tx, &effect(&record), position)?;
+        }
+    }
+    tx.execute(
+        "UPDATE security_usage SET bytes = (SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))), 0)
+         FROM entries WHERE payload_type NOT LIKE 'snailfish.change.%'
+           AND payload_type NOT LIKE 'snailfish.snapshot.%'
+           AND payload_type NOT LIKE 'snailfish.accept.%') WHERE id = 1",
+        [],
+    )?;
     // [QTA-1]: the moved changes count against the quota. The usage comes
     // from the log, so it is right also after a storage fault.
     tx.execute(
@@ -1437,7 +1626,103 @@ fn insert_entry(
             params![id.as_slice(), key.as_slice(), to_i64(acc.position)?],
         )?;
     }
+    if acc.record.is_security() {
+        c.execute(
+            "UPDATE security_usage SET bytes = bytes + ?1 WHERE id = 1",
+            params![to_i64(json.len() as u64)?],
+        )?;
+    }
+    apply_effect(c, &effect(&acc.record), acc.position)
+}
+
+/// Keep the device tables and the write level of the space file equal to
+/// the space state after a stored record (`PROTOCOL.md` 10.2). The request
+/// checks read the tables.
+fn apply_effect(c: &Connection, e: &Effect, position: u64) -> Result<(), StoreError> {
+    match e {
+        Effect::Epoch { removed, .. } => {
+            for d in removed {
+                c.execute(
+                    "DELETE FROM devices WHERE device_id = ?1",
+                    params![d.as_slice()],
+                )?;
+                c.execute(
+                    "INSERT OR IGNORE INTO removed (device_id, position) VALUES (?1, ?2)",
+                    params![d.as_slice(), to_i64(position)?],
+                )?;
+            }
+        }
+        Effect::WriteLevel(level) => {
+            c.execute(
+                "UPDATE space SET write_level = ?1 WHERE id = 1",
+                params![to_i64(*level)?],
+            )?;
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+/// The devices that an epoch record removed.
+fn load_removed(c: &Connection) -> Result<std::collections::BTreeSet<Hash32>, StoreError> {
+    let mut st = c.prepare("SELECT device_id FROM removed")?;
+    let mut q = st.query([])?;
+    let mut out = std::collections::BTreeSet::new();
+    while let Some(r) = q.next()? {
+        let id: Vec<u8> = r.get(0)?;
+        out.insert(
+            Hash32::try_from(id).map_err(|_| StoreError::Corrupt("a removed row is malformed"))?,
+        );
+    }
+    Ok(out)
+}
+
+/// The current recovery ID and its key: the last recovery record, or the
+/// genesis record (`PROTOCOL.md` 10.2).
+fn current_recovery(c: &Connection) -> Result<Option<(Hash32, [u8; 32])>, StoreError> {
+    let env: Option<String> = c
+        .query_row(
+            "SELECT envelope FROM entries
+             WHERE payload_type IN ('snailfish.genesis.v1', 'snailfish.recovery.v1')
+             ORDER BY position DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(env) = env else { return Ok(None) };
+    let mut state = State::default();
+    state
+        .apply_envelope(&env)
+        .map_err(|_| StoreError::Corrupt("a stored record does not parse"))?;
+    Ok(state.recovery)
+}
+
+/// The space state of the security records in the log, and in the staging
+/// table if `staged` (`PROTOCOL.md` 10.2). Every security record is in full
+/// (no compaction of security records), so the replay is complete.
+pub(crate) fn security_state(c: &Connection, staged: bool) -> Result<State, StoreError> {
+    let mut state = State::default();
+    let tables: &[&str] = if staged {
+        &["entries", "staging"]
+    } else {
+        &["entries"]
+    };
+    for t in tables {
+        let mut st = c.prepare(&format!(
+            "SELECT envelope FROM {t}
+             WHERE payload_type NOT LIKE 'snailfish.change.%'
+               AND payload_type NOT LIKE 'snailfish.snapshot.%'
+               AND payload_type NOT LIKE 'snailfish.accept.%'
+             ORDER BY position"
+        ))?;
+        let mut q = st.query([])?;
+        while let Some(r) = q.next()? {
+            state
+                .apply_envelope(&r.get::<_, String>(0)?)
+                .map_err(|_| StoreError::Corrupt("a stored record does not parse"))?;
+        }
+    }
+    Ok(state)
 }
 
 /// A [`SpaceView`] over the SQLite connection of the append transaction.
@@ -1448,7 +1733,7 @@ fn insert_entry(
 struct SqlView<'a> {
     conn: &'a Connection,
     log_id: [u8; 16],
-    level: u64,
+    state: State,
     // Read the staging table after the log: the chain of a repair chunk
     // continues the staged entries (`PROTOCOL.md` 10.9).
     staged: bool,
@@ -1457,13 +1742,10 @@ struct SqlView<'a> {
 
 impl<'a> SqlView<'a> {
     fn new(conn: &'a Connection, log_id: [u8; 16], staged: bool) -> Result<Self, StoreError> {
-        let level: i64 = conn.query_row("SELECT write_level FROM space WHERE id = 1", [], |r| {
-            r.get(0)
-        })?;
         Ok(Self {
             conn,
             log_id,
-            level: from_i64(level)?,
+            state: security_state(conn, staged)?,
             staged,
             error: RefCell::new(None),
         })
@@ -1548,43 +1830,27 @@ impl SpaceView for SqlView<'_> {
     }
 
     fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.query((|| {
-            let mut k: Option<Vec<u8>> = self
-                .conn
-                .query_row(
-                    "SELECT sign_key FROM devices WHERE device_id = ?1",
-                    params![id.as_slice()],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if k.is_none() && self.staged {
-                k = self
-                    .conn
-                    .query_row(
-                        "SELECT sign_key FROM staging WHERE device_id = ?1",
-                        params![id.as_slice()],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-            }
-            Ok(k.and_then(|k| <[u8; 32]>::try_from(k).ok()))
-        })())
+        self.state.device_key(id)
+    }
+
+    fn active_devices(&self) -> Vec<Hash32> {
+        self.state.devices.keys().copied().collect()
+    }
+
+    fn is_removed(&self, id: &Hash32) -> bool {
+        self.state.removed.contains(id)
+    }
+
+    fn device_level(&self, id: &Hash32) -> Option<u64> {
+        self.state.device_levels.get(id).copied()
     }
 
     fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.query((|| {
-            let g: Option<String> = self
-                .conn
-                .query_row("SELECT envelope FROM entries WHERE position = 1", [], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            Ok(
-                g.and_then(|g| snailfish_protocol::space::genesis_recovery_of(&g))
-                    .filter(|(r, _)| r == id)
-                    .map(|(_, k)| k),
-            )
-        })())
+        self.state.recovery_key(id)
+    }
+
+    fn recovery_known(&self, id: &Hash32) -> bool {
+        self.state.recovery_known(id)
     }
 
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
@@ -1605,11 +1871,11 @@ impl SpaceView for SqlView<'_> {
     }
 
     fn write_level(&self) -> u64 {
-        self.level
+        self.state.level
     }
 
     fn epoch(&self) -> u64 {
-        1
+        self.state.epoch
     }
 
     fn last_security(&self) -> u64 {

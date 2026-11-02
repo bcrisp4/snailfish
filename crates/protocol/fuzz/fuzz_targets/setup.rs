@@ -1,6 +1,7 @@
 //! Fuzz the readers of the user and setup surface (`PROTOCOL.md` 10.11 and
-//! 12): the token request, the device status, the authorization query, the
-//! redirect query, the webhook URL and the form reader.
+//! 12): the token request, the token response with its spaces, the device
+//! status, the authorization query, the redirect query, the webhook URL and
+//! the form reader.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -19,7 +20,12 @@ fuzz_target!(|data: &[u8]| {
             Ok(s)
         );
     }
-    let _ = setup::parse_token_response(data);
+    if let Ok(r) = setup::parse_token_response(data) {
+        assert_eq!(
+            setup::parse_token_response(&setup::token_response_body(&r)),
+            Ok(r)
+        );
+    }
     let _ = setup::parse_form(data, &setup::AUTHORIZE_FIELDS);
     if setup::redirect_uri_ok(data) {
         assert!(!data.contains(&b'?') && !data.contains(&b'#'));

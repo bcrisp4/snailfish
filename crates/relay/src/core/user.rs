@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
-use snailfish_protocol::encoding::{decode_id, encode_id, frame};
+use snailfish_protocol::encoding::{Hash32, decode_id, encode_id, frame};
 use snailfish_protocol::setup::{self, TokenKind};
 use webauthn_rs::prelude::{
     CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
@@ -834,6 +834,7 @@ impl Relay {
             "/u/groups/delete" => &["group", "csrf"],
             "/u/groups/members" => &["group", "device", "op", "csrf"],
             "/u/hold/release" => &["log", "force", "csrf"],
+            "/u/block" | "/u/unblock" => &["kind", "id", "csrf"],
             "/u/webhook" => &["url", "csrf"],
             "/u/signout" | "/u/webhook/test" | "/u/tenant/delete" => &["csrf"],
             _ => return Err(api(404, "not_found", "no route has this path")),
@@ -866,6 +867,7 @@ impl Relay {
                 Ok(r)
             }
             "/u/groups" | "/u/groups/delete" | "/u/groups/members" => group_write(&ctx, path),
+            "/u/block" | "/u/unblock" => block_write(&ctx, path == "/u/block"),
             "/u/hold/release" => {
                 let force = match ctx.field("force") {
                     "yes" => true,
@@ -1005,14 +1007,21 @@ impl Relay {
         let spaces = tenant_spaces(&tc, &tenant.dir)?;
         let devices = tenant_devices(&tc, &tenant.dir, &spaces)?;
         let hidden = format!("<input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">");
+        let actions = security_actions(&devices, self.cfg.levels.max);
         let mut html = format!(
             "<meta name=\"csrf\" content=\"{csrf}\"><p>Signed in as <b>{}</b>. \
              <form class=\"inline\" method=\"post\" action=\"/u/signout\">{hidden}<button>Sign out</button></form></p>",
             esc(&user.name)
         );
+        html.push_str(&actions_html(&actions));
         html.push_str(&spaces_html(&spaces, &quota, &hidden));
-        html.push_str(&devices_html(&devices, now));
-        html.push_str(&groups_html(&groups(&tc)?, &devices, &hidden));
+        html.push_str(&devices_html(&devices, now, &hidden));
+        html.push_str(&groups_html(
+            &groups(&tc)?,
+            &blocked_groups(&tc)?,
+            &devices,
+            &hidden,
+        ));
         html.push_str(&passkeys_html(&dir, &session.user_id)?);
         if !self.cfg.webhook_hosts.is_empty() {
             html.push_str(&webhook_html(&tc, &self.cfg.webhook_hosts, &hidden)?);
@@ -1055,6 +1064,10 @@ impl Relay {
                     format!("Snailfish: {} uses {pct}% of its storage quota.", sp.app),
                 ));
             }
+        }
+        // DESIGN.md "Monitoring and alerting" item 11: an open security action.
+        for (key, text) in security_actions(&devices, self.cfg.levels.max) {
+            cases.push((key, format!("Snailfish: {text}")));
         }
         for dv in &devices {
             if let Some(why) = dv.status.as_ref().and_then(|st| stalled(st, now)) {
@@ -1153,16 +1166,24 @@ fn tenant_devices(
         let rows: Vec<(Vec<u8>, String, String)> = st
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?;
-        for (id, ptype, env) in rows {
-            let id = encode_id("d_", &id);
+        let state = super::security_state(&sc, false)?;
+        for (raw, ptype, env) in rows {
+            let id = encode_id("d_", &raw);
             let name = device_name(&ptype, &env, &id).unwrap_or_else(|| "?".to_owned());
             let status = read_status(tc, &sp.log, &id, sp.head)?;
+            let level = Hash32::try_from(raw)
+                .ok()
+                .and_then(|h| state.device_levels.get(&h).copied())
+                .unwrap_or(0);
             out.push(DeviceRow {
+                blocked: is_blocked(tc, &id)?,
                 id,
                 name,
                 app: sp.app.clone(),
                 log: sp.log.clone(),
                 status,
+                level,
+                epoch: state.epoch,
             });
         }
     }
@@ -1225,9 +1246,9 @@ fn spaces_html(spaces: &[SpaceRow], quota: &Quotas, hidden: &str) -> String {
     html
 }
 
-fn devices_html(devices: &[DeviceRow], now: u64) -> String {
+fn devices_html(devices: &[DeviceRow], now: u64, hidden: &str) -> String {
     let mut html = String::from(
-        "<section><h2>Devices</h2><table><tr><th>Name</th><th>App</th><th>Status</th><th>Last report</th><th>Device ID</th></tr>",
+        "<section><h2>Devices</h2><table><tr><th>Name</th><th>App</th><th>Status</th><th>Last report</th><th>Device ID</th><th>Block</th></tr>",
     );
     for dv in devices {
         let status = match &dv.status {
@@ -1248,9 +1269,10 @@ fn devices_html(devices: &[DeviceRow], now: u64) -> String {
             .status
             .as_ref()
             .map_or_else(String::new, |st| st.time.to_string());
+        let block = block_form("device", &dv.id, dv.blocked, hidden);
         let _ = write!(
             html,
-            "<tr><td>{}</td><td>{}</td><td>{status}</td><td>{when}</td><td><code>{}</code></td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{status}</td><td>{when}</td><td><code>{}</code></td><td>{block}</td></tr>",
             esc(&dv.name),
             esc(&dv.app),
             esc(&dv.id)
@@ -1260,12 +1282,160 @@ fn devices_html(devices: &[DeviceRow], now: u64) -> String {
     html
 }
 
-fn groups_html(gs: &[(i64, String, Vec<String>)], devices: &[DeviceRow], hidden: &str) -> String {
+/// The block or unblock form of a device or a group (12.4). A blocked item
+/// shows "blocked" and the unblock button.
+fn block_form(kind: &str, id: &str, blocked: bool, hidden: &str) -> String {
+    let (action, label, note) = if blocked {
+        (
+            "/u/unblock",
+            "Unblock",
+            "<span class=\"warn\">blocked</span> ",
+        )
+    } else {
+        ("/u/block", "Block", "")
+    };
+    format!(
+        "{note}<form class=\"inline\" method=\"post\" action=\"{action}\">{hidden}\
+         <input type=\"hidden\" name=\"kind\" value=\"{kind}\"><input type=\"hidden\" name=\"id\" value=\"{}\">\
+         <button>{label}</button></form>",
+        esc(id)
+    )
+}
+
+/// The open security actions (12.4, DESIGN.md "Monitoring and alerting"
+/// item 10), as an alert key and a text for each.
+fn security_actions(devices: &[DeviceRow], max_level: u64) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for dv in devices {
+        if dv.blocked {
+            out.push((
+                format!("blocked:{}:{}", dv.log, dv.id),
+                format!(
+                    "device \"{}\" in {} is blocked. Remove it on a trusted device of the app, so that it cannot read new changes.",
+                    dv.name, dv.app
+                ),
+            ));
+        }
+        if dv.level < max_level {
+            out.push((
+                format!("level:{}:{}", dv.log, dv.id),
+                format!(
+                    "device \"{}\" in {} blocks a raise of the protocol level to {max_level}. Update the app on it, or remove it.",
+                    dv.name, dv.app
+                ),
+            ));
+        }
+        // Item 8: until a device that stays reports the new epoch, it can
+        // still write changes with the old key.
+        if dv.epoch > 1 && dv.status.as_ref().is_none_or(|st| st.epoch < dv.epoch) {
+            out.push((
+                format!("epoch:{}:{}:{}", dv.log, dv.id, dv.epoch),
+                format!(
+                    "device \"{}\" in {} has not reported key epoch {} yet. Until it does, it can still write changes with the old key.",
+                    dv.name, dv.app, dv.epoch
+                ),
+            ));
+        }
+    }
+    out
+}
+
+fn actions_html(actions: &[(String, String)]) -> String {
+    if actions.is_empty() {
+        return String::new();
+    }
+    let mut html = String::from("<section><h2>Open security actions</h2><ul>");
+    for (_, text) in actions {
+        let _ = write!(html, "<li class=\"warn\">{}</li>", esc(text));
+    }
+    html.push_str("</ul></section>");
+    html
+}
+
+/// True if the tenant file blocks the device: a block of the device, or of
+/// a machine group that holds it ([STO-12], 12.4).
+pub(crate) fn is_blocked(tc: &Connection, device: &str) -> Result<bool, StoreError> {
+    let hit: Option<i64> = tc
+        .query_row(
+            "SELECT 1 FROM blocks WHERE (kind = 'device' AND id = ?1)
+               OR (kind = 'group' AND id IN
+                   (SELECT CAST(group_id AS TEXT) FROM group_devices WHERE device_id = ?1))
+             LIMIT 1",
+            params![device],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(hit.is_some())
+}
+
+/// The IDs of the blocked machine groups.
+fn blocked_groups(tc: &Connection) -> Result<Vec<i64>, StoreError> {
+    let mut st = tc.prepare("SELECT id FROM blocks WHERE kind = 'group'")?;
+    let ids: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(ids.iter().filter_map(|i| i.parse().ok()).collect())
+}
+
+/// `POST /u/block` and `/u/unblock` (12.4). A block names a device that is
+/// active in a space of the tenant, or a machine group. An unblock removes
+/// the row only, so a removal stays final ([STO-12]).
+fn block_write(ctx: &Form<'_>, block: bool) -> ApiResult<Reply> {
+    let c = store::open(&ctx.tdir.join("tenant.db"), Kind::Tenant, false)?;
+    let (kind, id) = (ctx.field("kind"), ctx.field("id"));
+    match kind {
+        "device" if block => {
+            let spaces = tenant_spaces(&c, &ctx.tdir)?;
+            if !tenant_devices(&c, &ctx.tdir, &spaces)?
+                .iter()
+                .any(|d| d.id == id)
+            {
+                return Err(api(
+                    400,
+                    "bad_request",
+                    "the device is not a device of the tenant",
+                ));
+            }
+        }
+        "group" if block => {
+            let found: Option<i64> = c
+                .query_row(
+                    "SELECT id FROM groups WHERE CAST(id AS TEXT) = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if found.is_none() {
+                return Err(api(400, "bad_request", "no such group"));
+            }
+        }
+        "device" | "group" => {}
+        _ => return Err(api(400, "bad_request", "kind is device or group")),
+    }
+    if block {
+        c.execute(
+            "INSERT OR IGNORE INTO blocks (kind, id) VALUES (?1, ?2)",
+            params![kind, id],
+        )?;
+    } else {
+        c.execute(
+            "DELETE FROM blocks WHERE kind = ?1 AND id = ?2",
+            params![kind, id],
+        )?;
+    }
+    Ok(redirect("/u/"))
+}
+
+fn groups_html(
+    gs: &[(i64, String, Vec<String>)],
+    blocked: &[i64],
+    devices: &[DeviceRow],
+    hidden: &str,
+) -> String {
     let mut html = String::from("<section><h2>Machine groups</h2>");
     for (gid, name, members) in gs {
+        let block = block_form("group", &gid.to_string(), blocked.contains(gid), hidden);
         let _ = write!(
             html,
-            "<h3>{} <form class=\"inline\" method=\"post\" action=\"/u/groups/delete\">{hidden}\
+            "<h3>{} {block} <form class=\"inline\" method=\"post\" action=\"/u/groups/delete\">{hidden}\
              <input type=\"hidden\" name=\"group\" value=\"{gid}\"><button>Delete</button></form></h3><ul>",
             esc(name)
         );
@@ -1404,6 +1574,10 @@ fn group_write(ctx: &Form<'_>, path: &str) -> ApiResult<Reply> {
                 "DELETE FROM groups WHERE id = ?1",
                 params![ctx.field("group")],
             )?;
+            tx.execute(
+                "DELETE FROM blocks WHERE kind = 'group' AND id = ?1",
+                params![ctx.field("group")],
+            )?;
             tx.commit()?;
         }
         _ => {
@@ -1476,11 +1650,18 @@ struct DeviceRow {
     app: String,
     log: String,
     status: Option<StatusRow>,
+    /// The tenant file blocks the device or a group that holds it.
+    blocked: bool,
+    /// The device level ([VER-7]).
+    level: u64,
+    /// The current epoch of the space of the device.
+    epoch: u64,
 }
 
 /// The last status report of a device (10.11).
 pub(crate) struct StatusRow {
     state: String,
+    epoch: u64,
     outbox: u64,
     oldest: Option<u64>,
     applied: u64,
@@ -1509,7 +1690,7 @@ fn stalled(s: &StatusRow, now: u64) -> Option<&'static str> {
 }
 
 /// The columns of a `device_status` row.
-type StatusTuple = (String, i64, Option<i64>, i64, i64, Option<i64>);
+type StatusTuple = (String, i64, Option<i64>, i64, i64, Option<i64>, i64);
 
 fn read_status(
     tc: &Connection,
@@ -1519,7 +1700,7 @@ fn read_status(
 ) -> Result<Option<StatusRow>, StoreError> {
     let row: Option<StatusTuple> = tc
         .query_row(
-            "SELECT state, outbox, oldest, applied, time, behind_since FROM device_status
+            "SELECT state, outbox, oldest, applied, time, behind_since, epoch FROM device_status
              WHERE log_id = ?1 AND device_id = ?2",
             params![log, device],
             |r| {
@@ -1530,13 +1711,15 @@ fn read_status(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(state, outbox, oldest, applied, time, behind)| {
+    row.map(|(state, outbox, oldest, applied, time, behind, epoch)| {
         Ok(StatusRow {
             state,
+            epoch: from_i64(epoch)?,
             outbox: from_i64(outbox)?,
             oldest: oldest.map(from_i64).transpose()?,
             applied: from_i64(applied)?,
@@ -1856,6 +2039,7 @@ mod tests {
     fn row(applied: u64, head: u64, behind_since: Option<u64>) -> StatusRow {
         StatusRow {
             state: "ok".into(),
+            epoch: 1,
             outbox: 0,
             oldest: None,
             applied,

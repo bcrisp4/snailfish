@@ -454,6 +454,17 @@ pub struct TokenResponse {
     pub tenant: String,
     /// The relay time at which the token expires.
     pub expires: u64,
+    /// The spaces of the tenant, in log ID order (`PROTOCOL.md` 12.3).
+    pub spaces: Vec<SpaceRef>,
+}
+
+/// One space of a tenant in a setup token response (`PROTOCOL.md` 12.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceRef {
+    /// The log ID.
+    pub log: [u8; 16],
+    /// The app ID of the genesis record.
+    pub app: String,
 }
 
 /// The body of a setup token response.
@@ -463,6 +474,10 @@ pub fn token_response_body(r: &TokenResponse) -> Vec<u8> {
         "token": token_text(TokenKind::Setup, &r.token),
         "tenant": r.tenant,
         "expires": r.expires,
+        "spaces": r.spaces.iter().map(|s| serde_json::json!({
+            "log": encode_id("l_", &s.log),
+            "app": s.app,
+        })).collect::<Vec<_>>(),
     })
     .to_string()
     .into_bytes()
@@ -484,10 +499,31 @@ pub fn parse_token_response(body: &[u8]) -> Result<TokenResponse, WireError> {
         .get("expires")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| bad("expires is not an integer"))?;
+    // [VER-13]: a relay before M7 sends no `spaces`.
+    let mut spaces = Vec::new();
+    if let Some(list) = v.get("spaces") {
+        for x in list.as_array().ok_or_else(|| bad("spaces is not a list"))? {
+            let log = x
+                .get("log")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| bad("spaces: log is not a string"))?;
+            let log = decode_id::<16>(log, "l_").map_err(|e| bad(format!("spaces: log: {e}")))?;
+            let app = x
+                .get("app")
+                .and_then(serde_json::Value::as_str)
+                .filter(|a| (1..=255).contains(&a.len()))
+                .ok_or_else(|| bad("spaces: app is not a string of 1 to 255 bytes"))?;
+            spaces.push(SpaceRef {
+                log,
+                app: app.to_owned(),
+            });
+        }
+    }
     Ok(TokenResponse {
         token,
         tenant: tenant.to_owned(),
         expires,
+        spaces,
     })
 }
 
@@ -817,8 +853,31 @@ mod tests {
             token: [3; 32],
             tenant: format!("t_{}", "0".repeat(32)),
             expires: 600,
+            spaces: vec![SpaceRef {
+                log: [7; 16],
+                app: "com.example.tasks".into(),
+            }],
         };
-        assert_eq!(parse_token_response(&token_response_body(&resp)), Ok(resp));
+        assert_eq!(
+            parse_token_response(&token_response_body(&resp)),
+            Ok(resp.clone())
+        );
+        // [VER-13]: a relay before M7 sends no spaces.
+        let old = format!(
+            r#"{{"token":"{}","tenant":"{}","expires":600}}"#,
+            token_text(TokenKind::Setup, &resp.token),
+            resp.tenant
+        );
+        assert_eq!(parse_token_response(old.as_bytes()).unwrap().spaces, vec![]);
+        for bad_spaces in [
+            r#""spaces":{}"#,
+            r#""spaces":[{"log":"l_00","app":"a"}]"#,
+            r#""spaces":[{"log":"l_00000000000000000000000000000000","app":""}]"#,
+            r#""spaces":[{"app":"a"}]"#,
+        ] {
+            let body = old.replacen('}', &format!(",{bad_spaces}}}"), 1);
+            assert!(parse_token_response(body.as_bytes()).is_err(), "{body}");
+        }
     }
 
     #[test]

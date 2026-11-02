@@ -189,6 +189,15 @@ func TestHTTPVectorsDetectRelayFaults(t *testing.T) {
 		{"put-setup-any-text", "put setup-uppercase-hex"},
 		{"put-expiry-after", "put token-at-expiry"},
 		{"put-any-tenant", "put token-of-other-tenant"},
+		{"any-epoch", "append wrong-epoch"},
+		{"regrant-removed", "append grant-of-removed-device"},
+		{"epoch-old-recovery", "append epoch-wrong-recovery"},
+		{"level-above-max", "append unsupported-type"},
+		{"no-reserve", "append_reserve security-one-byte-over"},
+		{"no-security-limit", "append_reserve security-limit-reached"},
+		{"no-block", "access blocked-device"},
+		{"removed-as-unknown", "access removed-device"},
+		{"recovery-any-route", "access recovery-id-status"},
 	} {
 		err := checkHTTPWith(h, w, tc.mut)
 		if err == nil {

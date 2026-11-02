@@ -11,3 +11,5 @@ crates/*/fuzz/artifacts/
 crates/*/fuzz/target/
 crates/*/fuzz/coverage/
 mutants.diff
+# go build output of tools/vectorgen
+tools/vectorgen/vectorgen

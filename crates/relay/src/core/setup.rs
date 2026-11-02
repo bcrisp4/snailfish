@@ -3,12 +3,12 @@
 //! reports.
 
 use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
-use snailfish_protocol::encoding::{Hash32, encode_id};
+use snailfish_protocol::encoding::{Hash32, decode_id, encode_id};
 use snailfish_protocol::keys;
 use snailfish_protocol::setup::{self, TokenResponse};
 
 use super::{ApiResult, Relay, Request, Tenant, api, from_i64, random, to_i64};
-use crate::store::{self, Kind};
+use crate::store::{self, Kind, StoreError};
 
 /// A setup token expires this many seconds after its exchange ([USR-5]).
 pub const SETUP_TOKEN_SECONDS: u64 = 600;
@@ -18,11 +18,30 @@ fn bad_setup(why: &str) -> super::ApiError {
 }
 
 impl Relay {
+    /// The active spaces of a tenant in log ID order (12.3).
+    fn tenant_spaces(&self, tenant_id: String) -> ApiResult<Vec<setup::SpaceRef>> {
+        let t = self.tenant_by_id(tenant_id)?;
+        let tc = store::open(&t.db(), Kind::Tenant, false)?;
+        let mut st = tc
+            .prepare("SELECT log_id, app_id FROM spaces WHERE status = 'active' ORDER BY log_id")?;
+        let mut q = st.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = q.next()? {
+            let log: String = r.get(0)?;
+            out.push(setup::SpaceRef {
+                log: decode_id::<16>(&log, "l_")
+                    .map_err(|_| StoreError::Corrupt("a log ID in the space index is malformed"))?,
+                app: r.get(1)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// `POST /v1/setup/token` (12.3).
     pub(super) fn setup_token(&self, req: &Request, now: u64) -> ApiResult<(u16, Vec<u8>)> {
         self.guard(req)?;
         // Step 1: 8.6 steps 1 to 4. The device key comes from the body.
-        match self.verify(req, now, |_| None) {
+        match self.verify(req, now, super::no_signer) {
             Err(e) if e.code != "unknown_device" => return Err(e),
             _ => {}
         }
@@ -30,8 +49,7 @@ impl Relay {
         let r = setup::parse_token_request(&req.body).map_err(|e| api(400, "bad_request", e.0))?;
         // Step 3: 8.6 steps 5 to 7 with the keys of the body only.
         let id = keys::device_id(&r.device.sign, &r.device.seal);
-        let sign = r.device.sign;
-        let v = self.verify(req, now, |k| (k == &id).then_some(sign))?;
+        let v = self.verify(req, now, super::only_device(id, r.device.sign))?;
         let mut d = self.directory()?;
         let tx = d.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
@@ -96,16 +114,20 @@ impl Relay {
                 ],
             )?;
             // [USR-3]: the user of the code selects the tenant.
-            let tenant: String = tx.query_row(
-                "SELECT t.handle FROM users u JOIN tenants t ON t.tenant_id = u.tenant_id
+            let (tenant, tenant_id): (String, String) = tx.query_row(
+                "SELECT t.handle, t.tenant_id FROM users u JOIN tenants t ON t.tenant_id = u.tenant_id
                  WHERE u.user_id = ?1",
                 params![user_id],
-                |q| q.get(0),
+                |q| Ok((q.get(0)?, q.get(1)?)),
             )?;
+            // 12.3: the spaces of the tenant, so a device finds the space of
+            // its app before it makes a new one (13.4).
+            let spaces = self.tenant_spaces(tenant_id)?;
             Ok(setup::token_response_body(&TokenResponse {
                 token,
                 tenant,
                 expires,
+                spaces,
             }))
         })();
         match outcome {
@@ -162,7 +184,7 @@ impl Relay {
         tenant: &str,
         log: &str,
     ) -> ApiResult<(u16, Vec<u8>)> {
-        let (sp, v) = self.open_signed(req, now, tenant, log)?;
+        let (sp, v) = self.open_signed(req, now, tenant, log, false)?;
         let s = setup::parse_device_status(&req.body).map_err(|e| api(400, "bad_request", e.0))?;
         // DESIGN.md "Monitoring and alerting" item 7: the relay keeps the time
         // since which the applied position is behind the log head.

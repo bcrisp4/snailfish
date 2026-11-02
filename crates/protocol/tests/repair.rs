@@ -145,8 +145,20 @@ impl SpaceView for Shifted {
     fn device_key(&self, id: &[u8; 32]) -> Option<[u8; 32]> {
         self.0.device_key(id)
     }
+    fn active_devices(&self) -> Vec<[u8; 32]> {
+        self.0.active_devices()
+    }
+    fn is_removed(&self, id: &[u8; 32]) -> bool {
+        self.0.is_removed(id)
+    }
+    fn device_level(&self, id: &[u8; 32]) -> Option<u64> {
+        self.0.device_level(id)
+    }
     fn recovery_key(&self, id: &[u8; 32]) -> Option<[u8; 32]> {
         self.0.recovery_key(id)
+    }
+    fn recovery_known(&self, id: &[u8; 32]) -> bool {
+        self.0.recovery_known(id)
     }
     fn change(&self, c: &[u8; 16]) -> Option<(u64, [u8; 32])> {
         self.0.change(c)

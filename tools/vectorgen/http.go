@@ -105,35 +105,38 @@ type fetchJ struct {
 }
 
 type httpJ struct {
-	Version      int             `json:"version"`
-	Authority    string          `json:"authority"`
-	Now          int64           `json:"now"`
-	Limits       limitsJ         `json:"limits"`
-	UsedNonces   [][2]string     `json:"used_nonces"`
-	Tenant       string          `json:"tenant"`
-	LogID        string          `json:"log_id"`
-	Devices      []httpDeviceJ   `json:"devices"`
-	Signed       []signedJ       `json:"signed"`
-	Invalid      []invalidJ      `json:"invalid"`
-	Space        spaceJ          `json:"space"`
-	Append       []appendJ       `json:"append"`
-	AppendHold   []appendJ       `json:"append_hold"`
-	Fetch        []fetchJ        `json:"fetch"`
-	Status       []statusJ       `json:"status"`
-	Repair       []repairJ       `json:"repair"`
-	Enroll       []enrollCaseJ   `json:"enroll"`
-	AppendQuota  []quotaJ        `json:"append_quota"`
-	Tokens       []tokenCaseJ    `json:"tokens"`
-	PKCE         pkceJ           `json:"pkce"`
-	RedirectURIs []textCaseJ     `json:"redirect_uris"`
-	States       []textCaseJ     `json:"states"`
-	Authorize    []textCaseJ     `json:"authorize"`
-	SetupCodes   []setupCodeJ    `json:"setup_codes"`
-	SetupToken   []setupTokenJ   `json:"setup_token"`
-	SetupTokens  []heldTokenJ    `json:"setup_tokens"`
-	Put          []putJ          `json:"put"`
-	DeviceStatus []deviceStatusJ `json:"device_status"`
-	Webhook      webhookJ        `json:"webhook"`
+	Version       int             `json:"version"`
+	Authority     string          `json:"authority"`
+	Now           int64           `json:"now"`
+	Limits        limitsJ         `json:"limits"`
+	UsedNonces    [][2]string     `json:"used_nonces"`
+	Tenant        string          `json:"tenant"`
+	LogID         string          `json:"log_id"`
+	Devices       []httpDeviceJ   `json:"devices"`
+	Signed        []signedJ       `json:"signed"`
+	Invalid       []invalidJ      `json:"invalid"`
+	Space         spaceJ          `json:"space"`
+	Append        []appendJ       `json:"append"`
+	AppendHold    []appendJ       `json:"append_hold"`
+	Fetch         []fetchJ        `json:"fetch"`
+	Status        []statusJ       `json:"status"`
+	Repair        []repairJ       `json:"repair"`
+	Enroll        []enrollCaseJ   `json:"enroll"`
+	AppendQuota   []quotaJ        `json:"append_quota"`
+	Tokens        []tokenCaseJ    `json:"tokens"`
+	PKCE          pkceJ           `json:"pkce"`
+	RedirectURIs  []textCaseJ     `json:"redirect_uris"`
+	States        []textCaseJ     `json:"states"`
+	Authorize     []textCaseJ     `json:"authorize"`
+	SetupCodes    []setupCodeJ    `json:"setup_codes"`
+	SetupToken    []setupTokenJ   `json:"setup_token"`
+	SetupTokens   []heldTokenJ    `json:"setup_tokens"`
+	Put           []putJ          `json:"put"`
+	DeviceStatus  []deviceStatusJ `json:"device_status"`
+	Webhook       webhookJ        `json:"webhook"`
+	Recovery      []httpDeviceJ   `json:"recovery"`
+	Access        []accessJ       `json:"access"`
+	AppendReserve []reserveJ      `json:"append_reserve"`
 }
 
 type statusRespJ struct {
@@ -198,14 +201,26 @@ func httpTenant() string { return "t_" + hx(testSeed("tenant", "handle")[:16]) }
 // http entry 1 is genesis (protocol entry 1), 3 is the grant to B (protocol
 // entry 2), 100 is a grant to C (protocol entry 8), 101 is an epoch 2 record
 // with key sets to A, B and R1 (protocol entry 9).
+// The M7 cases (entries from 200) take a stored sealed value of the same
+// length: protocol entry 8 for one epoch, entry 11 for two. Their HPKE info
+// differs, so these key sets do not open. The relay never opens a key set,
+// and protocol.json checks the key sets that a device opens.
 func httpSealer(p *protocolJ) sealer {
 	m := map[int]int{1: 1, 3: 2, 100: 8, 101: 9}
 	return func(entry, index int, pk, info, plaintext []byte) ([]byte, error) {
 		pe, ok := m[entry]
-		if !ok {
-			return nil, fmt.Errorf("no stored key set for http entry %d", entry)
+		if ok {
+			return storedSealed(p, pe, index)
 		}
-		return storedSealed(p, pe, index)
+		if entry >= 200 {
+			switch len(plaintext) {
+			case 32:
+				return storedSealed(p, 8, 0)
+			case 64:
+				return storedSealed(p, 11, 0)
+			}
+		}
+		return nil, fmt.Errorf("no stored key set for http entry %d", entry)
 	}
 }
 
@@ -343,6 +358,9 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 	for _, d := range []*party{w.A, w.B, w.C} {
 		h.Devices = append(h.Devices, httpDeviceJ{d.name, hx(d.signSeed), d.idText})
 	}
+	for _, r := range []*party{w.R1, w.R2} {
+		h.Recovery = append(h.Recovery, httpDeviceJ{r.name, hx(r.signSeed), r.idText})
+	}
 	var envs []string
 	for _, e := range b.entries {
 		h.Space.Log = append(h.Space.Log, spaceEntryJ{e.Position, e.Envelope, e.RecordHash, e.Digest})
@@ -411,8 +429,7 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 	}()
 	level2, _, _ := signEnv(w.A, "snailfish.level.v1", obj(
 		"log", q(logText), "author", q(w.A.idText), "base", base4, "level", "2"))
-	// A recovery-signed epoch record parses (6.2). 10.6 step 11 refuses it
-	// because M4 accepts only changes and grants.
+	// A rotation by the current recovery ID, with no removed device (13.3).
 	epochKeys, err := b.keySets(101, []int{2}, w.A, w.B, w.R1)
 	if err != nil {
 		return nil, err
@@ -422,14 +439,7 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		"log", q(logText), "author", q(w.R1.idText), "base", base4,
 		"epoch", "2", "removed", "[]", "stay", list(q(stay[0].idText), q(stay[1].idText)),
 		"commitment", q(b64(commitment(w.logID, 2, w.appKeys[2]))), "keys", epochKeys))
-	type ac struct {
-		name   string
-		signer *party
-		envs   []string
-		want   []string
-		head   int
-		hd     []byte
-	}
+	type ac = appendCase
 	cases := []ac{
 		{"new-change", w.B, []string{newB}, []string{"stored:5"}, 0, nil},
 		{"exact-retry", w.A, []string{e2}, []string{"known:2"}, 0, nil},
@@ -462,13 +472,18 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		// The request signer is then any active device.
 		{"recovery-grant", w.B, []string{grant(w.R1, w.C, 2, 100, base4)}, []string{"stored:5"}, 0, nil},
 		{"recovery-grant-not-current", w.B, []string{grant(w.R2, w.C, 2, 100, base4)}, []string{"refused:not_active"}, 0, nil},
-		{"recovery-epoch", w.B, []string{recEpoch}, []string{"refused:unsupported"}, 0, nil},
+		{"recovery-epoch", w.B, []string{recEpoch}, []string{"stored:5"}, 0, nil},
 		// 6.2 allows only a device ID as the author of a change.
 		{"recovery-change", w.B, []string{mustChange(w.R1, 28, base4, 1, logText, `{"op":"x"}`)}, []string{"refused:invalid_record"}, 0, nil},
 	}
 	if err != nil {
 		return nil, err
 	}
+	m7, err2 := m7AppendCases(b, w, logText, base4, mustChange)
+	if err2 != nil {
+		return nil, err2
+	}
+	cases = append(cases, m7...)
 	runAppend := func(cases []ac, hold bool) ([]appendJ, error) {
 		var out []appendJ
 		for _, c := range cases {
@@ -740,6 +755,18 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		}
 	}
 	h.Invalid = inv
+
+	usedN := map[[2]string]bool{}
+	for _, u := range h.UsedNonces {
+		usedN[u] = true
+	}
+	if err := buildAccess(h, b, w, relayState{authority: h.Authority, now: h.Now, space: sp, used: usedN},
+		entriesPath, appendPath, spacePath+"/status"); err != nil {
+		return nil, err
+	}
+	if err := buildReserve(h, b, w, sp, mustChange); err != nil {
+		return nil, err
+	}
 
 	if err := buildSetup(h, b, w); err != nil {
 		return nil, err

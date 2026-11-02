@@ -11,6 +11,7 @@
 mod common;
 
 use common::{Fx, error_code, s};
+use rusqlite::Connection;
 use serde_json::Value;
 use snailfish_protocol::wire::{self, AppendResult};
 use snailfish_relay::core::Request;
@@ -540,6 +541,120 @@ fn device_status_cases() {
                 "{name}: {}",
                 String::from_utf8_lossy(&r.body)
             ),
+        }
+    }
+}
+
+fn append_results(c: &Value) -> Vec<AppendResult> {
+    c["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| match s(&x["status"]) {
+            "stored" => AppendResult::Stored(x["position"].as_u64().unwrap()),
+            "known" => AppendResult::Known(x["position"].as_u64().unwrap()),
+            _ => AppendResult::Refused(s(&x["error"]).to_owned()),
+        })
+        .collect()
+}
+
+/// `PROTOCOL.md` 10.6 steps 14 and 15 ([STO-15], T10), against
+/// `specs/quota/test.qnt::thiefLimitedTest`: the security record reserve and
+/// the daily limit of the request keyid. Neither one counts a change.
+#[test]
+fn append_reserve_cases() {
+    let h = common::load("http.json");
+    let cases = h["append_reserve"].as_array().unwrap();
+    assert!(cases.len() >= 7);
+    for c in cases {
+        let name = s(&c["name"]);
+        let mut fx = fresh(&h, s(&h["authority"]), true);
+        let reserve = c["reserve"].as_u64().unwrap();
+        fx.reopen_with(|cfg| cfg.security_reserve = reserve);
+        let (_, _, keyid) = fx.key(s(&c["signer"]));
+        let day = fx.now.load(std::sync::atomic::Ordering::SeqCst) / 86_400;
+        Connection::open(fx.space_file(fx.tenant()))
+            .unwrap()
+            .execute(
+                "INSERT INTO security_counts (signer, day, n) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (signer, day) DO UPDATE SET n = excluded.n",
+                rusqlite::params![
+                    keyid,
+                    i64::try_from(day).unwrap(),
+                    c["security_today"].as_i64().unwrap()
+                ],
+            )
+            .unwrap();
+        let path = format!("{}/append", fx.space_path(fx.tenant(), fx.log()));
+        let r = fx.relay.handle(&fx.signed(
+            "POST",
+            &path,
+            "",
+            s(&c["body"]).as_bytes(),
+            s(&c["signer"]),
+        ));
+        assert_eq!(r.status, 200, "{name}");
+        let (got, head) = wire::parse_append_response(&r.body).unwrap();
+        assert_eq!(got, append_results(c), "{name}");
+        assert_eq!(
+            head.position,
+            c["head"]["position"].as_u64().unwrap(),
+            "{name}"
+        );
+    }
+}
+
+/// 8.6 steps 5 to 7 on the relay ([STO-12], `PROTOCOL.md` 13.4): a blocked
+/// device, a removed device, and a request by the current recovery ID. The
+/// extra records go through the append route, so the relay keeps its own
+/// device tables. The blocks are rows of the tenant file, as the user page
+/// writes them (`crates/relay/tests/user.rs` runs the route).
+#[test]
+fn access_cases_return_the_vector_error() {
+    let h = common::load("http.json");
+    let cases = h["access"].as_array().unwrap();
+    assert!(cases.len() >= 10);
+    for c in cases {
+        let name = s(&c["name"]);
+        let fx = fresh(&h, s(&h["authority"]), true);
+        let extra: Vec<String> = c["extra"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| s(e).to_owned())
+            .collect();
+        if !extra.is_empty() {
+            let path = format!("{}/append", fx.space_path(fx.tenant(), fx.log()));
+            let body = format!(r#"{{"envelopes":[{}]}}"#, extra.join(","));
+            let r = fx
+                .relay
+                .handle(&fx.signed("POST", &path, "", body.as_bytes(), "A"));
+            let (got, _) = wire::parse_append_response(&r.body).unwrap();
+            assert!(
+                got.iter().all(|x| matches!(x, AppendResult::Stored(_))),
+                "{name}: {got:?}"
+            );
+        }
+        let tc = Connection::open(fx.tenant_db(fx.tenant())).unwrap();
+        for b in c["blocked"].as_array().unwrap() {
+            tc.execute(
+                "INSERT INTO blocks (kind, id) VALUES ('device', ?1)",
+                rusqlite::params![s(b)],
+            )
+            .unwrap();
+        }
+        let r = fx.relay.handle(&request(c, s(&c["method"])));
+        let want = s(&c["error"]);
+        if want.is_empty() {
+            assert_eq!(
+                r.status,
+                200,
+                "{name}: {}",
+                String::from_utf8_lossy(&r.body)
+            );
+        } else {
+            assert_eq!(common::error_code(&r), want, "{name}");
+            assert_eq!(r.status, 403, "{name}");
         }
     }
 }

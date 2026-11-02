@@ -53,8 +53,15 @@ type setupCodeJ struct {
 }
 
 type setupRespJ struct {
-	Tenant  string `json:"tenant"`
-	Expires int64  `json:"expires"`
+	Tenant  string      `json:"tenant"`
+	Expires int64       `json:"expires"`
+	Spaces  []spaceRefJ `json:"spaces"`
+}
+
+// spaceRefJ is one space of the tenant in a setup token response (12.3).
+type spaceRefJ struct {
+	Log string `json:"log"`
+	App string `json:"app"`
 }
 
 type setupTokenJ struct {
@@ -518,7 +525,8 @@ func putWant(c putJ) string {
 // replaySetupToken runs one setup_token case on the reference relay. It keeps
 // name, signer, body and headers, and takes the result from the reference.
 func replaySetupToken(h *httpJ, c setupTokenJ, mut string) setupTokenJ {
-	rs := &relayState{authority: h.Authority, now: h.Now, used: map[[2]string]bool{}, mut: mut}
+	rs := &relayState{authority: h.Authority, now: h.Now, used: map[[2]string]bool{}, mut: mut,
+		spaces: map[string][]spaceRefJ{h.Tenant: {{h.LogID, appName}}}}
 	status, resp, code := rs.setupToken(request{"POST", setupPath, "", c.Body, c.Headers}, h.SetupCodes)
 	out := setupTokenJ{Name: c.Name, Signer: c.Signer, Body: c.Body, Headers: c.Headers, Status: status, Response: resp}
 	if code != "" {

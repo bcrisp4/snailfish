@@ -38,8 +38,17 @@ pub struct Params {
     pub expires: u64,
     /// 16 random bytes.
     pub nonce: [u8; 16],
-    /// The device ID of the signer.
+    /// The device ID of the signer, or a recovery ID if `recovery` is set.
     pub keyid: Hash32,
+    /// True if `keyid` is a recovery ID (`r_`). Only `GET .../entries` and
+    /// `POST .../append` take it (`PROTOCOL.md` 8.2).
+    pub recovery: bool,
+}
+
+/// The ID text of a `keyid`: `r_` for a recovery ID, `d_` for a device ID.
+#[must_use]
+pub fn keyid_text(keyid: &Hash32, recovery: bool) -> String {
+    encode_id(if recovery { "r_" } else { "d_" }, keyid)
 }
 
 /// The parts of the request target that the signature covers.
@@ -94,6 +103,10 @@ pub enum RequestError {
     Expired,
     /// `bad_digest`: `content-digest` differs from the body.
     BadDigest,
+    /// `blocked`: the user blocked the device of `keyid` (8.6 step 5).
+    Blocked,
+    /// `removed`: an epoch record removed the device of `keyid` (8.6 step 6).
+    Removed,
     /// `unknown_device`: `keyid` names no active device.
     UnknownDevice,
 }
@@ -107,6 +120,8 @@ impl RequestError {
             Self::BadSignature(_) => "bad_signature",
             Self::Expired => "expired",
             Self::BadDigest => "bad_digest",
+            Self::Blocked => "blocked",
+            Self::Removed => "removed",
             Self::UnknownDevice => "unknown_device",
         }
     }
@@ -137,7 +152,7 @@ pub fn params_line(p: &Params) -> String {
         p.created,
         p.expires,
         encode_id("", &p.nonce),
-        encode_id("d_", &p.keyid),
+        keyid_text(&p.keyid, p.recovery),
     )
 }
 
@@ -229,14 +244,22 @@ pub fn parse_signature_input(value: &str) -> Result<(Params, &str), RequestError
     }
     let nonce = decode_id::<16>(nonce, "")
         .map_err(|_| RequestError::BadSignature("nonce is not 32 lowercase hex digits"))?;
-    let keyid = decode_id::<32>(keyid, "d_")
-        .map_err(|_| RequestError::BadSignature("keyid is not a device ID"))?;
+    let (keyid, recovery) = match decode_id::<32>(keyid, "d_") {
+        Ok(id) => (id, false),
+        Err(_) => (
+            decode_id::<32>(keyid, "r_").map_err(|_| {
+                RequestError::BadSignature("keyid is not a device ID or a recovery ID")
+            })?,
+            true,
+        ),
+    };
     Ok((
         Params {
             created,
             expires,
             nonce,
             keyid,
+            recovery,
         },
         line,
     ))
@@ -275,12 +298,14 @@ pub fn parse_signature(value: &str) -> Result<[u8; 64], RequestError> {
     ))
 }
 
-/// A request that passed the checks of 8.6 steps 1 to 6.
+/// A request that passed the checks of 8.6 steps 1 to 8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verified {
     /// The signer.
     pub keyid: Hash32,
-    /// The nonce, which the relay must store until `expires` (step 7).
+    /// True if `keyid` is a recovery ID.
+    pub recovery: bool,
+    /// The nonce, which the relay must store until `expires` (step 9).
     pub nonce: [u8; 16],
     /// The end of the validity.
     pub expires: u64,
@@ -303,10 +328,12 @@ fn required<'a>(headers: &[(&str, &'a str)], name: &str) -> Result<&'a str, Requ
     one(headers, name)?.ok_or(RequestError::BadSignature("a signature header is missing"))
 }
 
-/// Check a signed request (`PROTOCOL.md` 8.6 steps 1 to 6), in that order.
+/// Check a signed request (`PROTOCOL.md` 8.6 steps 1 to 8), in that order.
 ///
 /// `target.authority` must be the configured authority, not a value from
-/// the request. `device_key` returns the signing key of an active device.
+/// the request. `signer_key` is 8.6 steps 5 to 7: it takes the `keyid` and
+/// the recovery flag, and returns the signing key of an active device or of
+/// the current recovery ID, or the error of the step that fails.
 ///
 /// # Errors
 ///
@@ -316,7 +343,7 @@ pub fn check(
     target: &Target<'_>,
     body: &[u8],
     now: u64,
-    device_key: impl Fn(&Hash32) -> Option<[u8; 32]>,
+    signer_key: impl Fn(&Hash32, bool) -> Result<[u8; 32], RequestError>,
 ) -> Result<Verified, RequestError> {
     if let Some(a) = one(headers, AUTHORITY_HEADER)?
         && a != target.authority
@@ -340,13 +367,14 @@ pub fn check(
     if digest_value != content_digest(body) {
         return Err(RequestError::BadDigest);
     }
-    let pk = device_key(&params.keyid).ok_or(RequestError::UnknownDevice)?;
+    let pk = signer_key(&params.keyid, params.recovery)?;
     let base = signature_base(target, digest_value, line);
     PublicKey::from_bytes(&pk)
         .and_then(|k| k.verify_raw(base.as_bytes(), &sig))
         .map_err(|_| RequestError::BadSignature("the signature does not verify"))?;
     Ok(Verified {
         keyid: params.keyid,
+        recovery: params.recovery,
         nonce: params.nonce,
         expires: params.expires,
     })
@@ -388,6 +416,7 @@ mod tests {
             expires: created.checked_add(MAX_LIFETIME).unwrap(),
             nonce: [1; 16],
             keyid: [9; 32],
+            recovery: false,
         }
     }
 
@@ -408,7 +437,11 @@ mod tests {
     ) -> Result<Verified, RequestError> {
         let pairs: Vec<(&str, &str)> = h.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
         let pk = key().0.public();
-        check(&pairs, t, body, now, |id| (id == &[9; 32]).then_some(pk))
+        check(&pairs, t, body, now, |id, rec| {
+            (id == &[9; 32] && !rec)
+                .then_some(pk)
+                .ok_or(RequestError::UnknownDevice)
+        })
     }
 
     #[test]
@@ -497,9 +530,16 @@ mod tests {
 
         let pairs: Vec<(&str, &str)> = good.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
         assert_eq!(
-            check(&pairs, &t, b"{}", now, |_| None),
+            check(&pairs, &t, b"{}", now, |_, _| Err(
+                RequestError::UnknownDevice
+            )),
             Err(RequestError::UnknownDevice)
         );
+        // 8.6 steps 5 and 6: the error of the signer lookup comes back, and
+        // the signature is not checked.
+        for e in [RequestError::Blocked, RequestError::Removed] {
+            assert_eq!(check(&pairs, &t, b"{}", now, |_, _| Err(e.clone())), Err(e));
+        }
 
         for other in [
             target("PUT", "/v1/a", ""),
@@ -583,6 +623,8 @@ mod tests {
             RequestError::BadSignature("x"),
             RequestError::Expired,
             RequestError::BadDigest,
+            RequestError::Blocked,
+            RequestError::Removed,
             RequestError::UnknownDevice,
         ]
         .iter()
@@ -595,6 +637,8 @@ mod tests {
                 "bad_signature",
                 "expired",
                 "bad_digest",
+                "blocked",
+                "removed",
                 "unknown_device"
             ]
         );
@@ -634,6 +678,17 @@ mod tests {
                 prop_assert!(lifetime_ok(p.created, p.expires));
                 prop_assert_eq!(params_line(&p), line);
             }
+        }
+
+        /// A device ID and a recovery ID both write back to the same line,
+        /// with the prefix of the recovery flag (8.2).
+        #[test]
+        fn keyid_round_trip(id in any::<[u8; 32]>(), recovery in any::<bool>()) {
+            let p = Params { keyid: id, recovery, ..params(1) };
+            let line = format!("sf={}", params_line(&p));
+            let (back, _) = parse_signature_input(&line).unwrap();
+            prop_assert_eq!(back, p);
+            prop_assert!(line.contains(&keyid_text(&id, recovery)));
         }
 
         #[test]

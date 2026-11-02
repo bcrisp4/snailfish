@@ -213,6 +213,11 @@ pub(crate) fn grant_answer(
         }
         // [LOG-6]: transient. A repair puts the base back into the log.
         AppendResult::Refused(code) if code == "bad_base" => {}
+        // [STO-15], T10: transient. The user sees no warning, because the
+        // user can take no action.
+        AppendResult::Refused(code) if code == "reserve" || code == "security_limit" => {
+            e.status = Status::RelayUnavailable;
+        }
         AppendResult::Refused(code) => {
             state::drop_grant(&e.db, id)?;
             e.grant_refusals.insert(*id, code.clone());
@@ -527,6 +532,7 @@ fn signed(
         expires: now.saturating_add(request::MAX_LIFETIME),
         nonce: rand()?,
         keyid: engine.device_id,
+        recovery: false,
     };
     let auth = authority(&engine.space.relay_url);
     let t = Target {

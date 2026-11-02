@@ -11,7 +11,7 @@ use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::hash::digest0;
 use snailfish_protocol::keys;
 use snailfish_protocol::records::{Body, Position};
-use snailfish_protocol::space::{Accepted, SpaceView};
+use snailfish_protocol::space::{Accepted, SpaceView, State};
 use snailfish_protocol::{envelope, write};
 
 use crate::{
@@ -21,6 +21,9 @@ use crate::{
 /// The state of an outbox row.
 pub(crate) const PENDING: &str = "pending";
 pub(crate) const REFUSED: &str = "refused";
+/// An outbox row that the relay refused with `wrong_epoch`: the engine
+/// encrypts it again with the current key before it sends it ([DLV-7]).
+pub(crate) const STALE_EPOCH: &str = "epoch";
 
 /// Open the state file with the durable settings and the schema, and bind
 /// it to one log and one device.
@@ -225,8 +228,14 @@ pub(crate) fn outbox_len(db: &Connection) -> Result<u64, EngineError> {
 /// Sign the change of an outbox row with the current verified head as the
 /// base. The engine signs each row once: a retry sends the same envelope
 /// ([DLV-7]).
-fn sign_change(e: &Engine, base: &Position, change_id: &[u8; 16], ciphertext: &[u8]) -> String {
-    let payload = write::change(&e.log_id, &e.device_id, base, 1, change_id, ciphertext);
+fn sign_change(
+    e: &Engine,
+    base: &Position,
+    epoch: u64,
+    change_id: &[u8; 16],
+    ciphertext: &[u8],
+) -> String {
+    let payload = write::change(&e.log_id, &e.device_id, base, epoch, change_id, ciphertext);
     let sig = e.sign.sign_record("snailfish.change.v1", &payload);
     envelope::write_json("snailfish.change.v1", &payload, &sig, &e.device())
 }
@@ -250,7 +259,9 @@ pub(crate) fn enqueue(e: &mut Engine, rows: &[OutboxRow]) -> Result<EnqueueResul
     let base = e.base()?;
     let log_id = e.log_id;
     let device = e.device_id;
-    let app_key = e.app_key.ok_or_else(|| {
+    // PROTOCOL.md 13.1: a new change uses the key of the current epoch.
+    let epoch = e.current_epoch()?;
+    let app_key = e.epoch_key(epoch)?.ok_or_else(|| {
         EngineError::Invalid(
             "the engine has no app key yet: the enrollment check has not passed".into(),
         )
@@ -259,9 +270,9 @@ pub(crate) fn enqueue(e: &mut Engine, rows: &[OutboxRow]) -> Result<EnqueueResul
     // signature need no database state.
     let mut prepared = Vec::with_capacity(parsed.len());
     for (cid, r) in &parsed {
-        let aad = keys::change_aad(&log_id, 1, cid, &device);
+        let aad = keys::change_aad(&log_id, epoch, cid, &device);
         let ct = keys::encrypt(&app_key, &aad, &r.change_bytes).map_err(|_| EngineError::Random)?;
-        let env = (base.position >= 1).then(|| sign_change(e, &base, cid, &ct));
+        let env = (base.position >= 1).then(|| sign_change(e, &base, epoch, cid, &ct));
         prepared.push((*cid, content_hash(&r.change_bytes), ct, env));
     }
     let tx = Transaction::new_unchecked(&e.db, TransactionBehavior::Immediate)?;
@@ -322,6 +333,7 @@ pub(crate) struct Pending {
 /// could not sign at enqueue (no verified log yet) is signed now, once,
 /// with the current verified head as its base.
 pub(crate) fn pending(e: &mut Engine, max: usize) -> Result<Vec<Pending>, EngineError> {
+    reencrypt_stale(e)?;
     let base = e.base()?;
     let tx = Transaction::new_unchecked(&e.db, TransactionBehavior::Immediate)?;
     let rows: Vec<OutboxItem> = {
@@ -351,7 +363,7 @@ pub(crate) fn pending(e: &mut Engine, max: usize) -> Result<Vec<Pending>, Engine
                     "a change needs a verified log before the push".into(),
                 ));
             }
-            let env = sign_change(e, &base, &cid, &ct);
+            let env = sign_change(e, &base, 1, &cid, &ct);
             tx.execute(
                 "UPDATE outbox SET envelope = ?1 WHERE seq = ?2",
                 params![env, seq],
@@ -365,6 +377,161 @@ pub(crate) fn pending(e: &mut Engine, max: usize) -> Result<Vec<Pending>, Engine
     }
     tx.commit()?;
     Ok(out)
+}
+
+/// [DLV-7]: encrypt each outbox change that the relay refused with
+/// `wrong_epoch` again with the key of the current epoch, keep its
+/// `change_id`, and sign it on the verified head. The relay checks a known
+/// `change_id` before the epoch, so the refusal shows that it holds no copy.
+/// A row stays stale until the verified log has a newer epoch than the row.
+fn reencrypt_stale(e: &Engine) -> Result<(), EngineError> {
+    let rows: Vec<(i64, Vec<u8>, String)> = {
+        let mut st = e
+            .db
+            .prepare("SELECT seq, change_id, envelope FROM outbox WHERE state = ?1 ORDER BY seq")?;
+        st.query_map([STALE_EPOCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let epoch = e.current_epoch()?;
+    let base = e.base()?;
+    let Some(key) = e.epoch_key(epoch)? else {
+        return Ok(());
+    };
+    for (seq, cid, env) in rows {
+        let cid: [u8; 16] = cid
+            .try_into()
+            .map_err(|_| EngineError::Storage("a stored change_id is not 16 bytes".into()))?;
+        let old = Envelope::parse(env.as_bytes())
+            .map_err(|err| EngineError::Storage(format!("outbox envelope: {err}")))?;
+        let r = snailfish_protocol::records::parse_payload(&old.payload_type, &old.payload)
+            .map_err(|err| EngineError::Storage(format!("outbox envelope: {err}")))?;
+        let Body::Change {
+            epoch: old_epoch, ..
+        } = r.body
+        else {
+            return Err(EngineError::Storage("an outbox row is not a change".into()));
+        };
+        if old_epoch >= epoch {
+            continue;
+        }
+        let plain = decrypt_change(e, &old)
+            .ok_or_else(|| EngineError::Storage("an outbox change does not decrypt".into()))?;
+        let aad = keys::change_aad(&e.log_id, epoch, &cid, &e.device_id);
+        let ct = keys::encrypt(&key, &aad, &plain).map_err(|_| EngineError::Random)?;
+        let env = sign_change(e, &base, epoch, &cid, &ct);
+        e.db.execute(
+            "UPDATE outbox SET ciphertext = ?1, envelope = ?2, state = ?3 WHERE seq = ?4",
+            params![ct, env, PENDING, seq],
+        )?;
+    }
+    Ok(())
+}
+
+/// The relay refused a change with `wrong_epoch` ([DLV-7]).
+pub(crate) fn stale_epoch(db: &Connection, change_id: &[u8; 16]) -> Result<(), EngineError> {
+    db.execute(
+        "UPDATE outbox SET state = ?1 WHERE change_id = ?2 AND state = ?3",
+        params![STALE_EPOCH, &change_id[..], PENDING],
+    )?;
+    Ok(())
+}
+
+/// The current epoch of the verified log: 1 and one more for each epoch
+/// record, because each epoch record carries the next epoch ([LOG-8]).
+pub(crate) fn current_epoch(db: &Connection) -> Result<u64, EngineError> {
+    let n: i64 = db.query_row(
+        "SELECT count(*) FROM log WHERE payload_type = 'snailfish.epoch.v1'",
+        [],
+        |r| r.get(0),
+    )?;
+    to_u64(n).map(|n| n.saturating_add(1))
+}
+
+/// The space state of the security records of the verified log
+/// (`PROTOCOL.md` 10.2). Every security record is in full, so the replay
+/// is complete.
+pub(crate) fn security_state(db: &Connection) -> Result<State, EngineError> {
+    let mut st = db.prepare(&format!(
+        "SELECT envelope FROM log WHERE {NOT_SECURITY} ORDER BY position"
+    ))?;
+    let mut q = st.query([])?;
+    let mut state = State::default();
+    while let Some(r) = q.next()? {
+        state
+            .apply_envelope(&r.get::<_, String>(0)?)
+            .map_err(|err| EngineError::Storage(format!("stored record: {err}")))?;
+    }
+    Ok(state)
+}
+
+/// The key of `epoch` from the verified log (`PROTOCOL.md` 13.1): from the
+/// key set to `device` in its own genesis record or grant if that set holds
+/// the epoch, else from the epoch record of `epoch`. The key must match the
+/// commitment of the epoch record. `None` if the log seals no key of that
+/// epoch to the device.
+pub(crate) fn open_epoch_key(
+    db: &Connection,
+    log_id: &[u8; 16],
+    device: &Hash32,
+    seal_seed: &[u8; 32],
+    epoch: u64,
+) -> Result<Option<[u8; 32]>, EngineError> {
+    let bad = |m: String| EngineError::Storage(format!("key of epoch {epoch}: {m}"));
+    let parse = |json: &str| -> Result<snailfish_protocol::records::Record, EngineError> {
+        let env = Envelope::parse(json.as_bytes()).map_err(|err| bad(err.to_string()))?;
+        snailfish_protocol::records::parse_payload(&env.payload_type, &env.payload)
+            .map_err(|err| bad(err.to_string()))
+    };
+    let mut commitment = None;
+    let mut sets = Vec::new();
+    if let Some((_, json)) = activation(db, device)?
+        && let Body::Genesis { keys, .. } | Body::Grant { keys, .. } = parse(&json)?.body
+    {
+        sets.extend(keys);
+    }
+    let rows: Vec<String> = {
+        let mut st = db.prepare(
+            "SELECT envelope FROM log WHERE payload_type = 'snailfish.epoch.v1' ORDER BY position",
+        )?;
+        st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+    };
+    for json in rows {
+        if let Body::Epoch {
+            epoch: e,
+            commitment: c,
+            keys,
+            ..
+        } = parse(&json)?.body
+            && e == epoch
+        {
+            commitment = Some(c);
+            sets.extend(keys);
+        }
+    }
+    let Some(commitment) = commitment else {
+        return Ok(None);
+    };
+    for set in sets
+        .iter()
+        .filter(|k| k.to == snailfish_protocol::records::Author::Device(*device))
+    {
+        let Some(i) = set.epochs.iter().position(|e| *e == epoch) else {
+            continue;
+        };
+        let opened = keys::open_key_set(seal_seed, log_id, device, &set.epochs, &set.sealed)
+            .map_err(|err| bad(err.to_string()))?;
+        let key = *opened
+            .get(i)
+            .ok_or_else(|| bad("the key set holds fewer keys than epochs".into()))?;
+        if keys::key_commitment(log_id, epoch, &key) != commitment {
+            return Err(bad("the key does not match the commitment".into()));
+        }
+        return Ok(Some(key));
+    }
+    Ok(None)
 }
 
 /// The relay refused an envelope for ever ([DLV-9]).
@@ -461,10 +628,23 @@ pub(crate) fn set_caught_up(db: &Connection, v: bool) -> Result<(), EngineError>
     Ok(())
 }
 
-/// A view of the verified log inside one transaction.
+/// A view of the verified log inside one transaction. `state` is the space
+/// state of 10.2 after the last stored entry: the caller applies each entry
+/// that it stores.
 pub(crate) struct DbSpace<'a> {
     pub tx: &'a Transaction<'a>,
     pub log_id: [u8; 16],
+    pub state: State,
+}
+
+impl<'a> DbSpace<'a> {
+    pub(crate) fn new(tx: &'a Transaction<'a>, log_id: [u8; 16]) -> Result<Self, EngineError> {
+        Ok(Self {
+            tx,
+            log_id,
+            state: security_state(tx)?,
+        })
+    }
 }
 
 impl SpaceView for DbSpace<'_> {
@@ -478,26 +658,22 @@ impl SpaceView for DbSpace<'_> {
         digest_at(self.tx, &self.log_id, position).ok().flatten()
     }
     fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.tx
-            .query_row("SELECT sign FROM devices WHERE id = ?1", [&id[..]], |r| {
-                r.get::<_, Vec<u8>>(0)
-            })
-            .optional()
-            .ok()
-            .flatten()
-            .and_then(|b| b.try_into().ok())
+        self.state.device_key(id)
+    }
+    fn active_devices(&self) -> Vec<Hash32> {
+        self.state.devices.keys().copied().collect()
+    }
+    fn is_removed(&self, id: &Hash32) -> bool {
+        self.state.removed.contains(id)
+    }
+    fn device_level(&self, id: &Hash32) -> Option<u64> {
+        self.state.device_levels.get(id).copied()
     }
     fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.tx
-            .query_row("SELECT envelope FROM log WHERE position = 1", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()
-            .ok()
-            .flatten()
-            .and_then(|g| snailfish_protocol::space::genesis_recovery_of(&g))
-            .filter(|(r, _)| r == id)
-            .map(|(_, k)| k)
+        self.state.recovery_key(id)
+    }
+    fn recovery_known(&self, id: &Hash32) -> bool {
+        self.state.recovery_known(id)
     }
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
         self.tx
@@ -512,14 +688,10 @@ impl SpaceView for DbSpace<'_> {
             .and_then(|(p, h)| Some((u64::try_from(p).ok()?, h.try_into().ok()?)))
     }
     fn write_level(&self) -> u64 {
-        self.tx
-            .query_row("SELECT level FROM space", [], |r| r.get::<_, i64>(0))
-            .ok()
-            .and_then(|l| u64::try_from(l).ok())
-            .unwrap_or(1)
+        self.state.level
     }
     fn epoch(&self) -> u64 {
-        1
+        self.state.epoch
     }
     fn last_security(&self) -> u64 {
         // Fail closed: on a read error every security record is stale, so
@@ -599,11 +771,24 @@ pub(crate) fn store_entry(
             params![&id[..], &key[..]],
         )?;
     }
-    if let Body::Genesis { level, .. } = a.record.body {
-        tx.execute(
-            "INSERT INTO space (id, level) VALUES (1, ?1)",
-            [to_i64(level)?],
-        )?;
+    match &a.record.body {
+        Body::Genesis { level, .. } => {
+            tx.execute(
+                "INSERT INTO space (id, level) VALUES (1, ?1)",
+                [to_i64(*level)?],
+            )?;
+        }
+        Body::Level { level } => {
+            tx.execute("UPDATE space SET level = ?1", [to_i64(*level)?])?;
+        }
+        // The devices table holds the active devices: the list that the
+        // user confirms ([LOG-7]).
+        Body::Epoch { removed, .. } => {
+            for d in removed {
+                tx.execute("DELETE FROM devices WHERE id = ?1", [&d[..]])?;
+            }
+        }
+        _ => {}
     }
     let Some(cid) = cid else {
         return Ok(Own::No);
@@ -694,7 +879,7 @@ pub(crate) fn decrypt_change(e: &Engine, env: &Envelope) -> Option<Vec<u8>> {
         return None;
     };
     let aad = keys::change_aad(&r.log, *epoch, change_id, r.author.id());
-    keys::decrypt(e.app_key.as_ref()?, &aad, ciphertext).ok()
+    keys::decrypt(&e.epoch_key(*epoch).ok()??, &aad, ciphertext).ok()
 }
 
 /// Store the setup record of a new space: the genesis record at seq 1.

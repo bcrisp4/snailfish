@@ -36,6 +36,8 @@ fuzz_target!(|data: &[u8]| {
     };
     // Any key: the check must never panic, and must refuse each request
     // whose key is unknown.
-    let r = request::check(&headers, &t, body, 1_767_225_600, |_| None);
+    let r = request::check(&headers, &t, body, 1_767_225_600, |_, _| {
+        Err(request::RequestError::UnknownDevice)
+    });
     assert!(r.is_err());
 });

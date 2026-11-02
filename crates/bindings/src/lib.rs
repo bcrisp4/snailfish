@@ -195,6 +195,8 @@ pub enum Status {
     ClockSkew,
     Fork { cause: String },
     SetupFailed { cause: String },
+    Blocked,
+    Removed,
 }
 
 /// The status text of DESIGN.md "Sync status", without its cause.
