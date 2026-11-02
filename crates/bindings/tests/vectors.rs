@@ -289,6 +289,18 @@ fn exchange(relay: &snailfish_relay::core::Relay, engine: &std::sync::Arc<snailf
 /// in place of the browser approval. A marshalling fault in `SignIn` or
 /// `SetupToken` fails here ([USR-4], [USR-5]).
 fn sign_in(relay: &snailfish_relay::core::Relay, keys: &snailfish::DeviceKeys) -> String {
+    sign_in_with(relay, |si, back| {
+        si.token_request(back, keys, snailfish_relay::core::system_time())
+            .unwrap()
+    })
+    .token
+}
+
+/// The sign-in with a token request that `request` signs.
+fn sign_in_with(
+    relay: &snailfish_relay::core::Relay,
+    request: impl Fn(&snailfish::SignIn, &str) -> snailfish::Request,
+) -> snailfish::SetupToken {
     let redirect = "com.example.tasks:/cb";
     let si = snailfish::SignIn::new("https://sync.example.net", redirect).unwrap();
     let url = si.authorize_url();
@@ -304,13 +316,11 @@ fn sign_in(relay: &snailfish_relay::core::Relay, keys: &snailfish::DeviceKeys) -
         .issue_code("sam", &field("code_challenge"), redirect)
         .unwrap();
     let back = format!("{redirect}?code={code}&state={}", field("state"));
-    let req = si
-        .token_request(&back, keys, snailfish_relay::core::system_time())
-        .unwrap();
+    let req = request(&si, &back);
     let (status, headers, body) = send(relay, req);
     let t = si.read_token(status, &headers, &body).unwrap();
     assert!(t.token.starts_with("st_"));
-    t.token
+    t
 }
 
 fn send(
@@ -882,7 +892,138 @@ fn setup_failure_and_new_token_cross_the_binding() {
         "paused: quota"
     );
     assert!(a.set_setup_token("st_00").is_err());
-    a.set_setup_token(&sign_in(&relay, &ka)).unwrap();
+    // M6 open item: the engine signs the new token request with its keys.
+    let token = sign_in_with(&relay, |si, back| {
+        si.token_request_for_engine(back, &a, snailfish_relay::core::system_time())
+            .unwrap()
+    });
+    a.set_setup_token(&token.token).unwrap();
     exchange(&relay, &a);
     assert_eq!(a.status().unwrap(), snailfish::Status::Ok);
+}
+
+/// 13.3 step 6 through the binding: B replaces the recovery key first, so
+/// the recovery record of A gets `not_active`, and A needs the current key
+/// again. Returns the key of B.
+fn recovery_race(
+    relay: &snailfish_relay::core::Relay,
+    a: &std::sync::Arc<snailfish::Engine>,
+    b: &std::sync::Arc<snailfish::Engine>,
+    current: &str,
+) -> String {
+    let by_a = snailfish::new_recovery_key().unwrap();
+    let by_b = snailfish::new_recovery_key().unwrap();
+    a.replace_recovery_key(current, &by_a).unwrap();
+    b.replace_recovery_key(current, &by_b).unwrap();
+    exchange(relay, b);
+    exchange(relay, b);
+    assert!(!a.recovery_key_needed().unwrap());
+    exchange(relay, a);
+    assert!(a.recovery_key_needed().unwrap());
+    by_b
+}
+
+/// S4, S5 and T9 through the binding (`PROTOCOL.md` 13.2 to 13.4): A removes
+/// B, B stops, A replaces the recovery key, and a new device N recovers the
+/// space with the new key and the sign-in that names the space. A
+/// marshalling fault in an M7 record, status or method fails here.
+#[test]
+fn removal_and_recovery_cross_the_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = snailfish_relay::core::Config::new(dir.path().join("relay"), "sync.example.net");
+    cfg.secrets_dir = dir.path().join("secrets");
+    let relay = snailfish_relay::core::Relay::open(cfg).unwrap();
+    let tenant = relay.add_user("sam").unwrap();
+    let mut ka = snailfish::new_device_keys().unwrap();
+    let kb = snailfish::new_device_keys().unwrap();
+    let setup = snailfish::create_space(
+        "com.example.tasks",
+        &snailfish::NewDevice {
+            keys: ka.clone(),
+            name: "A".into(),
+        },
+    )
+    .unwrap();
+    ka.app_key.clone_from(&setup.app_key);
+    let sp = space(&setup.log_id, &tenant);
+    let path = |n: &str| dir.path().join(n).to_str().unwrap().to_owned();
+    let sa = MemStore::shared();
+    snailfish::install_setup(
+        &path("a"),
+        sp.clone(),
+        &ka,
+        &setup.envelopes,
+        &sign_in(&relay, &ka),
+        sa.clone(),
+    )
+    .unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(&path("a"), sp.clone(), sa).unwrap());
+    exchange(&relay, &a);
+    let ne = snailfish::NewEnrollment::new("https://sync.example.net", &kb, "B", None).unwrap();
+    let te = snailfish::TrustedEnrollment::new(a.clone(), ne.payload().unwrap(), None).unwrap();
+    drive(&relay, &te, &ne, (true, true));
+    let sb = MemStore::shared();
+    snailfish::install_enrollment(
+        &path("b"),
+        sp.clone(),
+        &kb,
+        &ne.joined().unwrap().unwrap(),
+        sb.clone(),
+    )
+    .unwrap();
+    let b = std::sync::Arc::new(snailfish::Engine::open(&path("b"), sp.clone(), sb).unwrap());
+    exchange(&relay, &b);
+
+    let by_b = recovery_race(&relay, &a, &b, &setup.recovery_key);
+    let new = snailfish::new_recovery_key().unwrap();
+    assert!(codec::recovery_parse(&new).is_ok());
+    a.replace_recovery_key(&by_b, &new).unwrap();
+    assert!(!a.recovery_key_needed().unwrap());
+    exchange(&relay, &a);
+    exchange(&relay, &a);
+    assert!(!a.removal_pending().unwrap());
+    assert!(matches!(
+        a.replace_recovery_key(&by_b, &snailfish::new_recovery_key().unwrap()),
+        Err(snailfish::SnailfishError::Engine { .. } | snailfish::SnailfishError::Invalid { .. })
+    ));
+
+    let list = a.active_devices().unwrap();
+    assert_eq!(list.len(), 2);
+    let me = list.iter().find(|d| d.this_device).unwrap();
+    assert_eq!(me.name, "A");
+    let other = list.iter().find(|d| !d.this_device).unwrap().clone();
+    assert_eq!(other.name, "B");
+    a.remove_devices(std::slice::from_ref(&other.id)).unwrap();
+    assert!(a.removal_pending().unwrap());
+    exchange(&relay, &a);
+    assert!(!a.removal_pending().unwrap());
+    assert_eq!(a.removal_to_confirm().unwrap(), None);
+    assert_eq!(a.active_devices().unwrap().len(), 1);
+    exchange(&relay, &b);
+    assert_eq!(b.status().unwrap(), snailfish::Status::Removed);
+    assert_eq!(
+        snailfish::status_text(&snailfish::Status::Removed),
+        "stopped: removed"
+    );
+    assert_eq!(
+        snailfish::status_text(&snailfish::Status::Blocked),
+        "paused: blocked"
+    );
+
+    let kn = snailfish::new_device_keys().unwrap();
+    let token = sign_in_with(&relay, |si, back| {
+        si.token_request(back, &kn, snailfish_relay::core::system_time())
+            .unwrap()
+    });
+    assert_eq!(token.spaces.len(), 1);
+    assert_eq!(token.spaces[0].log_id, setup.log_id);
+    assert_eq!(token.spaces[0].app_id, "com.example.tasks");
+    let sn = MemStore::shared();
+    let n = std::sync::Arc::new(
+        snailfish::Engine::open_recovery(&path("n"), sp, &kn, &new, "N", sn.clone()).unwrap(),
+    );
+    exchange(&relay, &n);
+    assert_eq!(n.status().unwrap(), snailfish::Status::Ok);
+    assert_eq!(n.active_devices().unwrap().len(), 2);
+    assert_eq!(sn.app_key(&setup.log_id), Some(setup.app_key));
 }

@@ -78,7 +78,8 @@ caught_by = "quotaReported"
 
 [[exhaustive]]
 config = "tiny"
-invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported"]
+invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported",
+              "withinReserve", "honestSecurityStored"]
 mutants = ["noQuota", "quotaDrops", "quotaBlocksFetch", "quotaBlocksSecurity", "quotaNoPause"]
 why = "Two devices, at most three records of size 1 or 2, a quota of 1 that the operator can raise to 2."
 

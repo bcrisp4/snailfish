@@ -105,3 +105,29 @@ func recoverSpace(
     let space = SpaceRef(relayUrl: relayURL, tenant: token.tenant, logId: found.logId, appId: appID)
     try await device.recover(space: space, keys: keys, recoveryKey: recoveryKey, name: name)
 }
+
+/// A new sign-in after `stopped: setup failed` (PROTOCOL.md 10.5, 12.3): the
+/// engine signs the token request with the device keys that it holds, and
+/// gets the new setup token. The space keeps its genesis record and recovery
+/// key, so the recovery key on paper stays valid.
+func signInAgain(
+    device: SyncDevice, relayURL: String, transport: Transport, browser: (URL) async throws -> URL
+) async throws {
+    guard let engine = await device.engine else { throw SetupError.syncOff }
+    let si = try SignIn(relayUrl: relayURL, redirectUri: redirectURI)
+    guard let authorize = URL(string: si.authorizeUrl()) else { throw SetupError.message("bad authorize URL") }
+    let redirect = try await browser(authorize).absoluteString
+    let now = { UInt64(Date().timeIntervalSince1970) }
+    var (status, headers, body) = try await transport.send(
+        try si.tokenRequestForEngine(redirect: redirect, engine: engine, now: now()))
+    let token: SetupToken
+    do {
+        token = try si.readToken(status: status, headers: headers, body: body)
+    } catch SnailfishError.Invalid(let message) where message.contains("expired") {
+        // PROTOCOL.md 8.5: after `expired`, send once more with the relay time.
+        (status, headers, body) = try await transport.send(
+            try si.tokenRequestForEngine(redirect: redirect, engine: engine, now: now()))
+        token = try si.readToken(status: status, headers: headers, body: body)
+    }
+    try engine.setSetupToken(token: token.token)
+}

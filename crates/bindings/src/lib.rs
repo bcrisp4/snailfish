@@ -493,6 +493,27 @@ impl SignIn {
             .token_request(redirect, &keys.to_engine()?, now)?)
     }
 
+    /// The setup token request signed with the device keys of `engine`, for
+    /// a new sign-in after `stopped: setup failed`. The app then gives the
+    /// token to [`Engine::set_setup_token`], and the space keeps its genesis
+    /// record and recovery key.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn token_request_for_engine(
+        &self,
+        redirect: &str,
+        engine: &Engine,
+        now: u64,
+    ) -> Result<Request> {
+        Ok(engine
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .sign_in_request(&self.inner, redirect, now)?)
+    }
+
     /// Read the answer of the setup token request.
     ///
     /// # Errors

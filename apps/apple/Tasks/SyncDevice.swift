@@ -265,10 +265,11 @@ actor SyncDevice {
     /// the grant opens the app key.
     func recover(space sp: SpaceRef, keys: DeviceKeys, recoveryKey: String, name: String) throws {
         try clearUncommitted()
+        let dir = engineDir.path
+        let ks = keyStore
         try openEngine(sp, open: {
             try Engine.openRecovery(
-                dataDir: engineDir.path, space: sp, keys: keys, recoveryKey: recoveryKey, name: name,
-                keyStore: keyStore)
+                dataDir: dir, space: sp, keys: keys, recoveryKey: recoveryKey, name: name, keyStore: ks)
         }) { e in
             try store.db.transaction {
                 try store.db.exec("DELETE FROM outbox; DELETE FROM applied;")

@@ -108,6 +108,14 @@ impl World {
     /// relay core. Only the browser approval is skipped: the relay issues
     /// the code for the challenge of the sign-in.
     fn sign_in(&self, keys: &DeviceKeys) -> crate::signin::SetupToken {
+        self.sign_in_with(|si, redirect, now| si.token_request(redirect, keys, now).unwrap())
+    }
+
+    /// The sign-in with a token request that `request` signs.
+    fn sign_in_with(
+        &self,
+        request: impl Fn(&crate::signin::SignIn, &str, u64) -> Request,
+    ) -> crate::signin::SetupToken {
         let si = crate::signin::SignIn::new(URL, "com.example.tasks:/cb").unwrap();
         let code = self
             .relay
@@ -121,9 +129,7 @@ impl World {
             .1
             .to_owned();
         let redirect = format!("com.example.tasks:/cb?code={code}&state={state}");
-        let req = si
-            .token_request(&redirect, keys, RELAY_TIME.load(Ordering::SeqCst))
-            .unwrap();
+        let req = request(&si, &redirect, RELAY_TIME.load(Ordering::SeqCst));
         let (status, headers, body) = self.send(&req);
         si.read_token(status, &headers, &body).unwrap()
     }
@@ -1756,6 +1762,13 @@ fn refused_create_is_a_setup_failure_and_other_refusals_are_not() {
             cause: "bad_setup".into()
         }
     );
+    // M6 open item: the app signs in again with the keys of the engine, so
+    // the space keeps its genesis record and its recovery key.
+    let token = w.sign_in_with(|si, redirect, now| ea.sign_in_request(si, redirect, now).unwrap());
+    ea.set_setup_token(&token.token).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Ok);
+    assert_eq!(ea.verified_head().unwrap().position, 1);
     let mut sync = ea.start_sync();
     let req = sync.next_request(&mut ea).unwrap().unwrap();
     assert!(req.url.ends_with("/v1/info"));
@@ -3735,4 +3748,83 @@ fn blocked_device_pauses_until_the_unblock() {
     tc.execute("DELETE FROM blocks", []).unwrap();
     w.exchange(&mut eb);
     assert_eq!(eb.status(), Status::Ok);
+}
+
+/// `specs/spacelog/test.qnt::fullRecoveryTest` with a race, [LOG-7],
+/// `PROTOCOL.md` 13.4 step 6: A appends a grant while the grant of the full
+/// recovery waits, so the relay refuses the recovery grant with
+/// `stale_base`. The engine holds the recovery key, so it signs the grant
+/// again on the new tip with no question, and N becomes active.
+#[test]
+fn stale_recovery_grant_is_signed_again() {
+    let (mut w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let kn = new_device_keys().unwrap();
+    let mut en = Engine::open_recovery(
+        &w.root.join("n"),
+        w.space(),
+        &kn,
+        &w.recovery_key.clone(),
+        "N",
+    )
+    .unwrap();
+    let mut sync = en.start_sync();
+    let mut held = None;
+    for _ in 0..20 {
+        let Some(req) = sync.next_request(&mut en).unwrap() else {
+            break;
+        };
+        if req.url.ends_with("/append") {
+            held = Some(req);
+            break;
+        }
+        let (st, h, body) = w.send(&req);
+        sync.handle_response(&mut en, st, &h, &body).unwrap();
+    }
+    let held = held.expect("N sends its grant");
+    queue_grant(&ea, "C");
+    w.exchange(&mut ea);
+    let (st, h, body) = w.send(&held);
+    assert!(String::from_utf8_lossy(&body).contains("stale_base"));
+    sync.handle_response(&mut en, st, &h, &body).unwrap();
+    drop(sync);
+    assert_eq!(en.grants_to_confirm().unwrap(), Vec::<String>::new());
+    w.exchange(&mut en);
+    assert_eq!(en.status(), Status::Ok);
+    assert!(en.active_devices().unwrap().iter().any(|d| d.this_device));
+}
+
+/// [STO-15], T10, `specs/quota/test.qnt::thiefLimitedTest`: the relay
+/// refuses a grant and an epoch record past the security record reserve.
+/// Both refusals are transient: the engine keeps both records, reports
+/// `paused: relay unavailable`, and sends them after the operator raises
+/// the reserve.
+#[test]
+fn security_records_past_the_reserve_wait() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let mut cfg = relay_config(&w.root);
+    cfg.security_reserve = 1;
+    w.relay = Relay::open(cfg).unwrap();
+    queue_grant(&ea, "C");
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::RelayUnavailable);
+    assert_eq!(state::grants(&ea.db).unwrap().len(), 1, "the grant waits");
+    let eb_id = w.engine(&b).device_id();
+    ea.remove_devices(std::slice::from_ref(&eb_id)).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::RelayUnavailable);
+    assert!(ea.removal_pending().unwrap(), "the removal waits");
+    w.relay = Relay::open(relay_config(&w.root)).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(state::grants(&ea.db).unwrap(), vec![]);
+    // [LOG-7]: the grant of C landed first in the same request, so the
+    // device list changed and the user confirms the removal again.
+    assert_eq!(ea.removal_to_confirm().unwrap(), Some(vec![eb_id.clone()]));
+    ea.remove_devices(std::slice::from_ref(&eb_id)).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Ok);
+    assert!(!ea.removal_pending().unwrap());
 }

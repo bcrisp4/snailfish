@@ -130,6 +130,19 @@ impl SignIn {
         keys: &DeviceKeys,
         now: u64,
     ) -> Result<Request, EngineError> {
+        let sk = SecretKey::from_seed(&keys.sign_seed);
+        self.signed_token_request(redirect, &sk, &keys::seal_public(&keys.seal_seed), now)
+    }
+
+    /// [`SignIn::token_request`] with a signing key and an X-Wing public key.
+    fn signed_token_request(
+        &self,
+        redirect: &str,
+        sk: &SecretKey,
+        seal: &[u8; keys::SEAL_PK_LEN],
+        now: u64,
+    ) -> Result<Request, EngineError> {
+        let seal = Box::new(*seal);
         let query = redirect
             .strip_prefix(self.authorize.redirect_uri.as_str())
             .and_then(|r| r.strip_prefix('?'))
@@ -140,8 +153,6 @@ impl SignIn {
         if state != self.authorize.state {
             return Err(bad("the redirect holds another state"));
         }
-        let sk = SecretKey::from_seed(&keys.sign_seed);
-        let seal = Box::new(keys::seal_public(&keys.seal_seed));
         let device = Keys {
             sign: sk.public(),
             seal: seal.clone(),
@@ -181,7 +192,7 @@ impl SignIn {
                 value: "application/json".into(),
             },
         ];
-        for (name, value) in request::sign(&sk, &t, &body, &p).pairs() {
+        for (name, value) in request::sign(sk, &t, &body, &p).pairs() {
             headers.push(Header {
                 name: name.into(),
                 value: value.into(),
@@ -237,5 +248,30 @@ impl SignIn {
                 })
                 .collect(),
         })
+    }
+}
+
+impl crate::Engine {
+    /// The setup token request of `si`, signed with the device keys of this
+    /// engine. After `stopped: setup failed`, the app signs in again with the
+    /// keys that it holds, reads the token with [`SignIn::read_token`], and
+    /// gives it to [`crate::Engine::set_setup_token`]. The space keeps its
+    /// genesis record and recovery key.
+    ///
+    /// # Errors
+    ///
+    /// As [`SignIn::token_request`].
+    pub fn sign_in_request(
+        &self,
+        si: &SignIn,
+        redirect: &str,
+        now: u64,
+    ) -> Result<Request, EngineError> {
+        si.signed_token_request(
+            redirect,
+            &self.sign,
+            &keys::seal_public(&self.seal_seed),
+            now,
+        )
     }
 }

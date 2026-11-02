@@ -423,4 +423,28 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(got["s1"]?["title"] as? String, "after the fire")
         XCTAssertEqual(got["p1"]?["title"] as? String, "before the fire")
     }
+
+    /// M6 open item, PROTOCOL.md 10.5: the relay refuses to create the space
+    /// with a setup token of another device (`stopped: setup failed`). The
+    /// app signs in again with the keys of the engine, and the next sync
+    /// creates the same space, so the recovery key stays valid.
+    func testSignInAgainAfterSetupFailed() async throws {
+        let relay = try env("SNAILFISH_RELAY_URL")
+        let approver = try env("SNAILFISH_APPROVER")
+        try await PythonDevice(base: approver).call("POST", "user")
+        let a = try device("a")
+        _ = try await createSpace(
+            device: a, relayURL: relay, name: "A", transport: transport, browser: browser(approver))
+        let other = try await signIn(
+            relayURL: relay, keys: try newDeviceKeys(), transport: transport, browser: browser(approver))
+        let engineOpt = await a.engine
+        let engine = try XCTUnwrap(engineOpt)
+        try engine.setSetupToken(token: other.token)
+        let failed = try await a.sync(transport)
+        XCTAssertEqual(failed, .setupFailed(cause: "bad_setup"))
+        try await signInAgain(device: a, relayURL: relay, transport: transport, browser: browser(approver))
+        let ok = try await a.sync(transport)
+        XCTAssertEqual(ok, .ok)
+        XCTAssertEqual(try engine.verifiedHead().position, 1)
+    }
 }

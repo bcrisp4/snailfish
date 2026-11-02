@@ -246,6 +246,16 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Sign in again after `stopped: setup failed`, with the keys of this
+    /// device, so the next sync creates the same space.
+    func signInAgain(browser: @escaping (URL) async throws -> URL) {
+        let relay = relayURL
+        run("sign in again") { [self] in
+            step = .working("Signing in")
+            try await Tasks.signInAgain(device: device, relayURL: relay, transport: transport, browser: browser)
+        }
+    }
+
     /// Leave a space that the relay refused to create, so the user can turn
     /// on sync again.
     func leaveFailedSetup() {

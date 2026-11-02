@@ -1068,7 +1068,7 @@ The engine signs the record with its own device key, or with the recovery key if
 3. The user types the current recovery key. The app gives the engine the current key and the new key.
 4. The engine derives both key pairs (section 9). It signs a recovery record with the current recovery key. The record holds the new recovery keys, the possession proof, and one key set to the new recovery ID with each epoch from 1 to the current epoch.
 5. After the recovery record is in the verified log, the engine signs a rotation: an epoch record with an empty `removed` list, by its own device key. T9 needs this rotation, because the holder of the old key can open each earlier key set.
-6. After `stale_base` for the recovery record, the engine drops it and asks for the current recovery key again.
+6. After `stale_base` or `not_active` for the recovery record, the engine drops it and asks for the current recovery key again. `not_active` means that another recovery record came first and retired the key that signed this one.
 
 ### 13.4 Full recovery
 

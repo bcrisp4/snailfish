@@ -11,9 +11,12 @@ from __future__ import annotations
 import subprocess
 from typing import TYPE_CHECKING
 
+import httpx
 import snailfish as sf
 from conftest import Relay, cli, demo, demo_env, dump, enroll, sync_ok
 
+from snailfish_demo import app
+from snailfish_demo.cli import SOFT_REDIRECT, Crasher, http_transport
 from snailfish_demo.softbrowser import SoftBrowser
 
 if TYPE_CHECKING:
@@ -203,3 +206,33 @@ def test_all_devices_lost_full_recovery(relay: Relay, tmp_path: Path) -> None:
     for old in (a, b):
         r = demo(old, "sync")
         assert "Status.REMOVED" in r.stdout, r.stdout + r.stderr
+
+
+def test_sign_in_again_after_setup_failed(relay: Relay, tmp_path: Path) -> None:
+    """M6 open item, PROTOCOL.md 10.5: the relay refuses to create the space
+    with a setup token of another device (`stopped: setup failed`). The demo
+    signs in again with the keys of the engine, and the next sync creates the
+    same space, so the recovery key on paper stays valid."""
+    a = tmp_path / "a"
+    key = create_with_key(relay, a)
+    br = SoftBrowser(relay.browser, relay.url)
+    with httpx.Client(timeout=30) as client:
+        send = http_transport(client, Crasher())
+        other = app.sign_in(
+            relay.url,
+            sf.new_device_keys(),
+            SOFT_REDIRECT,
+            lambda authorize_url: br.approve(authorize_url, "sam"),
+            send,
+        )
+    dev = app.Device(a)
+    dev.engine.set_setup_token(other.token)
+    dev.close()
+    del dev
+    r = demo(a, "sync")
+    assert "SETUP_FAILED" in r.stdout, r.stdout + r.stderr
+    r = demo(a, "sign-in-again", "--browser", str(relay.browser), "--user", "sam")
+    assert r.returncode == 0, r.stdout + r.stderr
+    sync_ok(a)
+    r = recover(relay, tmp_path / "n", key)
+    assert r.returncode == 0, r.stdout + r.stderr

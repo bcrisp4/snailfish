@@ -197,6 +197,15 @@ struct RemovalRow {
     state: String,
 }
 
+impl RemovalRow {
+    /// True if the user must confirm the list again ([LOG-7]): after the
+    /// engine found other active devices, or after `stale_base` with other
+    /// active devices in the verified log.
+    fn waits_for_user(&self, list: &str) -> bool {
+        self.state == CONFIRM || (self.state == STALE && self.confirmed != list)
+    }
+}
+
 fn removal_row(db: &Connection) -> Result<Option<RemovalRow>, EngineError> {
     Ok(db
         .query_row(
@@ -285,7 +294,12 @@ pub(crate) fn answer(e: &mut Engine, item: &Item, r: &AppendResult) -> Result<()
     match r {
         // It leaves the state file when the verified log holds it.
         AppendResult::Stored(_) | AppendResult::Known(_) | AppendResult::Conflict(_) => {}
-        AppendResult::Refused(code) if code == "stale_base" => {
+        // 13.3 step 6: another recovery record came first. Its key is now
+        // current, and the record of this device either names a stale base
+        // or a retired author (`not_active`, 10.6 step 7 runs first).
+        AppendResult::Refused(code)
+            if code == "stale_base" || (code == "not_active" && matches!(item, Item::Recovery)) =>
+        {
             let next = if matches!(item, Item::Recovery) {
                 AGAIN
             } else {
@@ -440,7 +454,8 @@ impl Engine {
         }
         ids.sort_unstable();
         ids.dedup();
-        if removal_row(&self.db)?.is_some_and(|r| r.state != CONFIRM) {
+        let list = state::device_list(&self.db)?;
+        if removal_row(&self.db)?.is_some_and(|r| !r.waits_for_user(&list)) {
             return Err(EngineError::Invalid("another removal waits".into()));
         }
         self.db.execute(
@@ -449,7 +464,7 @@ impl Engine {
              ON CONFLICT (id) DO UPDATE SET removed = excluded.removed,
                confirmed = excluded.confirmed, after_recovery = NULL, envelope = NULL,
                state = excluded.state",
-            params![id_list(&ids), state::device_list(&self.db)?, SEND],
+            params![id_list(&ids), list, SEND],
         )?;
         Ok(())
     }
@@ -462,8 +477,11 @@ impl Engine {
     ///
     /// [`EngineError::Storage`].
     pub fn removal_to_confirm(&self) -> Result<Option<Vec<String>>, EngineError> {
+        let list = state::device_list(&self.db)?;
+        // A removal that got `stale_base` asks again as soon as the fetch
+        // shows other active devices, so the app can ask right after the sync.
         Ok(removal_row(&self.db)?
-            .filter(|r| r.state == CONFIRM)
+            .filter(|r| r.waits_for_user(&list))
             .map(|r| {
                 r.removed
                     .split(',')

@@ -7,6 +7,7 @@ Usage:
     snailfish-demo --dir DIR edit TASK FIELD VALUE
     snailfish-demo --dir DIR sync
     snailfish-demo --dir DIR list
+    snailfish-demo --dir DIR sign-in-again [--browser STATE --user NAME]
     snailfish-demo --dir DIR devices
     snailfish-demo --dir DIR remove [--confirm ask|yes|no] DEVICE_ID...
     snailfish-demo --dir DIR replace-recovery-key [--current KEY] [--new KEY]
@@ -219,6 +220,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list")
     sub.add_parser("dump")
     sub.add_parser("devices")
+    g = sub.add_parser("sign-in-again")
+    g.add_argument("--browser", type=Path)
+    g.add_argument("--user")
     r = sub.add_parser("remove")
     r.add_argument("--confirm", choices=("ask", "yes", "no"), default="ask")
     r.add_argument("device_ids", nargs="+")
@@ -327,6 +331,20 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "list":
             for line in app.iter_tasks(dev.tasks()):
                 print(line)
+        elif args.cmd == "sign-in-again":
+            with httpx.Client(timeout=30) as client:
+                send = http_transport(client, crasher)
+                if args.browser is not None:
+                    soft = softbrowser.SoftBrowser(args.browser, dev.space.relay_url)
+                    app.sign_in_again(
+                        dev,
+                        SOFT_REDIRECT,
+                        lambda authorize_url: soft.approve(authorize_url, args.user or ""),
+                        send,
+                    )
+                else:
+                    with Loopback() as lb:
+                        app.sign_in_again(dev, lb.uri, lb.wait, send)
         elif args.cmd == "devices":
             for d in dev.engine.active_devices():
                 print(f"{d.id} {d.name}{' (this device)' if d.this_device else ''}")

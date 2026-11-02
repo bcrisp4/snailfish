@@ -1,3 +1,4 @@
+import Snailfish
 import SwiftUI
 
 struct ContentView: View {
@@ -231,6 +232,11 @@ struct SyncSettings: View {
                     if model.status.hasPrefix("stopped: setup failed") {
                         Section {
                             Button("Sign in again") {
+                                let w = web.web
+                                then { model.signInAgain { try await w.redirect(for: $0) } }
+                            }
+                            .accessibilityIdentifier("sign-in-again")
+                            Button("Start over with a new space", role: .destructive) {
                                 then { model.leaveFailedSetup() }
                             }
                         }

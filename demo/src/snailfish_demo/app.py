@@ -231,6 +231,30 @@ def create_space(
     return setup.recovery_key
 
 
+def sign_in_again(dev: Device, redirect_uri: str, browser: Browser, send: Transport) -> None:
+    """Sign in again after `stopped: setup failed` (PROTOCOL.md 10.5, 12.3).
+
+    The engine signs the token request with the device keys that it holds,
+    so the next sync creates the same space, with the same recovery key.
+    """
+    si = sf.SignIn(dev.space.relay_url, redirect_uri)
+    redirect = browser(si.authorize_url())
+    status, headers, body = send(
+        si.token_request_for_engine(redirect, dev.engine, int(time.time()))
+    )
+    try:
+        token = si.read_token(status, headers, body)
+    except sf.SnailfishError.Invalid as e:
+        # PROTOCOL.md 8.5: after `expired`, send once more with the relay time.
+        if "expired" not in str(e):
+            raise
+        status, headers, body = send(
+            si.token_request_for_engine(redirect, dev.engine, int(time.time()))
+        )
+        token = si.read_token(status, headers, body)
+    dev.engine.set_setup_token(token.token)
+
+
 class SpaceExistsError(Exception):
     """The tenant has a space of this app: recover it, do not make another."""
 

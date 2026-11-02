@@ -25,5 +25,5 @@ done
 curl -fsS "http://127.0.0.1:$port/v1/health" > /dev/null || { echo "FAIL: the relay did not start"; cat "$log"; exit 1; }
 rc=0
 SNAILFISH_RELAY_URL="http://localhost:$port" SNAILFISH_INVITE="$invite" \
-  SNAILFISH_RELAY_ADMIN="$relay ${args[*]}" "$@" || rc=$?
+  SNAILFISH_RELAY_ADMIN="$(cd "$(dirname "$relay")" && pwd)/$(basename "$relay") ${args[*]}" "$@" || rc=$?
 exit "$rc"
