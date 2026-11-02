@@ -35,6 +35,9 @@ final class AppModel: ObservableObject {
     private var answer: CheckedContinuation<Bool, Never>?
     private var flow: Task<Void, Never>?
     private var syncing = false
+    // The last error of a sync, for the status text. An alert on each
+    // failure would return every 5 s while the device is offline.
+    private var syncError: String?
     // A setup or an enrollment uses the engine. The sync loop waits, so two
     // state machines never drive one engine at the same time.
     private var flows = 0
@@ -55,11 +58,13 @@ final class AppModel: ObservableObject {
         let args = UserDefaults.standard
         let fm = FileManager.default
         let support = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        let root = args.string(forKey: "data-dir").map { URL(fileURLWithPath: $0) }
-            ?? support.appendingPathComponent("Tasks", isDirectory: true)
-        // One keychain service for each data directory: two devices of one
-        // space on one Mac must not share a key item.
-        let service = "snailfish." + (Bundle.main.bundleIdentifier ?? appID) + ":" + root.standardizedFileURL.path
+        let dataDir = args.string(forKey: "data-dir")
+        let root = dataDir.map { URL(fileURLWithPath: $0) } ?? support.appendingPathComponent("Tasks", isDirectory: true)
+        // One keychain service for each `-data-dir`: two devices of one space
+        // on one Mac must not share a key item. The default directory has no
+        // path in the name, because the iOS container path changes after an
+        // app update.
+        let service = "snailfish." + (Bundle.main.bundleIdentifier ?? appID) + (dataDir.map { ":" + $0 } ?? "")
         #if os(iOS)
             // Documents is visible in Finder file sharing, so the log can be
             // copied off the iPhone.
@@ -77,12 +82,16 @@ final class AppModel: ObservableObject {
             tasks = try await device.tasks()
             syncOn = await device.syncOn
             status = try await device.statusText()
+            if let syncError { status += " (last sync: \(syncError))" }
         } catch {
             message = "\(error)"
         }
     }
 
     private func run(_ what: String, _ body: @escaping () async throws -> Void) {
+        // A flow that waits for an answer cannot see the cancel.
+        answer?.resume(returning: false)
+        answer = nil
         flow?.cancel()
         flow = Task {
             flows += 1
@@ -132,10 +141,11 @@ final class AppModel: ObservableObject {
         defer { syncing = false }
         do {
             _ = try await device.sync(transport, background: background)
+            syncError = nil
         } catch {
             // A connection failure is the app's error. The engine status
             // shows a relay error.
-            message = "sync: \(error.localizedDescription)"
+            syncError = error.localizedDescription
         }
         await refresh()
     }

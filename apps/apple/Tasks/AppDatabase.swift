@@ -21,6 +21,7 @@ final class AppDatabase {
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
             let e = SQLiteError(code: sqlite3_errcode(db), message: String(cString: sqlite3_errmsg(db)))
             sqlite3_close(db)
+            db = nil
             throw e
         }
         try exec("PRAGMA journal_mode=WAL")

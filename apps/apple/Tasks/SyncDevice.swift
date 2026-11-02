@@ -10,7 +10,9 @@ import Snailfish
 /// - `app.sqlite3`: the tasks, the app outbox and the applied position.
 /// - `engine/`: the engine state. Excluded from backups, so a state file
 ///   never arrives on a device without its keys (T14).
-/// - `space.json`: the space reference, after sync is on.
+/// - `space.json`: the space reference, after sync is on. Excluded from
+///   backups for the same reason. A restored device opens with sync off and
+///   keeps its tasks.
 /// - `measure.jsonl`: the sync delay log (`Measurements`), unless the
 ///   caller puts the log in another place.
 ///
@@ -63,7 +65,11 @@ actor SyncDevice {
 
     private func excludeEngineFromBackup() throws {
         try FileManager.default.createDirectory(at: engineDir, withIntermediateDirectories: true)
-        var url = engineDir
+        try Self.excludeFromBackup(engineDir)
+    }
+
+    private static func excludeFromBackup(_ url: URL) throws {
+        var url = url
         var v = URLResourceValues()
         v.isExcludedFromBackup = true
         try url.setResourceValues(v)
@@ -217,11 +223,12 @@ actor SyncDevice {
         try installSetup(
             dataDir: engineDir.path, space: sp, keys: keys, envelopes: envelopes, setupToken: setupToken,
             keyStore: keyStore)
-        let e = try openEngine(sp)
-        try store.db.transaction {
-            // Rows of an earlier space that the relay refused to create.
-            try store.db.exec("DELETE FROM outbox; DELETE FROM applied;")
-            try store.outboxEveryField { try e.newChangeId() }
+        try openEngine(sp) { e in
+            try store.db.transaction {
+                // Rows of an earlier space that the relay refused to create.
+                try store.db.exec("DELETE FROM outbox; DELETE FROM applied;")
+                try store.outboxEveryField { try e.newChangeId() }
+            }
         }
         flushOutbox()
     }
@@ -232,21 +239,26 @@ actor SyncDevice {
     /// engine takes them after the first sync opens the app key.
     func finishJoin(space sp: SpaceRef, keys: DeviceKeys, joined: Joined) throws {
         try installEnrollment(dataDir: engineDir.path, space: sp, keys: keys, joined: joined, keyStore: keyStore)
-        let e = try openEngine(sp)
-        try store.db.transaction {
-            try store.db.exec("DELETE FROM outbox; DELETE FROM applied;")
-            try store.outboxEveryField { try e.newChangeId() }
+        try openEngine(sp) { e in
+            try store.db.transaction {
+                try store.db.exec("DELETE FROM outbox; DELETE FROM applied;")
+                try store.outboxEveryField { try e.newChangeId() }
+            }
         }
     }
 
-    @discardableResult
-    private func openEngine(_ sp: SpaceRef) throws -> Engine {
+    /// Open the engine, run `prepare`, then write `space.json`. The file is
+    /// the commit point: a crash before it leaves sync off, so the [MRG-5]
+    /// rows of `prepare` exist whenever sync is on.
+    private func openEngine(_ sp: SpaceRef, prepare: (Engine) throws -> Void) throws {
         let e = try Engine.open(dataDir: engineDir.path, space: sp, keyStore: keyStore)
+        try prepare(e)
         try JSONEncoder().encode(SpaceFile(sp)).write(to: spaceFile, options: .atomic)
+        // The atomic write makes a new file, so set the exclusion each time.
+        try Self.excludeFromBackup(spaceFile)
         space = sp
         engine = e
         store.deviceID = try e.deviceId()
-        return e
     }
 
     /// Leave a space that the relay refused to create (`stopped: setup
@@ -256,6 +268,9 @@ actor SyncDevice {
     func leaveFailedSetup() throws {
         // A sync holds the engine, so its directory and lock stay in use.
         guard !syncing else { throw SetupError.message("a sync is running: try again") }
+        if let account = space?.logId, let keychain = keyStore as? KeychainKeyStore {
+            try keychain.delete(account: account)
+        }
         engine = nil
         space = nil
         try? FileManager.default.removeItem(at: spaceFile)

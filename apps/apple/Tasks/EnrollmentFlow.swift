@@ -61,7 +61,10 @@ func invite(engine: Engine, scanned: String?, transport: Transport, ui: Enrollme
             try await Task.sleep(nanoseconds: pollNanoseconds)
         }
     }
-    return cause(try t.state())
+    let end = try t.state()
+    if end == .done { return "" }
+    let c = cause(end)
+    return c.isEmpty ? "the enrollment ended with no result" : c
 }
 
 /// Join a space as a new device ([ENR-1] to [ENR-9]). The function makes

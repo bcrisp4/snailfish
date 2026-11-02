@@ -155,6 +155,8 @@ struct SyncSettings: View {
     /// Keeps an action to run after the sheet closes.
     let later: (@escaping () -> Void) -> Void
     @Environment(\.dismiss) private var dismiss
+    // Read once when the sheet opens: the log grows without a bound.
+    @State private var summary = ""
 
     private func then(_ action: @escaping () -> Void) {
         later(action)
@@ -211,7 +213,7 @@ struct SyncSettings: View {
                     }
                 }
                 Section("Measurements") {
-                    Text(model.measurements.summary()).font(.footnote)
+                    Text(summary).font(.footnote)
                     Button("Measure the durable commit cost") {
                         then { model.runBenchmark() }
                     }
@@ -221,6 +223,7 @@ struct SyncSettings: View {
                 }
             }
             .navigationTitle("Sync")
+            .onAppear { summary = model.measurements.summary() }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
