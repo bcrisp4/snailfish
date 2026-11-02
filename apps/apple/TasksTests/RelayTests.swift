@@ -127,6 +127,7 @@ final class RelayTests: XCTestCase {
         // S2: the trusted device shows the QR code, and the new device
         // reads it from the image.
         let b = try device("b")
+        try await b.edit(task: "t0", field: "title", value: .string("b offline"))
         let m1 = CodeMatch()
         let engineAOpt = await a.engine
         let engineA = try XCTUnwrap(engineAOpt)
@@ -141,7 +142,7 @@ final class RelayTests: XCTestCase {
         let v3 = try await b.sync(transport)
         XCTAssertEqual(v3, .ok)
         let v4 = try await b.tasks().map(\.title)
-        XCTAssertEqual(v4, ["offline milk"], "[MRG-5]: the edit before sync arrives")
+        XCTAssertEqual(v4.sorted(), ["b offline", "offline milk"], "[MRG-5]: the edit before sync arrives")
 
         // The other direction: the new device shows the QR code, and the
         // trusted device B scans it.
@@ -171,9 +172,13 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(v8, .ok)
         let v9 = try await b.sync(transport)
         XCTAssertEqual(v9, .ok)
+        // B queued its edit from before sync at the end of its first sync,
+        // so A and C get it after the last sync of B.
+        _ = try await a.sync(transport)
+        _ = try await c.sync(transport)
         let gotA = try await sorted(a)
-        XCTAssertEqual(gotA.map(\.title), ["from c", "offline milk"])
-        XCTAssertEqual(gotA.map(\.done), [false, true])
+        XCTAssertEqual(gotA.map(\.title), ["b offline", "from c", "offline milk"])
+        XCTAssertEqual(gotA.map(\.done), [false, false, true])
         let gotB = try await sorted(b)
         let gotC = try await sorted(c)
         XCTAssertEqual(gotB, gotA)

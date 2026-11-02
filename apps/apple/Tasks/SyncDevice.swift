@@ -11,7 +11,8 @@ import Snailfish
 /// - `engine/`: the engine state. Excluded from backups, so a state file
 ///   never arrives on a device without its keys (T14).
 /// - `space.json`: the space reference, after sync is on.
-/// - `measure.jsonl`: the sync delay log (`Measurements`).
+/// - `measure.jsonl`: the sync delay log (`Measurements`), unless the
+///   caller puts the log in another place.
 ///
 /// The keys are in the key store, never in this directory.
 actor SyncDevice {
@@ -28,13 +29,13 @@ actor SyncDevice {
     nonisolated var engineDir: URL { root.appendingPathComponent("engine", isDirectory: true) }
     private nonisolated var spaceFile: URL { root.appendingPathComponent("space.json") }
 
-    init(root: URL, keyStore: KeyStore) throws {
+    init(root: URL, keyStore: KeyStore, measurements: Measurements? = nil) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         self.root = root
         self.keyStore = keyStore
         let db = try AppDatabase(path: root.appendingPathComponent("app.sqlite3").path)
         store = TaskStore(db: db, deviceID: try Self.localID(root))
-        measurements = Measurements(file: root.appendingPathComponent("measure.jsonl"))
+        self.measurements = measurements ?? Measurements(file: root.appendingPathComponent("measure.jsonl"))
         if let data = try? Data(contentsOf: root.appendingPathComponent("space.json")) {
             let sp = try JSONDecoder().decode(SpaceFile.self, from: data).ref
             space = sp
@@ -43,10 +44,8 @@ actor SyncDevice {
             store.deviceID = try e.deviceId()
         }
         try excludeEngineFromBackup()
-        if engine != nil {
-            // [DLV-2]: give the outbox rows to the engine at every startup.
-            try flushOutboxNow()
-        }
+        // [DLV-2]: give the outbox rows to the engine at every startup.
+        flushOutbox()
     }
 
     /// The device ID of the stamps before sync: random, kept in a file.
@@ -80,7 +79,23 @@ actor SyncDevice {
         let cid = try engine?.newChangeId()
         try store.edit(task: task, field: field, value: value, changeID: cid)
         if let cid { measurements.edit(changeID: cid) }
-        try flushOutboxNow()
+        flushOutbox()
+    }
+
+    /// The last error of a flush outside a sync, for the UI.
+    private(set) var flushError: String?
+
+    /// `flushOutboxNow` after an edit or at startup. The rows stay in the app
+    /// outbox on an error, and the next flush gives them to the engine
+    /// again. A new device cannot encrypt until its first sync opens the app
+    /// key from its grant ([ENR-9]), so an error here is expected then.
+    private func flushOutbox() {
+        do {
+            try flushOutboxNow()
+            flushError = nil
+        } catch {
+            flushError = "\(error)"
+        }
     }
 
     /// Give the outbox rows to the engine, in batches of 500 ([DLV-4]). A
@@ -193,14 +208,20 @@ actor SyncDevice {
             try store.db.exec("DELETE FROM outbox; DELETE FROM applied;")
             try store.outboxEveryField { try e.newChangeId() }
         }
-        try flushOutboxNow()
+        flushOutbox()
     }
 
     /// Finish the enrollment of a new device (S2). The engine state comes
     /// first, so no stored keys exist without the checkpoint ([ENR-9]).
+    /// The tasks of the device before sync get outbox rows ([MRG-5]). The
+    /// engine takes them after the first sync opens the app key.
     func finishJoin(space sp: SpaceRef, keys: DeviceKeys, joined: Joined) throws {
         try installEnrollment(dataDir: engineDir.path, space: sp, keys: keys, joined: joined, keyStore: keyStore)
-        try openEngine(sp)
+        let e = try openEngine(sp)
+        try store.db.transaction {
+            try store.db.exec("DELETE FROM outbox; DELETE FROM applied;")
+            try store.outboxEveryField { try e.newChangeId() }
+        }
     }
 
     @discardableResult

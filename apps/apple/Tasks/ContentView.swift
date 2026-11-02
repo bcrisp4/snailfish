@@ -3,7 +3,14 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var model: AppModel
     @State private var newTitle = ""
-    @State private var showSettings = false
+    // One sheet at a time. SwiftUI drops a sheet that opens while another
+    // one closes, so an action of the settings sheet runs after it closes.
+    enum Sheet: Identifiable {
+        case settings, flow
+        var id: Self { self }
+    }
+    @State private var sheet: Sheet?
+    @State private var afterSettings: (() -> Void)?
     @Environment(\.scenePhase) private var phase
     @StateObject private var web = WebSignInBox()
 
@@ -33,18 +40,22 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem {
                     Button {
-                        showSettings = true
+                        sheet = .settings
                     } label: {
                         Label("Sync", systemImage: model.syncOn ? "arrow.triangle.2.circlepath" : "icloud.slash")
                     }
                     .accessibilityIdentifier("sync-settings")
                 }
             }
-            .sheet(isPresented: $showSettings) {
-                SyncSettings(model: model, web: web)
+            .sheet(item: $sheet, onDismiss: sheetClosed) { which in
+                switch which {
+                case .settings: SyncSettings(model: model, web: web) { afterSettings = $0 }
+                case .flow: FlowSheet(model: model)
+                }
             }
-            .sheet(isPresented: flowShown) {
-                FlowSheet(model: model)
+            .onChange(of: model.step) { _, step in
+                if step != .none, sheet == nil { sheet = .flow }
+                if step == .none, sheet == .flow { sheet = nil }
             }
             .alert(
                 model.message ?? "", isPresented: Binding(get: { model.message != nil }, set: { _ in model.message = nil })
@@ -58,8 +69,14 @@ struct ContentView: View {
         }
     }
 
-    private var flowShown: Binding<Bool> {
-        Binding(get: { model.step != .none }, set: { if !$0 { model.cancelFlow() } })
+    private func sheetClosed() {
+        if let action = afterSettings {
+            afterSettings = nil
+            action()
+        } else if model.step != .none {
+            // The user closed the flow sheet with a swipe.
+            model.cancelFlow()
+        }
     }
 
     private func add() {
@@ -135,7 +152,14 @@ struct StatusBar: View {
 struct SyncSettings: View {
     @ObservedObject var model: AppModel
     @ObservedObject var web: WebSignInBox
+    /// Keeps an action to run after the sheet closes.
+    let later: (@escaping () -> Void) -> Void
     @Environment(\.dismiss) private var dismiss
+
+    private func then(_ action: @escaping () -> Void) {
+        later(action)
+        dismiss()
+    }
 
     var body: some View {
         NavigationStack {
@@ -143,6 +167,7 @@ struct SyncSettings: View {
                 Section("Relay") {
                     TextField("Relay URL", text: $model.relayURL)
                         .autocorrectionDisabled()
+                        .noAutocapitalization()
                         .disabled(model.syncOn)
                         .accessibilityIdentifier("relay-url")
                     Text("Sync: \(model.status)")
@@ -150,40 +175,34 @@ struct SyncSettings: View {
                 if !model.syncOn {
                     Section("First device") {
                         Button("Turn on sync") {
-                            dismiss()
                             let w = web.web
-                            model.turnOnSync { try await w.redirect(for: $0) }
+                            then { model.turnOnSync { try await w.redirect(for: $0) } }
                         }
                         .accessibilityIdentifier("turn-on-sync")
                     }
                     Section("Add to my account") {
                         Button("Scan the code of my other device") {
-                            dismiss()
-                            model.joinSpace(scan: true)
+                            then { model.joinSpace(scan: true) }
                         }
                         Button("Show a code for my other device") {
-                            dismiss()
-                            model.joinSpace(scan: false)
+                            then { model.joinSpace(scan: false) }
                         }
                         .accessibilityIdentifier("join-show")
                     }
                 } else {
                     Section("Add a device") {
                         Button("Show a code for the new device") {
-                            dismiss()
-                            model.addDevice(scan: false)
+                            then { model.addDevice(scan: false) }
                         }
                         .accessibilityIdentifier("invite-show")
                         Button("Scan the code of the new device") {
-                            dismiss()
-                            model.addDevice(scan: true)
+                            then { model.addDevice(scan: true) }
                         }
                     }
                     if model.status.hasPrefix("stopped: setup failed") {
                         Section {
                             Button("Sign in again") {
-                                dismiss()
-                                model.leaveFailedSetup()
+                                then { model.leaveFailedSetup() }
                             }
                         }
                     }
@@ -194,8 +213,7 @@ struct SyncSettings: View {
                 Section("Measurements") {
                     Text(model.measurements.summary()).font(.footnote)
                     Button("Measure the durable commit cost") {
-                        dismiss()
-                        model.runBenchmark()
+                        then { model.runBenchmark() }
                     }
                     ShareLink(item: model.measurements.file) {
                         Label("Export the measurement log", systemImage: "square.and.arrow.up")
@@ -297,6 +315,7 @@ struct RecoveryKeyView: View {
             TextField("Type the key from your paper", text: $typed)
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
+                .noAutocapitalization()
                 .accessibilityIdentifier("recovery-typed")
             if wrong { Text("The key does not match. Check your paper.").foregroundStyle(.red) }
             Button("Check") {

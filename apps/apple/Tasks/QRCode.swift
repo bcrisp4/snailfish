@@ -152,6 +152,7 @@ struct ScanView: View {
                 TextField("Or type the code", text: $typed)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
+                    .noAutocapitalization()
                 Button("Use code") { found(typed) }
                     .disabled(typed.isEmpty)
             }
@@ -160,5 +161,17 @@ struct ScanView: View {
             do { try scanner.start(found: found) } catch { self.error = "\(error)" }
         }
         .onDisappear { scanner.stop() }
+    }
+}
+
+extension View {
+    /// The payload and the codes are case-sensitive in their first part, so
+    /// the keyboard must not capitalize them.
+    func noAutocapitalization() -> some View {
+        #if os(iOS)
+            return textInputAutocapitalization(.never)
+        #else
+            return self
+        #endif
     }
 }
