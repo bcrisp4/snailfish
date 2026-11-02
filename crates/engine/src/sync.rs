@@ -618,6 +618,9 @@ impl Sync {
             }
         }
         tx.commit().map_err(|e| Answer::Engine(e.into()))?;
+        // After the commit: a key store failure here leaves the key to
+        // `keystore::open`, which opens it from the grant again.
+        engine.keep_app_key().map_err(Answer::Engine)?;
         let enrolling = enrolling(engine).map_err(Answer::Engine)?;
         self.hold = f.hold;
         if let Some(cause) = degraded {

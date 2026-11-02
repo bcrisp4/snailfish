@@ -34,12 +34,20 @@ pub enum SnailfishError {
         /// The cause.
         message: String,
     },
+    /// The host key store failed or holds no keys for the space. The app
+    /// must not continue with weaker key storage (C62).
+    KeyStore {
+        /// The cause.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for SnailfishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid { message } | Self::Engine { message } => f.write_str(message),
+            Self::Invalid { message } | Self::Engine { message } | Self::KeyStore { message } => {
+                f.write_str(message)
+            }
             Self::Locked => f.write_str("another engine uses this data directory"),
             Self::ResetRequired => f.write_str("reset required"),
         }
@@ -60,6 +68,7 @@ impl From<snailfish_engine::EngineError> for SnailfishError {
             snailfish_engine::EngineError::Locked => Self::Locked,
             snailfish_engine::EngineError::ResetRequired => Self::ResetRequired,
             snailfish_engine::EngineError::Invalid(message) => Self::Invalid { message },
+            snailfish_engine::EngineError::KeyStore(message) => Self::KeyStore { message },
             other => Self::Engine {
                 message: other.to_string(),
             },
@@ -68,6 +77,68 @@ impl From<snailfish_engine::EngineError> for SnailfishError {
 }
 
 type Result<T> = std::result::Result<T, SnailfishError>;
+
+/// A failure of the host key store. The message holds no secret.
+#[derive(Debug, uniffi::Error)]
+pub enum KeyStoreError {
+    /// The store refused the call, for example the keychain without its
+    /// entitlement (`errSecMissingEntitlement`).
+    Failed {
+        /// The cause.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for KeyStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self::Failed { message } = self;
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for KeyStoreError {}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for KeyStoreError {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Failed { message: e.reason }
+    }
+}
+
+/// The secret store of the host app (DESIGN.md "App integration"). The
+/// engine reads and writes one item for each space, named by the log ID.
+/// The Swift app uses the data protection keychain. A failure must not
+/// fall back to weaker storage.
+#[uniffi::export(with_foreign)]
+pub trait KeyStore: Send + std::marker::Sync {
+    /// Read the item `account`, or `None` if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyStoreError::Failed`].
+    fn load(&self, account: String) -> std::result::Result<Option<Vec<u8>>, KeyStoreError>;
+
+    /// Write the item `account` durably. Replace an item that exists.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyStoreError::Failed`].
+    fn store(&self, account: String, secret: Vec<u8>) -> std::result::Result<(), KeyStoreError>;
+}
+
+/// The engine form of a host [`KeyStore`].
+struct HostKeyStore(std::sync::Arc<dyn KeyStore>);
+
+impl snailfish_engine::keystore::KeyStore for HostKeyStore {
+    fn load(&self, account: &str) -> std::result::Result<Option<Vec<u8>>, String> {
+        self.0.load(account.to_owned()).map_err(|e| e.to_string())
+    }
+
+    fn store(&self, account: &str, secret: &[u8]) -> std::result::Result<(), String> {
+        self.0
+            .store(account.to_owned(), secret.to_vec())
+            .map_err(|e| e.to_string())
+    }
+}
 
 // The engine owns these types. `uniffi::remote` mirrors each definition for
 // the FFI only, and the compiler refuses a mirror that differs from the
@@ -329,7 +400,7 @@ pub fn create_space(app_id: &str, first: &NewDevice) -> Result<SpaceSetup> {
 }
 
 /// Give the setup records and the setup token to the engine of the first
-/// device.
+/// device, then write the keys to the key store.
 ///
 /// # Errors
 ///
@@ -341,13 +412,15 @@ pub fn install_setup(
     keys: &DeviceKeys,
     envelopes: &[String],
     setup_token: &str,
+    key_store: std::sync::Arc<dyn KeyStore>,
 ) -> Result<()> {
-    Ok(snailfish_engine::setup::install_setup(
+    Ok(snailfish_engine::keystore::install_setup(
         &PathBuf::from(data_dir),
         space,
         &keys.to_engine()?,
         envelopes,
         setup_token,
+        &HostKeyStore(key_store),
     )?)
 }
 
@@ -440,9 +513,9 @@ impl Joined {
     }
 }
 
-/// Create the engine state of a new device after its enrollment. Its
-/// syncs upload nothing until the log passes the checkpoint check
-/// ([ENR-9]).
+/// Create the engine state of a new device after its enrollment, then
+/// write the keys to the key store. Its syncs upload nothing until the log
+/// passes the checkpoint check ([ENR-9]).
 ///
 /// # Errors
 ///
@@ -454,12 +527,14 @@ pub fn install_enrollment(
     space: SpaceRef,
     keys: &DeviceKeys,
     joined: &Joined,
+    key_store: std::sync::Arc<dyn KeyStore>,
 ) -> Result<()> {
-    Ok(snailfish_engine::setup::install_enrollment(
+    Ok(snailfish_engine::keystore::install_enrollment(
         &PathBuf::from(data_dir),
         space,
         &keys.to_engine()?,
         &joined.to_engine()?,
+        &HostKeyStore(key_store),
     )?)
 }
 
@@ -816,15 +891,24 @@ fn poisoned() -> SnailfishError {
 
 #[uniffi::export]
 impl Engine {
-    /// Open the engine state in `data_dir`. One engine per directory.
+    /// Open the engine state in `data_dir` with the keys of the space from
+    /// `key_store`. One engine per directory.
     ///
     /// # Errors
     ///
-    /// [`SnailfishError::Locked`] or [`SnailfishError::Engine`].
+    /// [`SnailfishError::Locked`], [`SnailfishError::KeyStore`] or
+    /// [`SnailfishError::Engine`].
     #[uniffi::constructor]
-    pub fn open(data_dir: &str, space: SpaceRef, keys: &DeviceKeys) -> Result<Self> {
-        let inner =
-            snailfish_engine::Engine::open(&PathBuf::from(data_dir), space, &keys.to_engine()?)?;
+    pub fn open(
+        data_dir: &str,
+        space: SpaceRef,
+        key_store: std::sync::Arc<dyn KeyStore>,
+    ) -> Result<Self> {
+        let inner = snailfish_engine::keystore::open(
+            &PathBuf::from(data_dir),
+            space,
+            std::sync::Arc::new(HostKeyStore(key_store)),
+        )?;
         Ok(Self {
             inner: Mutex::new(inner),
         })
@@ -951,21 +1035,6 @@ impl Engine {
         Ok(Applied::from_engine(
             &self.inner.lock().map_err(|_| poisoned())?.verified_head()?,
         ))
-    }
-
-    /// The app key of epoch 1, if the engine has it. A new device has it
-    /// after its sync checks the enrollment checkpoint.
-    ///
-    /// # Errors
-    ///
-    /// [`SnailfishError::Engine`].
-    pub fn app_key(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|_| poisoned())?
-            .app_key()
-            .map(|k| k.to_vec()))
     }
 
     /// The grants that wait for the user to confirm them again ([LOG-7]).

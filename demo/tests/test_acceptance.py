@@ -58,13 +58,18 @@ def test_relay_storage_holds_no_plaintext(relay: Relay, tmp_path: Path) -> None:
     sync_ok(b)
     assert dump(b)["tasks"][task]["title"] == marker
     relay.stop()
-    keys = [json.loads((d / "keys.json").read_text())["keys"] for d in (a, b)]
+    # The key store items: the signing seed, the X-Wing seed and the app key.
+    items = [
+        bytes.fromhex(v)
+        for d in (a, b)
+        for v in json.loads((d / "keystore.json").read_text()).values()
+    ]
     # Each needle is long enough that random ciphertext does not hold it.
     needles = [marker.encode(), task.encode(), b'"title":"']
-    for k in keys:
-        for v in k.values():
-            raw = bytes.fromhex(v)
-            needles += [raw, v.encode(), base64.b64encode(raw)]
+    for item in items:
+        for i in range(0, 96, 32):
+            raw = item[i : i + 32]
+            needles += [raw, raw.hex().encode(), base64.b64encode(raw)]
     files = [p for p in relay.data.rglob("*") if p.is_file()]
     assert any(p.name == "tenant.db" for p in files)
     assert any(p.parent.name == "spaces" for p in files)

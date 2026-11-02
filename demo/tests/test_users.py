@@ -40,8 +40,8 @@ def test_first_device_gets_its_tenant_through_the_handoff(relay: Relay, tmp_path
     a = tmp_path / "a"
     create(relay, a)
     sync_ok(a)
-    keys = json.loads((a / "keys.json").read_text())
-    assert keys["space"]["tenant"].startswith("t_")
+    space = json.loads((a / "space.json").read_text())
+    assert space["tenant"].startswith("t_")
     page = browser(relay).page()
     assert dump(a)["log_id"] in page
 
@@ -53,7 +53,7 @@ def test_second_user_cannot_reach_the_first_tenant(relay: Relay, tmp_path: Path)
     a, b = tmp_path / "a", tmp_path / "b"
     setup(relay, a, b)
     sam_log = dump(a)["log_id"]
-    sam_tenant = json.loads((a / "keys.json").read_text())["space"]["tenant"]
+    sam_tenant = json.loads((a / "space.json").read_text())["tenant"]
     kim = relay.add_user("kim")
     k = tmp_path / "k"
     create(relay, k, browser=kim, user="kim")
@@ -64,12 +64,14 @@ def test_second_user_cannot_reach_the_first_tenant(relay: Relay, tmp_path: Path)
     assert sam_tenant not in kim_page
     # A device with the keys of kim names the tenant and the space of sam:
     # it is not active there, so the relay refuses each read and write.
-    keys = json.loads((k / "keys.json").read_text())
-    keys["space"]["tenant"] = sam_tenant
-    keys["space"]["log_id"] = sam_log
+    space = json.loads((k / "space.json").read_text())
+    kim_item = json.loads((k / "keystore.json").read_text())[space["log_id"]]
+    space["tenant"] = sam_tenant
+    space["log_id"] = sam_log
     x = tmp_path / "x"
     x.mkdir()
-    (x / "keys.json").write_text(json.dumps(keys))
+    (x / "space.json").write_text(json.dumps(space))
+    (x / "keystore.json").write_text(json.dumps({sam_log: kim_item}))
     assert demo(x, "edit", "t9", "title", "intruder").returncode == 0
     r = demo(x, "sync")
     assert r.returncode != 0

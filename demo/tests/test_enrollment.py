@@ -30,6 +30,8 @@ from conftest import (
     sync_ok,
 )
 
+from snailfish_demo.app import key_store
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -59,9 +61,17 @@ def http_send(
     return resp.status, out, resp.getheaders()
 
 
-def keys_of(device: Path) -> dict[str, Any]:
-    """Return the key file of a device."""
-    return json.loads((device / "keys.json").read_text())
+def space_of(device: Path) -> dict[str, Any]:
+    """Return the space reference of a device."""
+    return json.loads((device / "space.json").read_text())
+
+
+def app_key_of(device: Path) -> bytes:
+    """Return the app key in the key store of a device: the last 32 bytes
+    of its item."""
+    item = key_store(device).load(space_of(device)["log_id"])
+    assert item is not None
+    return item[64:]
 
 
 def test_new_device_joins_and_the_relay_refuses_an_unknown_key(
@@ -76,14 +86,18 @@ def test_new_device_joins_and_the_relay_refuses_an_unknown_key(
     sync_ok(a)
     sync_ok(b)
     assert dump(b)["tasks"] == {"t1": {"title": "buy milk"}}
-    assert keys_of(b)["keys"]["app_key"] == keys_of(a)["keys"]["app_key"]
+    assert app_key_of(b) == app_key_of(a) != bytes(32)
     edit(b, "t1", "buy oat milk")
     sync_ok(b)
     sync_ok(a)
     assert dump(a)["tasks"] == {"t1": {"title": "buy oat milk"}}
 
-    space = sf.SpaceRef(**keys_of(a)["space"])
-    stranger = sf.Engine.open(str(tmp_path / "x"), space, sf.new_device_keys())
+    space = sf.SpaceRef(**space_of(a))
+    k = sf.new_device_keys()
+    stranger_keys = key_store(tmp_path / "x")
+    (tmp_path / "x").mkdir()
+    stranger_keys.store(space.log_id, k.sign_seed + k.seal_seed + k.app_key)
+    stranger = sf.Engine.open(str(tmp_path / "x"), space, stranger_keys)
     fetches: list[tuple[int, bytes]] = []
     sync = stranger.start_sync()
     while (req := sync.next_request()) is not None:
@@ -251,7 +265,8 @@ def test_relay_that_substitutes_keys_causes_a_code_mismatch(tmp_path: Path) -> N
         (tc, tout), (nc, nout) = finish(t), finish(n)
         assert (tc, nc) == (1, 1), tout + nout
         assert "codes differ" in tout and "codes differ" in nout
-        assert not (b / "keys.json").exists()
+        assert not (b / "space.json").exists()
+        assert not (b / "keystore.json").exists()
         sync_ok(a)
         assert dump(a)["head"] == head, "no grant"
     finally:
@@ -307,7 +322,7 @@ def test_device_with_a_lost_grant_repairs_the_log(relay: Relay, tmp_path: Path) 
     # setup enrolled one device before the backup, so the grant of B is
     # at position 3, and B repairs from the relay head at position 2.
     assert "repair: the relay lost positions 3 to 4" in out, out
-    log = keys_of(a)["space"]["log_id"]
+    log = space_of(a)["log_id"]
     assert relay.admin("release-hold", "sam", log).returncode == 0
     sync_ok(a)
     assert dump(a)["tasks"] == {"t1": {"title": "from b"}}

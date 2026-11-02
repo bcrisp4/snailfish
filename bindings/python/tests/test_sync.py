@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import pytest
 import snailfish as sf
+from keystores import MemStore, stored
 from snailfish_demo.softbrowser import SoftBrowser
 
 if TYPE_CHECKING:
@@ -142,17 +143,19 @@ def test_change_from_a_reaches_b(relay: Relay, tmp_path: Path) -> None:
     setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
     space, token = relay.first_device(ka, setup.log_id)
-    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token)
-    a = sf.Engine.open(str(tmp_path / "a"), space, ka)
+    sa = MemStore()
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token, sa)
+    a = sf.Engine.open(str(tmp_path / "a"), space, sa)
     exchange(relay, a)
     assert a.status() == sf.Status.OK()
     t, n = enroll(relay, a, kb, (True, True))
     assert (t.state(), n.state()) == (sf.EnrollState.DONE(), sf.EnrollState.DONE())
     joined = n.joined()
     assert joined is not None and joined.position == 2
-    sf.install_enrollment(str(tmp_path / "b"), space, kb, joined)
-    b = sf.Engine.open(str(tmp_path / "b"), space, kb)
-    assert b.app_key() is None
+    sb = MemStore()
+    sf.install_enrollment(str(tmp_path / "b"), space, kb, joined, sb)
+    b = sf.Engine.open(str(tmp_path / "b"), space, sb)
+    assert sb.items[setup.log_id][64:] == bytes(32)
     cid = a.new_change_id()
     result = a.enqueue_many([sf.OutboxRow(change_id=cid, change_bytes=b"rename")])
     assert (result.stored, result.refused) == ([cid], [])
@@ -160,7 +163,7 @@ def test_change_from_a_reaches_b(relay: Relay, tmp_path: Path) -> None:
     assert a.outbox_len() == 0
     exchange(relay, b)
     assert b.status() == sf.Status.OK()
-    assert b.app_key() == setup.app_key
+    assert sb.items[setup.log_id][64:] == setup.app_key
 
     got = b.changes_after(b.genesis_base(), 500)
     assert [(c.position, c.change_id, c.change_bytes) for c in got] == [
@@ -180,8 +183,9 @@ def test_wrong_authority_is_paused(relay: Relay, tmp_path: Path) -> None:
     ka.app_key = setup.app_key
     url = relay.url.replace("localhost", "127.0.0.1")
     space, token = relay.first_device(ka, setup.log_id, url)
-    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token)
-    a = sf.Engine.open(str(tmp_path / "a"), space, ka)
+    sa = MemStore()
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token, sa)
+    a = sf.Engine.open(str(tmp_path / "a"), space, sa)
     exchange(relay, a)
     assert a.status() == sf.Status.RELAY_AUTHORITY()
 
@@ -197,7 +201,7 @@ def test_relay_down_is_unavailable(tmp_path: Path) -> None:
         log_id=setup.log_id,
         app_id=APP,
     )
-    a = sf.Engine.open(str(tmp_path / "a"), space, ka)
+    a = sf.Engine.open(str(tmp_path / "a"), space, stored(ka, setup.log_id))
     sync = a.start_sync()
     req = sync.next_request()
     assert req is not None
@@ -214,8 +218,9 @@ def test_hold_and_repair_cross_the_binding(relay: Relay, tmp_path: Path) -> None
     setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
     space, token = relay.first_device(ka, setup.log_id)
-    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token)
-    a = sf.Engine.open(str(tmp_path / "a"), space, ka)
+    sa = MemStore()
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token, sa)
+    a = sf.Engine.open(str(tmp_path / "a"), space, sa)
     exchange(relay, a)
     a.enqueue_many([sf.OutboxRow(change_id=a.new_change_id(), change_bytes=b"x")])
     exchange(relay, a)
@@ -266,8 +271,9 @@ def test_code_mismatch_appends_no_grant(relay: Relay, tmp_path: Path) -> None:
     setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
     space, token = relay.first_device(ka, setup.log_id)
-    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token)
-    a = sf.Engine.open(str(tmp_path / "a"), space, ka)
+    sa = MemStore()
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token, sa)
+    a = sf.Engine.open(str(tmp_path / "a"), space, sa)
     exchange(relay, a)
     t, n = enroll(relay, a, sf.new_device_keys(), (True, False))
     assert isinstance(t.state(), sf.EnrollState.FAILED)

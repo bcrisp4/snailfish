@@ -40,6 +40,26 @@ private func list(_ v: Any?) throws -> [[String: Any]] {
     try XCTUnwrap(v as? [[String: Any]])
 }
 
+/// A host key store in memory. With `fail`, each call throws, as the
+/// keychain does without its entitlement (C62).
+final class MemStore: KeyStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [String: Data] = [:]
+    let fail: Bool
+
+    init(fail: Bool = false) { self.fail = fail }
+
+    func load(account: String) throws -> Data? {
+        if fail { throw KeyStoreError.Failed(message: "errSecMissingEntitlement") }
+        return lock.withLock { items[account] }
+    }
+
+    func store(account: String, secret: Data) throws {
+        if fail { throw KeyStoreError.Failed(message: "errSecMissingEntitlement") }
+        lock.withLock { items[account] = secret }
+    }
+}
+
 final class VectorTests: XCTestCase {
     private var protocolVectors: [String: Any] = [:]
     private var signKeys: [String: Data] = [:]
@@ -245,11 +265,22 @@ final class VectorTests: XCTestCase {
         let space = SpaceRef(
             relayUrl: "https://r.example/", tenant: "t_" + String(repeating: "0", count: 32),
             logId: setup.logId, appId: "com.example.tasks")
+        // A store that fails stops the open with the cause, and an empty
+        // store stops it too (C62).
+        XCTAssertThrowsError(try Engine.open(dataDir: dir.path, space: space, keyStore: MemStore(fail: true))) {
+            guard case .KeyStore(let message) = $0 as? SnailfishError else { return XCTFail("\($0)") }
+            XCTAssertTrue(message.contains("errSecMissingEntitlement"), message)
+        }
+        let store = MemStore()
+        XCTAssertThrowsError(try Engine.open(dataDir: dir.path, space: space, keyStore: store)) {
+            guard case .KeyStore = $0 as? SnailfishError else { return XCTFail("\($0)") }
+        }
         try installSetup(
             dataDir: dir.path, space: space, keys: ka, envelopes: setup.envelopes,
-            setupToken: "st_" + String(repeating: "0", count: 64))
-        let engine = try Engine.open(dataDir: dir.path, space: space, keys: ka)
-        XCTAssertThrowsError(try Engine.open(dataDir: dir.path, space: space, keys: ka)) { error in
+            setupToken: "st_" + String(repeating: "0", count: 64), keyStore: store)
+        XCTAssertEqual(try store.load(account: setup.logId), ka.signSeed + ka.sealSeed + ka.appKey)
+        let engine = try Engine.open(dataDir: dir.path, space: space, keyStore: store)
+        XCTAssertThrowsError(try Engine.open(dataDir: dir.path, space: space, keyStore: store)) { error in
             XCTAssertEqual(error as? SnailfishError, .Locked)
         }
         let cid = try engine.newChangeId()
