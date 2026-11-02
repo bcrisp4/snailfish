@@ -79,9 +79,12 @@ jobs:
       - run: rustup toolchain install --profile minimal
       - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
       - uses: jdx/mise-action@v2
+      # One cache for the Apple jobs. The app job builds the Rust of this job
+      # (the XCFramework) and the relay, so only the app job saves the cache.
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: apple
+          save-if: false
       - id: sim
         run: |
           id=$(bindings/scripts/ios-sim.sh)
@@ -100,11 +103,9 @@ jobs:
       - run: rustup toolchain install --profile minimal
       - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
       - uses: jdx/mise-action@v2
-      # The same Rust builds as the swift job (the XCFramework), plus the
-      # relay for the app tests.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: app
+          shared-key: apple
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - id: sim
         run: |
