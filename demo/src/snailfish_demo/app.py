@@ -227,8 +227,11 @@ def create_space(
     return setup.recovery_key
 
 
-# How long an enrollment waits between two reads of the session.
-POLL_SECONDS = 0.2
+# How long an enrollment waits between two reads of the session. The relay
+# refills 2 requests per second for each IP address (`RATE` in
+# crates/relay/src/http.rs). The two devices of an enrollment often share
+# one address, so each device polls at most once a second.
+POLL_SECONDS = 1.0
 
 
 class Answer(Protocol):

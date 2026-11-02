@@ -14,8 +14,10 @@ protocol EnrollmentUI: AnyObject, Sendable {
 }
 
 /// How long an enrollment waits between two reads of the session. The
-/// relay limits the rate for each IP address, so do not poll faster.
-private let pollNanoseconds: UInt64 = 200_000_000
+/// relay refills 2 requests per second for each IP address (`RATE` in
+/// crates/relay/src/http.rs). The two devices of an enrollment often share
+/// one address, so each device polls at most once a second.
+private let pollNanoseconds: UInt64 = 1_000_000_000
 
 private func ended(_ s: EnrollState) -> Bool {
     switch s {
