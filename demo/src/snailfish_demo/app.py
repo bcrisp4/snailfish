@@ -5,8 +5,10 @@ The layout of a device directory:
 - `app.sqlite3`: the app database. It holds the tasks, the app outbox and
   the applied position (DESIGN.md "App integration").
 - `engine/`: the engine state file. Only the engine writes it.
-- `keys.json`: the device keys and the space reference. A real app keeps the
-  keys in its key store.
+- `space.json`: the space reference.
+- `keystore.json`: the key store of the demo (`FileKeyStore`). The engine
+  reads and writes the device keys and the app key there. The Swift app
+  uses the data protection keychain.
 
 The merge rules meet the merge contract ([MRG-1], [MRG-2]): each field of a
 task is a last-writer-wins register on a hybrid logical clock, with the
@@ -119,24 +121,6 @@ CREATE TABLE IF NOT EXISTS applied_log (change_id BLOB PRIMARY KEY);
 """
 
 
-def keys_to_json(k: sf.DeviceKeys) -> dict[str, str]:
-    """Return the JSON form of device keys."""
-    return {
-        "sign_seed": k.sign_seed.hex(),
-        "seal_seed": k.seal_seed.hex(),
-        "app_key": k.app_key.hex(),
-    }
-
-
-def keys_from_json(d: dict[str, str]) -> sf.DeviceKeys:
-    """Read the JSON form of device keys."""
-    return sf.DeviceKeys(
-        sign_seed=bytes.fromhex(d["sign_seed"]),
-        seal_seed=bytes.fromhex(d["seal_seed"]),
-        app_key=bytes.fromhex(d["app_key"]),
-    )
-
-
 def write_private(path: Path, text: str) -> None:
     """Write a file with mode 0600, durably, through a temporary name."""
     tmp = path.with_suffix(".tmp")
@@ -146,6 +130,37 @@ def write_private(path: Path, text: str) -> None:
         f.flush()
         os.fsync(f.fileno())
     tmp.replace(path)
+
+
+class FileKeyStore(sf.KeyStore):
+    """The key store of the demo: one JSON file with mode 0600 that maps each
+    account to its item in hex (DESIGN.md "App integration")."""
+
+    def __init__(self, path: Path) -> None:
+        """Use the file at `path`. The first write creates it."""
+        self.path = path
+
+    def _items(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {}
+        items: dict[str, str] = json.loads(self.path.read_text())
+        return items
+
+    def load(self, account: str) -> bytes | None:
+        """Return the item of `account`, or None."""
+        v = self._items().get(account)
+        return None if v is None else bytes.fromhex(v)
+
+    def store(self, account: str, secret: bytes) -> None:
+        """Replace the item of `account`, durably."""
+        items = self._items()
+        items[account] = secret.hex()
+        write_private(self.path, json.dumps(items))
+
+
+def key_store(data_dir: Path) -> FileKeyStore:
+    """Return the key store of the device in `data_dir`."""
+    return FileKeyStore(data_dir / "keystore.json")
 
 
 class Browser(Protocol):
@@ -200,8 +215,15 @@ def create_space(
         "app_id": APP_ID,
     }
     dir_a.mkdir(parents=True, exist_ok=True)
-    write_private(dir_a / "keys.json", json.dumps({"space": space, "keys": keys_to_json(ka)}))
-    sf.install_setup(str(dir_a / "engine"), sf.SpaceRef(**space), ka, setup.envelopes, token.token)
+    sf.install_setup(
+        str(dir_a / "engine"),
+        sf.SpaceRef(**space),
+        ka,
+        setup.envelopes,
+        token.token,
+        key_store(dir_a),
+    )
+    write_private(dir_a / "space.json", json.dumps(space))
     return setup.recovery_key
 
 
@@ -323,10 +345,11 @@ def join(
         "app_id": APP_ID,
     }
     data_dir.mkdir(parents=True, exist_ok=True)
-    # The engine state comes first: a key file with no engine state would
-    # open a new state with no checkpoint ([ENR-9]).
-    sf.install_enrollment(str(data_dir / "engine"), sf.SpaceRef(**space), keys, joined)
-    write_private(data_dir / "keys.json", json.dumps({"space": space, "keys": keys_to_json(keys)}))
+    # The engine writes its state, then the keys ([ENR-9]).
+    sf.install_enrollment(
+        str(data_dir / "engine"), sf.SpaceRef(**space), keys, joined, key_store(data_dir)
+    )
+    write_private(data_dir / "space.json", json.dumps(space))
     return ""
 
 
@@ -353,13 +376,9 @@ class Device:
         rows to the engine again ([DLV-2]).
         """
         self.dir = data_dir
-        cfg = json.loads((data_dir / "keys.json").read_text())
-        self.space = sf.SpaceRef(**cfg["space"])
-        self.engine = sf.Engine.open(
-            str(data_dir / "engine"), self.space, keys_from_json(cfg["keys"])
-        )
+        self.space = sf.SpaceRef(**json.loads((data_dir / "space.json").read_text()))
+        self.engine = sf.Engine.open(str(data_dir / "engine"), self.space, key_store(data_dir))
         self.device_id = self.engine.device_id()
-        self.key_stored = bytes.fromhex(cfg["keys"]["app_key"]) != bytes(32)
         self.now_ms = now_ms or (lambda: time.time_ns() // 1_000_000)
         self.crash_point: Callable[[str], None] = crash_point or _no_crash
         self.db = sqlite3.connect(data_dir / "app.sqlite3", isolation_level=None)
@@ -479,28 +498,9 @@ class Device:
             status, headers, body = send(req)
             exchange.handle_response(status, headers, body)
         self.repairs = self.engine.take_repairs()
-        self.keep_app_key()
         self.pull()
         self.flush_outbox()
         return self.engine.status()
-
-    def keep_app_key(self) -> None:
-        """Write the app key to the key file once the engine has it.
-
-        A new device gets the app key from its grant after the first sync
-        checks the enrollment checkpoint ([ENR-9]). The app keeps it in its
-        key store, as DESIGN.md "App integration" requires.
-        """
-        if self.key_stored:
-            return
-        key = self.engine.app_key()
-        if key is None:
-            return
-        path = self.dir / "keys.json"
-        cfg = json.loads(path.read_text())
-        cfg["keys"]["app_key"] = key.hex()
-        write_private(path, json.dumps(cfg))
-        self.key_stored = True
 
     def pull(self) -> int:
         """Apply the changes after the applied position ([DLV-10], [DLV-11]).

@@ -11,6 +11,7 @@
 
 pub mod codec;
 pub mod enroll;
+pub mod keystore;
 pub mod setup;
 pub mod signin;
 mod state;
@@ -66,6 +67,9 @@ pub enum EngineError {
     /// The applied position of the app is not on the verified log
     /// ([DLV-12]). The app must reset.
     ResetRequired,
+    /// The host key store failed or holds no keys for the space. The engine
+    /// does not continue without the key store (C62).
+    KeyStore(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -83,6 +87,7 @@ impl std::fmt::Display for EngineError {
             Self::ResetRequired => {
                 f.write_str("reset required: the applied position is not on the verified log")
             }
+            Self::KeyStore(e) => write!(f, "key store: {e}"),
         }
     }
 }
@@ -294,6 +299,10 @@ pub struct Engine {
     // `None` until the engine has the app key: a new device opens it from
     // its grant after the checkpoint check ([ENR-9]).
     app_key: Option<[u8; 32]>,
+    // The host key store, if `keystore::open` opened the engine, and
+    // whether its item holds the app key.
+    key_store: Option<std::sync::Arc<dyn keystore::KeyStore>>,
+    app_key_stored: bool,
     status: Status,
     // Seconds to add to the device clock: relay time - device time ([WIR-7]).
     clock_offset: i64,
@@ -387,6 +396,8 @@ impl Engine {
             sign,
             seal_seed: keys.seal_seed,
             app_key: (keys.app_key != [0; 32]).then_some(keys.app_key),
+            key_store: None,
+            app_key_stored: false,
             status: Status::Ok,
             clock_offset: 0,
             grant_refusals: std::collections::BTreeMap::new(),
