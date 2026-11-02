@@ -139,13 +139,18 @@ The relay has four surfaces. This section lists operations only. Cryptography li
 
 User sign-in uses passkeys (WebAuthn) that the relay serves, with the `webauthn-rs` crate.
 
-- The relay operator creates each user with a command, for example `snailfish-relay user add sam`. The command prints a one-time invite link that expires after 7 days.
+- The relay operator creates each user with a command, for example `snailfish-relay user add sam`. The command prints a one-time invite link. Only an invite link registers a passkey, and there is no public signup route. A link works once and expires after 7 days. The relay stores only a SHA-256 hash of the link token. [USR-1]
 - The user opens the link and registers a passkey. The user can register more passkeys later on the user page.
-- The relay assigns each user a random user ID. The user directory maps the user ID to the tenant and to the passkey credentials.
-- If the user loses every passkey, the relay operator makes a new invite link. The new link removes the old passkeys of that user.
+- If the user loses every passkey, the relay operator makes a new invite link with `snailfish-relay user invite sam`. The new link removes the old passkeys, the browser sessions, the authorization codes and the setup tokens of that user, and it replaces an unused older link. [USR-2]
+- The relay assigns each user a random user ID. The user directory maps the user ID to the tenant and to the passkey credentials. The relay selects a tenant only from the user ID of the passkey session or of the setup token. [USR-3]
 - The WebAuthn relying party ID is the relay domain. The relay needs a stable HTTPS domain, for example a Tailscale `ts.net` name, because a passkey works only on its domain.
 
-The native app gets a setup token through the system browser (`ASWebAuthenticationSession` on Apple platforms). The flow uses an authorization code with PKCE, as RFC 8252 requires for native apps. The relay binds the setup token to the device public keys, and the token expires after 10 minutes.
+The native app gets a setup token through the system browser (`ASWebAuthenticationSession` on Apple platforms). `PROTOCOL.md` section 12 gives the exact routes.
+
+- The flow uses an authorization code with PKCE (S256), as RFC 8252 requires for native apps. The relay issues a code only after a signed-in user approves the request. It binds the code to the user, the code challenge and the redirect URI, accepts it once, and lets it expire after 60 seconds. [USR-4]
+- The app exchanges the code and its verifier for a setup token, in a request that the device key signs. The relay binds the setup token to the device ID and the tenant of the user, and the token expires after 10 minutes. [USR-5]
+- Space creation needs a setup token that names the device that signs the request and the tenant of the request path. [USR-6]
+- Every user write needs an exact Origin match and an anti-CSRF token bound to the session. Device and setup routes refuse a request with the session cookie. User routes refuse a request with a device signature. [USR-7]
 
 ### App integration
 
@@ -188,7 +193,7 @@ Sync status. The engine reports one of these values, and the app shows it to the
 - `ok`.
 - `degraded`, with the cause: a skipped change, a rejected envelope, a snapshot over the size limit or a snapshot that this engine cannot read.
 - `paused`, with the cause: `quota`, `blocked`, `restore hold`, `relay authority`, `repair needs another device` or `relay unavailable`. The engine tries again by itself. A block or a restore hold ends on the user page. `relay authority` means that the signed authority differs from the relay configuration, and a fix of that configuration starts sync again. `relay unavailable` means that the relay gave an HTTP error or an answer that the engine cannot read, for example a page from a proxy. Only a readable answer from the relay can give `relay too old`.
-- `stopped`, with the cause: `fork`, `missing records`, `update required`, `relay too old`, `clock skew`, `removed` or `deleted`. Sync needs a user action.
+- `stopped`, with the cause: `fork`, `missing records`, `update required`, `relay too old`, `clock skew`, `removed`, `deleted` or `setup failed`. Sync needs a user action. `setup failed` means that the relay refused to create a new space, for example after the setup token expired: the user signs in again.
 
 - The engine keeps its state in its own SQLite file in `data_dir`: the outbox of encrypted envelopes and the verified log.
 - The app keeps two records in its own database: the app outbox, and the applied position (log position and log digest).
@@ -462,6 +467,16 @@ Rules:
 - The relay limits the spaces per tenant and the stored bytes per space. The product of the two limits bounds the storage of one tenant. The relay reserves capacity in each space for security records and two snapshots. [STO-14]
 - The security record reserve is 16 MiB by default, outside the space quota. One person writes about 150 KB of security records in 10 years: about 20 grants of 4 KB, 10 epoch records and 50 device records. The relay refuses more than 10 security records from one device in one day, so a stolen device cannot fill the reserve before the block. The relay operator can raise the reserve. [STO-15]
 
+### Quotas
+
+The relay operator sets the space quota and the most spaces for each tenant in the relay configuration. The operator can set other values for one user.
+
+- The relay refuses an append of a change that takes the stored change bytes of the space past the space quota. The result is `quota`, and the relay stores nothing for that envelope. The check runs in the append transaction of STO-11. [QTA-1]
+- At a full quota, the relay continues to serve every stored record. [QTA-2]
+- Security records do not count against the space quota, and the relay never refuses one for quota. M7 adds the security record reserve of STO-15. [QTA-3]
+- `quota` is transient. The engine keeps the change in its outbox, reports `paused: quota`, and sends it again at each later sync. [QTA-4]
+- The relay refuses a new space if the tenant holds the most spaces that its configuration allows. [QTA-5]
+
 ## Diagram
 
 ```mermaid
@@ -653,7 +668,7 @@ User signals:
 9. The user page shows usage against quota for each space, with a warning at 80%.
 10. The user page shows open security actions (from M7), for example a block that waits for a trusted device to remove the device, or a device that blocks a level raise.
 11. Each user can set a webhook URL. The relay sends a JSON message with a `text` field for a stalled device, a quota warning and an open security action. Slack incoming webhooks accept this format. Other services, for example ntfy, need an adapter.
-12. The relay operator sets an allowlist of webhook hosts. An empty allowlist turns webhooks off. The relay resolves the host and connects to the address that it checked. It refuses loopback, link-local and private addresses unless the allowlist names that address. It follows no redirects, waits at most 10 seconds and reads at most 4 KiB of the response.
+12. The relay operator sets an allowlist of webhook hosts. An empty allowlist turns webhooks off. The relay resolves the host and connects to the address that it checked. It refuses loopback, link-local, private, shared (CGNAT) and reserved addresses, also inside an IPv6 address, unless the allowlist names that address. It follows no redirects, waits at most 10 seconds and reads at most 4 KiB of the response. [USR-8]
 
 Client-detected failures:
 
@@ -687,8 +702,8 @@ T3. An attacker tries to get a user account, or to take over the account of a us
 
 T4. Cross-site request forgery against the user page.
 
-- Every user write requires an exact Origin match and an anti-CSRF token bound to the session.
-- Device routes reject cookies and accept only device signatures.
+- Every user write requires an exact Origin match and an anti-CSRF token bound to the session (USR-7).
+- Device routes reject the session cookie and accept only device signatures.
 
 T5. An attacker replays a captured device request.
 

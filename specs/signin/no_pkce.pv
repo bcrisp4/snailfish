@@ -1,0 +1,2 @@
+(* Variant vNoPkce. Run: proverif -lib lib.pvl no_pkce.pv *)
+process System(vNoPkce)

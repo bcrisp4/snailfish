@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from snailfish_demo.softbrowser import SoftBrowser
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -36,22 +38,35 @@ class Relay:
         """Create one user and start the relay on a free port.
 
         `authority` is the authority that request signatures cover. A test
-        relay in front of this relay passes its own authority.
+        relay in front of this relay passes its own authority. The WebAuthn
+        relying party needs a domain name, so the authority is `localhost`.
+        The user "sam" registers a passkey in a software browser, whose state
+        file is `browser`.
         """
         if not RELAY.exists():
             pytest.fail(f"{RELAY} is missing: run cargo build -p snailfish-relay")
         self.data = data
         self.port = free_port()
-        self.authority = authority or f"127.0.0.1:{self.port}"
+        self.authority = authority or f"localhost:{self.port}"
         self.url = f"http://{self.authority}"
-        self.tenant = subprocess.run(
-            [str(RELAY), "--data", str(data), "user", "add", "sam"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
         self.proc: subprocess.Popen[bytes] | None = None
+        self.serve_args: list[str] = []
         self.start()
+        self.browser = self.add_user("sam")
+
+    def add_user(self, name: str) -> Path:
+        """Create a user, register its passkey, and return the state file of
+        its software browser. The browser connects to the relay itself, so it
+        works before a test proxy starts."""
+        link = self.admin("user", "add", name)
+        assert link.returncode == 0, link.stderr
+        state = self.data.parent / f"browser-{name}.json"
+        SoftBrowser(state, self.url, connect=f"127.0.0.1:{self.port}").register(link.stdout.strip())
+        return state
+
+    def global_args(self) -> list[str]:
+        """The arguments that each relay command takes."""
+        return ["--data", str(self.data), "--authority", self.authority, "--origin", self.url]
 
     def start(self) -> None:
         """Start the relay process and wait for the health route."""
@@ -59,12 +74,10 @@ class Relay:
             [
                 str(RELAY),
                 "serve",
-                "--data",
-                str(self.data),
+                *self.global_args(),
                 "--listen",
                 f"127.0.0.1:{self.port}",
-                "--authority",
-                self.authority,
+                *self.serve_args,
             ]
         )
         deadline = time.monotonic() + 10
@@ -90,7 +103,7 @@ class Relay:
     def admin(self, *args: str) -> subprocess.CompletedProcess[str]:
         """Run a `snailfish-relay` operator command on the data directory."""
         return subprocess.run(
-            [str(RELAY), "--data", str(self.data), *args],
+            [str(RELAY), *self.global_args(), *args],
             capture_output=True,
             text=True,
             check=False,
@@ -221,15 +234,32 @@ def enroll(
     return finish(t), finish(n)
 
 
-def setup(relay: Relay, a: Path, b: Path) -> None:
-    """Create the space with device A, then enroll device B from A."""
-    subprocess.run(
-        cli("setup", "--relay", relay.url, "--tenant", relay.tenant, str(a)),
+def create(relay: Relay, a: Path, browser: Path | None = None, user: str = "sam") -> None:
+    """Create a space with device A. A signs in through the software browser
+    and gets its tenant handle and setup token (PROTOCOL.md 12.3)."""
+    r = subprocess.run(
+        cli(
+            "setup",
+            "--relay",
+            relay.url,
+            "--browser",
+            str(browser or relay.browser),
+            "--user",
+            user,
+            str(a),
+        ),
         env=demo_env(),
-        check=True,
+        check=False,
         capture_output=True,
+        text=True,
         timeout=60,
     )
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def setup(relay: Relay, a: Path, b: Path) -> None:
+    """Create the space with device A, then enroll device B from A."""
+    create(relay, a)
     sync_ok(a)
     (tc, tout), (nc, nout) = enroll(relay, a, b)
     assert (tc, nc) == (0, 0), tout + nout

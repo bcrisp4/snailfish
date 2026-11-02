@@ -3,7 +3,9 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Run the ProVerif models of specs/enrollment and compare each result to expect.toml.
+"""Run the ProVerif models of specs/ and compare each result to expect.toml.
+
+Each directory of specs/ with an expect.toml is a ProVerif model.
 
 ProVerif 2.05 must be on PATH. Run `eval $(opam env)` first.
 Exit codes: 0 all results match, 1 a mismatch, a missing or extra query, an
@@ -23,7 +25,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DIR = ROOT / "enrollment"
 LIB = "lib.pvl"
 RESULT = re.compile(r"^RESULT (?P<query>.+?) (?P<verdict>is true|is false|cannot be proved)\.$")
 EXPECTED_VALUES = ("true", "false", "reachable", "unproved")
@@ -69,8 +70,13 @@ def parse_output(text: str) -> list[Result]:
 
 
 def is_reachability(query: str) -> bool:
-    """Return True if the query is a `not event(X)` reachability query."""
-    return query.startswith("not event(")
+    """Return True if the query is a `not event(X)` or `not (event(X) && ...)` reachability query."""
+    return query.startswith(("not event(", "not (event("))
+
+
+def model_dirs(root: Path) -> list[Path]:
+    """Return each directory of `root` that holds an expect.toml, in name order."""
+    return sorted(p.parent for p in root.glob("*/expect.toml"))
 
 
 def compare(file: str, results: list[Result], expected: dict[str, str]) -> list[str]:
@@ -187,13 +193,18 @@ def main(argv: list[str] | None = None) -> int:
         The exit code.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--dir", type=Path, default=DEFAULT_DIR, help="model directory with lib.pvl and expect.toml")
+    parser.add_argument("--dir", type=Path, help="one model directory with lib.pvl and expect.toml (default: each one)")
     parser.add_argument("--timeout", type=int, default=1800, help="seconds for each ProVerif run")
     args = parser.parse_args(argv)
     if shutil.which("proverif") is None:
         print(MISSING_MESSAGE, file=sys.stderr)
         return 2
-    return check_directory(args.dir, args.timeout)
+    dirs = [args.dir] if args.dir else model_dirs(ROOT)
+    if not dirs:
+        print(f"FAIL no expect.toml in {ROOT}")
+        return 1
+    codes = [check_directory(d, args.timeout) for d in dirs]
+    return max(codes)
 
 
 if __name__ == "__main__":

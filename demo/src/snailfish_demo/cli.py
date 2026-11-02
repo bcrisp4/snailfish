@@ -1,7 +1,7 @@
 """The demo task app CLI.
 
 Usage:
-    snailfish-demo setup --relay URL --tenant T DIR_A
+    snailfish-demo setup --relay URL [--browser STATE --user NAME] DIR_A
     snailfish-demo --dir DIR invite [--scan TEXT] [--recovery-key KEY] [--confirm ask|yes|no]
     snailfish-demo join --relay URL [--scan TEXT] [--name NAME] [--confirm ask|yes|no] DIR
     snailfish-demo --dir DIR edit TASK FIELD VALUE
@@ -15,6 +15,11 @@ devices print the 6-digit code, and the user confirms the match on each
 device at a prompt. `--confirm yes` or `--confirm no` answers the prompt
 with no input, for tests.
 
+`setup` signs in to the relay in the system browser and creates a space.
+It prints the sign-in URL and waits for the browser to return to a loopback
+address. `--browser STATE --user NAME` uses the software browser of
+`softbrowser.py` with the state file STATE instead, for tests.
+
 `SNAILFISH_DEMO_CRASH_AT=N` makes the process exit at the Nth crash point
 of the run, with no cleanup, as a kill does. The crash points are before
 and after each HTTP request, and around each app transaction. The crash
@@ -24,6 +29,7 @@ tests use them.
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import sys
@@ -33,7 +39,7 @@ from typing import TYPE_CHECKING
 import httpx
 import snailfish as sf
 
-from snailfish_demo import app
+from snailfish_demo import app, softbrowser
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -88,6 +94,51 @@ def http_transport(client: httpx.Client, crash_point: Crasher) -> app.Transport:
     return send
 
 
+# The redirect URI of the software browser. It never navigates, so a
+# private-use scheme like that of a phone app works (PROTOCOL.md 12.2).
+SOFT_REDIRECT = "com.example.tasks:/callback"
+
+
+class _CatchServer(http.server.HTTPServer):
+    """An HTTP server that keeps the path of the redirect."""
+
+    got: str | None = None
+
+
+class _Catch(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path.startswith("/callback?") and isinstance(self.server, _CatchServer):
+            self.server.got = self.path
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Sign-in done. You can close this page.")
+
+
+class Loopback:
+    """A one-request HTTP server on 127.0.0.1 that catches the redirect of
+    the system browser (RFC 8252 section 7.3)."""
+
+    def __init__(self) -> None:
+        """Listen on a free port."""
+        self.server = _CatchServer(("127.0.0.1", 0), _Catch)
+        self.uri = f"http://127.0.0.1:{self.server.server_port}/callback"
+
+    def __enter__(self) -> Loopback:
+        """Return self."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Stop listening."""
+        self.server.server_close()
+
+    def wait(self, authorize_url: str) -> str:
+        """Print the sign-in URL and return the redirect URL of the browser."""
+        say(f"open this URL in a browser to sign in: {authorize_url}")
+        while self.server.got is None:
+            self.server.handle_request()
+        return f"http://127.0.0.1:{self.server.server_port}{self.server.got}"
+
+
 def say(line: str) -> None:
     """Print one line at once, so a test can read it while the process runs."""
     print(line, flush=True)
@@ -135,7 +186,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("setup")
     s.add_argument("--relay", required=True)
-    s.add_argument("--tenant", required=True)
+    s.add_argument("--browser", type=Path)
+    s.add_argument("--user")
     s.add_argument("dir_a", type=Path)
     i = sub.add_parser("invite")
     i.add_argument("--scan")
@@ -157,7 +209,20 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "setup":
-        key = app.create_space(args.relay, args.tenant, args.dir_a)
+        with httpx.Client(timeout=30) as client:
+            send = http_transport(client, Crasher())
+            if args.browser is not None:
+                soft = softbrowser.SoftBrowser(args.browser, args.relay)
+                key = app.create_space(
+                    args.relay,
+                    args.dir_a,
+                    SOFT_REDIRECT,
+                    lambda authorize_url: soft.approve(authorize_url, args.user or ""),
+                    send,
+                )
+            else:
+                with Loopback() as lb:
+                    key = app.create_space(args.relay, args.dir_a, lb.uri, lb.wait, send)
         print(f"recovery key (write it down): {key}")
         return 0
     if args.cmd == "join":

@@ -184,3 +184,34 @@ async fn signed_fetch_works_through_the_router() {
     let page = wire::parse_fetch(&body).unwrap();
     assert_eq!(page.entries.iter().map(|e| e.0).collect::<Vec<_>>(), [3, 4]);
 }
+
+/// PROTOCOL.md 12.6: the router lets at least 120 sign-in starts of one
+/// address through to the core, then answers with `rate_limited`.
+#[tokio::test]
+async fn sign_in_routes_are_rate_limited() {
+    let fx = Fx::new();
+    let app = router(fx.relay.clone());
+    let req = || {
+        Request::post("/u/signin/start")
+            .header("origin", "https://sync.example.net")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"nobody"}"#))
+            .unwrap()
+    };
+    // The bucket refills at 2 requests each second while the loop runs, so
+    // the first 429 comes at request 121 or a little later.
+    let mut passed = 0;
+    loop {
+        let resp = app.clone().oneshot(req()).await.unwrap();
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        passed += 1;
+        assert!(passed < 1000, "no rate limit");
+    }
+    assert!(passed >= 120, "{passed}");
+    // A route outside 12.6 has no limit.
+    let resp = app.oneshot(get("/v1/health")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

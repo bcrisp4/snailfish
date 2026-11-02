@@ -1,0 +1,214 @@
+(* Snailfish user sign-in and the native setup handoff: shared model. See README.md.
+   Every variant file selects one value of type variant and runs System. *)
+
+type user.
+type tenant.
+type skey.
+type pkey.
+type tkey.
+type tpkey.
+type variant.
+
+(* Variants. vNone is the design in DESIGN.md. Each other value is one deliberate flaw. *)
+const vNone: variant.
+const vNoPkce: variant.
+const vUnboundToken: variant.
+const vNoTenantCheck: variant.
+const vPlainInvite: variant.
+
+(* The network is the attacker. *)
+free c: channel.
+
+(* TLS as a server-authenticated channel: a client encrypts its request and a
+   fresh reply key to the relay key, and the relay replies with that key. Any
+   party, the attacker too, can open a channel to the relay. *)
+free skTls: tkey [private].
+fun tpub(tkey): tpkey.
+fun tenc(bitstring, tpkey): bitstring.
+reduc forall m: bitstring, k: tkey; tdec(tenc(m, tpub(k)), k) = m.
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m, k), k) = m.
+
+(* Ed25519 for device keys and the passkey assertion, as an ideal signature. *)
+fun pk(skey): pkey.
+fun sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; checksig(sign(m, k), pk(k)) = m.
+reduc forall m: bitstring, k: skey; getmess(sign(m, k)) = m.
+
+(* SHA-256 with no inverse: the invite hash and the PKCE challenge. *)
+fun hash(bitstring): bitstring.
+
+(* Each user has one tenant. The relay maps the user ID to it. *)
+fun ten(user): tenant [data].
+
+(* Labels of the requests. *)
+const lreg: bitstring.
+const lchal: bitstring.
+const lauth: bitstring.
+const lsignin: bitstring.
+const lauthz: bitstring.
+const ltok: bitstring.
+const lput: bitstring.
+const lok: bitstring.
+
+(* Relay storage. *)
+table invites(user, bitstring).
+table passkeys(user, pkey).
+table chals(bitstring).
+table sessions(bitstring, user).
+table codes(bitstring, user, bitstring).
+table tokens(bitstring, user, pkey).
+
+(* The variants differ only in these functions. *)
+(* Rules: [USR-1] The relay stores only a hash of the invite token. *)
+letfun stored(v: variant, it: bitstring) = if v = vPlainInvite then it else hash(it).
+(* Rules: [USR-4] The code needs the verifier of its challenge. *)
+letfun pkceok(v: variant, chal: bitstring, ver: bitstring) = v = vNoPkce || chal = hash(ver).
+(* Rules: [USR-5] [USR-6] The token names the device that signs the request. *)
+letfun devok(v: variant, d: pkey, bound: pkey) = v = vUnboundToken || d = bound.
+(* Rules: [USR-3] [USR-6] The tenant of the path is the tenant of the token user. *)
+letfun tenok(v: variant, t: tenant, u: user) = v = vNoTenantCheck || t = ten(u).
+
+(* Events. *)
+event HonestUser(user).
+event UserRegisters(user, pkey).
+event PasskeyRegistered(user, pkey).
+event Approves(user, bitstring).
+event AppStarts(pkey, bitstring).
+event AppGetsToken(pkey, tenant).
+event TokenIssued(user, pkey).
+event SpaceCreated(tenant, pkey).
+
+(* The relay. Each branch is one route. A route reads one TLS request.
+   Rules: [USR-1] [USR-3] [USR-4] [USR-5] [USR-6] *)
+let Relay(v: variant) =
+  (* Passkey registration with an invite token. *)
+  (! in(c, x: bitstring);
+     let (=lreg, it: bitstring, p: pkey, kc: bitstring) = tdec(x, skTls) in
+     get invites(u, h) suchthat h = stored(v, it) in
+     insert passkeys(u, p);
+     event PasskeyRegistered(u, p);
+     out(c, senc(lok, kc)))
+  (* A sign-in challenge. *)
+| (! in(c, x: bitstring);
+     let (=lchal, kc: bitstring) = tdec(x, skTls) in
+     new ch: bitstring;
+     insert chals(ch);
+     out(c, senc(ch, kc)))
+  (* Passkey sign-in. The user ID comes from the passkey, never from a tenant name. *)
+| (! in(c, x: bitstring);
+     let (=lsignin, u: user, sg: bitstring, kc: bitstring) = tdec(x, skTls) in
+     get passkeys(=u, p) in
+     let (=lauth, ch: bitstring) = checksig(sg, p) in
+     get chals(=ch) in
+     new s: bitstring;
+     insert sessions(s, u);
+     out(c, senc(s, kc)))
+  (* The user approves a native sign-in: an authorization code for a challenge. *)
+| (! in(c, x: bitstring);
+     let (=lauthz, s: bitstring, chal: bitstring, kc: bitstring) = tdec(x, skTls) in
+     get sessions(=s, u) in
+     new code: bitstring;
+     insert codes(code, u, chal);
+     event Approves(u, chal);
+     out(c, senc(code, kc)))
+  (* The setup token exchange. The device key signs the request. *)
+| (! in(c, x: bitstring);
+     let (=ltok, code: bitstring, ver: bitstring, d: pkey, sg: bitstring, kc: bitstring) = tdec(x, skTls) in
+     if checksig(sg, d) = (ltok, code, ver) then
+     get codes(=code, u, chal) in
+     if pkceok(v, chal, ver) then
+     new tok: bitstring;
+     insert tokens(tok, u, d);
+     event TokenIssued(u, d);
+     out(c, senc((tok, ten(u)), kc)))
+  (* Space creation with a setup token. *)
+| (! in(c, x: bitstring);
+     let (=lput, tok: bitstring, t: tenant, d: pkey, sg: bitstring, kc: bitstring) = tdec(x, skTls) in
+     if checksig(sg, d) = (lput, tok, t) then
+     get tokens(=tok, u, bound) in
+     if devok(v, d, bound) && tenok(v, t, u) then
+     event SpaceCreated(t, d);
+     out(c, senc(lok, kc))).
+
+(* A native app on the device of an honest user. It opens the system browser
+   with its challenge, and the user approves it. The user approves only a
+   request that the own app starts: the model has no phishing page.
+   The redirect is public, because another app can claim the same URL scheme,
+   and the app reads a code that the attacker can replace. The app can leak its
+   setup token.
+   Rules: [USR-4] [USR-5] [USR-6] *)
+let App(s: bitstring) =
+  new dsk: skey;
+  new ver: bitstring;
+  let d = pk(dsk) in
+  event AppStarts(d, hash(ver));
+  new k1: bitstring;
+  out(c, tenc((lauthz, s, hash(ver), k1), tpub(skTls)));
+  in(c, y1: bitstring);
+  let code = sdec(y1, k1) in
+  out(c, code);
+  in(c, got: bitstring);
+  new k2: bitstring;
+  out(c, tenc((ltok, got, ver, d, sign((ltok, got, ver), dsk), k2), tpub(skTls)));
+  in(c, y2: bitstring);
+  let (tok: bitstring, t: tenant) = sdec(y2, k2) in
+  event AppGetsToken(d, t);
+  out(c, tok);
+  new k3: bitstring;
+  out(c, tenc((lput, tok, t, d, sign((lput, tok, t), dsk), k3), tpub(skTls))).
+
+(* An honest user. The relay operator sends the invite token on a private
+   channel. A copy of the relay storage is public (T1).
+   Rules: [USR-1] [USR-3] *)
+let HonestUserP(v: variant) =
+  new u: user;
+  new it: bitstring;
+  new pkk: skey;
+  event HonestUser(u);
+  insert invites(u, stored(v, it));
+  out(c, (u, stored(v, it)));
+  event UserRegisters(u, pk(pkk));
+  new k1: bitstring;
+  out(c, tenc((lreg, it, pk(pkk), k1), tpub(skTls)));
+  in(c, =senc(lok, k1));
+  new k2: bitstring;
+  out(c, tenc((lchal, k2), tpub(skTls)));
+  in(c, y: bitstring);
+  let ch = sdec(y, k2) in
+  new k3: bitstring;
+  out(c, tenc((lsignin, u, sign((lauth, ch), pkk), k3), tpub(skTls)));
+  in(c, z: bitstring);
+  let s: bitstring = sdec(z, k3) in
+  !App(s).
+
+(* The attacker holds an account on the same relay: a second user. *)
+let AttackerUser(v: variant) =
+  new ua: user;
+  new ita: bitstring;
+  insert invites(ua, stored(v, ita));
+  out(c, (ua, ita)).
+
+let System(v: variant) =
+  out(c, tpub(skTls)); (Relay(v) | !HonestUserP(v) | !AttackerUser(v)).
+
+(* Queries. *)
+
+(* (a) Tenant isolation. A space in the tenant of an honest user needs a device
+   whose app started a sign-in that this user approved. *)
+query u: user, d: pkey, ch: bitstring;
+  event(SpaceCreated(ten(u), d)) && event(HonestUser(u)) ==> event(Approves(u, ch)) && event(AppStarts(d, ch)).
+
+(* (b) An app gets a token only for a user who approved the challenge of this app.
+   An injected code cannot move the app into the tenant of the attacker. *)
+query u: user, d: pkey, ch: bitstring;
+  event(AppGetsToken(d, ten(u))) ==> event(Approves(u, ch)) && event(AppStarts(d, ch)).
+
+(* (c) Only the holder of the invite registers a passkey for an honest user. *)
+query u: user, p: pkey;
+  event(PasskeyRegistered(u, p)) && event(HonestUser(u)) ==> event(UserRegisters(u, p)).
+
+(* (d) Reachability. A pass of (a) to (c) must not be vacuous. *)
+query u: user, d: pkey; event(TokenIssued(u, d)) && event(HonestUser(u)).
+query u: user, d: pkey, ch: bitstring; event(SpaceCreated(ten(u), d)) && event(HonestUser(u)) && event(AppStarts(d, ch)).
+query u: user, p: pkey; event(PasskeyRegistered(u, p)) && event(HonestUser(u)).

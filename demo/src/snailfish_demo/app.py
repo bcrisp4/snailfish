@@ -148,23 +148,60 @@ def write_private(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
-def create_space(relay_url: str, tenant: str, dir_a: Path) -> str:
+class Browser(Protocol):
+    """Shows the sign-in page of the relay to the user and returns the URL
+    that the relay redirects to after the user allows the app."""
+
+    def __call__(self, authorize_url: str) -> str:
+        """Return the redirect URL for `authorize_url`."""
+        ...
+
+
+def sign_in(
+    relay_url: str, keys: sf.DeviceKeys, redirect_uri: str, browser: Browser, send: Transport
+) -> sf.SetupToken:
+    """The native sign-in of PROTOCOL.md 12.2 and 12.3: the user signs in
+    with a passkey in the browser and allows the app, and the device key
+    exchanges the code for a setup token and the tenant handle."""
+    si = sf.SignIn(relay_url, redirect_uri)
+    redirect = browser(si.authorize_url())
+    status, headers, body = send(si.token_request(redirect, keys, int(time.time())))
+    try:
+        return si.read_token(status, headers, body)
+    except sf.SnailfishError.Invalid as e:
+        # PROTOCOL.md 8.5: after `expired`, send once more with the relay time.
+        if "expired" not in str(e):
+            raise
+    status, headers, body = send(si.token_request(redirect, keys, int(time.time())))
+    return si.read_token(status, headers, body)
+
+
+def create_space(
+    relay_url: str, dir_a: Path, redirect_uri: str, browser: Browser, send: Transport
+) -> str:
     """Create a space with device A as its first device.
 
-    The engine makes the recovery key and the genesis record. The function
-    writes A's key file and engine setup. A's next sync creates the space on
-    the relay. Each other device joins through an enrollment.
+    The user signs in first. The sign-in gives the tenant handle and the
+    setup token. The engine makes the recovery key and the genesis record.
+    The function writes A's key file and engine setup. A's next sync creates
+    the space on the relay. Each other device joins through an enrollment.
 
     Returns:
         The recovery key in its display form. Show it once.
     """
     ka = sf.new_device_keys()
+    token = sign_in(relay_url, ka, redirect_uri, browser, send)
     setup = sf.create_space(APP_ID, sf.NewDevice(keys=ka, name="A"))
     ka.app_key = setup.app_key
-    space = {"relay_url": relay_url, "tenant": tenant, "log_id": setup.log_id, "app_id": APP_ID}
+    space = {
+        "relay_url": relay_url,
+        "tenant": token.tenant,
+        "log_id": setup.log_id,
+        "app_id": APP_ID,
+    }
     dir_a.mkdir(parents=True, exist_ok=True)
     write_private(dir_a / "keys.json", json.dumps({"space": space, "keys": keys_to_json(ka)}))
-    sf.install_setup(str(dir_a / "engine"), sf.SpaceRef(**space), ka, setup.envelopes)
+    sf.install_setup(str(dir_a / "engine"), sf.SpaceRef(**space), ka, setup.envelopes, token.token)
     return setup.recovery_key
 
 

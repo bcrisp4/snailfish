@@ -15,12 +15,14 @@ RUN cargo build --locked --release -p snailfish-relay -p snailfish-bindings -p s
 
 FROM python:3.13-slim-trixie AS wheels
 COPY demo/uv.lock /tmp/uv.lock
-# httpx and its dependencies, at the versions of demo/uv.lock.
+# httpx, cbor2, cryptography and their dependencies, at the versions of
+# demo/uv.lock.
 RUN python3 - <<'EOF' > /tmp/req.txt
 import tomllib
 lock = tomllib.load(open("/tmp/uv.lock", "rb"))
 for p in lock["package"]:
-    if p["name"] in ("anyio", "certifi", "h11", "httpcore", "httpx", "idna", "sniffio", "typing-extensions"):
+    if p["name"] in ("anyio", "certifi", "h11", "httpcore", "httpx", "idna", "sniffio", "typing-extensions",
+                     "cbor2", "cryptography", "cffi", "pycparser"):
         print(f'{p["name"]}=={p["version"]}')
 EOF
 RUN pip download --no-deps --only-binary=:all: -r /tmp/req.txt -d /wheels \

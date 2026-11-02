@@ -6,13 +6,20 @@ requires-python = ">=3.13"
 license = "MIT OR Apache-2.0"
 
 [dependency-groups]
-dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]
+# The tests sign in with the software browser of the demo (demo/src).
+dev = [
+  "pytest==9.1.1",
+  "ruff==0.17.2",
+  "pyright==1.1.414",
+  "cbor2==5.7.1",
+  "cryptography==46.0.3",
+]
 
 [tool.pytest.ini_options]
 addopts = ["--strict-markers", "-q"]
 testpaths = ["tests"]
 # `make bindings-python` writes snailfish.py and libsnailfish here.
-pythonpath = ["build", "tests"]
+pythonpath = ["build", "tests", "../../demo/src"]
 
 [tool.ruff]
 line-length = 88
@@ -51,4 +58,4 @@ select = [
 [tool.pyright]
 typeCheckingMode = "strict"
 include = ["tests"]
-extraPaths = ["build", "tests"]
+extraPaths = ["build", "tests", "../../demo/src"]

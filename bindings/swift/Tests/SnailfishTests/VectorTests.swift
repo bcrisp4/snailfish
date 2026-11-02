@@ -245,7 +245,9 @@ final class VectorTests: XCTestCase {
         let space = SpaceRef(
             relayUrl: "https://r.example/", tenant: "t_" + String(repeating: "0", count: 32),
             logId: setup.logId, appId: "com.example.tasks")
-        try installSetup(dataDir: dir.path, space: space, keys: ka, envelopes: setup.envelopes)
+        try installSetup(
+            dataDir: dir.path, space: space, keys: ka, envelopes: setup.envelopes,
+            setupToken: "st_" + String(repeating: "0", count: 64))
         let engine = try Engine.open(dataDir: dir.path, space: space, keys: ka)
         XCTAssertThrowsError(try Engine.open(dataDir: dir.path, space: space, keys: ka)) { error in
             XCTAssertEqual(error as? SnailfishError, .Locked)
@@ -302,5 +304,12 @@ final class VectorTests: XCTestCase {
             body: Data((#"{"entries":[],"head":{"position":0,"digest":""# + d0 + #""},"has_more":false,"hold":true}"#).utf8))
         XCTAssertEqual(try engine.status(), .restoreHold)
         XCTAssertThrowsError(try deviceId(signPk: Data(count: 32), sealPk: Data(count: 1215)))
+        // PROTOCOL.md 12.2: the native sign-in crosses the binding.
+        let signIn = try SignIn(relayUrl: "https://r.example", redirectUri: "com.example.tasks:/cb")
+        XCTAssertTrue(
+            signIn.authorizeUrl().hasPrefix("https://r.example/u/authorize?response_type=code&code_challenge="))
+        XCTAssertThrowsError(try signIn.tokenRequest(redirect: "com.example.tasks:/cb?code=x&state=y", keys: ka, now: 1))
+        XCTAssertEqual(statusText(status: .quota), "paused: quota")
+        XCTAssertEqual(statusText(status: .setupFailed(cause: "bad_setup")), "stopped: setup failed")
     }
 }

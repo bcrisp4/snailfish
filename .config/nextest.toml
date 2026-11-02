@@ -7,4 +7,7 @@ fail-fast = { max-fail = 1, terminate = "immediate" }
 # This test binary runs a second `cargo build` of the bindings in the dev
 # profile, so it adds about 20 s to each mutant. It catches only the uniffi-bindgen `main`
 # mutant, which .cargo/mutants.toml excludes. `make check` still runs it.
-default-filter = "not binary_id(snailfish-uniffi-bindgen::generate)"
+# The webhook send loop test waits for a background task with a short poll,
+# and the rate limit router test depends on the wall clock refill. They
+# catch only the mutants that .cargo/mutants.toml excludes for them.
+default-filter = "not binary_id(snailfish-uniffi-bindgen::generate) and not test(send_loop_delivers_messages_and_alerts) and not test(sign_in_routes_are_rate_limited)"

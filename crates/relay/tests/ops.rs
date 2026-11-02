@@ -248,6 +248,32 @@ fn backup_and_restore_hold_each_space() {
     assert_eq!(error_code(&fx.fetch(fx.tenant(), 0, 10)), "unknown_space");
 }
 
+/// [QTA-1], [LOG-10]: a repair after a restore moves the lost change back,
+/// and the space usage counts it again. Without this, each repair would let
+/// a space grow past its quota by the repaired bytes.
+#[test]
+fn repair_counts_the_moved_changes_in_the_usage() {
+    let mut fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let out = tempfile::TempDir::new().unwrap();
+    let dst = out.path().join("b1");
+    ops::backup(fx.dir.path(), &dst).unwrap();
+    let before = fx.usage(fx.tenant());
+    let change = fx.change("A", 4, [0x53; 16], 40, 2);
+    let (_, _, head5) = fx.append(fx.tenant(), "A", std::slice::from_ref(&change));
+    let after = fx.usage(fx.tenant());
+    assert_eq!(after, before + change.len() as u64);
+    ops::restore(fx.dir.path(), &dst, true, 1).unwrap();
+    fx.restart(common::limits_of(&fx.h));
+    assert_eq!(fx.usage(fx.tenant()), before);
+    let body = wire::repair_start_body(&head_of(&fx, 4), &[(5, change)]).unwrap();
+    let r = fx.post(fx.tenant(), "repair", &body, "A");
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let (sid, _) = wire::parse_repair_started(&r.body).unwrap();
+    assert_eq!(finish(&fx, "A", sid, head5), 200);
+    assert_eq!(fx.usage(fx.tenant()), after);
+}
+
 /// [STO-8]: while a backup holds its lock, the relay refuses space creation
 /// and creates no space file.
 #[test]
@@ -293,6 +319,62 @@ fn schema_one_files_migrate_forward() {
             .status,
         201
     );
+}
+
+/// [VER-14], [QTA-1]: schema 3 files from M4 open and gain the M5 tables.
+/// The space file gets its usage from the stored changes, so the quota
+/// counts the changes from before the migration.
+#[test]
+fn schema_three_files_migrate_forward() {
+    let mut fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let want: u64 = fx.h["space"]["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| common::s(&e["envelope"]))
+        .filter(|e| e.contains("\"snailfish.change.v1\""))
+        .map(|e| e.len() as u64)
+        .sum();
+    assert!(want > 0);
+    for (path, tables) in [
+        (
+            fx.tenant_db(fx.tenant()),
+            &[
+                "limits",
+                "device_status",
+                "groups",
+                "group_devices",
+                "webhook",
+                "alerts",
+                "webhook_outbox",
+            ][..],
+        ),
+        (fx.space_file(fx.tenant()), &["usage"][..]),
+        (
+            fx.dir.path().join("directory.db"),
+            &[
+                "passkeys",
+                "invites",
+                "sessions",
+                "codes",
+                "setup_tokens",
+                "setup_nonces",
+            ][..],
+        ),
+    ] {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        for t in tables {
+            c.execute_batch(&format!("DROP TABLE {t};")).unwrap();
+        }
+        c.execute_batch("PRAGMA user_version = 3;").unwrap();
+    }
+    fx.restart(common::limits_of(&fx.h));
+    assert_eq!(fx.fetch(fx.tenant(), 0, 10).status, 200);
+    assert_eq!(fx.usage(fx.tenant()), want);
+    // directory.db migrated at the restart: an invite and a setup token work.
+    assert!(fx.relay.invite("sam").unwrap().contains("#it_"));
+    fx.setup_token("sam", "A");
 }
 
 /// [LOG-11], PROTOCOL.md 10.9: a session expires at its start + 86,400

@@ -31,14 +31,21 @@ boot=$(( $(cat "$state/boot" 2>/dev/null || echo 0) + 1 ))
 echo "$boot" > "$state/boot.tmp" && sync "$state/boot.tmp" && mv "$state/boot.tmp" "$state/boot" && sync "$state"
 mark "SF-BOOT $boot"
 
-"$relay" --data "$state/relay" serve --listen 127.0.0.1:8080 --authority 127.0.0.1:8080 &
+# The WebAuthn relying party needs a domain name, so the authority is localhost.
+rargs=(--data "$state/relay" --authority localhost:8080 --origin http://localhost:8080)
+url=http://localhost:8080
+"$relay" "${rargs[@]}" serve --listen 127.0.0.1:8080 &
 for _ in $(seq 100); do "$relay" health --url http://127.0.0.1:8080/v1/health 2>/dev/null && break; sleep 0.1; done
 "$relay" health --url http://127.0.0.1:8080/v1/health || fail "the relay did not start"
 
 if [ ! -e "$state/setup-done" ]; then
   # The host kills only after SF-WORK, so the setup completes once.
-  tenant=$("$relay" --data "$state/relay" user add sam) || fail "user add"
-  python3 -m snailfish_demo.cli setup --relay http://127.0.0.1:8080 --tenant "$tenant" "$state/a" > /dev/null || fail "setup"
+  # Sam registers a passkey in the software browser, and device A signs in
+  # with it (PROTOCOL.md 12).
+  link=$("$relay" "${rargs[@]}" user add sam) || fail "user add"
+  python3 -c 'import sys; from pathlib import Path; from snailfish_demo.softbrowser import SoftBrowser; SoftBrowser(Path(sys.argv[1]), sys.argv[2]).register(sys.argv[3])' \
+    "$state/browser.json" "$url" "$link" || fail "register"
+  python3 -m snailfish_demo.cli setup --relay "$url" --browser "$state/browser.json" --user sam "$state/a" > /dev/null || fail "setup"
   demo a sync > /dev/null || fail "setup sync"
   # B joins through an enrollment: A shows the payload, B reads it.
   demo a invite --confirm yes > "$state/invite.out" 2>&1 &
@@ -46,7 +53,7 @@ if [ ! -e "$state/setup-done" ]; then
   for _ in $(seq 100); do grep -q '^payload: ' "$state/invite.out" && break; sleep 0.1; done
   payload=$(sed -n 's/^payload: //p' "$state/invite.out")
   [ -n "$payload" ] || fail "no payload"
-  python3 -m snailfish_demo.cli join --relay http://127.0.0.1:8080 --scan "$payload" --confirm yes --name B "$state/b" > /dev/null || fail "join"
+  python3 -m snailfish_demo.cli join --relay "$url" --scan "$payload" --confirm yes --name B "$state/b" > /dev/null || fail "join"
   wait "$invite" || fail "invite"
   sync
   touch "$state/setup-done" && sync "$state"

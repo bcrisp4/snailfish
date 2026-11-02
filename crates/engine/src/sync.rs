@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use rusqlite::{Transaction, TransactionBehavior};
 use snailfish_protocol::encoding::encode_id;
 use snailfish_protocol::request::{self, Params, Target};
+use snailfish_protocol::setup;
 use snailfish_protocol::space::{self, Mode, Verdict};
 use snailfish_protocol::wire::{self, AppendResult, FetchEntry, Head, Limits};
 
@@ -29,6 +30,7 @@ enum Phase {
     Grants,
     Push,
     LastFetch,
+    DeviceReport,
     Done,
 }
 
@@ -49,6 +51,8 @@ enum Sent {
     RepairChunk(Vec<(u64, String)>),
     RepairFinish,
     Status,
+    // The body of the device status report.
+    DeviceStatus(Vec<u8>),
 }
 
 /// A repair session in this exchange (`PROTOCOL.md` 10.9).
@@ -88,6 +92,9 @@ pub struct Sync {
 
 /// The most fetch pages with no new entry in one exchange.
 const MAX_EMPTY_PAGES: u32 = 3;
+/// An unchanged device status report goes at most once in this many
+/// seconds of corrected time (`PROTOCOL.md` 10.11).
+pub(crate) const REPORT_EVERY: u64 = 3600;
 
 /// A fault of the relay that stops sync (`stopped: fork`).
 struct Stop(String);
@@ -127,6 +134,15 @@ impl Sync {
                     if engine.verified_head()?.position == 0
                         && state::setup_genesis(&engine.db)?.is_some()
                     {
+                        // [USR-6]: space creation needs a setup token, so an
+                        // engine without one asks for a sign-in.
+                        if state::setup_token(&engine.db)?.is_none() {
+                            engine.status = Status::SetupFailed {
+                                cause: "no setup token".into(),
+                            };
+                            self.phase = Phase::Done;
+                            continue;
+                        }
                         Some(Sent::Create)
                     } else {
                         self.phase = Phase::FirstFetch;
@@ -151,6 +167,26 @@ impl Sync {
                     next
                 }
                 Phase::Report => Some(Sent::Status),
+                Phase::DeviceReport => {
+                    let now = engine.now();
+                    let (applied, outbox, oldest) = state::report_fields(&engine.db, now)?;
+                    let body = setup::device_status_body(&setup::DeviceStatus {
+                        state: engine.status.text().to_owned(),
+                        outbox,
+                        oldest,
+                        applied,
+                        epoch: 1,
+                    });
+                    // PROTOCOL.md 10.11: a report that equals the last
+                    // accepted one goes at most once in REPORT_EVERY.
+                    let unchanged = state::last_report(&engine.db)?
+                        .is_some_and(|(b, t)| b == body && now < t.saturating_add(REPORT_EVERY));
+                    if unchanged {
+                        self.phase = Phase::Done;
+                        continue;
+                    }
+                    Some(Sent::DeviceStatus(body))
+                }
                 Phase::Grants | Phase::Push => {
                     if !self.queued {
                         self.queue(engine)?;
@@ -240,11 +276,13 @@ impl Sync {
             ),
             Sent::Create => {
                 let g = state::setup_genesis(&engine.db)?.ok_or(EngineError::UnexpectedResponse)?;
+                let token =
+                    state::setup_token(&engine.db)?.ok_or(EngineError::UnexpectedResponse)?;
                 (
                     "PUT",
                     space_path,
                     String::new(),
-                    wire::genesis_body(&g),
+                    wire::genesis_body(&g, &token),
                     true,
                 )
             }
@@ -293,6 +331,13 @@ impl Sync {
                     true,
                 )
             }
+            Sent::DeviceStatus(body) => (
+                "POST",
+                format!("{space_path}/device-status"),
+                String::new(),
+                body.clone(),
+                true,
+            ),
         })
     }
 
@@ -380,6 +425,10 @@ impl Sync {
             Sent::RepairChunk(chunk) => self.repair_answer(&chunk, body, false),
             Sent::RepairFinish => self.repair_finished(engine, body),
             Sent::Status => self.status_answer(engine, body),
+            Sent::DeviceStatus(report) => {
+                self.phase = Phase::Done;
+                state::set_last_report(&engine.db, &report, engine.now()).map_err(Answer::Engine)
+            }
         };
         match result {
             Ok(()) => Ok(()),
@@ -390,7 +439,13 @@ impl Sync {
             }
             Err(Answer::Stop(Stop(cause))) => {
                 engine.status = Status::Fork { cause };
-                self.phase = Phase::Done;
+                // An active device reports the stop to the user page. A new
+                // device in its enrollment is not active, so it sends nothing.
+                self.phase = if enrolling(engine)? {
+                    Phase::Done
+                } else {
+                    Phase::DeviceReport
+                };
                 Ok(())
             }
             Err(Answer::Engine(e)) => Err(e),
@@ -411,6 +466,12 @@ impl Sync {
             self.phase = Phase::Repair;
             return Ok(());
         }
+        // A refused status report changes no status: the report is for the
+        // user page only.
+        if matches!(sent, Sent::DeviceStatus(_)) {
+            self.phase = Phase::Done;
+            return Ok(());
+        }
         let late = self.repair.as_ref().is_some_and(|r| r.late);
         engine.status = match code.as_deref() {
             Some("wrong_authority") => Status::RelayAuthority,
@@ -424,6 +485,13 @@ impl Sync {
             // the chain check, so the relay does not know the signer.
             Some("bad_repair" | "unknown_device") if late => Status::RepairNeedsAnotherDevice,
             Some("expired") => Status::ClockSkew,
+            Some(code @ ("bad_setup" | "space_limit" | "bad_request"))
+                if matches!(sent, Sent::Create) =>
+            {
+                Status::SetupFailed {
+                    cause: code.to_owned(),
+                }
+            }
             Some("space_exists") => Status::Fork {
                 cause: "the relay holds another genesis record for this log".into(),
             },
@@ -447,7 +515,16 @@ impl Sync {
             },
             _ => Status::RelayUnavailable,
         };
-        self.phase = Phase::Done;
+        // DESIGN.md "Monitoring and alerting" item 6: a refusal that leaves
+        // this device active in the space still reaches the user page. The
+        // other refusals would refuse the report too.
+        self.phase = match (&engine.status, &sent) {
+            (_, Sent::Create) => Phase::Done,
+            (Status::Fork { .. } | Status::Degraded { .. }, _) if !enrolling(engine)? => {
+                Phase::DeviceReport
+            }
+            _ => Phase::Done,
+        };
         Ok(())
     }
 
@@ -585,6 +662,8 @@ impl Sync {
         }
         self.phase = match self.phase {
             Phase::FirstFetch => self.after_first_fetch(engine).map_err(Answer::Engine)?,
+            // PROTOCOL.md 10.11: the status report is the last request.
+            Phase::LastFetch => Phase::DeviceReport,
             _ => Phase::Done,
         };
         Ok(())
@@ -682,6 +761,11 @@ impl Sync {
                 // outbox and goes again after the hold.
                 AppendResult::Refused(code) if code == "on_hold" => {
                     engine.status = Status::RestoreHold;
+                }
+                // [QTA-4]: transient. The change stays in the outbox and
+                // goes again at each later sync.
+                AppendResult::Refused(code) if code == "quota" => {
+                    engine.status = Status::Quota;
                 }
                 // [DLV-9]: a permanent refusal.
                 AppendResult::Refused(code) => {

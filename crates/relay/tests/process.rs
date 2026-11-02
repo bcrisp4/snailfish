@@ -88,3 +88,26 @@ fn serve_refuses_an_empty_authority() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--authority"));
 }
+
+/// Without this, `user add` could exit 0 and print no invite link, and the
+/// operator would have no way to give the user a passkey.
+#[test]
+fn user_add_prints_the_invite_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(BIN)
+        .args(["user", "add", "sam", "--data"])
+        .arg(dir.path().join("data"))
+        .args(["--authority", "relay.test"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let link = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        link.starts_with("https://relay.test/u/invite#it_"),
+        "{link}"
+    );
+}

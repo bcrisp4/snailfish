@@ -28,7 +28,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-PREFIXES = ("DLV", "MRG", "LOG", "CMP", "ENR", "FRK", "WIR", "VER", "STO")
+PREFIXES = ("DLV", "MRG", "LOG", "CMP", "ENR", "FRK", "WIR", "VER", "STO", "USR", "QTA")
 VALID_ID = re.compile(rf"^(?:{'|'.join(PREFIXES)})-[1-9][0-9]*$")
 # Anything that looks like a rule tag, valid or not.
 TAG_LIKE = re.compile(r"\[([A-Za-z]{2,5}-[0-9A-Za-z]+)\]")

@@ -87,7 +87,11 @@ func checkHTTPWith(h *httpJ, w *world, mut string) error {
 		}
 		r := *rs
 		r.authority = c.Authority
-		if code := r.verifyRequest(request{c.Method, c.Path, c.Query, c.Body, c.Headers}); code != "" {
+		verify := r.verifyRequest
+		if c.Path == setupPath {
+			verify = r.verifySetupRequest
+		}
+		if code := verify(request{c.Method, c.Path, c.Query, c.Body, c.Headers}); code != "" {
 			return fmt.Errorf("signed %s: reference relay returns %s", c.Name, code)
 		}
 	}
@@ -146,6 +150,19 @@ func checkHTTPWith(h *httpJ, w *world, mut string) error {
 			return fmt.Errorf("append_hold %s: head differs from the reference", c.Name)
 		}
 	}
+	for _, c := range h.AppendQuota {
+		sg := keys[c.Signer]
+		if sg == nil {
+			return fmt.Errorf("append_quota %s: unknown signer", c.Name)
+		}
+		got, err := replayQuota(sp, c, sg.idText, h.Limits)
+		if err != nil {
+			return fmt.Errorf("append_quota %s: %w", c.Name, err)
+		}
+		if err := compare("append_quota "+c.Name, c, got); err != nil {
+			return err
+		}
+	}
 	for _, c := range h.Fetch {
 		st := sp.clone()
 		st.hold = c.Hold
@@ -183,6 +200,9 @@ func checkHTTPWith(h *httpJ, w *world, mut string) error {
 		if err := compare("enroll "+c.Name, c, got); err != nil {
 			return err
 		}
+	}
+	if err := checkSetup(h, w, mut); err != nil {
+		return err
 	}
 	if err := checkHTTPCoverage(h); err != nil {
 		return err
@@ -234,6 +254,15 @@ func checkHTTPCoverage(h *httpJ) error {
 			have[fmt.Sprintf("status hold %v reported %v", c.Response.Hold, *c.TipInLog)] = true
 		}
 	}
+	for _, c := range h.AppendQuota {
+		for _, r := range c.Results {
+			if r.Error != nil {
+				have["append_quota "+*r.Error] = true
+			} else {
+				have["append_quota "+r.Status] = true
+			}
+		}
+	}
 	for _, c := range h.Repair {
 		for _, s := range c.Steps {
 			if s.Error != nil {
@@ -262,6 +291,7 @@ func checkHTTPCoverage(h *httpJ) error {
 		"enroll bad_request", "enroll bad_digest", "enroll unknown_device",
 		"enroll unknown_session", "enroll session_exists", "enroll bad_step", "enroll session_closed",
 		"append stale_base",
+		"append_quota quota", "append_quota stored", "append_quota known",
 		"append_hold on_hold", "append_hold known", "append_hold stored", "append_hold stale_base",
 		"fetch hold true", "fetch hold false",
 		"status bad_request", "status hold true reported true", "status hold true reported false", "status hold false reported null",
@@ -475,5 +505,27 @@ func replayEnroll(envs []string, logID, tenant string, c enrollCaseJ, keys map[s
 		}
 		out.Steps = append(out.Steps, ns)
 	}
+	return out, nil
+}
+
+// replayQuota runs an append_quota case on a copy of sp with the quota of the
+// case. It keeps name, signer, quota and body, and takes used, the results and
+// the head from the reference relay.
+func replayQuota(sp *space, c quotaJ, keyid string, lim limitsJ) (quotaJ, error) {
+	st := sp.clone()
+	st.quota = c.Quota
+	out := quotaJ{Name: c.Name, Signer: c.Signer, Quota: c.Quota, Used: st.used, Body: c.Body}
+	if c.Quota < 1 {
+		return out, fmt.Errorf("quota %d", c.Quota)
+	}
+	res, err := st.appendBatch(keyid, c.Body, lim)
+	if err != nil {
+		return out, err
+	}
+	for _, r := range res {
+		out.Results = append(out.Results, resultJOf(r))
+	}
+	n := len(st.entries)
+	out.Head = headJ{n, hx(st.digestAt(n))}
 	return out, nil
 }

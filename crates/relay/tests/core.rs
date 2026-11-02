@@ -243,9 +243,13 @@ fn put_is_idempotent_and_refuses_other_genesis() {
     }
     .to_json("d_x");
     let path = fx.space_path(fx.tenant(), fx.log());
-    let r = fx
-        .relay
-        .handle(&fx.signed("PUT", &path, "", &wire::genesis_body(&other), "A"));
+    let r = fx.relay.handle(&fx.signed(
+        "PUT",
+        &path,
+        "",
+        &wire::genesis_body(&other, &fx.setup_token("sam", "A")),
+        "A",
+    ));
     assert_eq!((r.status, error_code(&r).as_str()), (409, "space_exists"));
     assert_eq!(
         wire::parse_head_body(&fx.put_genesis(fx.tenant()).body).unwrap(),
@@ -260,20 +264,32 @@ fn put_refuses_invalid_records_and_other_signers() {
     let g = s(&fx.h["space"]["genesis"]);
     // Another log ID in the path.
     let other_log = fx.space_path(fx.tenant(), "l_00000000000000000000000000000000");
-    let r = fx
-        .relay
-        .handle(&fx.signed("PUT", &other_log, "", &wire::genesis_body(g), "A"));
+    let r = fx.relay.handle(&fx.signed(
+        "PUT",
+        &other_log,
+        "",
+        &wire::genesis_body(g, &fx.setup_token("sam", "A")),
+        "A",
+    ));
     assert_eq!((r.status, error_code(&r).as_str()), (422, "invalid_record"));
     // A change record is not a genesis record.
     let change = fx.change("A", 1, [1; 16], 60, 1);
-    let r = fx
-        .relay
-        .handle(&fx.signed("PUT", &path, "", &wire::genesis_body(&change), "A"));
+    let r = fx.relay.handle(&fx.signed(
+        "PUT",
+        &path,
+        "",
+        &wire::genesis_body(&change, &fx.setup_token("sam", "A")),
+        "A",
+    ));
     assert_eq!((r.status, error_code(&r).as_str()), (422, "invalid_record"));
     // The signer is not the device of the genesis record.
-    let r = fx
-        .relay
-        .handle(&fx.signed("PUT", &path, "", &wire::genesis_body(g), "B"));
+    let r = fx.relay.handle(&fx.signed(
+        "PUT",
+        &path,
+        "",
+        &wire::genesis_body(g, &fx.setup_token("sam", "A")),
+        "B",
+    ));
     assert_eq!((r.status, error_code(&r).as_str()), (403, "unknown_device"));
     let r = fx.relay.handle(&fx.signed("PUT", &path, "", b"{}", "A"));
     assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_request"));

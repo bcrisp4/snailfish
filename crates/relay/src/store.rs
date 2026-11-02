@@ -22,7 +22,7 @@ pub enum Kind {
 }
 
 /// The schema version of every file kind.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The schema of `directory.db`.
 const DIRECTORY_DDL: &str = "CREATE TABLE IF NOT EXISTS users (
@@ -39,14 +39,33 @@ const DIRECTORY_DDL: &str = "CREATE TABLE IF NOT EXISTS users (
                     device_id TEXT NOT NULL, expires INTEGER NOT NULL, state TEXT NOT NULL,
                     m0 TEXT, m1 TEXT, m2 TEXT, m3 TEXT, m4 TEXT, m5 TEXT
                  ) WITHOUT ROWID;
-                 CREATE INDEX IF NOT EXISTS enroll_sessions_expires ON enroll_sessions (expires);";
+                 CREATE INDEX IF NOT EXISTS enroll_sessions_expires ON enroll_sessions (expires);
+                 CREATE TABLE IF NOT EXISTS passkeys (
+                    cred_id BLOB PRIMARY KEY, user_id TEXT NOT NULL,
+                    passkey TEXT NOT NULL, created INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE INDEX IF NOT EXISTS passkeys_user ON passkeys (user_id);
+                 CREATE TABLE IF NOT EXISTS invites (
+                    user_id TEXT PRIMARY KEY, token_hash BLOB NOT NULL UNIQUE, expires INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS sessions (
+                    id_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, expires INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS codes (
+                    code_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, challenge TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL, expires INTEGER NOT NULL, used INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS setup_tokens (
+                    token_hash BLOB PRIMARY KEY, user_id TEXT NOT NULL, device_id BLOB NOT NULL,
+                    expires INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS setup_nonces (
+                    keyid TEXT NOT NULL, nonce TEXT NOT NULL, expires INTEGER NOT NULL,
+                    PRIMARY KEY (keyid, nonce)
+                 ) WITHOUT ROWID;";
 
-impl Kind {
-    fn ddl(self) -> &'static str {
-        match self {
-            Self::Directory => DIRECTORY_DDL,
-            Self::Tenant => {
-                "CREATE TABLE IF NOT EXISTS tenant (
+/// The schema of a `tenant.db`.
+const TENANT_DDL: &str = "CREATE TABLE IF NOT EXISTS tenant (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     handle TEXT NOT NULL
                  );
@@ -78,10 +97,38 @@ impl Kind {
                     fresh INTEGER NOT NULL,
                     time INTEGER NOT NULL,
                     PRIMARY KEY (log_id, device_id)
-                 ) WITHOUT ROWID;"
-            }
-            Self::Space => {
-                "CREATE TABLE IF NOT EXISTS space (
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS limits (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    max_spaces INTEGER,
+                    space_bytes INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS device_status (
+                    log_id TEXT NOT NULL, device_id TEXT NOT NULL, state TEXT NOT NULL,
+                    outbox INTEGER NOT NULL, oldest INTEGER, applied INTEGER NOT NULL,
+                    epoch INTEGER NOT NULL, time INTEGER NOT NULL, behind_since INTEGER,
+                    PRIMARY KEY (log_id, device_id)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE
+                 );
+                 CREATE TABLE IF NOT EXISTS group_devices (
+                    group_id INTEGER NOT NULL, device_id TEXT NOT NULL,
+                    PRIMARY KEY (group_id, device_id)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS webhook (
+                    id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT NOT NULL,
+                    last_time INTEGER, last_result TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS alerts (
+                    key TEXT PRIMARY KEY, sent INTEGER NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS webhook_outbox (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, queued INTEGER NOT NULL
+                 );";
+
+/// The schema of a space file.
+const SPACE_DDL: &str = "CREATE TABLE IF NOT EXISTS space (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     log_id BLOB NOT NULL,
                     app_id TEXT NOT NULL,
@@ -125,8 +172,21 @@ impl Kind {
                     base_position INTEGER NOT NULL,
                     tip INTEGER,
                     finished INTEGER
-                 ) WITHOUT ROWID;"
-            }
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS usage (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    bytes INTEGER NOT NULL
+                 );
+                 INSERT OR IGNORE INTO usage (id, bytes)
+                    SELECT 1, COALESCE(SUM(length(CAST(envelope AS BLOB))), 0) FROM entries
+                    WHERE payload_type LIKE 'snailfish.change.%';";
+
+impl Kind {
+    fn ddl(self) -> &'static str {
+        match self {
+            Self::Directory => DIRECTORY_DDL,
+            Self::Tenant => TENANT_DDL,
+            Self::Space => SPACE_DDL,
         }
     }
 }

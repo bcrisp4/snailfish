@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "The Snailfish demo task app: a CLI on the Python binding."
 requires-python = ">=3.13"
 license = "MIT OR Apache-2.0"
-dependencies = ["httpx==0.28.1"]
+dependencies = ["httpx==0.28.1", "cbor2==5.7.1", "cryptography==46.0.3"]
 
 [project.scripts]
 snailfish-demo = "snailfish_demo.cli:main"
@@ -14,7 +14,7 @@ requires = ["uv_build>=0.10,<0.11"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414"]
+dev = ["pytest==9.1.1", "ruff==0.17.2", "pyright==1.1.414", "playwright==1.55.0"]
 
 [tool.pytest.ini_options]
 addopts = ["--strict-markers", "-q"]

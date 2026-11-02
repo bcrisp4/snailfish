@@ -7,7 +7,7 @@ The `protocol` crate, the sync engine, the Python binding and the Swift binding 
 | `protocol.json` | `tools/vectorgen` (Go) | One valid space log with every record type of `PROTOCOL.md` section 6, envelope variants, frames, IDs, key sets, change ciphertexts and recovery keys |
 | `strict-json.json` | `tools/vectorgen` (Go) | Payloads that `PROTOCOL.md` section 3 accepts or refuses, one case for each rule, and the section 6 rules for `sign` keys, recovery proofs and epoch records |
 | `recovery-key.json` | `tools/vectorgen` (Go) | Valid and invalid recovery key text forms (`PROTOCOL.md` section 9) |
-| `http.json` | `tools/vectorgen` (Go) | Request signatures (`PROTOCOL.md` section 8) and append, fetch, status, repair and enrollment session results of the HTTP API (section 10) |
+| `http.json` | `tools/vectorgen` (Go) | Request signatures (`PROTOCOL.md` section 8), append, quota, fetch, status, repair, enrollment session, space creation and device status results of the HTTP API (section 10), and the token texts, sign-in, setup token and webhook rules of section 12 |
 | `enroll.json` | `tools/vectorgen` (Go) | Session codes and payloads, transcripts and confirmations of enrollment (`PROTOCOL.md` sections 6.3 and 11) |
 | `third_party/cctv-ed25519.json` | C2SP CCTV, commit `50a8ecf2a220f4c8bdc4f085789b8e85c26829e7`, BSD-3-Clause (`third_party/CCTV-LICENSE`) | The 914 Ed25519 edge-case vectors |
 | `third_party/hpke-rfc9180.json` | `cfrg/draft-irtf-cfrg-hpke` commit `b1f7cb0cdeab6906c61b3d6574e8bdfdbe1cd3fb` | RFC 9180 vector for base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20Poly1305 |
@@ -153,12 +153,47 @@ All times are Unix seconds. Byte strings are lowercase hex, unless the field is 
           "response": JSON value or null,             the response body: {"expires": n} for open, else the session object. null if the relay returns an error.
           "error": code or null
       } ]
-  } ]
+  } ],
+  "append_quota": [ {
+      "name", "signer": device name,
+      "quota": n,                                     the space quota in bytes
+      "used": n,                                      the stored change bytes of space.log before the case
+      "body": str, "results": [ as in "append" ], "head": { "position", "digest": hex }
+  } ],
+  "tokens": [ { "name", "kind": "invite" or "code" or "setup", "text", "valid": bool, "hash": hex or null } ],
+  "pkce": {
+      "valid":   [ { "name", "verifier", "challenge" } ],
+      "invalid": [ { "name", "verifier" } ]
+  },
+  "redirect_uris": [ { "name", "text", "valid": bool } ],   text: the decoded redirect URI
+  "states":        [ { "name", "text", "valid": bool } ],
+  "authorize":     [ { "name", "text", "valid": bool } ],   text: the query of GET /u/authorize, without "?"
+  "setup_codes": [ { "code": "ac_...", "challenge", "redirect_uri", "tenant", "expires": n, "used": bool } ],
+  "setup_token": [ {
+      "name", "signer": device name,
+      "body": str, "headers": [ [name, value] ],      the request POST /v1/setup/token at the relay time "now"
+      "status": n,
+      "response": { "tenant", "expires": n } or null, null if the relay returns an error
+      "error": code or null
+  } ],
+  "setup_tokens": [ { "token": "st_...", "device": device name, "tenant", "expires": n } ],
+  "put": [ {
+      "name", "signer": device name, "path", "body": str,
+      "existing": envelope str or "",                 the genesis record of the space before the case, "" for no space
+      "status": n, "head": { "position", "digest": hex } or null, "error": code or null
+  } ],
+  "device_status": [ { "name", "body": str, "error": "bad_request" or null } ],
+  "webhook": {
+      "allowlist": [ host ],
+      "urls": [ { "name", "text", "valid": bool } ],
+      "messages": [ { "text", "body": str } ]         body: the exact request body bytes
+  }
 }
 ```
 
 - Each `signed` case verifies with the `sign_seed` public key of its signer. `headers` are the exact header values.
-- Each `invalid` case breaks one check of `PROTOCOL.md` 8.6. The relay returns `error` for it. The space has the devices of `space.log` as active devices.
+- Each `invalid` case breaks one check of `PROTOCOL.md` 8.6, or the session cookie rule of section 10 (also with other cookies in the header). The relay returns `error` for it.
+- The `signed` case `post-setup-token` is signed by C. C is not active in the space. Step 5 of 8.6 accepts the device of the `device` keys of the body (12.3). The space has the devices of `space.log` as active devices.
 - `space.log` is the log of the space before each `append` case: genesis (recovery key R1, first device A), a change by A, a grant to B by A, and a change by B. Each `append` case starts from this log, so the cases are independent.
 - `append` covers a new change, an exact retry (`known`), the same `change_id` with another record hash (`conflict`), a second copy in one request, a bad base, a base at or after the new position, an author that differs from the request signer (a record by C that A sends), another log ID, an unsupported type, a wrong epoch, a too large change, a grant of an active device, and one request with mixed results.
 - `append` also covers the base rule for security records ([LOG-7]): a grant whose base is before the last security record is `stale_base`, and a grant whose base is after the last security record but before a change is `stored`.
@@ -172,7 +207,19 @@ All times are Unix seconds. Byte strings are lowercase hex, unless the field is 
 - `enroll` also covers each message out of order (`bad_step`), a `done` body and a trusted `hello` body on the new-device route, a `confirm` body and a new-device `hello` body on the trusted route, a `done` body with another tenant (`bad_request`), and writes after done (`session_closed`, except exact retries).
 - `enroll` also covers a cancel by each side, writes and cancel retries after a cancel, a read and a write at and after `expires` (`unknown_session`), an open again after expiry, an unknown session on each route, unknown fields, malformed bodies, and the check order of the signed routes: `bad_digest`, then `bad_request`, then `unknown_device`, then the session.
 - A step `response` is a JSON value. A reader compares parsed JSON values, because the relay sends each stored message as it stored it, in any layout. A new-device or trusted object with no message is `{}`.
+- `enroll` also covers a duplicate key at the top level and in a `hello` object (`bad_request`).
 - A reader signs each request of a signed step with the `sign_seed` of its signer, a `created` of `at` and a nonce that it did not use before.
+
+- `append_quota` starts each case from `space.log`. The stored change bytes are the sum of the byte lengths of the change envelopes of the log, as `space.log` holds them (10.6 step 14). Security records do not count. A reader sets the space quota to `quota` and checks that it computes `used`.
+- `append_quota` covers a change that fits exactly, a change one byte over (`quota`, nothing stored), a grant at a full quota (`stored`), an exact retry at a full quota (`known`), two changes in one request where the first counts for the second, and an envelope with extra whitespace, which counts with its length in the request.
+- `tokens` holds valid and invalid texts of `PROTOCOL.md` 2.2. `kind` names the prefix that the reader expects. `hash` is SHA-256 of the 32 token bytes.
+- `pkce` computes `challenge` as `BASE64URL(SHA-256(ASCII(verifier)))` without padding. The first valid case is RFC 7636 appendix B.
+- `redirect_uris`, `states` and `authorize` cover one rule of 12.2 for each invalid case. A reader decodes each `authorize` name and value once, as `application/x-www-form-urlencoded`, so `+` is a space.
+- `setup_token` cases run against `setup_codes` at the relay time `now`, with no used nonce. The response also holds a `token` that the relay makes. A reader checks only that it is an `st_` text.
+- `setup_token` covers a valid exchange, malformed bodies, a duplicate key, a `keyid` that is not the device ID of `device` (`unknown_device`), the session cookie (alone and among other cookies), a foreign cookie that the relay ignores, and each `bad_setup` cause of 12.3 steps 4 and 5.
+- `put` cases run against `setup_tokens` at the relay time `now`, after 8.6 steps 1 to 4. They cover a create (`201`), exact retries with an unknown or expired token (`200`), another genesis record (`space_exists`), malformed `setup` values (`bad_request`), each `bad_setup` cause of 10.5 step 3, a signer that is not the genesis device and a genesis record of another log.
+- `device_status` covers valid bodies and one rule of 10.11 or section 3 for each invalid body.
+- `webhook.urls` uses `webhook.allowlist`. An IPv6 entry of the allowlist has no brackets. The cases cover a query, default and explicit ports, port limits, IPv6 literals in and not in their shortest form, and bytes that the target does not allow. `webhook.messages` escapes `"`, `\` and control characters, and writes each other character as UTF-8.
 
 ## Format of `enroll.json`
 

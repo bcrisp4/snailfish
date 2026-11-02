@@ -17,6 +17,7 @@ pub mod records;
 pub mod recovery;
 pub mod repair;
 pub mod request;
+pub mod setup;
 pub mod sig;
 pub mod space;
 pub mod strict;

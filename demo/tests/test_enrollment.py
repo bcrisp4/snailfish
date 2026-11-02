@@ -231,7 +231,7 @@ def test_relay_that_substitutes_keys_causes_a_code_mismatch(tmp_path: Path) -> N
     (`specs/enrollment/user_blind.pv` shows why the comparison matters)."""
     port = free_port()
     mitm = SubstitutingRelay(port)
-    relay = Relay(tmp_path / "relay", authority=f"127.0.0.1:{port}")
+    relay = Relay(tmp_path / "relay", authority=f"localhost:{port}")
     mitm.target = relay.port
     server = mitm.serve()
     try:

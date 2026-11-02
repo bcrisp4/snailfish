@@ -156,20 +156,23 @@ pub fn new_device_keys() -> Result<DeviceKeys, EngineError> {
     })
 }
 
-/// Give the setup records to the engine of the first device in `data_dir`,
-/// so that its next sync creates the space on the relay.
+/// Give the setup records and the setup token to the engine of the first
+/// device in `data_dir`, so that its next sync creates the space on the
+/// relay (`PROTOCOL.md` 10.5, [USR-6]).
 ///
 /// # Errors
 ///
 /// As [`crate::Engine::open`], and [`EngineError::Invalid`] for an envelope
-/// that does not parse.
+/// that does not parse or a text that is not a setup token.
 pub fn install_setup(
     data_dir: &Path,
     space: SpaceRef,
     keys: &DeviceKeys,
     envelopes: &[String],
+    setup_token: &str,
 ) -> Result<(), EngineError> {
     let e = crate::Engine::open(data_dir, space, keys)?;
+    crate::state::set_setup_token(&e.db, setup_token)?;
     crate::state::add_setup(&e.db, envelopes)
 }
 

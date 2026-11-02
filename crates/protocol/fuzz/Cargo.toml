@@ -85,3 +85,10 @@ path = "fuzz_targets/mailbox.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "setup"
+path = "fuzz_targets/setup.rs"
+test = false
+doc = false
+bench = false

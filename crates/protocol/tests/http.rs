@@ -87,10 +87,37 @@ fn relay_check(h: &Value, sp: &MemorySpace, c: &Value, authority: &str) -> Resul
         path: s(&c["path"]),
         query: s(&c["query"]),
     };
+    // PROTOCOL.md 10: a sync or setup route refuses the session cookie
+    // first, and ignores other cookies.
+    let session_cookie = hs
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
+        .any(|c| c.trim().split('=').next() == Some("sf_session"));
+    if session_cookie {
+        return Err("bad_request".into());
+    }
+    // 12.3 step 3: the token route takes the key of the body only.
+    let body_key = (t.path == "/v1/setup/token")
+        .then(|| snailfish_protocol::setup::parse_token_request(s(&c["body"]).as_bytes()).ok())
+        .flatten()
+        .map(|r| {
+            (
+                snailfish_protocol::keys::device_id(&r.device.sign, &r.device.seal),
+                r.device.sign,
+            )
+        });
     let now = h["now"].as_u64().unwrap();
-    let v = request::check(&pairs, &t, s(&c["body"]).as_bytes(), now, |id| {
-        sp.devices.get(id).copied()
-    })
+    let v = request::check(
+        &pairs,
+        &t,
+        s(&c["body"]).as_bytes(),
+        now,
+        |id| match body_key {
+            Some((k, sign)) => (id == &k).then_some(sign),
+            None => sp.devices.get(id).copied(),
+        },
+    )
     .map_err(|e| e.code().to_owned())?;
     let used = h["used_nonces"].as_array().unwrap().iter().any(|p| {
         s(&p[0]) == snailfish_protocol::encoding::encode_id("d_", &v.keyid)

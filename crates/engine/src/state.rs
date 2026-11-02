@@ -162,7 +162,23 @@ fn migrate(db: &Connection) -> Result<(), EngineError> {
              COMMIT;",
         )?;
     }
-    const { assert!(SCHEMA_VERSION == 4) };
+    if found < 5 {
+        // M5: the setup token of the first device (PROTOCOL.md 12.3), and
+        // the fields of the device status report (10.11). An old outbox row
+        // keeps a NULL queue time: the migration has no relay clock offset,
+        // so report_fields stamps it with the corrected time.
+        db.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE setup_token (id INTEGER PRIMARY KEY CHECK (id = 1), token BLOB NOT NULL);
+             ALTER TABLE meta ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE meta ADD COLUMN report BLOB;
+             ALTER TABLE meta ADD COLUMN report_time INTEGER;
+             ALTER TABLE outbox ADD COLUMN queued INTEGER;
+             PRAGMA user_version = 5;
+             COMMIT;",
+        )?;
+    }
+    const { assert!(SCHEMA_VERSION == 5) };
     Ok(())
 }
 
@@ -281,9 +297,9 @@ pub(crate) fn enqueue(e: &mut Engine, rows: &[OutboxRow]) -> Result<EnqueueResul
             }
             (None, None) => {
                 tx.execute(
-                    "INSERT INTO outbox (change_id, content_hash, ciphertext, envelope, state)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![&cid[..], &hash[..], ct, env, PENDING],
+                    "INSERT INTO outbox (change_id, content_hash, ciphertext, envelope, state, queued)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![&cid[..], &hash[..], ct, env, PENDING, to_i64(e.now())?],
                 )?;
                 out.stored.push(cid.to_vec());
             }
@@ -698,6 +714,91 @@ pub(crate) fn add_setup(db: &Connection, envelopes: &[String]) -> Result<(), Eng
         )?;
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Store the setup token of the first device (`PROTOCOL.md` 12.3).
+pub(crate) fn set_setup_token(db: &Connection, token: &str) -> Result<(), EngineError> {
+    let t =
+        snailfish_protocol::setup::parse_token(snailfish_protocol::setup::TokenKind::Setup, token)
+            .map_err(|e| EngineError::Invalid(format!("setup token: {e}")))?;
+    db.execute(
+        "INSERT INTO setup_token (id, token) VALUES (1, ?1)
+         ON CONFLICT (id) DO UPDATE SET token = excluded.token",
+        [&t[..]],
+    )?;
+    Ok(())
+}
+
+/// The setup token of the first device, if the app gave one.
+pub(crate) fn setup_token(db: &Connection) -> Result<Option<[u8; 32]>, EngineError> {
+    let t: Option<Vec<u8>> = db
+        .query_row("SELECT token FROM setup_token WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    t.map(|t| {
+        <[u8; 32]>::try_from(t)
+            .map_err(|_| EngineError::Storage("a stored setup token is not 32 bytes".into()))
+    })
+    .transpose()
+}
+
+/// Keep the applied position of the last `changes_after` call (10.11).
+pub(crate) fn set_applied(db: &Connection, position: u64) -> Result<(), EngineError> {
+    // Most calls repeat the value, and an unchanged row needs no write.
+    db.execute(
+        "UPDATE meta SET applied = ?1 WHERE applied != ?1",
+        [to_i64(position)?],
+    )?;
+    Ok(())
+}
+
+/// The fields of the device status report (10.11): the applied position,
+/// the pending outbox rows and the queue time of the oldest one. A row from
+/// before schema 5 gets `now`, the corrected time, as its queue time.
+pub(crate) fn report_fields(
+    db: &Connection,
+    now: u64,
+) -> Result<(u64, u64, Option<u64>), EngineError> {
+    db.execute(
+        "UPDATE outbox SET queued = ?1 WHERE queued IS NULL",
+        [to_i64(now)?],
+    )?;
+    let applied: i64 = db.query_row("SELECT applied FROM meta", [], |r| r.get(0))?;
+    let (n, oldest): (i64, Option<i64>) = db.query_row(
+        "SELECT count(*), MIN(queued) FROM outbox WHERE state = ?1",
+        [PENDING],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let n = to_u64(n)?;
+    let oldest = if n == 0 {
+        None
+    } else {
+        oldest.map(to_u64).transpose()?
+    };
+    Ok((to_u64(applied)?, n, oldest))
+}
+
+/// The last device status report that the relay accepted, and its corrected
+/// time.
+pub(crate) fn last_report(db: &Connection) -> Result<Option<(Vec<u8>, u64)>, EngineError> {
+    let (body, time): (Option<Vec<u8>>, Option<i64>) =
+        db.query_row("SELECT report, report_time FROM meta", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    match (body, time) {
+        (Some(b), Some(t)) => Ok(Some((b, to_u64(t)?))),
+        _ => Ok(None),
+    }
+}
+
+/// Keep the device status report that the relay accepted (10.11).
+pub(crate) fn set_last_report(db: &Connection, body: &[u8], time: u64) -> Result<(), EngineError> {
+    db.execute(
+        "UPDATE meta SET report = ?1, report_time = ?2",
+        params![body, to_i64(time)?],
+    )?;
     Ok(())
 }
 

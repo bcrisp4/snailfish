@@ -15,9 +15,6 @@ gitignore = true
 # workspace, also crates/bindings/tests.
 test_workspace = true
 timeout_multiplier = 3.0
-# The relay `webauthn` feature gates crates/relay/src/passkey.rs. The
-# workspace runs do not compile it, so the Makefile excludes it there.
-# `make rust-mutants-passkey` tests it with the feature.
 # Kani proofs and fuzz targets are not unit tests. Do not mutate them.
 exclude_globs = ["**/fuzz/**"]
 exclude_re = [
@@ -65,6 +62,23 @@ exclude_re = [
   "replace write_level -> u64 with 0",
   "replace write_level -> u64 with 1",
   "replace < with > in TrustedEnrollment::on_session",
+  # Only a storage fault inside the token exchange returns an error other
+  # than `bad_setup`, and a test cannot make one portably. With `true`, that
+  # fault commits the claimed nonce, which the refusal keeps anyway.
+  "replace match guard e.code == \"bad_setup\" with true in Relay::setup_token",
+  # Equivalent mutant: with `<=`, the expiry sweep keeps a ceremony whose
+  # expiry is exactly now until the next sweep. `Auth::take` refuses it at
+  # that time, so no finish can use it, and the next sweep drops it.
+  "replace < with <= in Auth::keep",
+  # Only send_loop_delivers_messages_and_alerts catches these. It polls for
+  # a background task, so the nextest `mutants` profile omits it, and `make
+  # check` runs it.
+  "webhook.rs:.*: replace run with \\(\\)",
+  "webhook.rs:.*: replace >= with < in run",
+  # Only sign_in_routes_are_rate_limited catches this. Its bucket refills
+  # from the wall clock, so the nextest `mutants` profile omits it, and
+  # `make check` runs it. full_map_drops_only_full_buckets covers the bucket.
+  "http.rs:.*: delete ! in handler",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`

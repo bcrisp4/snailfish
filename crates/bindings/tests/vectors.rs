@@ -243,6 +243,35 @@ fn exchange(relay: &snailfish_relay::core::Relay, engine: &std::sync::Arc<snailf
 }
 
 /// One request to the relay core, as the host app sends it.
+/// The native sign-in of `PROTOCOL.md` 12.2 and 12.3 through the binding,
+/// against the real relay core. The relay issues the code for the challenge,
+/// in place of the browser approval. A marshalling fault in `SignIn` or
+/// `SetupToken` fails here ([USR-4], [USR-5]).
+fn sign_in(relay: &snailfish_relay::core::Relay, keys: &snailfish::DeviceKeys) -> String {
+    let redirect = "com.example.tasks:/cb";
+    let si = snailfish::SignIn::new("https://sync.example.net", redirect).unwrap();
+    let url = si.authorize_url();
+    let (_, query) = url.split_once('?').unwrap();
+    let field = |k: &str| {
+        query
+            .split('&')
+            .find_map(|p| p.strip_prefix(&format!("{k}=")))
+            .unwrap()
+            .to_owned()
+    };
+    let code = relay
+        .issue_code("sam", &field("code_challenge"), redirect)
+        .unwrap();
+    let back = format!("{redirect}?code={code}&state={}", field("state"));
+    let req = si
+        .token_request(&back, keys, snailfish_relay::core::system_time())
+        .unwrap();
+    let (status, headers, body) = send(relay, req);
+    let t = si.read_token(status, &headers, &body).unwrap();
+    assert!(t.token.starts_with("st_"));
+    t.token
+}
+
 fn send(
     relay: &snailfish_relay::core::Relay,
     req: snailfish::Request,
@@ -331,7 +360,7 @@ fn engine_object_syncs_two_devices() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
     let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), &ka).unwrap());
     let locked = snailfish::Engine::open(pa, sp.clone(), &ka).err().unwrap();
     assert!(matches!(locked, snailfish::SnailfishError::Locked));
@@ -448,7 +477,7 @@ fn enrollment_mismatch_through_the_binding() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
     let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
     exchange(&relay, &a);
     let te = snailfish::TrustedEnrollment::new(a.clone(), None, None).unwrap();
@@ -554,7 +583,7 @@ fn engine_object_reports_a_repair() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
     let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
     exchange(&relay, &a);
     let backup = dir.path().join("backup");
@@ -604,7 +633,7 @@ fn confirm_again_crosses_the_binding() {
     let sp = space(&setup.log_id, &tenant);
     let pa = dir.path().join("a");
     let pa = pa.to_str().unwrap();
-    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes).unwrap();
+    snailfish::install_setup(pa, sp.clone(), &ka, &setup.envelopes, &sign_in(&relay, &ka)).unwrap();
     let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), &ka).unwrap());
     exchange(&relay, &a);
     let open = |t: &snailfish::TrustedEnrollment| {
@@ -700,4 +729,56 @@ fn drive_until_append(
         }
     }
     panic!("no append");
+}
+
+/// [USR-6] through the binding: a setup token of another device stops the
+/// engine with `stopped: setup failed`. A malformed new token is refused,
+/// and a new token of this device creates the space.
+#[test]
+fn setup_failure_and_new_token_cross_the_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = snailfish_relay::core::Config::new(dir.path().join("relay"), "sync.example.net");
+    cfg.secrets_dir = dir.path().join("secrets");
+    let relay = snailfish_relay::core::Relay::open(cfg).unwrap();
+    let tenant = relay.add_user("sam").unwrap();
+    let mut ka = snailfish::new_device_keys().unwrap();
+    let other = snailfish::new_device_keys().unwrap();
+    let setup = snailfish::create_space(
+        "com.example.tasks",
+        &snailfish::NewDevice {
+            keys: ka.clone(),
+            name: "A".into(),
+        },
+    )
+    .unwrap();
+    ka.app_key.clone_from(&setup.app_key);
+    let sp = space(&setup.log_id, &tenant);
+    let pa = dir.path().join("a");
+    let pa = pa.to_str().unwrap();
+    snailfish::install_setup(
+        pa,
+        sp.clone(),
+        &ka,
+        &setup.envelopes,
+        &sign_in(&relay, &other),
+    )
+    .unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp, &ka).unwrap());
+    exchange(&relay, &a);
+    let status = a.status().unwrap();
+    assert_eq!(
+        status,
+        snailfish::Status::SetupFailed {
+            cause: "bad_setup".into()
+        }
+    );
+    assert_eq!(snailfish::status_text(&status), "stopped: setup failed");
+    assert_eq!(
+        snailfish::status_text(&snailfish::Status::Quota),
+        "paused: quota"
+    );
+    assert!(a.set_setup_token("st_00").is_err());
+    a.set_setup_token(&sign_in(&relay, &ka)).unwrap();
+    exchange(&relay, &a);
+    assert_eq!(a.status().unwrap(), snailfish::Status::Ok);
 }

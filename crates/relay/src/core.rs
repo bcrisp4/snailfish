@@ -27,6 +27,10 @@ use snailfish_protocol::wire::{self, AppendResult, Head, Limits, RepairItem};
 use crate::store::{self, Kind, StoreError};
 
 mod enroll;
+mod setup;
+pub mod user;
+
+pub use user::Quotas;
 
 /// The protocol levels that the relay accepts ([VER-6]).
 pub const LEVELS: [u64; 1] = [1];
@@ -62,17 +66,41 @@ pub struct Config {
     pub limits: Limits,
     /// The relay time.
     pub clock: Clock,
+    /// The origin of the user page, for example `https://sync.example.net`
+    /// (`PROTOCOL.md` 12.4). Each user write must name it exactly ([USR-7]).
+    pub origin: String,
+    /// The `secrets` directory with `session.key` ([STO-9]). It is outside
+    /// the data directory, and backups do not copy it.
+    pub secrets_dir: PathBuf,
+    /// The default quotas of each tenant ([QTA-1], [QTA-5]).
+    pub quotas: Quotas,
+    /// The webhook host allowlist. Empty turns webhooks off ([USR-8]).
+    /// [`Relay::open`] drops empty entries, which a comma list such as
+    /// `SNAILFISH_WEBHOOK_HOSTS=""` gives.
+    pub webhook_hosts: Vec<String>,
 }
 
 impl Config {
     /// A configuration with the default limits and the system clock.
     #[must_use]
+    ///
+    /// The origin is `https://` and the authority. The `secrets` directory
+    /// is the sibling `secrets` of the data directory.
     pub fn new(data_dir: impl Into<PathBuf>, authority: impl Into<String>) -> Self {
+        let data_dir = data_dir.into();
+        let authority = authority.into();
+        let secrets_dir = data_dir
+            .parent()
+            .map_or_else(|| PathBuf::from("secrets"), |p| p.join("secrets"));
         Self {
-            data_dir: data_dir.into(),
-            authority: authority.into(),
+            origin: format!("https://{authority}"),
+            data_dir,
+            authority,
             limits: Limits::default(),
             clock: Arc::new(system_time),
+            secrets_dir,
+            quotas: Quotas::default(),
+            webhook_hosts: Vec::new(),
         }
     }
 }
@@ -90,18 +118,24 @@ pub fn system_time() -> u64 {
 pub enum OpenError {
     /// The authority is missing or malformed.
     Authority(&'static str),
+    /// The user page origin is not a valid `WebAuthn` origin.
+    Origin(&'static str),
     /// A storage failure.
     Store(StoreError),
     /// The user name is in use.
     UserExists,
+    /// No user has the name.
+    UnknownUser,
 }
 
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Authority(why) => write!(f, "authority: {why}"),
+            Self::Origin(why) => write!(f, "origin: {why}"),
             Self::Store(e) => e.fmt(f),
             Self::UserExists => f.write_str("a user with this name exists"),
+            Self::UnknownUser => f.write_str("no user has this name"),
         }
     }
 }
@@ -134,10 +168,14 @@ pub struct Request {
 pub struct Response {
     /// The HTTP status.
     pub status: u16,
-    /// The JSON body.
+    /// The body.
     pub body: Vec<u8>,
     /// The relay time for the `snailfish-time` header.
     pub time: u64,
+    /// The `content-type` of the body.
+    pub content_type: &'static str,
+    /// Other headers, for example `set-cookie` and `location`.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Response {
@@ -148,6 +186,37 @@ impl Response {
             status,
             body: wire::error_body(code, message),
             time,
+            content_type: JSON,
+            headers: Vec::new(),
+        }
+    }
+
+    /// The value of the first header with this name, if any.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header(&self.headers, name)
+    }
+}
+
+/// The JSON content type.
+pub const JSON: &str = "application/json";
+
+/// The answer of a route before the relay time.
+#[derive(Debug)]
+pub(crate) struct Reply {
+    status: u16,
+    body: Vec<u8>,
+    content_type: &'static str,
+    headers: Vec<(String, String)>,
+}
+
+impl Reply {
+    fn json((status, body): (u16, Vec<u8>)) -> Self {
+        Self {
+            status,
+            body,
+            content_type: JSON,
+            headers: Vec::new(),
         }
     }
 }
@@ -203,9 +272,11 @@ type ApiResult<T> = Result<T, ApiError>;
 #[derive(Clone)]
 pub struct Relay {
     cfg: Arc<Config>,
+    auth: Arc<user::Auth>,
 }
 
 struct Tenant {
+    id: String,
     dir: PathBuf,
 }
 
@@ -259,7 +330,8 @@ impl Relay {
     /// [`OpenError::Authority`] if the authority is empty or not in the
     /// form of `PROTOCOL.md` 8.3, and [`OpenError::Store`] for a storage
     /// failure, also a database file with a newer schema ([VER-15]).
-    pub fn open(cfg: Config) -> Result<Self, OpenError> {
+    pub fn open(mut cfg: Config) -> Result<Self, OpenError> {
+        cfg.webhook_hosts.retain(|h| !h.is_empty());
         let a = &cfg.authority;
         if a.is_empty() {
             return Err(OpenError::Authority("the relay needs an authority"));
@@ -273,7 +345,11 @@ impl Relay {
         }
         std::fs::create_dir_all(cfg.data_dir.join("tenants")).map_err(StoreError::Io)?;
         store::open(&cfg.data_dir.join("directory.db"), Kind::Directory, true)?;
-        Ok(Self { cfg: Arc::new(cfg) })
+        let auth = user::Auth::open(&cfg)?;
+        Ok(Self {
+            cfg: Arc::new(cfg),
+            auth: Arc::new(auth),
+        })
     }
 
     /// The configuration.
@@ -364,16 +440,35 @@ impl Relay {
     pub fn handle(&self, req: &Request) -> Response {
         let now = (self.cfg.clock)();
         match self.dispatch(req, now) {
-            Ok((status, body)) => Response {
-                status,
-                body,
+            Ok(r) => Response {
+                status: r.status,
+                body: r.body,
                 time: now,
+                content_type: r.content_type,
+                headers: r.headers,
             },
             Err(e) => Response::error(e.status, e.code, &e.message, now),
         }
     }
 
-    fn dispatch(&self, req: &Request, now: u64) -> ApiResult<(u16, Vec<u8>)> {
+    fn dispatch(&self, req: &Request, now: u64) -> ApiResult<Reply> {
+        if req.path == "/u" || req.path.starts_with("/u/") {
+            return self.user_route(req, now);
+        }
+        // [USR-7]: the sync and setup routes take no browser session. This
+        // check runs before every other check (PROTOCOL.md 10). Other cookies,
+        // for example of a proxy, pass.
+        if user::session_cookie(req).is_some() {
+            return Err(api(
+                400,
+                "bad_request",
+                "this route takes no session cookie",
+            ));
+        }
+        self.device_route(req, now).map(Reply::json)
+    }
+
+    fn device_route(&self, req: &Request, now: u64) -> ApiResult<(u16, Vec<u8>)> {
         let segs: Vec<&str> = req.path.split('/').collect();
         match (req.method.as_str(), segs.as_slice()) {
             ("GET", ["", "v1", "health"]) => Ok((200, br#"{"status":"ok"}"#.to_vec())),
@@ -384,6 +479,10 @@ impl Relay {
             ("POST", ["", "v1", "t", t, "s", l, "append"]) => self.append(req, now, t, l),
             ("GET", ["", "v1", "t", t, "s", l, "entries"]) => self.entries(req, now, t, l),
             ("POST", ["", "v1", "t", t, "s", l, "status"]) => self.status(req, now, t, l),
+            ("POST", ["", "v1", "t", t, "s", l, "device-status"]) => {
+                self.device_status(req, now, t, l)
+            }
+            ("POST", ["", "v1", "setup", "token"]) => self.setup_token(req, now),
             ("POST", ["", "v1", "t", t, "s", l, "repair"]) => {
                 self.repair(req, now, t, l, RepairRoute::Start)
             }
@@ -450,11 +549,18 @@ impl Relay {
             )
             .optional()?;
         let id = id.ok_or_else(|| api(404, "unknown_tenant", "no tenant has this handle"))?;
+        Ok(self.tenant_by_id(id)?)
+    }
+
+    /// The files of a tenant ID from the directory. The name check keeps a
+    /// corrupt directory row from naming a path outside `tenants`.
+    fn tenant_by_id(&self, id: String) -> Result<Tenant, StoreError> {
         if !safe_name(&id, 32) {
-            return Err(StoreError::Corrupt("a tenant ID is malformed").into());
+            return Err(StoreError::Corrupt("a tenant ID is malformed"));
         }
         Ok(Tenant {
-            dir: self.cfg.data_dir.join("tenants").join(id),
+            dir: self.cfg.data_dir.join("tenants").join(&id),
+            id,
         })
     }
 
@@ -543,13 +649,14 @@ impl Relay {
         // request, not `unknown_space`.
         let log_id = decode_id::<16>(log, "l_")
             .map_err(|_| api(400, "bad_request", "the log ID is malformed"))?;
-        let raw = wire::parse_genesis(&req.body).map_err(|e| {
+        let body = wire::parse_genesis(&req.body).map_err(|e| {
             if e.0.starts_with("genesis body:") {
                 api(400, "bad_request", e.0)
             } else {
                 api(422, "invalid_record", e.0)
             }
         })?;
+        let raw = &body.genesis;
         // The device key comes from the genesis record: the space does not
         // exist yet. The record signature is checked below ([WIR-2]).
         let record = records::parse_payload(&raw.envelope.payload_type, &raw.envelope.payload)
@@ -591,6 +698,20 @@ impl Relay {
                 409,
                 "space_exists",
                 "the space exists with another genesis record",
+            ));
+        }
+        // 10.5 steps 3 and 4 ([USR-6], [QTA-5]).
+        self.check_setup(&tenant, &body.setup, &v.keyid, now)?;
+        let spaces: i64 = tx.query_row(
+            "SELECT count(*) FROM spaces WHERE status = 'active'",
+            [],
+            |r| r.get(0),
+        )?;
+        if from_i64(spaces)? >= user::limits(&tx, &self.cfg.quotas)?.max_spaces {
+            return Err(api(
+                507,
+                "space_limit",
+                "the tenant holds the most spaces that its configuration allows",
             ));
         }
         // [STO-8]: no space file appears while a backup copies the files.
@@ -702,6 +823,7 @@ impl Relay {
             )
         })?;
         let hold = hold_since(&tc, log)?.is_some();
+        let space_bytes = user::limits(&tc, &self.cfg.quotas)?.space_bytes;
         drop(tc);
         let sc = store::open(&path, Kind::Space, false)?;
         let stored: Vec<u8> =
@@ -715,6 +837,7 @@ impl Relay {
             log_id,
             log: log.to_owned(),
             hold,
+            space_bytes,
         })
     }
 
@@ -726,7 +849,7 @@ impl Relay {
         log: &str,
     ) -> ApiResult<(u16, Vec<u8>)> {
         let (sp, v) = self.open_signed(req, now, tenant, log)?;
-        let (mut sc, log_id, hold) = (sp.conn, sp.log_id, sp.hold);
+        let (mut sc, log_id, hold, quota) = (sp.conn, sp.log_id, sp.hold, sp.space_bytes);
         let limits = &self.cfg.limits;
         let items = wire::parse_append(&req.body, limits.max_append_envelopes)
             .map_err(|e| api(400, "bad_request", e.0))?;
@@ -735,6 +858,8 @@ impl Relay {
         // transaction in the space file.
         let tx = sc.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut results = Vec::with_capacity(items.len());
+        let mut used: u64 =
+            from_i64(tx.query_row("SELECT bytes FROM usage WHERE id = 1", [], |r| r.get(0))?)?;
         {
             let view = SqlView::new(&tx, log_id, false)?;
             for item in items {
@@ -750,8 +875,19 @@ impl Relay {
                 let verdict = check_append(&view, &raw.envelope, mode);
                 view.take_error()?;
                 results.push(match verdict {
+                    // 10.6 step 14 ([QTA-1], [QTA-3]): only a change counts,
+                    // with the length of its envelope text as stored.
+                    Verdict::Store(acc)
+                        if acc.record.change_id().is_some()
+                            && used.saturating_add(raw.json.len() as u64) > quota =>
+                    {
+                        AppendResult::Refused("quota".into())
+                    }
                     Verdict::Store(acc) => {
                         insert_entry(&tx, &acc, &raw.envelope.payload_type, &raw.json)?;
+                        if acc.record.change_id().is_some() {
+                            used = used.saturating_add(raw.json.len() as u64);
+                        }
                         AppendResult::Stored(acc.position)
                     }
                     Verdict::Known(p) => AppendResult::Known(p),
@@ -760,6 +896,10 @@ impl Relay {
                 });
             }
         }
+        tx.execute(
+            "UPDATE usage SET bytes = ?1 WHERE id = 1",
+            params![to_i64(used)?],
+        )?;
         let head = read_head(&tx)?;
         tx.commit()?;
         Ok((200, wire::append_response(&results, &head)))
@@ -976,6 +1116,16 @@ struct OpenSpace {
     log_id: [u8; 16],
     log: String,
     hold: bool,
+    /// The space quota in bytes ([QTA-1]).
+    space_bytes: u64,
+}
+
+/// The value of the first header with this name, in any case.
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1154,6 +1304,13 @@ fn move_staged(tx: &Connection, session: &[u8; 16], tip: u64, now: u64) -> Resul
     tx.execute(
         "INSERT INTO devices (device_id, sign_key, position)
          SELECT device_id, sign_key, position FROM staging WHERE device_id IS NOT NULL",
+        [],
+    )?;
+    // [QTA-1]: the moved changes count against the quota. The usage comes
+    // from the log, so it is right also after a storage fault.
+    tx.execute(
+        "UPDATE usage SET bytes = (SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))), 0)
+         FROM entries WHERE payload_type LIKE 'snailfish.change.%') WHERE id = 1",
         [],
     )?;
     tx.execute("DELETE FROM staging", [])?;

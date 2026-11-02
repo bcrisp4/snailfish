@@ -105,23 +105,35 @@ type fetchJ struct {
 }
 
 type httpJ struct {
-	Version    int           `json:"version"`
-	Authority  string        `json:"authority"`
-	Now        int64         `json:"now"`
-	Limits     limitsJ       `json:"limits"`
-	UsedNonces [][2]string   `json:"used_nonces"`
-	Tenant     string        `json:"tenant"`
-	LogID      string        `json:"log_id"`
-	Devices    []httpDeviceJ `json:"devices"`
-	Signed     []signedJ     `json:"signed"`
-	Invalid    []invalidJ    `json:"invalid"`
-	Space      spaceJ        `json:"space"`
-	Append     []appendJ     `json:"append"`
-	AppendHold []appendJ     `json:"append_hold"`
-	Fetch      []fetchJ      `json:"fetch"`
-	Status     []statusJ     `json:"status"`
-	Repair     []repairJ     `json:"repair"`
-	Enroll     []enrollCaseJ `json:"enroll"`
+	Version      int             `json:"version"`
+	Authority    string          `json:"authority"`
+	Now          int64           `json:"now"`
+	Limits       limitsJ         `json:"limits"`
+	UsedNonces   [][2]string     `json:"used_nonces"`
+	Tenant       string          `json:"tenant"`
+	LogID        string          `json:"log_id"`
+	Devices      []httpDeviceJ   `json:"devices"`
+	Signed       []signedJ       `json:"signed"`
+	Invalid      []invalidJ      `json:"invalid"`
+	Space        spaceJ          `json:"space"`
+	Append       []appendJ       `json:"append"`
+	AppendHold   []appendJ       `json:"append_hold"`
+	Fetch        []fetchJ        `json:"fetch"`
+	Status       []statusJ       `json:"status"`
+	Repair       []repairJ       `json:"repair"`
+	Enroll       []enrollCaseJ   `json:"enroll"`
+	AppendQuota  []quotaJ        `json:"append_quota"`
+	Tokens       []tokenCaseJ    `json:"tokens"`
+	PKCE         pkceJ           `json:"pkce"`
+	RedirectURIs []textCaseJ     `json:"redirect_uris"`
+	States       []textCaseJ     `json:"states"`
+	Authorize    []textCaseJ     `json:"authorize"`
+	SetupCodes   []setupCodeJ    `json:"setup_codes"`
+	SetupToken   []setupTokenJ   `json:"setup_token"`
+	SetupTokens  []heldTokenJ    `json:"setup_tokens"`
+	Put          []putJ          `json:"put"`
+	DeviceStatus []deviceStatusJ `json:"device_status"`
+	Webhook      webhookJ        `json:"webhook"`
 }
 
 type statusRespJ struct {
@@ -499,6 +511,50 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		return nil, err
 	}
 
+	// ---- append cases with a space quota (10.6 step 14, [QTA-1] to [QTA-3]) ----
+	used := sp.used
+	n := func(env string) int64 { return int64(len(env)) }
+	newA29 := mustChange(w.A, 29, base4, 1, logText, `{"op":"add","task":5}`)
+	spaced := "{ " + newB[1:len(newB)-1] + " }"
+	type qc struct {
+		name   string
+		signer *party
+		quota  int64
+		envs   []string
+		want   []string
+	}
+	quotaCases := []qc{
+		{"change-fits-exactly", w.B, used + n(newB), []string{newB}, []string{"stored:5"}},
+		{"change-one-byte-over", w.B, used + n(newB) - 1, []string{newB}, []string{"refused:quota"}},
+		{"grant-at-full-quota", w.A, used, []string{grant(w.A, w.C, 2, 100, base4)}, []string{"stored:5"}},
+		{"exact-retry-at-full-quota", w.A, used, []string{e2}, []string{"known:2"}},
+		{"earlier-envelope-counts", w.A, used + n(newA21) + n(newA29) - 1, []string{newA21, newA29}, []string{"stored:5", "refused:quota"}},
+		{"both-fit", w.A, used + n(newA21) + n(newA29), []string{newA21, newA29}, []string{"stored:5", "stored:6"}},
+		{"length-as-the-request-holds-it", w.B, used + n(newB), []string{spaced}, []string{"refused:quota"}},
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range quotaCases {
+		body := `{"envelopes":[` + strings.Join(c.envs, ",") + `]}`
+		got, e := replayQuota(sp, quotaJ{Name: c.name, Signer: c.signer.name, Quota: c.quota, Body: body}, c.signer.idText, h.Limits)
+		if e != nil {
+			return nil, fmt.Errorf("append_quota %s: %w", c.name, e)
+		}
+		var g []string
+		for _, r := range got.Results {
+			if r.Error != nil {
+				g = append(g, "refused:"+*r.Error)
+			} else {
+				g = append(g, fmt.Sprintf("%s:%d", r.Status, *r.Position))
+			}
+		}
+		if strings.Join(g, " ") != strings.Join(c.want, " ") {
+			return nil, fmt.Errorf("append_quota %s: reference gives %v, expected %v", c.name, g, c.want)
+		}
+		h.AppendQuota = append(h.AppendQuota, got)
+	}
+
 	// ---- fetch cases ----
 	type fc struct {
 		name         string
@@ -583,9 +639,11 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 	h.Signed = []signedJ{
 		std("fetch-get", w.A, "GET", httpAuthority, entriesPath, "after=0&limit=500", ""),
 		postB,
-		std("put-create", w.A, "PUT", httpAuthority, spacePath, "", `{"genesis":`+h.Space.Genesis+`}`),
+		std("put-create", w.A, "PUT", httpAuthority, spacePath, "", `{"genesis":`+h.Space.Genesis+`,"setup":"`+tokenText("setup", "A")+`"}`),
 		std("fetch-query-several-params", w.A, "GET", httpAuthority, entriesPath, "after=2&limit=2&a=b%20c&d=%2F&e=", ""),
 		std("fetch-port-authority", w.A, "GET", portAuth, entriesPath, "after=0&limit=500", ""),
+		std("post-setup-token", w.C, "POST", httpAuthority, setupPath, "",
+			obj("code", q(tokenText("code", "ok")), "code_verifier", q(verifierFor("signin")), "redirect_uri", q(signinURI), "device", keysRaw(w.C))),
 	}
 
 	// ---- invalid cases ----
@@ -659,6 +717,11 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		cd[i] = alpha[strings.IndexByte(alpha, cd[i])^1]
 		sig = ed25519.Sign(w.A.signPriv, []byte(sigBase(s.Method, s.Authority, s.Path, s.Query, string(cd), s.SignatureParams)))
 		add(s, withHdr(withHdr(s.Headers, "content-digest", string(cd)), "signature", sigHdr(sig)), "bad_signature")
+		// PROTOCOL.md 10: the sync routes take no cookie.
+		s = mk("cookie-header")
+		add(s, append(append([][2]string{}, s.Headers...), [2]string{"cookie", "sf_session=x"}), "bad_request")
+		s = mk("cookie-session-among-others")
+		add(s, append(append([][2]string{}, s.Headers...), [2]string{"cookie", "theme=dark; sf_session=x"}), "bad_request")
 		s = mk("wrong-authority")
 		add(s, withHdr(s.Headers, "snailfish-authority", otherAuth), "wrong_authority")
 		s = newSigned("signed-for-other-authority", w.A, "GET", otherAuth, entriesPath, "after=0&limit=2", "", now, now+300, nonceFor("other-auth"))
@@ -677,6 +740,10 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 		}
 	}
 	h.Invalid = inv
+
+	if err := buildSetup(h, b, w); err != nil {
+		return nil, err
+	}
 
 	// the reference relay must accept every signed case and give each invalid case its code
 	if err := checkHTTP(h, w); err != nil {
@@ -1051,6 +1118,15 @@ func buildEnrollHTTP(h *httpJ, b *logBuilder, w *world, envs []string, keys map[
 			nw(now+4, `{"hello":{"device":`+tr.NewDevice[:len(tr.NewDevice)-1]+`,"x":1}}}`, "400 bad_request"),
 			tw(A, now+5, `{"done":{"tenant":"`+h.Tenant+`","checkpoint":`+cpEnv+`,"x":1}}`, "400 bad_request"),
 			nr(now+6, "200 open n: t:"),
+		}},
+		// 10.10: a duplicate key at any depth breaks the section.
+		{"duplicate-key", []st{
+			open(A, now, sid, opened),
+			nw(now+1, `{"hello":{"device":`+tr.NewDevice+`},"hello":{"device":`+tr.NewDevice+`}}`, "400 bad_request"),
+			nw(now+2, `{"hello":{"device":`+tr.NewDevice+`,"device":`+tr.NewDevice+`}}`, "400 bad_request"),
+			nw(now+3, newHello, "200 open n:hello t:"),
+			tw(A, now+4, trustedHello[:len(trustedHello)-2]+`,"commitment":"`+b64(unhex(tr.Commitment))+`"}}`, "400 bad_request"),
+			nr(now+5, "200 open n:hello t:"),
 		}},
 		{"malformed", []st{
 			{"open", A, now, "", openBody("e_" + strings.ToUpper(sid[2:])), "", "400 bad_request"},

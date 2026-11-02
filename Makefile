@@ -30,11 +30,9 @@ BASE ?= main
 MUTANTS_JOBS ?= 4
 MUTANTS_SHARD ?=
 MUTANTS_MIN_TIMEOUT ?= 120
-# passkey.rs compiles only with the webauthn feature, so the workspace runs
-# skip it: an uncompiled mutant shows as MISSED. rust-mutants-passkey tests it.
 # Round-robin sharding gives each shard about the same work. With slice
 # sharding, the shards that get the relay mutants take about 3 times longer.
-MUTANTS_ARGS = --workspace --exclude crates/relay/src/passkey.rs -j $(MUTANTS_JOBS) \
+MUTANTS_ARGS = --workspace -j $(MUTANTS_JOBS) \
   --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT) \
   $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD) --sharding round-robin)
 # cargo-mutants and the tests write below TMPDIR. On macOS, each SQLite commit
@@ -49,15 +47,15 @@ MUTANTS_TMPDIR ?= $(shell mount | grep -q ' on $(RAMDISK) ' && echo $(RAMDISK))
 # 4 jobs used 3 GB, about 0.6 GB for each build directory. Require 2 GB for
 # each job and the baseline.
 MUTANTS_MIN_FREE_GB ?= $$(( ($(MUTANTS_JOBS) + 1) * 2 ))
-MUTANTS_TARGETS := rust-mutants rust-mutants-passkey rust-mutants-diff
+MUTANTS_TARGETS := rust-mutants rust-mutants-diff
 ifneq ($(MUTANTS_TMPDIR),)
 $(MUTANTS_TARGETS): export TMPDIR := $(MUTANTS_TMPDIR)
 endif
 
-.PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-powerloss \
+.PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-browser test-powerloss \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
-        rust-nightly-check rust-nightly-components rust-mutants-passkey mutants-ramdisk mutants-tmpdir verify-crypto
+        rust-nightly-check rust-nightly-components mutants-ramdisk mutants-tmpdir verify-crypto
 
 ## The gate for each commit: Rust lint and tests, the shared vectors in Go and
 ## Python, runner tests, then the fast Quint tier. `make test-swift` needs Xcode,
@@ -164,13 +162,6 @@ endef
 rust-mutants: mutants-tmpdir
 	@$(CARGO) mutants $(MUTANTS_ARGS); $(check_mutants)
 
-## Mutants of crates/relay/src/passkey.rs, which only the `webauthn` feature
-## compiles. A feature flag is valid for one package only, so the workspace
-## runs above cannot enable it.
-rust-mutants-passkey: mutants-tmpdir
-	@$(CARGO) mutants -p snailfish-relay --features webauthn -f crates/relay/src/passkey.rs \
-	  -j $(MUTANTS_JOBS) --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT); $(check_mutants)
-
 ## Mutants in the Rust code that changed since BASE (default main). Run before a
 ## merge. It does not see a test that a change made weaker in other code, so
 ## rust-mutants still runs nightly.
@@ -247,16 +238,25 @@ test-python: bindings-python
 	  sh -c 'cd bindings/python && mise exec -- uv run --locked pytest'
 
 
-## The M2 and M3 acceptance tests: the demo app on the Python binding against a
+## The M2 to M5 acceptance tests: the demo app on the Python binding against a
 ## relay process. Sync between two devices, a plaintext scan of the relay files,
 ## merge order, a client crash at each step of push and pull, and the M3 log
 ## integrity cases: S6 backup, restore, repair and release, a change during the
 ## hold, the "not repaired" refusal, and a fork through the record base.
 test-demo: bindings-python
 	$(CARGO) build -p snailfish-relay
+	cd demo && mise exec -- uv run --locked playwright install chromium
 	cd demo && mise exec -- uv run --locked ruff check . && mise exec -- uv run --locked ruff format --check . \
 	  && mise exec -- uv run --locked pyright \
 	  && SNAILFISH_RELAY_BIN=$(CURDIR)/target/debug/snailfish-relay mise exec -- uv run --locked pytest
+
+## The user page in Chromium with a virtual passkey (demo/tests/test_browser.py).
+## A quick check after a change to app.js, the page HTML or its headers.
+## make test-demo runs it too. The first run downloads the pinned Chromium.
+test-browser: bindings-python
+	$(CARGO) build -p snailfish-relay
+	cd demo && mise exec -- uv run --locked playwright install chromium
+	cd demo && SNAILFISH_RELAY_BIN=$(CURDIR)/target/debug/snailfish-relay mise exec -- uv run --locked pytest tests/test_browser.py
 
 ## The power-loss test: SIGKILL a QEMU VM during push and pull, KILLS times.
 ## About 5 minutes for 20 kills on an M5 with HVF, after the first boot.
@@ -274,6 +274,6 @@ test-swift: bindings-swift
 
 ## ---------------------------------------------------------------- ProVerif
 
-## ProVerif models of enrollment. Needs `opam install proverif`. About 30 seconds.
+## ProVerif models of enrollment and sign-in. Needs `opam install proverif`. About 30 seconds.
 verify-crypto:
 	eval $$(opam env 2>/dev/null); mise exec -- uv run --script specs/tools/proverif.py

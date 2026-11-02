@@ -1,0 +1,2 @@
+(* Variant vPlainInvite. Run: proverif -lib lib.pvl plain_invite.pv *)
+process System(vPlainInvite)

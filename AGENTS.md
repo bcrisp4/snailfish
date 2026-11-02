@@ -15,7 +15,9 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | Protocol, engine, or relay Rust logic | `specs/conformance.md`, the relevant model actions and named scenarios | Add a real-path Rust test of the same scenario, with model path, scenario name, and rule IDs. Model results do not verify Rust behaviour. |
 | A function in `crates/protocol` | The model rule and `PROTOCOL.md` section | Add a property test and bounded Kani harness. Cite the rule ID. These checks address different input domains. |
 | Enrollment, removal, or key sealing | `specs/enrollment/README.md`, `lib.pvl`, and `expect.toml` | Update the security model and a broken variant. A symbolic security result depends on its attacker assumptions. |
+| Sign-in, invite links, the setup token, or tenant selection | `specs/signin/README.md`, `lib.pvl`, and `expect.toml` | Update the security model and a broken variant. Tenant isolation depends on these rules. |
 | A wire format or untrusted parser | `PROTOCOL.md`, `vectors/README.md`, existing vectors and fuzz seeds | Write the format, then change `tools/vectorgen` (Go), then the Rust. Add a seeded fuzz target for each parser. Two implementations from one spec catch misreadings that one cannot. Models omit byte-level faults. |
+| The user page: its HTML, `APP_JS` or headers in `crates/relay/src/core/user.rs` | `PROTOCOL.md` 12.4 and `demo/tests/test_browser.py` | Extend the Chromium test for each new page flow. The software browsers (`softbrowser.py`, `tests/common/passkey.rs`) skip CSP, `Referrer-Policy` and the browser `Origin` rule. They passed two faults that broke every form and the native approval. |
 | The binding API (`crates/bindings`) | `crates/engine/src/codec.rs`, `bindings/python/tests`, `bindings/swift/Tests` | Put logic in `snailfish-engine`, not in the binding. Run the shared vectors in each binding, because a marshalling fault passes the Rust tests. |
 | Verification tools or CI | `specs/README.md`, the runner tests, and `.github/workflows/verify.yml` | Reject tool errors and incomplete runs. An expected counterexample must identify the intended property. |
 
@@ -28,11 +30,12 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | Before a merge with model or protocol changes | `make verify MODEL=<model>` and `make verify-deep MODEL=<model>` for each affected model | Sampling and exhaustive finite configurations provide different evidence. |
 | Before a merge with a tagged design-rule change | `make verify-drift BASE=<base>` | A changed rule requires a model, scenario, manifest, or coverage change. |
 | Before a merge with shared-tool or CI changes | `make verify` and `make verify-deep` | Shared tools can invalidate results for every model and backend. |
-| Before a merge with enrollment model changes | `make verify-crypto` | Every design and broken-variant query must match its expectation. |
+| Before a merge with enrollment or sign-in model changes | `make verify-crypto` | Every design and broken-variant query must match its expectation. |
 | Before each push with Rust changes | `make rust-mutants-diff BASE=@{push}` (`BASE=main` for a branch with no push) | This tests only the new commits, in minutes. A survivor found in CI costs a 30 to 60 minute round. |
 | Before a merge with Rust changes | `make rust-kani` and the CI `mutants` job | Bounded harnesses and fault-sensitive tests check the implementation. The CI job tests every mutant in the branch diff, so a local branch-wide run repeats it. |
 | Before a merge with parser changes | `make rust-fuzz` | Arbitrary bytes exercise parser failure paths. |
 | Before a merge with format, vector or binding changes | `make test-swift` on macOS | Linux has no Xcode, so `make check` skips the Swift binding. CI runs it in the `swift` job. |
+| After a change to the user page or `APP_JS` | `make test-browser` | Chromium with a virtual WebAuthn authenticator runs the page script against a relay process. The first run downloads the Chromium build that `demo/uv.lock` pins, through Playwright. `make check` runs it too. |
 | Before a merge with engine, relay storage or demo changes | `make test-powerloss` | A SIGKILL of a VM finds a missing fsync that a process crash cannot find. `make check` runs only the process crash tests (`make test-demo`). |
 | Before a merge with `Dockerfile` or relay dependency changes | `docker build .` and the `image` CI job | The static musl and vendored OpenSSL build fails only in the container. |
 | After a change to `PROTOCOL.md` bytes | `make vectors`, then `make vectors-check` | Go `crypto/hpke` takes no fixed ephemeral key, so a regeneration changes every `sealed` value. Regenerate only for a format change. |
