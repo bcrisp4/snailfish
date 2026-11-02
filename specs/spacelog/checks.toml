@@ -61,9 +61,9 @@ skip = ["relayLogValid", "noStaleChangeStored"]
 why = "A malicious relay appends records in any order, so its log is not valid by design (relayLogValid). It can also store a change after a later epoch record (limit T8, checked in forkRelay)."
 
 # wThiefSigned needs about 14 exact steps: enrolment, a removal, and a submit
-# from the removed thief. With 6 records a stray record often uses up the ids
-# first (4 traces in 5000). 9 records give about 46 in 5000. 9 is the maximum:
-# dig packs each id into two decimal digits of an int64.
+# from the removed thief. Each stray record uses up an id, so the config needs
+# spare ids for the witness to occur in each sampled run. dig packs each id into
+# two decimal digits of an int64, and 9 records keep it below 10^18 for any ids.
 [configs.thief]
 BAD = "Set(2)"
 FAULTS = 'Set("recovery")'

@@ -36,7 +36,7 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | `forkRelay` | The relay serves two valid branches. |
 | `forgeRelay` | The relay offers records with no signature. |
 | `reorderRelay` | The relay appends records in any order, also when `check` refuses them. |
-| `thief` | A device that the attacker controls ignores its own removal. Up to 9 records, because with 6 records `wThiefSigned` occurs in about 1 trace of 1 000. |
+| `thief` | A device that the attacker controls ignores its own removal. Up to 9 records, so that `wThiefSigned` occurs in each sampled run. |
 | `honest4` | An honest relay with 4 devices. The baseline of the base-rule and key mutants. |
 | `compromisedHonest` | A compromised key signs bounded record templates. The honest relay must refuse invalid records. |
 | `compromisedReorder` | A malicious relay stores those signed records. Honest clients must reject invalid records. |
