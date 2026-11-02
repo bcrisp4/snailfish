@@ -1,0 +1,49 @@
+# Checks for the protocol level model. specs/tools/verify.py reads this file.
+
+model = "model.qnt"
+module = "levels"
+tests = "test.qnt"
+test_module = "levelsTest"
+invariants = ["levelSupported", "recordsAtLevel"]
+fast_config = "bounded"
+witness_configs = ["bounded"]
+witness_steps = 30
+
+[deep]
+config = "tiny"
+invariants = ["levelSupported", "recordsAtLevel"]
+max_steps = 8
+
+[defaults]
+DEVS = "Set(1, 2, 3)"
+TOP = "2"
+MAX_REC = "7"
+BUG = '"none"'
+
+[configs.bounded]
+
+[configs.tiny]
+DEVS = "Set(1, 2)"
+MAX_REC = "5"
+
+[mutants.grantBelowLevel]
+base = "bounded"
+caught_by = "levelSupported"
+
+[mutants.levelIgnoresDevices]
+base = "bounded"
+caught_by = "levelSupported"
+
+[mutants.lowLevelAccepted]
+base = "bounded"
+caught_by = "recordsAtLevel"
+
+[mutants.deviceLevelDown]
+base = "bounded"
+caught_by = "levelSupported"
+
+[[exhaustive]]
+config = "tiny"
+invariants = ["levelSupported", "recordsAtLevel"]
+mutants = ["levelIgnoresDevices", "lowLevelAccepted", "deviceLevelDown"]
+why = "Two devices, levels 1 and 2, at most five records."

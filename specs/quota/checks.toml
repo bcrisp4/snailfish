@@ -2,14 +2,17 @@ model = "model.qnt"
 module = "quota"
 tests = "test.qnt"
 test_module = "quotaTest"
-invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported"]
+invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported",
+              "withinReserve", "honestSecurityStored"]
+test_modules = ["quotaTestThief"]
 fast_config = "bounded"
-witness_configs = ["bounded"]
+witness_configs = ["bounded", "thief"]
 witness_steps = 20
 
 [deep]
 config = "tiny"
-invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported"]
+invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported",
+              "withinReserve", "honestSecurityStored"]
 # TLC checks the complete tiny state graph. This is a bounded cross-check.
 max_steps = 6
 
@@ -17,9 +20,28 @@ max_steps = 6
 QUOTA = "2"
 MAX_QUOTA = "3"
 MAX_RECORDS = "4"
+RESERVE = "4"
+LIMIT = "2"
+THIEF = "false"
 BUG = '"none"'
 
 [configs.bounded]
+
+# Device 2 is a thief. The reserve holds the daily limit of the thief and one
+# removal, so the limit is what keeps room for the removal.
+[configs.thief]
+THIEF = "true"
+RESERVE = "3"
+MAX_RECORDS = "5"
+
+# A reserve smaller than the daily limit of the thief: only the reserve check
+# keeps the stored security records within the reserve.
+[configs.reserveSmall]
+THIEF = "true"
+RESERVE = "2"
+LIMIT = "3"
+skip = ["honestSecurityStored"]
+why = "The reserve is smaller than the daily limit, so the thief can fill it by design. thief checks honestSecurityStored with a correctly sized reserve."
 
 [configs.tiny]
 QUOTA = "1"
@@ -42,6 +64,14 @@ caught_by = "servesStored"
 base = "bounded"
 caught_by = "securityNotBlocked"
 
+[mutants.noSecurityLimit]
+base = "thief"
+caught_by = "honestSecurityStored"
+
+[mutants.noReserve]
+base = "reserveSmall"
+caught_by = "withinReserve"
+
 [mutants.quotaNoPause]
 base = "bounded"
 caught_by = "quotaReported"
@@ -51,3 +81,18 @@ config = "tiny"
 invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported"]
 mutants = ["noQuota", "quotaDrops", "quotaBlocksFetch", "quotaBlocksSecurity", "quotaNoPause"]
 why = "Two devices, at most three records of size 1 or 2, a quota of 1 that the operator can raise to 2."
+
+[configs.tinyThief]
+QUOTA = "1"
+MAX_QUOTA = "2"
+THIEF = "true"
+RESERVE = "2"
+LIMIT = "1"
+MAX_RECORDS = "4"
+
+[[exhaustive]]
+config = "tinyThief"
+invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked", "quotaReported",
+              "withinReserve", "honestSecurityStored"]
+mutants = ["noSecurityLimit"]
+why = "A thief with a daily limit of 1, a reserve of 2 and at most four records."

@@ -17,15 +17,17 @@
 //  - The relay holds up to two branches of the log. An honest relay uses branch 0.
 //    A malicious relay can copy a prefix to branch 1 and serve any branch to any
 //    device. A device fetches one record at a time from the position after its tip.
-//  - The app data, compaction, recovery records, levels and request signing are out
-//    of scope. A change record carries only its author and its epoch number.
+//  - A recovery key is RK (0) or the negative id of the recovery record that made
+//    it. The space state names the current recovery key and the retired ones.
+//  - The app data, compaction, levels and request signing are out of scope.
+//    A change record carries only its author and its epoch number.
 //
 // The const BUG selects one deliberate violation of the design. "none" is the
 // design. specs/spacelog/checks.toml binds the consts for each config and each
 // mutant, and specs/tools/verify.py runs them.
 module spacelog {
   type Key = int
-  type Kind = Genesis | Grant | Epoch | Change
+  type Kind = Genesis | Grant | Epoch | Recovery | Change
   type Verdict = Ok | BadSig | BadBase | BaseRule | BadAuthor | BadState
   type Status = Running | Forked | Rejected
 
@@ -35,7 +37,7 @@ module spacelog {
     | EvCheckpoint | EvEnrolled | EvEpochVerified | EvForkBranch | EvForkDetected
     | EvForgedRejected | EvDeviceRejected | EvForged | EvReplayed | EvStaleWrite | EvThiefSigned
     | EvInvalidSigned | EvInvalidRelayRefused | EvInvalidStored | EvInvalidClientRejected
-    | EvResigned | EvReconfirmed
+    | EvResigned | EvReconfirmed | EvRecoveryAppended | EvRecoveryStart | EvFullRecovery
 
   type LogRec = {
     id: int,               // unique for each signature. Stands for the signature bytes.
@@ -43,12 +45,13 @@ module spacelog {
     author: Key,           // the signing key
     bpos: int,             // base position
     bdig: int,             // base digest: the digest of the log prefix that ends at bpos
-    subject: Key,          // genesis: the first device. grant: the new device.
+    subject: Key,          // genesis: the first device. grant: the new device. recovery: the new recovery key.
     removed: Set[Key],     // epoch: the devices that the record removes
     stay: Set[Key],        // epoch: the devices that stay. The new key is sealed to them.
-    sealed: Set[int],      // grant: the keys sealed to the subject
+    sealed: Set[int],      // grant and recovery: the keys sealed to the subject
     epoch: int,            // genesis: 1. epoch: the new epoch. change: the epoch of its key.
     key: int,              // genesis and epoch: the id of the new key
+    rec: Key,              // epoch: the recovery key that the new key is sealed to
   }
 
   // The space state after the last entry of a log.
@@ -58,6 +61,8 @@ module spacelog {
     epoch: int,
     keys: Set[int],        // the key of each epoch
     lastSec: int,          // position of the last security record
+    rk: Key,               // the current recovery key
+    retired: Set[Key],     // recovery keys that a recovery record replaced
   }
 
   type Log = { recs: List[LogRec], sp: Space }
@@ -65,11 +70,12 @@ module spacelog {
   // A signed statement of one log position and its digest (Enrollment, step 8).
   type Checkpoint = { has: bool, pos: int, dig: int }
 
-  // The grant that the user confirmed on a device, and the active and removed
-  // devices that the device showed at that time ([LOG-7]).
-  type Confirm = { has: bool, subject: Key, active: Set[Key], removed: Set[Key] }
+  // The grant or removal that the user confirmed on a device, and the active
+  // and removed devices that the device showed at that time ([LOG-7]). For a
+  // removal, `subject` is the removed device.
+  type Confirm = { has: bool, kind: Kind, subject: Key, active: Set[Key], removed: Set[Key] }
 
-  // Ghost: the device list that the user confirmed for a signed grant.
+  // Ghost: the device list that the user confirmed for a signed grant or removal.
   type Confirmed = { id: int, active: Set[Key], removed: Set[Key] }
 
   type Device = {
@@ -111,7 +117,7 @@ module spacelog {
     "fork",       // the relay keeps a second branch and serves any branch to any device
     "reorder",    // the relay appends any signed record to any branch, in any order, also a replay
     "forge",      // the relay appends a grant or a change with a signature that nobody made
-    "recovery",   // the recovery key can sign a grant or an epoch record
+    "recovery",   // the recovery key can sign a grant or an epoch record, a device can start a full recovery, and a thief holds the first recovery key (T9)
     "signedInvalid", // a compromised device key (BAD) signs a record from a bounded set of invalid templates
   )
 
@@ -137,6 +143,9 @@ module spacelog {
     "selfRemovalAllowed",   // an epoch record can remove its own author
     "grantActiveSubject",   // a grant for a device that is already active is valid
     "resignNoReconfirm",    // after stale_base the engine signs a grant again without a new confirmation, also after a grant or a removal arrived
+    "resignEpochNoReconfirm", // after stale_base the engine signs a removal again without a new confirmation, also after a grant arrived
+    "oldRecoveryAccepted",  // a recovery key that a recovery record replaced can still sign
+    "epochSealsToOldRecovery", // an epoch record seals the new key to the first recovery key, not the current one
   )
 
   pure val DEVICE_ONLY: Set[str] = Set("trustsRelayVerdict", "baseUnchecked", "staleWriteEpoch")
@@ -160,9 +169,10 @@ module spacelog {
 
   pure def anyRec(l: List[LogRec], f: LogRec => bool): bool = l.indices().exists(i => f(l.nth(i)))
 
-  pure val emptySpace: Space = { active: Set(), removed: Set(), epoch: 0, keys: Set(), lastSec: 0 }
+  pure val emptySpace: Space =
+    { active: Set(), removed: Set(), epoch: 0, keys: Set(), lastSec: 0, rk: RK, retired: Set() }
   pure val emptyLog: Log = { recs: List(), sp: emptySpace }
-  pure val noConfirm: Confirm = { has: false, subject: 0, active: Set(), removed: Set() }
+  pure val noConfirm: Confirm = { has: false, kind: Grant, subject: 0, active: Set(), removed: Set() }
   pure val freshDevice: Device =
     { log: emptyLog, status: Running, wepoch: 0, cp: { has: false, pos: 0, dig: 0 }, conf: noConfirm }
 
@@ -171,20 +181,23 @@ module spacelog {
     | Genesis => Set(r.key)
     | Grant => r.sealed
     | Epoch => Set(r.key)
+    | Recovery => r.sealed
     | Change => Set()
   }
 
   pure def sealTo(r: LogRec): Set[Key] = match r.kind {
-    | Genesis => Set(r.subject, RK)
+    | Genesis => Set(r.subject, r.author)
     | Grant => Set(r.subject)
-    | Epoch => r.stay.union(Set(RK))
+    | Epoch => r.stay.union(Set(r.rec))
+    | Recovery => Set(r.subject)
     | Change => Set()
   }
 
   // The space state after one entry.
   // Rules: [LOG-8]
   pure def applyRec(sp: Space, r: LogRec, pos: int, bug: str): Space = match r.kind {
-    | Genesis => { active: Set(r.subject), removed: Set(), epoch: 1, keys: Set(r.key), lastSec: pos }
+    | Genesis => { active: Set(r.subject), removed: Set(), epoch: 1, keys: Set(r.key), lastSec: pos,
+                   rk: r.author, retired: Set() }
     | Grant => { ...sp, active: sp.active.union(Set(r.subject)), lastSec: pos }
     | Epoch => {
         ...sp,
@@ -194,6 +207,8 @@ module spacelog {
         keys: sp.keys.union(Set(r.key)),
         lastSec: pos,
       }
+    // The new recovery key replaces the current one ("Space log", recovery record).
+    | Recovery => { ...sp, rk: r.subject, retired: sp.retired.union(Set(sp.rk)), lastSec: pos }
     | Change => sp
   }
 
@@ -203,13 +218,18 @@ module spacelog {
   pure def rebuild(recs: List[LogRec], bug: str): Log =
     recs.foldl(emptyLog, (l, r) => appendRec(l, r, bug))
 
+  // The recovery key that can sign: the current one. A retired key cannot (T9).
+  pure def recoveryOk(sp: Space, k: Key, bug: str): bool =
+    k == sp.rk or (bug == "oldRecoveryAccepted" and sp.retired.contains(k))
+
   // Who can sign a record, judged against the state before it.
   // Rules: [LOG-2] [LOG-8]
   pure def authorOk(sp: Space, r: LogRec, bug: str): bool = match r.kind {
     | Genesis => r.author == RK
-    | Grant => sp.active.contains(r.author) or r.author == RK
+    | Grant => sp.active.contains(r.author) or recoveryOk(sp, r.author, bug)
                or (bug == "grantFromRemoved" and sp.removed.contains(r.author))
-    | Epoch => sp.active.contains(r.author) or r.author == RK
+    | Epoch => sp.active.contains(r.author) or recoveryOk(sp, r.author, bug)
+    | Recovery => recoveryOk(sp, r.author, bug)
     | Change => sp.active.contains(r.author)
   }
 
@@ -224,6 +244,10 @@ module spacelog {
                and (bug == "selfRemovalAllowed" or not(r.removed.contains(r.author)))
                and (bug == "epochSkipAllowed" or r.epoch == sp.epoch + 1)
                and (bug == "epochSealsToAll" or r.stay == sp.active.exclude(r.removed))
+               and (bug == "epochSealsToOldRecovery" or r.rec == sp.rk)
+    // The new key is new, and the record seals every key of the space to it.
+    | Recovery => r.sealed == sp.keys and r.subject < 0
+                  and not(sp.retired.union(Set(sp.rk)).contains(r.subject))
     | Change => bug == "epochUnchecked" or r.epoch == sp.epoch
   }
 
@@ -261,6 +285,7 @@ module spacelog {
       | Genesis => Set(r.subject)
       | Grant => a.union(Set(r.subject))
       | Epoch => a.exclude(r.removed)
+      | Recovery => a
       | Change => a
     })
 
@@ -276,8 +301,17 @@ module spacelog {
       | Genesis => Set(r.key)
       | Grant => k
       | Epoch => k.union(Set(r.key))
+      | Recovery => k
       | Change => k
     })
+
+  // The current recovery key of a prefix, and the recovery keys that it retired.
+  pure def refRk(recs: List[LogRec]): Key =
+    recs.foldl(RK, (k, r) => if (r.kind == Recovery) r.subject else k)
+
+  pure def refRetired(recs: List[LogRec]): Set[Key] =
+    recs.indices().fold(Set(), (s, j) =>
+      if (recs.nth(j).kind == Recovery) s.union(Set(refRk(recs.slice(0, j)))) else s)
 
   // The position of the last security record in a prefix. 0 if none.
   pure def refLastSec(recs: List[LogRec]): int =
@@ -338,7 +372,7 @@ module spacelog {
   action createSpace(d: Key): bool = {
     val id = env.nextId
     val g = { id: id, kind: Genesis, author: RK, bpos: 0, bdig: 0, subject: d,
-              removed: Set(), stay: Set(), sealed: Set(), epoch: 1, key: id }
+              removed: Set(), stay: Set(), sealed: Set(), epoch: 1, key: id, rec: RK }
     all {
       id == 1,
       id <= MAX_REC,
@@ -353,23 +387,28 @@ module spacelog {
   // The base of a new record: the tip of the verified log of the author.
   pure def blank(id: int, kind: Kind, author: Key, view: Log): LogRec =
     { id: id, kind: kind, author: author, bpos: view.recs.length(), bdig: dig(view.recs),
-      subject: 0, removed: Set(), stay: Set(), sealed: Set(), epoch: 0, key: 0 }
+      subject: 0, removed: Set(), stay: Set(), sealed: Set(), epoch: 0, key: 0, rec: 0 }
 
   // A device signs a record that is valid in its own view. A device that an
   // attacker controls also signs after its own removal: it checks the record as
-  // if it were still active.
+  // if it were still active, and a record by a recovery key as if that key were
+  // current.
   // A change carries the write epoch of the device. The device does not check
   // that epoch against its own log, so a stale write epoch stays possible.
   def selfOk(d: Key, r: LogRec): bool = {
     val view = dev(d).log
     val seen = if (HON.contains(d)) view
+               else if (r.author <= 0) { recs: view.recs, sp: { ...view.sp, rk: r.author } }
                else { recs: view.recs, sp: { ...view.sp, active: view.sp.active.union(Set(r.author)) } }
     val judged = if (r.kind == Change) { ...r, epoch: view.sp.epoch } else r
     check(seen, judged, Set(judged), deviceBug(BUG)) == Ok
   }
 
+  // The user types the current recovery key on any device. A thief also holds
+  // the first recovery key RK (T9).
   def signerOk(d: Key, signer: Key): bool =
-    ready(d) and (signer == d or (FAULTS.contains("recovery") and signer == RK))
+    ready(d) and (signer == d or (FAULTS.contains("recovery")
+      and (signer == dev(d).log.sp.rk or (BAD.contains(d) and signer == RK))))
 
   // The signed record goes to the relay. `conf` is the new confirmation state of
   // the device, and `cs` the ghost confirmations.
@@ -398,13 +437,14 @@ module spacelog {
   action signGrant(d: Key, signer: Key, subject: Key): bool = {
     val view = dev(d).log
     val c = dev(d).conf
-    val retry = c.has and c.subject == subject
+    val retry = c.has and c.kind == Grant and c.subject == subject
     val same = c.active == view.sp.active and c.removed == view.sp.removed
     val keep = retry and (same or BUG == "resignNoReconfirm")
-    val conf = if (keep) c else { has: true, subject: subject, active: view.sp.active, removed: view.sp.removed }
+    val conf = if (keep) c
+               else { has: true, kind: Grant, subject: subject, active: view.sp.active, removed: view.sp.removed }
     val r = { ...blank(env.nextId, Grant, signer, view), subject: subject, sealed: view.sp.keys }
     val es = Set(
-      if (signer == RK) Set(EvRecoveryGrant) else Set(),
+      if (signer <= 0) Set(EvRecoveryGrant) else Set(),
       if (keep) Set(EvResigned) else Set(),
       if (retry and not(keep)) Set(EvReconfirmed) else Set(),
     ).flatten()
@@ -416,22 +456,65 @@ module spacelog {
     }
   }
 
-  // Removal and key rotation. The honest author seals the new key to each device
-  // that stays. The key is new, except under BUG resignReusesKey, where the engine
-  // signs a refused record again with the key of the refused one.
+  // Removal and key rotation. The device shows the devices that stay, and the
+  // user confirms the list (T8). The honest author seals the new key to each
+  // device that stays and to the current recovery key. The key is new, except
+  // under BUG resignReusesKey, where the engine signs a refused record again
+  // with the key of the refused one.
+  // [LOG-7]: after `stale_base` the engine signs again on the new tip. It asks
+  // the user again if a grant or a removal arrived, as for a grant.
   action signEpoch(d: Key, signer: Key, gone: Key): bool = {
     val removed = Set(gone)
     val view = dev(d).log
+    val c = dev(d).conf
+    val retry = c.has and c.kind == Epoch and c.subject == gone
+    val same = c.active == view.sp.active and c.removed == view.sp.removed
+    val keep = retry and (same or BUG == "resignEpochNoReconfirm")
+    val conf = if (keep) c
+               else { has: true, kind: Epoch, subject: gone, active: view.sp.active, removed: view.sp.removed }
     val reuse = BUG == "resignReusesKey" and env.lastKey.get(d) != 0
                 and not(anyRec(view.recs, x => x.kind == Epoch and x.key == env.lastKey.get(d)))
     val key = if (reuse) env.lastKey.get(d) else env.nextId
     val stay = if (BUG == "epochSealsToAll") view.sp.active else view.sp.active.exclude(removed)
+    val rec = if (BUG == "epochSealsToOldRecovery") RK else view.sp.rk
     val r = { ...blank(env.nextId, Epoch, signer, view), removed: removed, stay: stay,
-              epoch: view.sp.epoch + 1, key: key }
+              epoch: view.sp.epoch + 1, key: key, rec: rec }
+    val es = Set(
+      if (signer <= 0) Set(EvRecoveryGrant) else Set(),
+      if (keep) Set(EvResigned) else Set(),
+      if (retry and not(keep)) Set(EvReconfirmed) else Set(),
+    ).flatten()
     all {
       signerOk(d, signer),
-      submit(d, r, if (signer == RK) Set(EvRecoveryGrant) else Set(), env.lastKey.set(d, key), false),
+      submitConf(d, r, es, env.lastKey.set(d, key), false, conf,
+                 env.confirms.union(Set({ id: r.id, active: conf.active, removed: conf.removed }))),
     }
+  }
+
+  // Recovery key replacement (T9). The user types the current recovery key on
+  // a device. It signs a recovery record that names a new recovery key and seals
+  // every key of the space to it. A thief signs one with the first key RK.
+  action signRecovery(d: Key, signer: Key): bool = {
+    val view = dev(d).log
+    val r = { ...blank(env.nextId, Recovery, signer, view), subject: -env.nextId, sealed: view.sp.keys }
+    all {
+      ready(d),
+      signer == view.sp.rk or (FAULTS.contains("recovery") and BAD.contains(d) and signer == RK),
+      submit(d, r, Set(), env.lastKey, false),
+    }
+  }
+
+  // Full recovery (S5). A device with no checkpoint verifies the log from the
+  // genesis record (T7 limit: it has no earlier view). The user then types the
+  // recovery key, which signs a grant for the device (signGrant with signer rk).
+  action recoverStart(d: Key): bool = all {
+    FAULTS.contains("recovery"),
+    not(dev(d).cp.has),
+    dev(d).status == Running,
+    devs' = devs.set(d, { ...dev(d), cp: { has: true, pos: 0, dig: 0 } }),
+    branches' = branches,
+    pending' = pending,
+    env' = ev(EvRecoveryStart),
   }
 
   // A device encrypts a change with its write epoch. A device that has not yet
@@ -467,9 +550,14 @@ module spacelog {
     val es = Set(
       if (r.kind == Genesis) Set(EvGenesis) else Set(),
       if (r.kind == Grant) Set(EvGrantAppended) else Set(),
-      if (r.kind == Grant and r.author == RK) Set(EvRecoveryGrant) else Set(),
+      if (r.kind == Grant and r.author <= 0) Set(EvRecoveryGrant) else Set(),
       if (r.kind == Epoch) Set(EvEpochAppended) else Set(),
       if (r.kind == Epoch and r.removed != Set()) Set(EvRemovalAppended) else Set(),
+      if (r.kind == Recovery) Set(EvRecoveryAppended) else Set(),
+      // S5: a device that the recovery key granted removes another device.
+      if (r.kind == Epoch and r.author > 0 and r.removed != Set()
+          and anyRec(branches.get(0).recs, x => x.kind == Grant and x.subject == r.author and x.author <= 0))
+        Set(EvFullRecovery) else Set(),
       if (r.kind == Change) Set(EvChangeAppended) else Set(),
       if (r.kind == Change and r.epoch >= 2) Set(EvNewEpochChange) else Set(),
     ).flatten()
@@ -540,7 +628,7 @@ module spacelog {
     val r = if (kind == Grant) { ...base, subject: subject, sealed: br.sp.keys }
             else if (kind == Epoch)
               { ...base, removed: Set(subject), stay: br.sp.active.exclude(Set(subject)),
-                         epoch: br.sp.epoch + 1, key: base.id }
+                         epoch: br.sp.epoch + 1, key: base.id, rec: br.sp.rk }
             else { ...base, epoch: br.sp.epoch }
     all {
       FAULTS.contains("forge"),
@@ -576,10 +664,10 @@ module spacelog {
       if (t == 0) { ...good, sealed: Set() }
       else if (t == 1)
         { ...base, kind: Epoch, removed: Set(subject), stay: br.sp.active.exclude(Set(subject)),
-                   epoch: br.sp.epoch + 2, key: base.id }
+                   epoch: br.sp.epoch + 2, key: base.id, rec: br.sp.rk }
       else if (t == 2)
         { ...base, kind: Epoch, removed: Set(d), stay: br.sp.active.exclude(Set(d)),
-                   epoch: br.sp.epoch + 1, key: base.id }
+                   epoch: br.sp.epoch + 1, key: base.id, rec: br.sp.rk }
       else if (t == 3) { ...good, bdig: base.bdig + 1, sealed: Set() }
       else good
     all {
@@ -648,16 +736,18 @@ module spacelog {
     { nondet d = DEVS.oneOf() createSpace(d) },
     {
       nondet d = DEVS.oneOf()
-      nondet signer = (if (FAULTS.contains("recovery")) Set(d, RK) else Set(d)).oneOf()
+      nondet signer = (if (FAULTS.contains("recovery")) Set(d, RK, dev(d).log.sp.rk) else Set(d)).oneOf()
       nondet subject = DEVS.oneOf()
       signGrant(d, signer, subject)
     },
     {
       nondet d = DEVS.oneOf()
-      nondet signer = (if (FAULTS.contains("recovery")) Set(d, RK) else Set(d)).oneOf()
+      nondet signer = (if (FAULTS.contains("recovery")) Set(d, RK, dev(d).log.sp.rk) else Set(d)).oneOf()
       nondet gone = DEVS.oneOf()
       signEpoch(d, signer, gone)
     },
+    { nondet d = DEVS.oneOf() nondet signer = Set(RK, dev(d).log.sp.rk).oneOf() signRecovery(d, signer) },
+    { nondet d = DEVS.oneOf() recoverStart(d) },
     { nondet d = DEVS.oneOf() signChange(d) },
     { nondet d = DEVS.oneOf() nondet subject = DEVS.oneOf() sendCheckpoint(d, subject) },
     { nondet r = pending.oneOf() relayAppend(r) },
@@ -691,7 +781,7 @@ module spacelog {
     recs.indices().forall(i => {
       val r = recs.nth(i)
       r.kind == Genesis or refActive(recs.slice(0, i)).contains(r.author)
-        or (r.author == RK and isSec(r))
+        or (r.author == refRk(recs.slice(0, i)) and isSec(r))
     })
   })
 
@@ -742,7 +832,8 @@ module spacelog {
     recs.indices().forall(i => {
       val r = recs.nth(i)
       r.kind == Grant implies
-        (env.signed.contains(r) and (refActive(recs.slice(0, i)).contains(r.author) or r.author == RK))
+        (env.signed.contains(r) and (refActive(recs.slice(0, i)).contains(r.author)
+                                     or r.author == refRk(recs.slice(0, i))))
     })
   })
 
@@ -790,13 +881,14 @@ module spacelog {
   // record, through the ref* definitions. None calls `check` or `stateOk`, and none
   // reads the signed or hostile ghost sets: a record is valid or not by its prefix.
 
-  // I12. A grant in a verified log seals exactly the keys of its prefix. A wrong
-  // set gives the new device a missing key, or a key it must not hold.
+  // I12. A grant or a recovery record in a verified log seals exactly the keys
+  // of its prefix. A wrong set gives the new device or the new recovery key a
+  // missing key, or a key it must not hold.
   val grantSealsAllKeys: bool = HON.forall(d => {
     val recs = dev(d).log.recs
     recs.indices().forall(i => {
       val r = recs.nth(i)
-      r.kind == Grant implies r.sealed == refKeys(recs.slice(0, i))
+      (r.kind == Grant or r.kind == Recovery) implies r.sealed == refKeys(recs.slice(0, i))
     })
   })
 
@@ -841,6 +933,28 @@ module spacelog {
     })
   })
 
+  // I17. Each removal in a verified log keeps exactly the devices that the user
+  // confirmed (T8): a device that a thief enrolled after the confirmation does
+  // not stay without a new confirmation ([LOG-7]).
+  val epochConfirmed: bool = HON.forall(d => {
+    val recs = dev(d).log.recs
+    recs.indices().forall(i => {
+      val r = recs.nth(i)
+      r.kind == Epoch implies env.confirms.forall(c => c.id == r.id implies
+        r.stay == c.active.exclude(r.removed))
+    })
+  })
+
+  // I18. The key of an epoch record in a verified log reaches no recovery key
+  // that an earlier recovery record retired, through any signed record (T9).
+  val retiredRecoveryIsolation: bool = HON.forall(d => {
+    val recs = dev(d).log.recs
+    recs.indices().forall(i => {
+      val r = recs.nth(i)
+      r.kind == Epoch implies holders(r.key, env.signed).intersect(refRetired(recs.slice(0, i))) == Set()
+    })
+  })
+
   // ---------------------------------------------------------------- witnesses
 
   def happened(e: Event): bool = env.events.contains(e)
@@ -848,6 +962,8 @@ module spacelog {
   val wGrant: bool = happened(EvGrantAppended)
   val wEnrolled: bool = happened(EvEnrolled)
   val wRecoveryGrant: bool = happened(EvRecoveryGrant)
+  val wRecoveryRecord: bool = happened(EvRecoveryAppended)
+  val wFullRecovery: bool = happened(EvFullRecovery)
   val wRemoval: bool = happened(EvRemovalAppended)
   val wEpochVerified: bool = happened(EvEpochVerified)
   val wNewEpochChange: bool = happened(EvNewEpochChange)

@@ -13,6 +13,8 @@ It uses one space and two devices. A record has an ID, a kind (change or securit
 | `[QTA-3]` | A security record does not count, and the relay stores it at a full quota. | `securityAtFullQuotaTest` |
 | `[QTA-4]` | After `quota`, the engine keeps the record in its outbox and reports `paused: quota`. A push after a larger quota stores it and ends the pause. | `fullQuotaKeepsOutboxTest`, `raiseStoresQueuedTest` |
 | `[DLV-7]` | A known record is `Known`, also at a full quota. | `knownBeforeQuotaTest` |
+| `[STO-15]` | Security records count against the reserve. The relay refuses a security record past the reserve, or past the daily limit of its author. Both refusals are transient. | `thiefLimitedTest` |
+| `[STO-12]` (part) | After the block, the relay refuses every request of the thief. | `thiefLimitedTest` |
 
 ## Invariants
 
@@ -23,8 +25,10 @@ It uses one space and two devices. A record has an ID, a kind (change or securit
 | `servesStored` | No fetch is refused for quota. | `quotaBlocksFetch` |
 | `securityNotBlocked` | No security record is refused for quota. | `quotaBlocksSecurity` |
 | `quotaReported` | Each quota refusal sets `paused: quota`. | `quotaNoPause` |
+| `withinReserve` | The stored security records never exceed the reserve. | `noReserve` (config `reserveSmall`) |
+| `honestSecurityStored` | T10: the relay never refuses the security record of an honest device. The thief config has a reserve that holds the daily limit of the thief and one removal. | `noSecurityLimit` |
 
-The four witnesses are a quota refusal, a security record at a full quota, a store after a quota raise and a fetch at a full quota.
+The six witnesses are a thief at its daily limit, a removal after a flood, a quota refusal, a security record at a full quota, a store after a quota raise and a fetch at a full quota.
 
 ## Results
 
@@ -33,7 +37,8 @@ The four witnesses are a quota refusal, a security record at a full quota, a sto
 ## Not covered
 
 - Log compaction. Stubs do not count against the quota, and compaction lowers the usage (S7). The model has only the operator quota raise. Compaction comes with M8.
-- The security record reserve and the security record rate limit (M7, [STO-15]).
+- The day boundary of the daily limit. One run is one relay day.
+- The 16 MiB default. The thief config scales the reserve to the limit.
 - The space count limit ([QTA-5], `specs/coverage.toml`).
 - The other append checks: signatures, bases, epochs and the restore hold. Other models check them.
 - Concurrent appends. The relay checks each append in one transaction ([STO-11]), so one action is one append.

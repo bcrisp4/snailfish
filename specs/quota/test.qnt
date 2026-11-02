@@ -1,5 +1,5 @@
 module quotaTest {
-  import quota(QUOTA = 2, MAX_QUOTA = 3, MAX_RECORDS = 4, BUG = "none").* from "./model"
+  import quota(QUOTA = 2, MAX_QUOTA = 3, MAX_RECORDS = 4, RESERVE = 4, LIMIT = 2, THIEF = false, BUG = "none").* from "./model"
 
   // [QTA-1] [QTA-4] S7: a change past the quota is refused. The engine keeps
   // it in its outbox and reports `paused: quota`.
@@ -34,4 +34,22 @@ module quotaTest {
       .then(all { s' = { ...s, relay: s.relay.append(client(1).outbox.head()) } })
       .then(push(1))
       .expect(not(wQuotaRefused) and client(1).outbox.length() == 0 and not(client(1).paused))
+}
+
+// [STO-15] A thief (device 2) sends security records until the block.
+module quotaTestThief {
+  import quota(QUOTA = 2, MAX_QUOTA = 3, MAX_RECORDS = 5, RESERVE = 3, LIMIT = 2, THIEF = true, BUG = "none").* from "./model"
+
+  // T10: the relay refuses the third security record of the thief in one day,
+  // so the reserve keeps room for the removal by device 1 after the block.
+  run thiefLimitedTest =
+    init
+      .then(enqueue(2, Security, 1)).then(push(2))
+      .then(enqueue(2, Security, 1)).then(push(2))
+      .then(enqueue(2, Security, 1)).then(push(2))
+      .expect(wThiefLimited and reserveUsed(s.relay) == 2 and client(2).outbox.length() == 1)
+      .then(block)
+      .then(enqueue(1, Security, 1)).then(push(1))
+      .expect(wRemovalAfterFlood and withinReserve and honestSecurityStored)
+      .then(push(2)).fail()
 }

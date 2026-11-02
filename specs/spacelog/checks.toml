@@ -16,7 +16,7 @@ invariants = [
   "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
   "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
   "noStaleChangeStored", "grantSealsAllKeys", "epochSequential", "noSelfRemoval",
-  "grantSubjectNew", "grantConfirmed",
+  "grantSubjectNew", "grantConfirmed", "epochConfirmed", "retiredRecoveryIsolation",
 ]
 
 witness_configs = ["honest", "forkRelay", "forgeRelay", "reorderRelay", "thief",
@@ -227,6 +227,30 @@ caught_by = "tests"
 test_module = "spacelogTest4"
 test = "resignReconfirmTest"
 
+# [LOG-7] T8: a removal that the engine signs again after a grant arrived
+# needs a new confirmation. The grant needs a third device that is not the
+# removed one, so 2 devices cannot reach it (finding S1).
+[mutants.resignEpochNoReconfirm]
+base = "honest4"
+caught_by = "tests"
+test_module = "spacelogTest4"
+test = "resignEpochReconfirmTest"
+
+# T9: a retired recovery key signs. Only the thief holds the first key after a
+# replacement. Sampling seldom reaches the replacement and a thief record with
+# the old key in one run.
+[mutants.oldRecoveryAccepted]
+base = "thief"
+caught_by = "tests"
+test_module = "spacelogTestThief"
+test = "oldRecoveryRefusedTest"
+
+# T9: an epoch record after a recovery record seals the new key to the old
+# recovery key.
+[mutants.epochSealsToOldRecovery]
+base = "honest"
+caught_by = "retiredRecoveryIsolation"
+
 # ---------------------------------------------------------------- exhaustive (TLC)
 # TLC checks every reachable state of a small config, at any depth. Each listed
 # mutant must also fail on the same config, so the config is big enough to
@@ -238,9 +262,9 @@ invariants = [
   "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
   "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
   "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
-  "noStaleChangeStored", "grantConfirmed",
+  "noStaleChangeStored", "grantConfirmed", "epochConfirmed", "retiredRecoveryIsolation",
 ]
-mutants = ["epochSealsToAll", "verifierIgnoresRemovals"]
+mutants = ["epochSealsToAll", "verifierIgnoresRemovals", "epochSealsToOldRecovery"]
 why = "An honest relay with 2 devices and 4 records: about 9 000 states, 13 seconds."
 
 [[exhaustive]]
@@ -255,7 +279,7 @@ invariants = [
   "authorActive", "noKeyToRemoved", "removedKeyIsolation", "baseRule",
   "activeSetDeterministic", "grantAuthorized", "forkStops", "baseInOwnLog",
   "writeEpochCurrent", "relayLogValid", "logChangeEpoch", "noFork",
-  "noStaleChangeStored", "grantConfirmed",
+  "noStaleChangeStored", "grantConfirmed", "epochConfirmed", "retiredRecoveryIsolation",
 ]
 why = "A thief ignores its own removal: about 35 000 states, 77 seconds."
 

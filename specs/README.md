@@ -4,7 +4,7 @@ These models check parts of `DESIGN.md`. Each model README states its assumption
 
 The fast and full Quint tiers sample traces. Apalache checks every trace up to a step bound. TLC checks every reachable state of selected finite configurations.
 
-ProVerif checks enrollment and sign-in queries for unbounded sessions under its symbolic attacker assumptions. None of these results establishes Rust conformance.
+ProVerif checks enrollment, removal and sign-in queries for unbounded sessions under its symbolic attacker assumptions. None of these results establishes Rust conformance.
 
 ## Layout
 
@@ -17,7 +17,7 @@ ProVerif checks enrollment and sign-in queries for unbounded sessions under its 
 | `<model>/_gen/` | Generated config modules and traces. Not committed. |
 | `tools/verify.py` | Runs the checks of each tier for each model. One `quint run` checks all invariants of a config and counts its witnesses. |
 | `tools/trace.py` | Finds and prints a counterexample with only the changed fields. |
-| `tools/proverif.py` | Runs the ProVerif files of each directory with an `expect.toml` (`enrollment/`, `signin/`) and compares each query with it. |
+| `tools/proverif.py` | Runs the ProVerif files of each directory with an `expect.toml` (`enrollment/`, `removal/`, `signin/`) and compares each query with it. |
 | `tools/rules.py` | Checks the rule IDs of `DESIGN.md` against the model citations (`.qnt`, `.pv` and `.pvl` files) and `coverage.toml`. Finds rule changes with no change in `specs/`. |
 | `coverage.toml` | The rules that no model encodes yet, each with a reason. |
 | [conformance.md](conformance.md) | Required model-to-Rust scenario tests, observable results, and persistence tests. |
@@ -39,11 +39,13 @@ The rule check verifies references, not semantics. The drift check requires a re
 | Model | Scope |
 | --- | --- |
 | [delivery](delivery/README.md) | Outbox, enqueue, push, pull, app DB restore, engine state loss, relay rollback, repair, restore hold. |
-| [spacelog](spacelog/README.md) | Genesis, grants, removal, key rotation, malicious relay behaviour, and bounded invalid records from compromised keys. |
+| [spacelog](spacelog/README.md) | Genesis, grants, removal, key rotation, recovery key replacement, full recovery, malicious relay behaviour, and bounded invalid records from compromised keys. |
+| [levels](levels/README.md) | Device records, level records, the grant level and the write level of new records. |
 | [epochs](epochs/README.md) | Epoch retries, deduplication, removal during a hold, and security-record repair after relay restore. |
 | [enrollment](enrollment/README.md) | ProVerif (symbolic, Dolev-Yao): numeric comparison, commit before reveal, signed confirmation, grant and checkpoint, app key sealing. Run with `make verify-crypto`. |
+| [removal](removal/README.md) | ProVerif (symbolic, Dolev-Yao): the epoch record after a removal and after a recovery record, the key sealing to the devices that stay and to the current recovery key. Run with `make verify-crypto`. |
 | [signin](signin/README.md) | ProVerif (symbolic, Dolev-Yao): invite links, passkey sign-in, the PKCE code, the setup token bound to the device key, and tenant isolation. Run with `make verify-crypto`. |
-| [quota](quota/README.md) | Space quota refusal, the outbox after a refusal, fetches and security records at a full quota. |
+| [quota](quota/README.md) | Space quota refusal, the outbox after a refusal, fetches and security records at a full quota, the security record reserve and the daily limit. |
 
 ## Exclusions
 

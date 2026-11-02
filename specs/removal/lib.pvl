@@ -1,0 +1,127 @@
+(* Snailfish removal, key rotation and recovery key replacement: shared model.
+   See README.md. Each variant file selects one value of type variant and runs
+   System. *)
+
+type skey.
+type kskey.
+type pkey.
+type kpkey.
+type variant.
+
+(* Variants. vNone is the design in DESIGN.md. Each other value is one deliberate flaw. *)
+const vNone: variant.
+const vSealToRemoved: variant.
+const vEpochUnsigned: variant.
+const vSealToOldRecovery: variant.
+
+free c: channel.
+
+(* The trusted device T and the device S that stays. *)
+free skT: skey [private].
+free dkT: kskey [private].
+free dkS: kskey [private].
+(* The data that S encrypts after it verifies the new epoch. *)
+free sdata: bitstring [private].
+
+(* The stolen device X and the stolen first recovery key R0. The attacker
+   holds their private keys and the epoch 1 app key, which X held (T8, T9). *)
+free skX: skey.
+free dkX: kskey.
+free skR0: skey.
+free dkR0: kskey.
+free appk1: bitstring.
+
+const lepoch: bitstring.
+const lrec: bitstring.
+const lproof: bitstring.
+
+(* Ed25519 as an ideal signature. *)
+fun pk(skey): pkey.
+fun sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; checksig(sign(m, k), pk(k)) = m.
+reduc forall m: bitstring, k: skey; getmess(sign(m, k)) = m.
+
+(* X-Wing as an ideal KEM. A key set seals a key to one recipient. *)
+fun kpub(kskey): kpkey.
+fun aenc(bitstring, kpkey): bitstring.
+reduc forall m: bitstring, d: kskey; adec(aenc(m, kpub(d)), d) = m.
+
+(* XChaCha20-Poly1305 with the app key of an epoch. *)
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m, k), k) = m.
+
+(* The key commitment of PROTOCOL.md 6.2. It has no inverse. *)
+fun commit(bitstring): bitstring.
+
+(* A key set names its recipient (PROTOCOL.md 7.3, `to`) and holds the sealed key. *)
+fun kset(kpkey, bitstring): bitstring [data].
+
+(* The variants differ only in these functions. *)
+(* Rules: [LOG-8] The epoch record seals the new key to each device that stays
+   and to the current recovery key. *)
+letfun removedSet(v: variant, k: bitstring) =
+  if v = vSealToRemoved then kset(kpub(dkX), aenc(k, kpub(dkX))) else kset(kpub(dkT), aenc(k, kpub(dkT))).
+letfun recSet(v: variant, kR1: kpkey, k: bitstring) =
+  if v = vSealToOldRecovery then kset(kpub(dkR0), aenc(k, kpub(dkR0))) else kset(kR1, aenc(k, kR1)).
+letfun epochmsg(v: variant, e: bitstring) =
+  if v = vEpochUnsigned then getmess(e) else checksig(e, pk(skT)).
+
+event TRotates(bitstring).
+event SAccepts(bitstring).
+
+(* T: the user types the current recovery key R0 on T and makes a new one, R1.
+   T appends a recovery record that R0 signs and that holds the possession
+   prf of R1 and the old keys sealed to R1. T then removes X: an epoch record
+   with a new app key, sealed to S, to T and to the current recovery key R1.
+   Rules: [LOG-2] [LOG-8] *)
+let T(v: variant) =
+  new skR1: skey;
+  new dkR1: kskey;
+  let kR1 = kpub(dkR1) in
+  let prf = sign((lproof, pk(skR1), kR1), skR1) in
+  let rr = sign((lrec, pk(skR1), kR1, prf, kset(kR1, aenc(appk1, kR1))), skR0) in
+  out(c, rr);
+  new appk2: bitstring;
+  event TRotates(appk2);
+  let er = sign((lepoch, pk(skX), commit(appk2),
+                 kset(kpub(dkS), aenc(appk2, kpub(dkS))), removedSet(v, appk2), recSet(v, kR1, appk2)), skT) in
+  out(c, er).
+
+(* S verifies the recovery record and the epoch record in log order. The
+   recovery record must carry a valid possession prf. The epoch record must
+   come from T, and its recovery key set must name the recovery key that the
+   recovery record made current. S opens its key set, checks the commitment and
+   then encrypts new data with the new key.
+   An epoch record by X before the block is out of scope: the relay order and
+   the block decide it (specs/spacelog, T8). *)
+let S(v: variant) =
+  in(c, rr: bitstring);
+  let (=lrec, pR1: pkey, kR1: kpkey, prf: bitstring, rset: bitstring) = checksig(rr, pk(skR0)) in
+  if checksig(prf, pR1) = (lproof, pR1, kR1) then
+  in(c, er: bitstring);
+  let (=lepoch, =pk(skX), cm: bitstring, sset: bitstring, tset: bitstring, rcs: bitstring) = epochmsg(v, er) in
+  let kset(=kpub(dkS), sealed: bitstring) = sset in
+  let kset(rto: kpkey, rsealed: bitstring) = rcs in
+  if rto = kR1 then
+  let k = adec(sealed, dkS) in
+  if commit(k) = cm then
+  event SAccepts(k);
+  out(c, senc(sdata, k)).
+
+let System(v: variant) =
+  out(c, (pk(skT), kpub(dkT), kpub(dkS)));
+  (!T(v) | !S(v)).
+
+(* (a) The removed device X and the stolen recovery key R0 never learn a key
+   that T rotates to. T8, T9 *)
+query k: bitstring; event(TRotates(k)) && attacker(k).
+
+(* (b) The data that S encrypts after it verifies the epoch stays secret. *)
+query attacker(sdata).
+
+(* (c) S uses only a key that T rotated to. *)
+query k: bitstring; event(SAccepts(k)) ==> event(TRotates(k)).
+
+(* (d) Reachability. A pass of (a) to (c) must not be vacuous. *)
+query k: bitstring; event(TRotates(k)).
+query k: bitstring; event(SAccepts(k)).

@@ -1,10 +1,10 @@
 # Space log model
 
-`model.qnt` models the security state of the space log: genesis, grants, epoch records (removal and key rotation), the signed base rule, the relay that orders appends, and client verification of the log. It covers DESIGN.md "Space log", the record table, "Enrollment" steps 8 and 9, threats T7 and T8, and closed issues C34, C35, C47 and C48. `checks.toml` lists the configs, limits and mutants. `test.qnt` holds the scenario tests.
+`model.qnt` models the security state of the space log: genesis, grants, epoch records (removal and key rotation), recovery records (recovery key replacement), the full recovery start, the signed base rule, the relay that orders appends, and client verification of the log. It covers DESIGN.md "Space log", the record table, "Enrollment" steps 8 and 9, threats T7 and T8, and closed issues C34, C35, C47 and C48. `checks.toml` lists the configs, limits and mutants. `test.qnt` holds the scenario tests.
 
 ## Abstractions
 
-- A key is an opaque int. A device key is the device ID. The recovery key is `RK` (0).
+- A key is an opaque int. A device key is the device ID. The first recovery key is `RK` (0). A recovery record makes a new recovery key: the negative ID of the record. The space state holds the current recovery key and the retired ones.
 - A signature is a record in the ghost set `env.signed`. Only the author adds a record to it. A malicious relay can offer a record that is not in the set, and the verifier then finds no signature.
 - A digest is the list of record IDs, folded to an int. IDs are unique, so equal digests mean equal prefixes.
 - The shared `protocol` crate is the pure function `check`. The relay and each device call it. A malicious relay does not.
@@ -25,6 +25,9 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | [ENR-8] [ENR-9] (partly) | `sendCheckpoint`, `fetchOne` with the checkpoint check |
 | [LOG-7] retry after `stale_base` | `signGrant`: the confirmed device list (`Confirm`), a new confirmation after a grant or a removal arrived, `grantConfirmed`, mutant `resignNoReconfirm`, tests `resignReconfirmTest` and `retryChecksStateTest` |
 | Grant by the recovery key (M4 decision 1) | `signGrant` with signer `RK` (fault class `recovery`), test `recoveryGrantTest` |
+| [LOG-7] retry of a removal, T8 confirmed list (M7) | `signEpoch` with the confirmed device list, mutant `resignEpochNoReconfirm`, test `resignEpochReconfirmTest` |
+| Recovery record, T9 (M7) | `signRecovery`, `recoveryOk`, `stateOk` for `Recovery`, mutants `oldRecoveryAccepted` and `epochSealsToOldRecovery`, tests `recoveryReplaceTest` and `oldRecoveryRefusedTest` |
+| Full recovery, S5 (M7) | `recoverStart`, then a grant by the current recovery key and a removal by the new device, test `fullRecoveryTest`, witness `wFullRecovery` |
 
 `specs/coverage.toml` lists the LOG rules that the model does not encode (hashes, repair sessions, deletion and the restore hold).
 
@@ -36,7 +39,7 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | `forkRelay` | The relay serves two valid branches. |
 | `forgeRelay` | The relay offers records with no signature. |
 | `reorderRelay` | The relay appends records in any order, also when `check` refuses them. |
-| `thief` | A device that the attacker controls ignores its own removal. Up to 9 records, so that `wThiefSigned` occurs in each sampled run. |
+| `thief` | A device that the attacker controls ignores its own removal and holds the first recovery key (T9). Up to 9 records, so that `wThiefSigned` occurs in each sampled run. |
 | `honest4` | An honest relay with 4 devices. The baseline of the base-rule and key mutants. |
 | `compromisedHonest` | A compromised key signs bounded record templates. The honest relay must refuse invalid records. |
 | `compromisedReorder` | A malicious relay stores those signed records. Honest clients must reject invalid records. |
@@ -58,11 +61,13 @@ The model is plain Quint, not Choreo. The relay is one shared log that every dev
 | `logChangeEpoch` | Each change in a verified log has the epoch of the state before it. |
 | `noFork` | Running honest devices never hold incomparable verified logs. |
 | `noStaleChangeStored` | The relay never stores a change with an epoch below a stored epoch record. |
-| `grantSealsAllKeys` | A verified grant seals exactly the keys from its preceding prefix. |
+| `grantSealsAllKeys` | A verified grant or recovery record seals exactly the keys from its preceding prefix. |
 | `epochSequential` | A verified rotation advances the epoch by one. |
 | `noSelfRemoval` | A verified rotation does not remove its own author. |
 | `grantSubjectNew` | A verified grant does not grant an active device again. |
 | `grantConfirmed` | A verified grant carries the device list that the user confirmed: the active and removed devices at its base. |
+| `epochConfirmed` | A verified removal keeps exactly the devices that the user confirmed. |
+| `retiredRecoveryIsolation` | The key of a verified epoch record reaches no recovery key that a recovery record retired, through any signed record. |
 
 ## Results
 
@@ -127,8 +132,9 @@ Each row names the model scenario and the Rust test that runs it through the pub
 
 ## Not covered
 
-- Recovery record replacement, protocol levels, the device record and the level record. A grant by the recovery key is covered.
-- The user confirmation of an epoch record. The [LOG-7] retry covers grants only, because M4 has no removal.
+- Protocol levels, the device record and the level record (specs/levels).
+- The possession proof of a recovery record. The model treats the new recovery key as fresh. `crates/protocol` checks the proof in the parser.
+- A full recovery that also replaces the recovery key in the same run. The two actions compose, and each has its own scenario.
 - Repair sessions, deletion and the restore hold (the delivery model has those).
 - Log compaction: snapshots, stubs and accept records.
 - Key secrecy as such. The model tracks which keys each record seals to which devices.

@@ -87,6 +87,23 @@ module spacelogTest {
       // Device 2 verified the removal. It cannot sign a grant.
       .then(signGrant(2, 2, 3)).fail()
 
+  // T9: the user replaces the recovery key, then rotates the app key. The new
+  // epoch key is sealed to the new recovery key only. The old recovery key can
+  // no longer sign: the relay refuses its grant.
+  run recoveryReplaceTest =
+    enrolTwo
+      .then(signRecovery(1, RK)).then(appendId(3))
+      .expect(happened(EvRecoveryAppended) and branches.get(0).sp.rk == -3)
+      .expect(branches.get(0).sp.retired == Set(RK) and holders(1, env.signed).contains(-3))
+      .then(fetchOne(1, 0))
+      .expect(dev(1).log.sp.rk == -3)
+      .then(signEpoch(1, 1, 2)).then(appendId(4))
+      .expect(branches.get(0).recs.nth(3).rec == -3 and not(holders(4, env.signed).contains(RK)))
+      .expect(retiredRecoveryIsolation and grantSealsAllKeys)
+      // The old key cannot sign on the new state: no device holds it as current.
+      .then(fetchOne(1, 0))
+      .then(signRecovery(1, RK)).fail()
+
   // Two security records with the same base. The relay appends the first and
   // refuses the second under the base rule. The author signs again on the new tip.
   run baseRaceTest =
@@ -224,6 +241,44 @@ module spacelogTest4 {
       .then(fetchOne(3, 0)).then(fetchOne(3, 0)).then(fetchOne(3, 0))
       .expect(dev(3).status == Running and dev(3).log.sp.active == Set(1, 2, 3))
       .expect(grantAuthorized and grantConfirmed and grantSealsAllKeys)
+
+  // Mutant resignEpochNoReconfirm ([LOG-7], T8). Device 1 removes device 2,
+  // and the user confirms that devices 1 and 3 stay. Device 3 grants device 4
+  // on the same base, and the relay appends that grant first. The removal gets
+  // stale_base. A grant arrived, so the user confirms the list again: device 4
+  // stays only after that confirmation.
+  run resignEpochReconfirmTest =
+    enrolTwo
+      .then(signGrant(1, 1, 3)).then(appendId(3))
+      .then(fetchOne(1, 0)).then(sendCheckpoint(1, 3))
+      .then(fetchOne(3, 0)).then(fetchOne(3, 0)).then(fetchOne(3, 0))
+      .then(signEpoch(1, 1, 2)).then(signGrant(3, 3, 4))
+      .then(appendId(5)).then(refuseId(4))
+      .expect(happened(EvRefusedBaseRule))
+      .then(fetchOne(1, 0))
+      .then(signEpoch(1, 1, 2))
+      .then(appendId(6)).then(fetchOne(1, 0))
+      .expect(branches.get(0).sp.active == Set(1, 3, 4) and dev(1).log.recs.length() == 5)
+      .expect(epochConfirmed)
+      .expect(happened(EvReconfirmed) and not(happened(EvResigned)))
+
+  // S5: every device is lost. Device 3 has no trusted device. It verifies the
+  // log from the genesis record, the user types the recovery key, which grants
+  // device 3, and device 3 then removes the old devices as a trusted device.
+  run fullRecoveryTest =
+    enrolTwo
+      .then(recoverStart(3))
+      .expect(happened(EvRecoveryStart))
+      .then(fetchOne(3, 0)).then(fetchOne(3, 0))
+      .then(signGrant(3, RK, 3)).then(appendId(3))
+      .then(fetchOne(3, 0))
+      .expect(dev(3).log.sp.active == Set(1, 2, 3))
+      .then(signEpoch(3, 3, 1)).then(appendId(4))
+      .then(fetchOne(3, 0))
+      .then(signEpoch(3, 3, 2)).then(appendId(5))
+      .then(fetchOne(3, 0))
+      .expect(happened(EvFullRecovery) and dev(3).log.sp.active == Set(3) and dev(3).log.sp.epoch == 3)
+      .expect(holders(5, env.signed) == Set(3, RK) and noKeyToRemoved and epochConfirmed and authorActive)
 }
 
 // A thief (device 2) ignores its own removal.
@@ -260,6 +315,22 @@ module spacelogTestThief {
       .then(relayDecides(4))
       .then(fetchIfAny(1))
       .expect(authorActive)
+
+  // Mutant oldRecoveryAccepted (T9). The thief holds the first recovery key.
+  // The user replaces it. The thief then signs a grant for device 3 with the
+  // old key. The relay and each verifier must refuse it.
+  run oldRecoveryRefusedTest =
+    init
+      .then(createSpace(1)).then(appendId(1))
+      .then(signGrant(1, 1, 2)).then(appendId(2))
+      .then(fetchOne(1, 0)).then(sendCheckpoint(1, 2))
+      .then(fetchOne(2, 0)).then(fetchOne(2, 0))
+      .then(signRecovery(1, RK)).then(appendId(3))
+      .then(fetchOne(2, 0)).then(fetchOne(1, 0))
+      .then(signGrant(2, RK, 3))
+      .then(relayDecides(4))
+      .then(fetchIfAny(1))
+      .expect(authorActive and grantAuthorized)
 }
 
 
