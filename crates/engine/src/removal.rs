@@ -91,12 +91,27 @@ fn parse_ids(text: &str) -> Result<Vec<Hash32>, EngineError> {
         .collect()
 }
 
-/// The device object of an active device, from its genesis record or grant.
-fn device_of(db: &Connection, id: &Hash32) -> Result<Device, EngineError> {
-    let (_, json) = state::activation(db, id)?
-        .ok_or_else(|| EngineError::Storage("an active device has no grant".into()))?;
-    crate::enroll::grant_device(&json)
-        .ok_or_else(|| EngineError::Storage("an active device has no grant".into()))
+/// The device object of each device of the genesis record and the grants,
+/// in one pass over the log.
+fn device_objects(db: &Connection) -> Result<BTreeMap<Hash32, Device>, EngineError> {
+    let rows: Vec<String> = {
+        let mut st = db.prepare(
+            "SELECT envelope FROM log
+             WHERE payload_type IN ('snailfish.genesis.v1', 'snailfish.grant.v1') ORDER BY position",
+        )?;
+        st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+    };
+    let mut out = BTreeMap::new();
+    for json in rows {
+        if let Some(d) = crate::enroll::grant_device(&json) {
+            out.insert(d.id, d);
+        }
+    }
+    Ok(out)
+}
+
+fn no_grant() -> EngineError {
+    EngineError::Storage("an active device has no grant".into())
 }
 
 /// The keys of the current recovery ID: of the last recovery record, else
@@ -159,9 +174,10 @@ fn sign_epoch(e: &Engine, removed: &[Hash32]) -> Result<String, EngineError> {
         .filter(|d| !removed.contains(d))
         .copied()
         .collect();
+    let objects = device_objects(&e.db)?;
     let mut sets = Vec::with_capacity(stay.len().saturating_add(1));
     for d in &stay {
-        let dev = device_of(&e.db, d)?;
+        let dev = objects.get(d).ok_or_else(no_grant)?;
         sets.push(seal(e, Author::Device(*d), &dev.keys, &[epoch], &[key])?);
     }
     let (rid, _) = view
@@ -193,7 +209,6 @@ struct RemovalRow {
     removed: String,
     confirmed: String,
     after_recovery: Option<Vec<u8>>,
-    envelope: Option<String>,
     state: String,
 }
 
@@ -209,15 +224,14 @@ impl RemovalRow {
 fn removal_row(db: &Connection) -> Result<Option<RemovalRow>, EngineError> {
     Ok(db
         .query_row(
-            "SELECT removed, confirmed, after_recovery, envelope, state FROM removal WHERE id = 1",
+            "SELECT removed, confirmed, after_recovery, state FROM removal WHERE id = 1",
             [],
             |r| {
                 Ok(RemovalRow {
                     removed: r.get(0)?,
                     confirmed: r.get(1)?,
                     after_recovery: r.get(2)?,
-                    envelope: r.get(3)?,
-                    state: r.get(4)?,
+                    state: r.get(3)?,
                 })
             },
         )
@@ -252,35 +266,53 @@ pub(crate) fn security_to_send(e: &mut Engine) -> Result<Vec<(Item, String)>, En
         return Ok(out);
     };
     if let Some(rid) = &row.after_recovery {
-        let current = state::security_state(&e.db)?
-            .recovery
-            .map(|(r, _)| r.to_vec());
+        let view = state::security_state(&e.db)?;
+        let current = view.recovery.map(|(r, _)| r.to_vec());
+        // Another recovery record replaced the key of this device after it
+        // landed. That replacement queues its own rotation (T9), so this one
+        // goes.
+        if view.retired.iter().any(|r| r[..] == rid[..]) {
+            e.db.execute("DELETE FROM removal", [])?;
+            return Ok(out);
+        }
         if current.as_ref() != Some(rid) {
             return Ok(out);
         }
     }
     let list = state::device_list(&e.db)?;
-    let removed = parse_ids(&row.removed)?;
-    let resign = row.state == STALE || (row.state == SEND && row.envelope.is_none());
-    if resign {
-        // [LOG-7]: sign again only on the list that the user confirmed.
-        if list != row.confirmed {
-            e.db.execute("UPDATE removal SET state = ?1, envelope = NULL", [CONFIRM])?;
+    let mut removed = parse_ids(&row.removed)?;
+    // Another epoch record removed some of the devices first. Drop them, and
+    // drop the removal if none is left ([LOG-7], as for a grant of a device
+    // that became active). A rotation has no removed device and stays.
+    let before = removed.len();
+    let active = state::security_state(&e.db)?.devices;
+    removed.retain(|d| active.contains_key(d));
+    if removed.len() < before {
+        if removed.is_empty() {
+            e.db.execute("DELETE FROM removal", [])?;
             return Ok(out);
         }
-        // 13.2 step 5: always a new key, because a refused record sealed
-        // the old key to its recipients.
-        let env = sign_epoch(e, &removed)?;
         e.db.execute(
-            "UPDATE removal SET state = ?1, envelope = ?2",
-            params![SEND, env],
+            "UPDATE removal SET removed = ?1, state = ?2",
+            params![id_list(&removed), CONFIRM],
         )?;
-        out.push((Item::Epoch, env));
-    } else if row.state == SEND
-        && let Some(env) = row.envelope
-    {
-        out.push((Item::Epoch, env));
+        return Ok(out);
     }
+    if row.state == CONFIRM {
+        return Ok(out);
+    }
+    // [LOG-7]: sign only on the list that the user confirmed.
+    if list != row.confirmed {
+        e.db.execute("UPDATE removal SET state = ?1", [CONFIRM])?;
+        return Ok(out);
+    }
+    // 13.2 steps 3 and 5: each sync until the verified log holds the record
+    // signs it on the verified head with a new key. A refused record sealed
+    // its key to its recipients, and a stored record whose answer was lost is
+    // in the verified log before this point, so the row is gone.
+    let env = sign_epoch(e, &removed)?;
+    e.db.execute("UPDATE removal SET state = ?1", [SEND])?;
+    out.push((Item::Epoch, env));
     Ok(out)
 }
 
@@ -305,10 +337,14 @@ pub(crate) fn answer(e: &mut Engine, item: &Item, r: &AppendResult) -> Result<()
             } else {
                 STALE
             };
-            e.db.execute(
-                &format!("UPDATE {table} SET state = ?1, envelope = NULL"),
-                [next],
-            )?;
+            if matches!(item, Item::Recovery) {
+                e.db.execute(
+                    "UPDATE recovery_record SET state = ?1, envelope = NULL",
+                    [next],
+                )?;
+            } else {
+                e.db.execute("UPDATE removal SET state = ?1", [next])?;
+            }
         }
         AppendResult::Refused(code) if code == "bad_base" => {}
         AppendResult::Refused(code) if code == "reserve" || code == "security_limit" => {
@@ -413,11 +449,12 @@ impl Engine {
     /// [`EngineError::Storage`].
     pub fn active_devices(&self) -> Result<Vec<ActiveDevice>, EngineError> {
         let view = state::security_state(&self.db)?;
+        let objects = device_objects(&self.db)?;
         let mut out = Vec::new();
         for id in view.devices.keys() {
             out.push(ActiveDevice {
                 id: encode_id("d_", id),
-                name: device_of(&self.db, id)?.name,
+                name: objects.get(id).ok_or_else(no_grant)?.name.clone(),
                 this_device: *id == self.device_id,
             });
         }
@@ -459,11 +496,10 @@ impl Engine {
             return Err(EngineError::Invalid("another removal waits".into()));
         }
         self.db.execute(
-            "INSERT INTO removal (id, removed, confirmed, after_recovery, envelope, state)
-             VALUES (1, ?1, ?2, NULL, NULL, ?3)
+            "INSERT INTO removal (id, removed, confirmed, after_recovery, state)
+             VALUES (1, ?1, ?2, NULL, ?3)
              ON CONFLICT (id) DO UPDATE SET removed = excluded.removed,
-               confirmed = excluded.confirmed, after_recovery = NULL, envelope = NULL,
-               state = excluded.state",
+               confirmed = excluded.confirmed, after_recovery = NULL, state = excluded.state",
             params![id_list(&ids), list, SEND],
         )?;
         Ok(())
@@ -573,8 +609,8 @@ impl Engine {
         // T9: the rotation that follows, so the holder of the old key cannot
         // read later changes.
         tx.execute(
-            "INSERT INTO removal (id, removed, confirmed, after_recovery, envelope, state)
-             VALUES (1, '', ?1, ?2, NULL, ?3)",
+            "INSERT INTO removal (id, removed, confirmed, after_recovery, state)
+             VALUES (1, '', ?1, ?2, ?3)",
             params![state::device_list(&tx)?, &next.id[..], SEND],
         )?;
         tx.commit()?;
@@ -637,11 +673,19 @@ impl Engine {
 
     /// Queue the grant of a full recovery (13.4 step 6): the recovery key
     /// signs a grant for this device on the verified head, with each epoch
-    /// key that the log seals to the recovery ID.
-    pub(crate) fn queue_recovery_grant(&mut self) -> Result<(), EngineError> {
+    /// key that the log seals to the recovery ID. A grant that is already
+    /// queued stays as it is, unless `again` (after `stale_base`).
+    pub(crate) fn queue_recovery_grant(&mut self, again: bool) -> Result<(), EngineError> {
         let Some(r) = self.recovery.as_ref() else {
             return Ok(());
         };
+        if !again
+            && state::grants(&self.db)?
+                .iter()
+                .any(|g| g.device_id == self.device_id)
+        {
+            return Ok(());
+        }
         let view = state::security_state(&self.db)?;
         if view.devices.contains_key(&self.device_id) {
             return Ok(());

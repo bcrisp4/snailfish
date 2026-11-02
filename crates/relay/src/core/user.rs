@@ -1005,7 +1005,7 @@ impl Relay {
         let tc = store::open(&tenant.db(), Kind::Tenant, false)?;
         let quota = limits(&tc, &self.cfg.quotas)?;
         let spaces = tenant_spaces(&tc, &tenant.dir)?;
-        let devices = tenant_devices(&tc, &tenant.dir, &spaces)?;
+        let devices = tenant_devices(&tc, &tenant.dir, &spaces, self.cfg.levels.max)?;
         let hidden = format!("<input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">");
         let actions = security_actions(&devices, self.cfg.levels.max);
         let mut html = format!(
@@ -1053,7 +1053,7 @@ impl Relay {
             return Ok(0);
         }
         let spaces = tenant_spaces(&c, &tenant.dir)?;
-        let devices = tenant_devices(&c, &tenant.dir, &spaces)?;
+        let devices = tenant_devices(&c, &tenant.dir, &spaces, self.cfg.levels.max)?;
         let quota = limits(&c, &self.cfg.quotas)?;
         let mut cases: Vec<(String, String)> = Vec::new();
         for sp in &spaces {
@@ -1146,11 +1146,14 @@ fn tenant_spaces(tc: &Connection, tdir: &Path) -> Result<Vec<SpaceRow>, StoreErr
 }
 
 /// The active devices of each space of `spaces`, with their names and
-/// their last status reports.
+/// their last status reports. The device levels come from a replay of the
+/// security records, so only a relay with a level above 1 (`max_level`)
+/// reads them. With level 1 only, each device has level 1.
 fn tenant_devices(
     tc: &Connection,
     tdir: &Path,
     spaces: &[SpaceRow],
+    max_level: u64,
 ) -> Result<Vec<DeviceRow>, StoreError> {
     let mut out = Vec::new();
     for sp in spaces {
@@ -1166,15 +1169,26 @@ fn tenant_devices(
         let rows: Vec<(Vec<u8>, String, String)> = st
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?;
-        let state = super::security_state(&sc, false)?;
+        let levels = if max_level > 1 {
+            super::security_state(&sc, false)?.device_levels
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        // Each epoch record carries the next epoch ([LOG-8]).
+        let epochs: i64 = sc.query_row(
+            "SELECT count(*) FROM entries WHERE payload_type = 'snailfish.epoch.v1'",
+            [],
+            |r| r.get(0),
+        )?;
+        let epoch = from_i64(epochs)?.saturating_add(1);
         for (raw, ptype, env) in rows {
             let id = encode_id("d_", &raw);
             let name = device_name(&ptype, &env, &id).unwrap_or_else(|| "?".to_owned());
             let status = read_status(tc, &sp.log, &id, sp.head)?;
             let level = Hash32::try_from(raw)
                 .ok()
-                .and_then(|h| state.device_levels.get(&h).copied())
-                .unwrap_or(0);
+                .and_then(|h| levels.get(&h).copied())
+                .unwrap_or(1);
             out.push(DeviceRow {
                 blocked: is_blocked(tc, &id)?,
                 id,
@@ -1183,7 +1197,7 @@ fn tenant_devices(
                 log: sp.log.clone(),
                 status,
                 level,
-                epoch: state.epoch,
+                epoch,
             });
         }
     }
@@ -1384,7 +1398,7 @@ fn block_write(ctx: &Form<'_>, block: bool) -> ApiResult<Reply> {
     match kind {
         "device" if block => {
             let spaces = tenant_spaces(&c, &ctx.tdir)?;
-            if !tenant_devices(&c, &ctx.tdir, &spaces)?
+            if !tenant_devices(&c, &ctx.tdir, &spaces, 1)?
                 .iter()
                 .any(|d| d.id == id)
             {
@@ -1593,7 +1607,7 @@ fn group_write(ctx: &Form<'_>, path: &str) -> ApiResult<Reply> {
             // A group member is a device that is active in a space of
             // the tenant (12.4).
             let spaces = tenant_spaces(&c, &ctx.tdir)?;
-            if !tenant_devices(&c, &ctx.tdir, &spaces)?
+            if !tenant_devices(&c, &ctx.tdir, &spaces, 1)?
                 .iter()
                 .any(|d| d.id == device)
             {

@@ -3464,6 +3464,18 @@ fn removal_rotates_the_key_and_stops_the_removed_device() {
     ));
     ea.remove_devices(std::slice::from_ref(&other.id)).unwrap();
     assert!(ea.removal_pending().unwrap());
+    assert_eq!(
+        ea.removal_to_confirm().unwrap(),
+        None,
+        "the user confirmed it"
+    );
+    assert!(
+        matches!(
+            ea.remove_devices(std::slice::from_ref(&other.id)),
+            Err(EngineError::Invalid(_))
+        ),
+        "a second removal waits for the first"
+    );
     w.exchange(&mut ea);
     assert!(!ea.removal_pending().unwrap(), "the verified log holds it");
     assert_eq!(ea.current_epoch().unwrap(), 2);
@@ -3563,6 +3575,8 @@ fn stale_removal_is_signed_again_with_a_new_key() {
     assert!(String::from_utf8_lossy(&body).contains("stale_base"));
     sync.handle_response(&mut ea, st, &h, &body).unwrap();
     drop(sync);
+    // The recovery record of B left the device list as it was.
+    assert_eq!(ea.removal_to_confirm().unwrap(), None);
     w.exchange(&mut ea);
     assert_eq!(ea.removal_to_confirm().unwrap(), None, "no question");
     assert!(!ea.removal_pending().unwrap());
@@ -3827,4 +3841,155 @@ fn security_records_past_the_reserve_wait() {
     w.exchange(&mut ea);
     assert_eq!(ea.status(), Status::Ok);
     assert!(!ea.removal_pending().unwrap());
+}
+
+/// [DLV-7], `specs/epochs/test.qnt::repairRetainsRotationTest`: a change
+/// that the relay refused with `wrong_epoch` while the relay missed an epoch
+/// record goes again as it is once the verified log holds its epoch, for
+/// example after a repair. It does not stay in the outbox for ever.
+#[test]
+fn stale_epoch_row_at_the_current_epoch_is_sent_again() {
+    let (mut w, mut a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    a.edit(&ea, b"refused once");
+    a.enqueue(&mut ea);
+    ea.db
+        .execute("UPDATE outbox SET state = ?1", [state::STALE_EPOCH])
+        .unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.outbox_len().unwrap(), 0);
+    assert_eq!(change_epochs(&w), vec![1]);
+}
+
+/// [LOG-7], `PROTOCOL.md` 13.2: A queues the removal of B, but N removes B
+/// first. The removal of A has no device left, so A drops it and asks
+/// nothing. Without this, `removal_pending` stays true for ever.
+#[test]
+fn removal_of_a_device_that_another_device_removed_is_dropped() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let b_id = w.engine(&b).device_id();
+    let kn = new_device_keys().unwrap();
+    let key = w.recovery_key.clone();
+    let mut en = Engine::open_recovery(&w.root.join("n"), w.space(), &kn, &key, "N").unwrap();
+    w.exchange(&mut en);
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    en.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    w.exchange(&mut en);
+    w.exchange(&mut ea);
+    assert_eq!(ea.removal_to_confirm().unwrap(), None);
+    assert!(!ea.removal_pending().unwrap());
+    assert_eq!(ea.status(), Status::Ok);
+    assert_eq!(ea.current_epoch().unwrap(), 2, "only the record of N");
+}
+
+/// T8, `PROTOCOL.md` 13.1: a relay that still serves a removed device (here
+/// a relay whose removed table lost its row) sends B its own removal. B
+/// stores the epoch record and the entries before it, then stops.
+#[test]
+fn removed_device_stores_its_removal_and_stops() {
+    let (mut w, mut a, b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    a.edit(&ea, b"before the removal");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    ea.remove_devices(&[eb.device_id()]).unwrap();
+    w.exchange(&mut ea);
+    let tenants = w.relay_data().join("tenants");
+    let tdir = std::fs::read_dir(&tenants)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let space = std::fs::read_dir(tdir.join("spaces"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let sc = Connection::open(&space).unwrap();
+    let id = decode_id::<32>(&eb.device_id(), "d_").unwrap();
+    sc.execute("DELETE FROM removed", []).unwrap();
+    sc.execute(
+        "INSERT INTO devices (device_id, sign_key, position) VALUES (?1, ?2, 3)",
+        rusqlite::params![
+            &id[..],
+            &snailfish_protocol::sig::SecretKey::from_seed(&w.keys[1].sign_seed).public()[..]
+        ],
+    )
+    .unwrap();
+    w.exchange(&mut eb);
+    assert_eq!(eb.status(), Status::Removed);
+    assert_eq!(
+        eb.verified_head().unwrap().position,
+        4,
+        "genesis, grant, change and the epoch record"
+    );
+}
+
+/// `PROTOCOL.md` 10.6 and 13.2: a refusal of an epoch record or a recovery
+/// record other than the transient ones is final. The engine drops the
+/// record and reports `degraded`, and does not sign it again at each sync.
+/// The relay answer is the external boundary here, because an honest relay
+/// refuses no record that an honest engine signs for ever.
+#[test]
+fn permanently_refused_security_records_are_dropped() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let b_id = w.engine(&b).device_id();
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    let refused = snailfish_protocol::wire::AppendResult::Refused("invalid_record".into());
+    crate::removal::answer(&mut ea, &crate::sync::Item::Epoch, &refused).unwrap();
+    assert!(!ea.removal_pending().unwrap());
+    assert!(matches!(ea.status(), Status::Degraded { .. }));
+    let new = Engine::new_recovery_key().unwrap();
+    ea.replace_recovery_key(&w.recovery_key.clone(), &new)
+        .unwrap();
+    crate::removal::answer(&mut ea, &crate::sync::Item::Recovery, &refused).unwrap();
+    assert!(!ea.recovery_key_needed().unwrap());
+    assert!(
+        !ea.removal_pending().unwrap(),
+        "the rotation after it goes too"
+    );
+    let transient = snailfish_protocol::wire::AppendResult::Refused("bad_base".into());
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    crate::removal::answer(&mut ea, &crate::sync::Item::Epoch, &transient).unwrap();
+    assert!(ea.removal_pending().unwrap());
+}
+
+/// T9, `PROTOCOL.md` 13.3: A replaces the recovery key, and B replaces it
+/// again before A rotates. The rotation of A waited for the key of A, which
+/// is now retired, so A drops it, and the rotation of B follows the newest
+/// key. Without this, A waits for ever and cannot start a removal.
+#[test]
+fn rotation_after_a_superseded_recovery_key_is_dropped() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    let by_a = Engine::new_recovery_key().unwrap();
+    ea.replace_recovery_key(&w.recovery_key.clone(), &by_a)
+        .unwrap();
+    w.exchange(&mut ea);
+    assert!(
+        ea.removal_pending().unwrap(),
+        "the rotation waits for the next sync"
+    );
+    w.exchange(&mut eb);
+    let by_b = Engine::new_recovery_key().unwrap();
+    eb.replace_recovery_key(&by_a, &by_b).unwrap();
+    w.exchange(&mut eb);
+    w.exchange(&mut eb);
+    w.exchange(&mut ea);
+    assert!(!ea.removal_pending().unwrap());
+    assert_eq!(ea.current_epoch().unwrap(), 2, "only the rotation of B");
+    w.recovery_key = by_b;
 }

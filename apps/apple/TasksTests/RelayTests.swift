@@ -399,8 +399,14 @@ final class RelayTests: XCTestCase {
         try await recoverSpace(
             device: s, relayURL: relay, name: "S", recoveryKey: key, transport: transport,
             browser: browser(approver))
+        // Until the grant is in the verified log, a restart must start the
+        // recovery again.
+        let waiting = try await s.recoveryWaits()
+        XCTAssertTrue(waiting)
         let v1 = try await s.sync(transport)
         XCTAssertEqual(v1, .ok)
+        let done = try await s.recoveryWaits()
+        XCTAssertFalse(done)
         let titles = try await s.tasks().map(\.title)
         XCTAssertEqual(titles, ["before the fire"])
         let lost = try await s.activeDevices().filter { !$0.thisDevice }.map(\.id)

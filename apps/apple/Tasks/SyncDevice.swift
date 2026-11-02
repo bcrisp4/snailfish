@@ -33,6 +33,10 @@ actor SyncDevice {
 
     nonisolated var engineDir: URL { root.appendingPathComponent("engine", isDirectory: true) }
     private nonisolated var spaceFile: URL { root.appendingPathComponent("space.json") }
+    /// Exists from the start of a full recovery until the verified log holds
+    /// the grant of this device. The engine keeps the recovery key in memory
+    /// only, so after a restart the user starts the recovery again.
+    private nonisolated var recoveringFile: URL { root.appendingPathComponent("recovering") }
 
     init(
         root: URL, keyStore: KeyStore, deleteKeys: @escaping (String) throws -> Void,
@@ -265,6 +269,7 @@ actor SyncDevice {
     /// the grant opens the app key.
     func recover(space sp: SpaceRef, keys: DeviceKeys, recoveryKey: String, name: String) throws {
         try clearUncommitted()
+        try Data().write(to: recoveringFile, options: .atomic)
         let dir = engineDir.path
         let ks = keyStore
         try openEngine(sp, open: {
@@ -276,6 +281,25 @@ actor SyncDevice {
                 try store.outboxEveryField { try e.newChangeId() }
             }
         }
+    }
+
+    /// True while a full recovery has not granted this device. After a
+    /// restart, the engine has no recovery key, so the app offers to start
+    /// the recovery again.
+    func recoveryWaits() throws -> Bool {
+        guard FileManager.default.fileExists(atPath: recoveringFile.path) else { return false }
+        if let engine, try engine.activeDevices().contains(where: \.thisDevice) {
+            try FileManager.default.removeItem(at: recoveringFile)
+            return false
+        }
+        return true
+    }
+
+    /// Drop a full recovery that did not finish, so the user can start it
+    /// again. The relay holds no record of this device yet.
+    func abandonRecovery() throws {
+        try leaveFailedSetup()
+        try? FileManager.default.removeItem(at: recoveringFile)
     }
 
     // MARK: Removal (S4, PROTOCOL.md 13.2) and key replacement (13.3)

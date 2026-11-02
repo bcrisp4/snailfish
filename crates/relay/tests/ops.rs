@@ -503,3 +503,43 @@ fn hold_report_text_names_devices_and_sessions() {
     assert!(text.contains(&format!("{} by", hex::encode(sid))), "{text}");
     assert!(text.contains("finished"), "{text}");
 }
+
+/// [LOG-8], [LOG-10], `PROTOCOL.md` 10.9 start step 4: the relay lost the
+/// epoch record that removes B, as after a restore of an older backup. A
+/// repair that brings the removal back cannot be signed by B, because the
+/// passed entries remove it. A, which stays, repairs the log.
+#[test]
+fn device_that_the_repair_entries_remove_cannot_repair() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let removal = fx.h["access"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "removed-device")
+        .map(|c| s(&c["extra"][0]).to_owned())
+        .unwrap();
+    let r = fx.post(
+        fx.tenant(),
+        "append",
+        format!(r#"{{"envelopes":[{removal}]}}"#).as_bytes(),
+        "A",
+    );
+    assert_eq!(r.status, 200);
+    let five: Vec<(u64, String)> = vec![(5, removal)];
+    fx.cut_log(fx.tenant(), 4);
+    // The older backup holds B as active and no removal.
+    let c = rusqlite::Connection::open(fx.space_file(fx.tenant())).unwrap();
+    c.execute("DELETE FROM removed", []).unwrap();
+    let (kb, idb, _) = fx.key("B");
+    c.execute(
+        "INSERT INTO devices (device_id, sign_key, position) VALUES (?1, ?2, 3)",
+        rusqlite::params![&idb[..], &kb.public()[..]],
+    )
+    .unwrap();
+    let body = wire::repair_start_body(&head_of(&fx, 4), &five).unwrap();
+    let r = fx.post(fx.tenant(), "repair", &body, "B");
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "removed"));
+    let r = fx.post(fx.tenant(), "repair", &body, "A");
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+}

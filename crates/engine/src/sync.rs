@@ -597,14 +597,10 @@ impl Sync {
         let log_id = engine.log_id;
         let tx = Transaction::new_unchecked(&engine.db, TransactionBehavior::Immediate)
             .map_err(|e| Answer::Engine(e.into()))?;
-        let mut degraded = None;
-        {
-            let mut view = DbSpace::new(&tx, log_id).map_err(Answer::Engine)?;
-            for (pos, entry) in &f.entries {
-                if let Some(cause) = verify_entry(engine, &mut view, *pos, entry)? {
-                    degraded = Some(cause);
-                }
-            }
+        let (mut degraded, removed) = verify_page(engine, &tx, &f.entries)?;
+        if removed {
+            tx.commit().map_err(|e| Answer::Engine(e.into()))?;
+            return Err(Answer::Removed);
         }
         let (head, digest) = state::head(&tx, &log_id).map_err(Answer::Engine)?;
         let at_head = !f.has_more && f.head.position == head;
@@ -732,7 +728,7 @@ impl Sync {
             Phase::Done
         } else if engine.recovering()? {
             // PROTOCOL.md 13.4 step 6: the recovery key grants this device.
-            match engine.queue_recovery_grant() {
+            match engine.queue_recovery_grant(false) {
                 Ok(()) => Phase::Grants,
                 Err(EngineError::Invalid(cause)) => {
                     engine.status = Status::Degraded { cause };
@@ -925,6 +921,28 @@ pub(crate) fn batch(items: Vec<(Item, String)>, limits: &Limits) -> (Batches, Ve
     (out, too_large)
 }
 
+/// Verify and store the entries of one fetch page inside the fetch
+/// transaction. Returns the last `degraded` cause, and true if an epoch
+/// record removed this device: the page then ends at that record, which is
+/// stored with the entries before it.
+fn verify_page(
+    engine: &Engine,
+    tx: &Transaction<'_>,
+    entries: &[(u64, FetchEntry)],
+) -> Result<(Option<String>, bool), Answer> {
+    let mut view = DbSpace::new(tx, engine.log_id).map_err(Answer::Engine)?;
+    let mut degraded = None;
+    for (pos, entry) in entries {
+        match verify_entry(engine, &mut view, *pos, entry) {
+            Ok(Some(cause)) => degraded = Some(cause),
+            Ok(None) => {}
+            Err(Answer::Removed) => return Ok((degraded, true)),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((degraded, false))
+}
+
 /// Verify and store one fetched entry inside the fetch transaction.
 /// Returns a `degraded` cause, if any. [WIR-2]: the check verifies the
 /// signature before `store_entry` changes any state.
@@ -975,13 +993,6 @@ fn verify_entry(
             }
         }
     };
-    // PROTOCOL.md 13.1, T8: an epoch record that removes this device ends
-    // its sync. The relay refuses its requests from now on.
-    if let snailfish_protocol::records::Body::Epoch { removed, .. } = &accepted.record.body
-        && removed.contains(&engine.device_id)
-    {
-        return Err(Answer::Removed);
-    }
     let content = if accepted.record.change_id().is_some() {
         let c = state::decrypt_change(engine, &raw.envelope).map(|b| state::content_hash(&b));
         // A new device has no app key before its checkpoint check. It
@@ -1004,6 +1015,13 @@ fn verify_entry(
     }
     view.state.apply(&accepted.record);
     crate::removal::verified(tx, &accepted.record, &engine.device_id).map_err(Answer::Engine)?;
+    // PROTOCOL.md 13.1, T8: an epoch record that removes this device ends
+    // its sync. The relay refuses its requests from now on.
+    if let snailfish_protocol::records::Body::Epoch { removed, .. } = &accepted.record.body
+        && removed.contains(&engine.device_id)
+    {
+        return Err(Answer::Removed);
+    }
     state::drop_setup(tx, &accepted.record_hash).map_err(Answer::Engine)?;
     if let Some((id, _)) = accepted.new_device {
         // [LOG-7]: the verified log holds a grant for this device, so the

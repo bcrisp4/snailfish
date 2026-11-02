@@ -923,7 +923,7 @@ impl Relay {
         )?;
         let reserve = self.cfg.security_reserve;
         {
-            let base = SqlView::new(&tx, log_id, false)?;
+            let base = SqlView::new(&tx, log_id, false);
             let mut view = snailfish_protocol::space::Overlay::new(&base);
             for item in items {
                 let Ok(raw) = item else {
@@ -1118,7 +1118,7 @@ impl Relay {
         if let Some(c) = &chain {
             keys.extend(c.accepted.iter().filter_map(|a| a.new_device));
         }
-        let removed = load_removed(&tx)?;
+        let removed = repair_removed(&tx, named.is_some(), chain.as_ref())?;
         let signers = Signers {
             keys: &keys,
             removed: &removed,
@@ -1384,7 +1384,7 @@ fn repair_chain<'b>(
         RepairBody::Chunk(c) if continues => (c.entries.as_slice(), true),
         _ => return Ok((&[], None)),
     };
-    let view = SqlView::new(tx, log_id, staged)?;
+    let view = SqlView::new(tx, log_id, staged);
     let c = run_chain(&view, entries);
     view.take_error()?;
     Ok((entries, Some(c)))
@@ -1401,6 +1401,28 @@ fn chain_result(c: &chain::Chain) -> ApiResult<()> {
         }
         Some((_, e @ ChainError::Invalid(r))) => Err(api(422, e.code(), r.to_string())),
     }
+}
+
+/// The removed devices for the signer check of a repair request: of the
+/// log, of the staged entries of a named session, and of the entries that
+/// passed the chain check ([LOG-8]). A device that they remove cannot sign
+/// the repair.
+fn repair_removed(
+    tx: &Connection,
+    staged: bool,
+    chain: Option<&chain::Chain>,
+) -> Result<std::collections::BTreeSet<Hash32>, StoreError> {
+    let mut removed = if staged {
+        security_state(tx, true)?.removed
+    } else {
+        load_removed(tx)?
+    };
+    for a in chain.map_or(&[][..], |c| &c.accepted[..]) {
+        if let Effect::Epoch { removed: r, .. } = effect(&a.record) {
+            removed.extend(r);
+        }
+    }
+    Ok(removed)
 }
 
 /// Start a session of `device` at `head`. A start replaces the session of
@@ -1733,7 +1755,10 @@ pub(crate) fn security_state(c: &Connection, staged: bool) -> Result<State, Stor
 struct SqlView<'a> {
     conn: &'a Connection,
     log_id: [u8; 16],
-    state: State,
+    // The space state of 10.2, built on first use. A change needs only its
+    // author key, the epoch and the write level, which the tables give, so
+    // a change append replays no security record.
+    state: std::cell::OnceCell<State>,
     // Read the staging table after the log: the chain of a repair chunk
     // continues the staged entries (`PROTOCOL.md` 10.9).
     staged: bool,
@@ -1741,13 +1766,23 @@ struct SqlView<'a> {
 }
 
 impl<'a> SqlView<'a> {
-    fn new(conn: &'a Connection, log_id: [u8; 16], staged: bool) -> Result<Self, StoreError> {
-        Ok(Self {
+    fn new(conn: &'a Connection, log_id: [u8; 16], staged: bool) -> Self {
+        Self {
             conn,
             log_id,
-            state: security_state(conn, staged)?,
+            state: std::cell::OnceCell::new(),
             staged,
             error: RefCell::new(None),
+        }
+    }
+
+    /// The space state of the log, and of the staging table if `staged`.
+    /// On a read error it is empty, and the request fails through
+    /// `take_error`.
+    fn state(&self) -> &State {
+        self.state.get_or_init(|| {
+            self.query(security_state(self.conn, self.staged).map(Some))
+                .unwrap_or_default()
         })
     }
 
@@ -1830,27 +1865,41 @@ impl SpaceView for SqlView<'_> {
     }
 
     fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.state.device_key(id)
+        if self.staged {
+            return self.state().device_key(id);
+        }
+        // The devices table holds the active devices of the log.
+        self.query((|| {
+            let k: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT sign_key FROM devices WHERE device_id = ?1",
+                    params![id.as_slice()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(k.and_then(|k| <[u8; 32]>::try_from(k).ok()))
+        })())
     }
 
     fn active_devices(&self) -> Vec<Hash32> {
-        self.state.devices.keys().copied().collect()
+        self.state().devices.keys().copied().collect()
     }
 
     fn is_removed(&self, id: &Hash32) -> bool {
-        self.state.removed.contains(id)
+        self.state().removed.contains(id)
     }
 
     fn device_level(&self, id: &Hash32) -> Option<u64> {
-        self.state.device_levels.get(id).copied()
+        self.state().device_levels.get(id).copied()
     }
 
     fn recovery_key(&self, id: &Hash32) -> Option<[u8; 32]> {
-        self.state.recovery_key(id)
+        self.state().recovery_key(id)
     }
 
     fn recovery_known(&self, id: &Hash32) -> bool {
-        self.state.recovery_known(id)
+        self.state().recovery_known(id)
     }
 
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
@@ -1871,11 +1920,34 @@ impl SpaceView for SqlView<'_> {
     }
 
     fn write_level(&self) -> u64 {
-        self.state.level
+        if self.staged {
+            return self.state().level;
+        }
+        self.query((|| {
+            let l: i64 =
+                self.conn
+                    .query_row("SELECT write_level FROM space WHERE id = 1", [], |r| {
+                        r.get(0)
+                    })?;
+            from_i64(l).map(Some)
+        })())
+        .unwrap_or(u64::MAX)
     }
 
     fn epoch(&self) -> u64 {
-        self.state.epoch
+        if self.staged {
+            return self.state().epoch;
+        }
+        // Each epoch record carries the next epoch ([LOG-8]).
+        self.query((|| {
+            let n: i64 = self.conn.query_row(
+                "SELECT count(*) FROM entries WHERE payload_type = 'snailfish.epoch.v1'",
+                [],
+                |r| r.get(0),
+            )?;
+            from_i64(n).map(|n| Some(n.saturating_add(1)))
+        })())
+        .unwrap_or(0)
     }
 
     fn last_security(&self) -> u64 {

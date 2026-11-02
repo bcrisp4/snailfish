@@ -217,6 +217,19 @@ struct SyncSettings: View {
                             then { model.addDevice(scan: true) }
                         }
                     }
+                    if model.recoveryWaits {
+                        Section("The recovery did not finish") {
+                            TextField("Recovery key from your paper", text: $recoveryKey)
+                                .autocorrectionDisabled()
+                                .noAutocapitalization()
+                            Button("Recover again") {
+                                let w = web.web
+                                let key = recoveryKey
+                                then { model.recoverAgain(recoveryKey: key) { try await w.redirect(for: $0) } }
+                            }
+                            .disabled(recoveryKey.isEmpty)
+                        }
+                    }
                     Section("Lost or stolen device") {
                         Button("Remove a device") {
                             then { model.showRemoval() }

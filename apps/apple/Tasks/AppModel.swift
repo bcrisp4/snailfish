@@ -29,6 +29,8 @@ final class AppModel: ObservableObject {
     @Published var tasks: [TaskItem] = []
     @Published var status = "sync off"
     @Published var syncOn = false
+    /// A full recovery did not grant this device before the app stopped.
+    @Published var recoveryWaits = false
     @Published var step: Step = .none
     @Published var message: String?
     @Published var relayURL: String {
@@ -89,6 +91,7 @@ final class AppModel: ObservableObject {
         do {
             tasks = try await device.tasks()
             syncOn = await device.syncOn
+            recoveryWaits = try await device.recoveryWaits()
             status = try await device.statusText()
             if let syncError { status += " (last sync: \(syncError))" }
         } catch {
@@ -184,19 +187,33 @@ final class AppModel: ObservableObject {
     /// recovery key (S5). After the sync grants this device, the user
     /// removes the lost devices.
     func recover(recoveryKey: String, browser: @escaping (URL) async throws -> URL) {
-        let relay = relayURL
         run("recover") { [self] in
-            step = .working("Signing in")
-            try await recoverSpace(
-                device: device, relayURL: relay, name: deviceName(), recoveryKey: recoveryKey,
-                transport: transport, browser: browser)
-            step = .working("Checking the log")
-            _ = try await device.sync(transport, background: false)
-            let devices = try await device.activeDevices()
-            guard devices.contains(where: \.thisDevice) else {
-                throw SetupError.message("the relay did not grant this device: \(status)")
-            }
-            step = .removal(devices)
+            try await recoverFlow(recoveryKey: recoveryKey, browser: browser)
+        }
+    }
+
+    private func recoverFlow(recoveryKey: String, browser: @escaping (URL) async throws -> URL) async throws {
+        let relay = relayURL
+        step = .working("Signing in")
+        try await recoverSpace(
+            device: device, relayURL: relay, name: deviceName(), recoveryKey: recoveryKey,
+            transport: transport, browser: browser)
+        step = .working("Checking the log")
+        _ = try await device.sync(transport, background: false)
+        let devices = try await device.activeDevices()
+        guard devices.contains(where: \.thisDevice) else {
+            throw SetupError.message("the relay did not grant this device: \(status)")
+        }
+        _ = try await device.recoveryWaits()
+        step = .removal(devices)
+    }
+
+    /// Start a full recovery again after it stopped before the grant (the
+    /// engine keeps the recovery key in memory only).
+    func recoverAgain(recoveryKey: String, browser: @escaping (URL) async throws -> URL) {
+        run("recover") { [self] in
+            try await device.abandonRecovery()
+            try await recoverFlow(recoveryKey: recoveryKey, browser: browser)
         }
     }
 

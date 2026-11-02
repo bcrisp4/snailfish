@@ -198,7 +198,6 @@ fn migrate_m7(db: &Connection) -> Result<(), EngineError> {
            removed TEXT NOT NULL,
            confirmed TEXT NOT NULL,
            after_recovery BLOB,
-           envelope TEXT,
            state TEXT NOT NULL
          );
          CREATE TABLE recovery_record (
@@ -411,7 +410,7 @@ pub(crate) fn pending(e: &mut Engine, max: usize) -> Result<Vec<Pending>, Engine
 /// `wrong_epoch` again with the key of the current epoch, keep its
 /// `change_id`, and sign it on the verified head. The relay checks a known
 /// `change_id` before the epoch, so the refusal shows that it holds no copy.
-/// A row stays stale until the verified log has a newer epoch than the row.
+/// A row whose epoch the verified log holds goes back to pending as it is.
 fn reencrypt_stale(e: &Engine) -> Result<(), EngineError> {
     let rows: Vec<(i64, Vec<u8>, String)> = {
         let mut st = e
@@ -442,7 +441,14 @@ fn reencrypt_stale(e: &Engine) -> Result<(), EngineError> {
         else {
             return Err(EngineError::Storage("an outbox row is not a change".into()));
         };
+        // The relay refused the epoch, but the verified log has it now, for
+        // example after a repair put a lost epoch record back. The envelope
+        // is valid as it is.
         if old_epoch >= epoch {
+            e.db.execute(
+                "UPDATE outbox SET state = ?1 WHERE seq = ?2",
+                params![PENDING, seq],
+            )?;
             continue;
         }
         let plain = decrypt_change(e, &old)
