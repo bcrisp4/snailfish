@@ -35,6 +35,10 @@ final class AppModel: ObservableObject {
     private var answer: CheckedContinuation<Bool, Never>?
     private var flow: Task<Void, Never>?
     private var syncing = false
+    // A setup or an enrollment uses the engine. The sync loop waits, so two
+    // state machines never drive one engine at the same time.
+    private var flows = 0
+    private var flowActive: Bool { flows > 0 }
 
     init(device: SyncDevice, measurements: Measurements) {
         self.device = device
@@ -55,7 +59,7 @@ final class AppModel: ObservableObject {
             ?? support.appendingPathComponent("Tasks", isDirectory: true)
         // One keychain service for each data directory: two devices of one
         // space on one Mac must not share a key item.
-        let service = "snailfish." + (Bundle.main.bundleIdentifier ?? appID) + "." + root.lastPathComponent
+        let service = "snailfish." + (Bundle.main.bundleIdentifier ?? appID) + ":" + root.standardizedFileURL.path
         #if os(iOS)
             // Documents is visible in Finder file sharing, so the log can be
             // copied off the iPhone.
@@ -81,7 +85,10 @@ final class AppModel: ObservableObject {
     private func run(_ what: String, _ body: @escaping () async throws -> Void) {
         flow?.cancel()
         flow = Task {
+            flows += 1
             do {
+                // A sync that started before the flow ends first.
+                while syncing { try await Task.sleep(nanoseconds: 50_000_000) }
                 try await body()
             } catch SetupError.cancelled {
             } catch is CancellationError {
@@ -89,7 +96,8 @@ final class AppModel: ObservableObject {
                 message = "\(what): \(error)"
             }
             if case .working = step { step = .none }
-            await refresh()
+            flows -= 1
+            await syncNow()
         }
     }
 
@@ -119,7 +127,7 @@ final class AppModel: ObservableObject {
     // MARK: Sync
 
     func syncNow(background: Bool = false) async {
-        guard await device.syncOn, !syncing else { return }
+        guard await device.syncOn, !syncing, !flowActive else { return }
         syncing = true
         defer { syncing = false }
         do {
@@ -151,7 +159,6 @@ final class AppModel: ObservableObject {
             let key = try await createSpace(
                 device: device, relayURL: relay, name: deviceName(), transport: transport, browser: browser)
             step = .recoveryKey(key)
-            await syncNow()
         }
     }
 
@@ -193,7 +200,6 @@ final class AppModel: ObservableObject {
             let cause = try await invite(engine: engine, scanned: scanned, transport: transport, ui: self)
             step = .none
             message = cause.isEmpty ? "The device joined." : "The enrollment failed: \(cause)"
-            await syncNow()
         }
     }
 
@@ -205,7 +211,6 @@ final class AppModel: ObservableObject {
                 device: device, relayURL: relay, name: deviceName(), scanned: scanned, transport: transport, ui: self)
             step = .none
             message = cause.isEmpty ? "This device joined." : "The enrollment failed: \(cause)"
-            await syncNow()
         }
     }
 

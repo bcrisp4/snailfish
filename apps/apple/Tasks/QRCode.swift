@@ -70,6 +70,12 @@ final class QRScanner: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @
 
     func start(found: @escaping (String) -> Void) throws {
         self.found = found
+        queue.sync { done = false }
+        // The view can appear again with the same scanner: configure once.
+        guard session.inputs.isEmpty else {
+            queue.async { self.session.startRunning() }
+            return
+        }
         guard let device = AVCaptureDevice.default(for: .video) else {
             throw SetupError.message("this device has no camera: type the code")
         }

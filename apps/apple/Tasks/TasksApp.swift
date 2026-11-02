@@ -7,29 +7,35 @@ import SwiftUI
 
 @main
 struct TasksApp: App {
-    @StateObject private var model: AppModel
+    // The app data and the engine open at launch. If the key store refuses
+    // the keys, the app fails closed and shows the cause (C62).
+    private let opened: Result<AppModel, Error>
 
     init() {
-        let m: AppModel
-        do {
-            m = try AppModel.make()
-        } catch {
-            fatalError("cannot open the app data: \(error)")
+        opened = Result { try AppModel.make() }
+        if case .success(let m) = opened {
+            #if os(iOS)
+                BackgroundSync.register(model: m)
+            #endif
+            LaunchActions.run(model: m)
         }
-        _model = StateObject(wrappedValue: m)
-        #if os(iOS)
-            BackgroundSync.register(model: m)
-        #endif
-        LaunchActions.run(model: m)
     }
 
     var body: some Scene {
         WindowGroup {
-            ContentView(model: model)
+            switch opened {
+            case .success(let model): ContentView(model: model)
+            case .failure(let error):
+                Text("The app cannot open its data: \(String(describing: error))")
+                    .padding()
+                    .textSelection(.enabled)
+            }
         }
         #if os(iOS)
             .backgroundTask(.appRefresh(BackgroundSync.identifier)) {
-                await BackgroundSync.handle(model: model)
+                if case .success(let model) = opened {
+                    await BackgroundSync.handle(model: model)
+                }
             }
         #endif
     }

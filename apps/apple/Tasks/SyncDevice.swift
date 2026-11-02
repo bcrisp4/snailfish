@@ -113,8 +113,14 @@ actor SyncDevice {
     }
 
     /// Exchange with the relay, then pull. Returns the engine status.
+    /// True while `sync` waits for the relay. The actor can run other calls
+    /// then.
+    private var syncing = false
+
     func sync(_ transport: Transport, background: Bool = false) async throws -> Status {
         guard let engine else { throw SetupError.syncOff }
+        syncing = true
+        defer { syncing = false }
         let exchange = try engine.startSync()
         while let req = try exchange.nextRequest() {
             let (status, headers, body) = try await transport.send(req)
@@ -123,6 +129,7 @@ actor SyncDevice {
         repairs = try engine.takeRepairs()
         try pull(background: background)
         try flushOutboxNow()
+        flushError = nil
         return try engine.status()
     }
 
@@ -145,8 +152,10 @@ actor SyncDevice {
             if batch.isEmpty { return applied }
             var arrived: [(Data, Int64)] = []
             try store.db.transaction {
+                // Read inside the transaction, so a crash between batches
+                // applies no change twice.
+                var pos = try store.applied()?.position ?? 0
                 for c in batch {
-                    let pos = try store.applied()?.position ?? 0
                     if c.position <= pos { continue }
                     let own = try store.db.query("SELECT 1 FROM outbox WHERE change_id = ?", [.blob(c.changeId)])
                     if !own.isEmpty {
@@ -162,6 +171,7 @@ actor SyncDevice {
                         "INSERT INTO applied (id, position, digest) VALUES (1, ?, ?) "
                             + "ON CONFLICT (id) DO UPDATE SET position = excluded.position, digest = excluded.digest",
                         [.int(Int64(c.position)), .blob(c.digest)])
+                    pos = c.position
                 }
             }
             for (cid, wall) in arrived {
@@ -184,12 +194,17 @@ actor SyncDevice {
     func statusText() throws -> String {
         guard let engine else { return "sync off" }
         let s = try engine.status()
+        var text = Snailfish.statusText(status: s)
         switch s {
         case .degraded(let cause), .fork(let cause), .setupFailed(let cause):
-            return "\(Snailfish.statusText(status: s)): \(cause)"
+            text += ": \(cause)"
         default:
-            return Snailfish.statusText(status: s)
+            break
         }
+        // Edits that the engine did not take yet, for example on a new
+        // device before its first sync.
+        if let flushError { text += " (edits wait: \(flushError))" }
+        return text
     }
 
     // MARK: Setup
@@ -239,6 +254,8 @@ actor SyncDevice {
     /// engine state and the user turns on sync again. The app keeps its
     /// tasks, and the next `turnOnSync` writes their outbox rows again.
     func leaveFailedSetup() throws {
+        // A sync holds the engine, so its directory and lock stay in use.
+        guard !syncing else { throw SetupError.message("a sync is running: try again") }
         engine = nil
         space = nil
         try? FileManager.default.removeItem(at: spaceFile)
