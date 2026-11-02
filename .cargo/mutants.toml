@@ -62,6 +62,15 @@ exclude_re = [
   "replace write_level -> u64 with 0",
   "replace write_level -> u64 with 1",
   "replace < with > in TrustedEnrollment::on_session",
+  # Equivalent mutants in M7 (D12, DESIGN.md C71): the engine has no
+  # synthetic level, so each device and each space it sees is at level 1,
+  # and no level record is valid. Reading the level and assuming 1 give the
+  # same result. The relay and protocol tests check the level rules with a
+  # synthetic level 2. Remove these entries with the first real level 2.
+  "engine/src/state.rs:.*: replace <impl SpaceView for DbSpace<'_>>::device_level -> Option<u64> with Some\\(1\\)",
+  "engine/src/state.rs:.*: replace <impl SpaceView for DbSpace<'_>>::write_level -> u64 with 1",
+  "engine/src/state.rs:.*: delete match arm Body::Genesis\\{level, \\.\\.\\} in store_entry",
+  "engine/src/state.rs:.*: delete match arm Body::Level\\{level\\} in store_entry",
   # Only a storage fault inside the token exchange returns an error other
   # than `bad_setup`, and a test cannot make one portably. With `true`, that
   # fault commits the claimed nonce, which the refusal keeps anyway.
