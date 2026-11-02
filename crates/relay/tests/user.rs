@@ -284,21 +284,6 @@ fn new_invite_removes_old_passkeys_and_sessions() {
     assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_passkey"));
 }
 
-/// PROTOCOL.md 12.4: a flood of sign-in starts that fills the ceremony
-/// store does not refuse the sign-in of the user, which starts after it.
-#[test]
-fn ceremony_flood_does_not_refuse_a_sign_in() {
-    let fx = Fx::new();
-    let (_, mut k) = signed_in(&fx);
-    let mut flood = Browser::new(&fx);
-    for _ in 0..snailfish_relay::core::user::MAX_CEREMONIES {
-        let r = flood.json("/u/signin/start", &json!({ "name": "sam" }));
-        assert_eq!(r.status, 200);
-    }
-    let r = Browser::new(&fx).sign_in("sam", &mut k);
-    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-}
-
 /// [USR-1], `specs/signin/plain_invite.pv`: the directory holds a hash of
 /// the invite token, never the token.
 #[test]

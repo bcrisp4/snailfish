@@ -1806,6 +1806,37 @@ impl Relay {
 mod tests {
     use super::*;
 
+    /// A registration ceremony, which needs no stored passkey.
+    fn ceremony(a: &Auth) -> Ceremony {
+        let (_, state) = a
+            .webauthn
+            .start_passkey_registration(Uuid::from_bytes([1; 16]), "sam", "sam", None)
+            .unwrap();
+        Ceremony::Register {
+            user_id: "u_x".into(),
+            state,
+            invite: None,
+        }
+    }
+
+    #[test]
+    fn full_ceremony_store_replaces_the_oldest() {
+        // 12.4: a flood of starts that fills the store cannot refuse the
+        // sign-in that starts after it. The oldest ceremony goes instead.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::new(dir.path().join("data"), "sync.example.net");
+        cfg.secrets_dir = dir.path().join("secrets");
+        let a = Auth::open(&cfg).unwrap();
+        let first = a.keep(ceremony(&a), 100).unwrap();
+        for _ in 1..MAX_CEREMONIES {
+            a.keep(ceremony(&a), 101).unwrap();
+        }
+        let last = a.keep(ceremony(&a), 102).unwrap();
+        assert_eq!(a.ceremonies.lock().unwrap().len(), MAX_CEREMONIES);
+        assert!(a.take(&hex(&first), 102).is_err(), "the oldest stays");
+        assert!(a.take(&hex(&last), 102).is_ok(), "the newest went");
+    }
+
     #[test]
     fn percent_of_quota() {
         // 12.4: a quota of 0 is full, and the percent rounds down.
