@@ -28,6 +28,13 @@ To sign a build, do these steps:
 2. Set `DEVELOPMENT_TEAM` and a `BUNDLE_ID_PREFIX` that your team owns.
 3. Sign in to your Apple account in Xcode.
 
+If a signed build fails, find the error in this table:
+
+| Error | Cause and fix |
+| --- | --- |
+| `No Accounts: Add a new account in Accounts settings.` | Xcode has no signed-in account, or the shell cannot read it. An agent sandbox cannot read the Xcode account. Run the command in a terminal outside the sandbox. If Xcode signed you out, sign in again in Xcode > Settings > Apple Accounts. |
+| `Build input file cannot be found: '.../Provisioning Profiles/<UUID>.provisionprofile'` | The first run with `-allowProvisioningUpdates` creates the profiles, and one target can refer to a profile before it exists. Run the same command again. |
+
 ## Run the demo: an iPhone joins from a Mac
 
 The iPhone must reach the relay. Use an HTTPS relay URL, for example a Tailscale `ts.net` name, because a passkey works only on its domain.
