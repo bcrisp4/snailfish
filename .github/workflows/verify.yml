@@ -19,6 +19,13 @@ on:
   schedule:
     - cron: "17 3 * * *"
 
+# A new push to a pull request cancels the run for the previous push. Its
+# results are out of date, and its jobs hold runners that the new run needs.
+# A push to main and the nightly run are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # The commit that the drift and mutants-diff gates compare with.
@@ -37,6 +44,13 @@ jobs:
       # rust-toolchain.toml pins the stable toolchain. Install it explicitly.
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
+      # Cache the dependency builds. cargo-mutants copies the tree without
+      # target/, so the mutants job gets no gain from this cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/protocol/fuzz -> target
       # cargo kani setup installs the nightly that fuzz and the fuzz lint need.
       # A restored mise cache skips the postinstall hook, so run it here.
       - run: mise exec -- cargo kani setup
@@ -58,6 +72,7 @@ jobs:
       - run: rustup toolchain install --profile minimal
       - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
       - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
       # The runner image chooses the simulator models. Use an iPhone on the
       # newest iOS runtime, because Package.swift needs iOS 17 or later.
       - id: sim
@@ -184,6 +199,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
       - run: mise exec -- cargo kani setup
       # A runner has 16 GB. decode_never_panics alone uses about 10.5 GB and
       # frame_layout about 9 GB, so two runs at once can stop the runner. One
@@ -240,6 +256,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/protocol/fuzz -> target
       - run: mise exec -- cargo kani setup
       - run: make rust-fuzz FUZZ_SECONDS=30
 

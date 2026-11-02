@@ -10,6 +10,9 @@ CARGO := mise exec -- cargo
 NIGHTLY_NAME := nightly-2026-08-21
 NIGHTLY := +$(NIGHTLY_NAME)
 FUZZ_SECONDS ?= 300
+# libFuzzer uses one core per target, so run one target per core. Each target
+# can use up to 2 GB (the libFuzzer -rss_limit_mb default).
+FUZZ_JOBS ?= $(shell getconf _NPROCESSORS_ONLN)
 # cargo-fuzz builds for the target that it was compiled for. A prebuilt
 # cargo-fuzz for Linux is a musl binary, and the address sanitizer does not
 # work with a static libc. So pass the host target of rustc.
@@ -29,13 +32,24 @@ MUTANTS_SHARD ?=
 MUTANTS_MIN_TIMEOUT ?= 120
 # passkey.rs compiles only with the webauthn feature, so the workspace runs
 # skip it: an uncompiled mutant shows as MISSED. rust-mutants-passkey tests it.
+# Round-robin sharding gives each shard about the same work. With slice
+# sharding, the shards that get the relay mutants take about 3 times longer.
 MUTANTS_ARGS = --workspace --exclude crates/relay/src/passkey.rs -j $(MUTANTS_JOBS) \
-  --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT) $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD))
+  --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT) \
+  $(if $(MUTANTS_SHARD),--shard $(MUTANTS_SHARD) --sharding round-robin)
+# cargo-mutants and the tests write below TMPDIR. On macOS, each SQLite commit
+# in the tests does an F_FULLFSYNC, which waits for the SSD. On a RAM disk the
+# workspace tests take about 6 s, not 45 s. If `make mutants-ramdisk` mounted
+# the RAM disk, the mutants targets use it.
+RAMDISK := /Volumes/snailfish-mutants
+RAMDISK_GB ?= 16
+MUTANTS_TMPDIR ?= $(wildcard $(RAMDISK))
+MUTANTS_ENV = $(if $(MUTANTS_TMPDIR),TMPDIR=$(MUTANTS_TMPDIR))
 
 .PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-powerloss \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
-        rust-nightly-check rust-nightly-components rust-mutants-passkey verify-crypto
+        rust-nightly-check rust-nightly-components rust-mutants-passkey mutants-ramdisk verify-crypto
 
 ## The gate for each commit: Rust lint and tests, the shared vectors in Go and
 ## Python, runner tests, then the fast Quint tier. `make test-swift` needs Xcode,
@@ -81,7 +95,7 @@ rust: rust-lint rust-test rust-deny
 rust-lint:
 	mise exec -- taplo fmt --check mise.toml Cargo.toml crates/*/Cargo.toml crates/*/fuzz/Cargo.toml \
 	  bindings/python/pyproject.toml \
-	  deny.toml clippy.toml rust-toolchain.toml .cargo/mutants.toml
+	  deny.toml clippy.toml rust-toolchain.toml .cargo/mutants.toml .config/nextest.toml
 	$(CARGO) fmt --all --check
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	@# Fuzz crates are separate workspaces, so lint each one too.
@@ -109,15 +123,18 @@ rust-nightly-check:
 	    echo "FAIL: Kani uses '$$kani_nightly', the Makefile uses '$(NIGHTLY_NAME)'. Update NIGHTLY_NAME."; exit 1; fi; \
 	  echo "ok: nightly $(NIGHTLY_NAME) matches Kani"
 
-## Each fuzz target for FUZZ_SECONDS (default 300). Seeds are in fuzz/seeds/.
+## Each fuzz target for FUZZ_SECONDS (default 300), FUZZ_JOBS targets at a
+## time. Seeds are in fuzz/seeds/. Each log is in fuzz/target/logs/.
 rust-fuzz: rust-nightly-check
 	@for dir in crates/*/fuzz; do \
-	  for target in $$(cd $$dir && $(CARGO) $(NIGHTLY) fuzz list); do \
-	    echo "== fuzz $$dir $$target ($(FUZZ_SECONDS)s)"; \
-	    mkdir -p $$dir/corpus/$$target; \
-	    (cd $$dir && $(CARGO) $(NIGHTLY) fuzz run --target $(FUZZ_TARGET) $$target corpus/$$target seeds/$$target \
-	      -- -max_total_time=$(FUZZ_SECONDS)) || exit 1; \
-	  done; \
+	  (cd $$dir && $(CARGO) $(NIGHTLY) fuzz build --target $(FUZZ_TARGET)) || exit 1; \
+	  mkdir -p $$dir/target/logs; \
+	  (cd $$dir && $(CARGO) $(NIGHTLY) fuzz list | xargs -P $(FUZZ_JOBS) -n 1 sh -c ' \
+	    mkdir -p corpus/$$1; \
+	    if $(CARGO) $(NIGHTLY) fuzz run --target $(FUZZ_TARGET) $$1 corpus/$$1 seeds/$$1 \
+	      -- -max_total_time=$(FUZZ_SECONDS) > target/logs/$$1.log 2>&1; \
+	    then echo "ok: fuzz $$1 ($(FUZZ_SECONDS)s)"; \
+	    else tail -n 60 target/logs/$$1.log; echo "FAIL: fuzz $$1"; exit 1; fi' sh) || exit 1; \
 	done
 
 ## cargo-mutants. A MISSED mutant fails the target. The exit code alone is not
@@ -136,13 +153,13 @@ endef
 ## Mutants of every crate in the workspace. Run nightly, and before a release.
 ## MUTANTS_SHARD=k/n runs one shard. CI runs 8 shards in parallel.
 rust-mutants:
-	@$(CARGO) mutants $(MUTANTS_ARGS); $(check_mutants)
+	@$(MUTANTS_ENV) $(CARGO) mutants $(MUTANTS_ARGS); $(check_mutants)
 
 ## Mutants of crates/relay/src/passkey.rs, which only the `webauthn` feature
 ## compiles. A feature flag is valid for one package only, so the workspace
 ## runs above cannot enable it.
 rust-mutants-passkey:
-	@$(CARGO) mutants -p snailfish-relay --features webauthn -f crates/relay/src/passkey.rs \
+	@$(MUTANTS_ENV) $(CARGO) mutants -p snailfish-relay --features webauthn -f crates/relay/src/passkey.rs \
 	  -j $(MUTANTS_JOBS) --minimum-test-timeout $(MUTANTS_MIN_TIMEOUT); $(check_mutants)
 
 ## Mutants in the Rust code that changed since BASE (default main). Run before a
@@ -153,7 +170,16 @@ rust-mutants-diff:
 	  git rev-parse --verify --quiet '$(BASE)^{commit}' > /dev/null || { echo "FAIL: BASE '$(BASE)' is not a git commit"; exit 1; }; \
 	  git diff $(BASE) -- '*.rs' > mutants.diff || { echo "FAIL: git diff $(BASE) failed"; exit 1; }; \
 	  if [ ! -s mutants.diff ]; then echo "ok: no Rust change since $(BASE)"; exit 0; fi; \
-	  $(CARGO) mutants $(MUTANTS_ARGS) --in-diff mutants.diff; $(check_mutants)
+	  $(MUTANTS_ENV) $(CARGO) mutants $(MUTANTS_ARGS) --in-diff mutants.diff; $(check_mutants)
+
+## macOS only: mount a RAM disk of RAMDISK_GB at RAMDISK for the mutants
+## targets. A run with 4 jobs used 3 GB at its peak. Eject it with
+## `diskutil eject $(RAMDISK)`. The contents are lost at a restart.
+mutants-ramdisk:
+	@if [ -d $(RAMDISK) ]; then echo "ok: $(RAMDISK) is mounted"; exit 0; fi; \
+	  dev=$$(hdiutil attach -nomount ram://$$(( $(RAMDISK_GB) * 2097152 )) | tr -d ' \t') && \
+	  diskutil erasevolume APFS $(notdir $(RAMDISK)) $$dev > /dev/null && \
+	  echo "ok: $(RAMDISK) ($(RAMDISK_GB) GB) on $$dev"
 
 ## Licences, advisories and sources of every dependency.
 rust-deny:
