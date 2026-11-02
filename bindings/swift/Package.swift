@@ -6,7 +6,7 @@ import PackageDescription
 
 let package = Package(
     name: "Snailfish",
-    platforms: [.iOS(.v17), .macOS(.v14)],
+    platforms: [.iOS("26.0"), .macOS(.v14)],
     products: [.library(name: "Snailfish", targets: ["Snailfish"])],
     targets: [
         .binaryTarget(name: "snailfishFFI", path: "build/Snailfish.xcframework"),

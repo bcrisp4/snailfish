@@ -1,6 +1,6 @@
 # Tasks: the Swift sample app
 
-Tasks is the SwiftUI version of the demo task app (DESIGN.md M6). It runs on iOS 17 and macOS 14. It uses the same app ID, change format and merge rules as the Python demo, so a demo device and an app device can share a space.
+Tasks is the SwiftUI version of the demo task app (DESIGN.md M6). It runs on iOS 26 and macOS 14. It uses the same app ID, change format and merge rules as the Python demo, so a demo device and an app device can share a space.
 
 | File | Content |
 | --- | --- |
@@ -63,7 +63,7 @@ The delay includes the clock difference of the two devices. Both clocks use NTP.
 
 To measure the commit cost on an iPhone, do these steps:
 
-1. Run `xcrun devicectl device process launch --device <UDID> <bundle ID> -bench-commit YES`.
+1. Run `xcrun devicectl device process launch --device <UDID> <bundle ID> -- -bench-commit YES`.
 2. Run `xcrun devicectl device copy from --device <UDID> --domain-type appDataContainer --domain-identifier <bundle ID> --source Documents/measure.jsonl --destination .`.
 3. Read the `commit` line.
 

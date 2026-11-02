@@ -49,6 +49,10 @@ case "${1:-}" in
     # of each XCFramework slice.
     mv "$gen/snailfishFFI.h" "$gen/headers/"
     cp "$gen/snailfishFFI.modulemap" "$gen/headers/module.modulemap"
+    # The C code in the static library (bundled SQLite) must target the same
+    # OS versions as Package.swift, or the app link warns that the objects
+    # are built for a newer OS than the app.
+    export IPHONEOS_DEPLOYMENT_TARGET=26.0 MACOSX_DEPLOYMENT_TARGET=14.0
     args=()
     for t in aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin; do
       $CARGO build -p snailfish-bindings --lib --release --target "$t"
