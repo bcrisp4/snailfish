@@ -1,0 +1,9 @@
+// Copy to Local.xcconfig, and set your team ID and a bundle ID prefix that
+// your team owns. `make app-macos-signed` and `make app-ios-device` read it.
+
+DEVELOPMENT_TEAM = XXXXXXXXXX
+BUNDLE_ID_PREFIX = com.example.yourname
+CODE_SIGN_STYLE = Automatic
+CODE_SIGN_IDENTITY = Apple Development
+CODE_SIGN_ENTITLEMENTS[sdk=macosx*] = Tasks/Tasks-macOS.entitlements
+CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*] = Tasks/Tasks-iOS.entitlements
