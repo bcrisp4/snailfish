@@ -3988,12 +3988,10 @@ fn stale_epoch_row_at_the_current_epoch_is_sent_again() {
     assert_eq!(change_epochs(&w), vec![1]);
 }
 
-/// [LOG-7], `PROTOCOL.md` 13.2: A queues the removal of B. Before A syncs,
-/// N removes D. The active devices changed, so A signs nothing and asks the
-/// user again. Without this, A would sign on a device list that the user
-/// did not confirm.
-#[test]
-fn removal_after_another_removal_needs_a_new_confirmation() {
+/// A space with A, B, D (enrolled by B) and N (by a full recovery), each
+/// synced. Returns the world, the engines of A and N, and the device ID
+/// texts of B and D.
+fn four_devices() -> (World, Engine, Engine, String, String) {
     let (mut w, a, b) = World::new();
     let mut ea = w.engine(&a);
     let mut eb = w.engine(&b);
@@ -4009,8 +4007,6 @@ fn removal_after_another_removal_needs_a_new_confirmation() {
     let mut en = Engine::open_recovery(&w.root.join("n"), w.space(), &kn, &key, "N").unwrap();
     w.exchange(&mut en);
     w.exchange(&mut ea);
-    let b_id = eb.device_id();
-    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
     let d_id = en
         .active_devices()
         .unwrap()
@@ -4018,12 +4014,42 @@ fn removal_after_another_removal_needs_a_new_confirmation() {
         .find(|d| d.name == "D")
         .unwrap()
         .id;
+    let b_id = eb.device_id();
+    (w, ea, en, b_id, d_id)
+}
+
+/// [LOG-7], `PROTOCOL.md` 13.2: A queues the removal of B. Before A syncs,
+/// N removes D. The active devices changed, so A signs nothing and asks the
+/// user again. Without this, A would sign on a device list that the user
+/// did not confirm.
+#[test]
+fn removal_after_another_removal_needs_a_new_confirmation() {
+    let (mut w, mut ea, mut en, b_id, d_id) = four_devices();
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
     en.remove_devices(std::slice::from_ref(&d_id)).unwrap();
     w.exchange(&mut en);
     w.exchange(&mut ea);
     assert_eq!(ea.removal_to_confirm().unwrap(), Some(vec![b_id]));
     assert_eq!(relay_types(&w, &ea).last().unwrap(), "snailfish.epoch.v1");
     assert_eq!(ea.current_epoch().unwrap(), 2, "only the record of N");
+}
+
+/// [LOG-7], `PROTOCOL.md` 13.2: A queues the removal of B and D. Before A
+/// syncs, N removes D. A asks the user again, for B only. Without this, A
+/// would show a device that is gone, and its record would remove a device
+/// that is not active.
+#[test]
+fn removal_of_a_device_that_another_device_removed_asks_for_the_rest() {
+    let (mut w, mut ea, mut en, b_id, d_id) = four_devices();
+    ea.remove_devices(&[b_id.clone(), d_id.clone()]).unwrap();
+    en.remove_devices(std::slice::from_ref(&d_id)).unwrap();
+    w.exchange(&mut en);
+    w.exchange(&mut ea);
+    assert_eq!(ea.removal_to_confirm().unwrap(), Some(vec![b_id.clone()]));
+    ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
+    w.exchange(&mut ea);
+    assert!(!ea.removal_pending().unwrap());
+    assert_eq!(ea.current_epoch().unwrap(), 3);
 }
 
 /// [LOG-7], `PROTOCOL.md` 13.2: A queues the removal of B, but N removes B
@@ -4126,6 +4152,35 @@ fn permanently_refused_security_records_are_dropped() {
     ea.remove_devices(std::slice::from_ref(&b_id)).unwrap();
     crate::removal::answer(&mut ea, &crate::sync::Item::Epoch, &transient).unwrap();
     assert!(ea.removal_pending().unwrap());
+}
+
+/// `PROTOCOL.md` 13.3 step 6: the relay refuses the recovery record with
+/// `stale_base`. The engine asks for the current key again, and a new
+/// replacement drops the old record and its rotation. Without this, the
+/// rotation that waits for the old record blocks the replacement for ever.
+#[test]
+fn stale_recovery_record_lets_the_user_replace_the_key_again() {
+    let (mut w, a, _) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let old = w.recovery_key.clone();
+    ea.replace_recovery_key(&old, &Engine::new_recovery_key().unwrap())
+        .unwrap();
+    let stale = snailfish_protocol::wire::AppendResult::Refused("stale_base".into());
+    crate::removal::answer(&mut ea, &crate::sync::Item::Recovery, &stale).unwrap();
+    assert!(ea.recovery_key_needed().unwrap());
+    assert!(ea.removal_pending().unwrap(), "the rotation waits");
+    let new = Engine::new_recovery_key().unwrap();
+    ea.replace_recovery_key(&old, &new).unwrap();
+    assert!(!ea.recovery_key_needed().unwrap());
+    w.exchange(&mut ea);
+    w.exchange(&mut ea);
+    assert!(!ea.removal_pending().unwrap());
+    let types = relay_types(&w, &ea);
+    assert_eq!(
+        types[types.len() - 2..],
+        ["snailfish.recovery.v1", "snailfish.epoch.v1"]
+    );
 }
 
 /// T9, `PROTOCOL.md` 13.3: A replaces the recovery key, and B replaces it
