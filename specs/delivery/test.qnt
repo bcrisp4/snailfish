@@ -164,6 +164,23 @@ module deliveryTest {
       .then(releaseHoldWarned)
       .expect(not(relay.hold) and noSilentLoss and env.lostAtRelease == Set(1))
 
+  // Mutant releaseIgnoresFresh ([LOG-15], F3): device 1 lost its engine state
+  // during the hold, so the user page marks it "not repaired", and a release
+  // without the warning is not possible. Device 1 does not fetch after the
+  // loss, so the test does not depend on the fresh flag over a fetch
+  // (notRepairedMarkTest). Sampling reaches this order too rarely to catch the
+  // mutant in each run.
+  run releaseNeedsWarningTest =
+    init
+      .then(edit(2, false, false)).then(enqueue(2, 0)).then(push(2, 0, false))
+      .then(edit(1, false, false)).then(enqueue(1, 1)).then(push(1, 1, false))
+      .then(fetchExtend(1, 2)).then(pull(1, false)).then(pull(1, false))
+      .then(restoreRelay(1))
+      .then(loseEngine(1))
+      .then(reportStatus(1)).then(reportStatus(2))
+      .expect(allReported and relay.marked == Set(1))
+      .then(releaseHold.fail())
+
   // The relay lowers the limit after enqueue. The relay refuses the envelope for ever.
   run refusedAtPushTest =
     init

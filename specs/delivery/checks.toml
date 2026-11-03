@@ -214,9 +214,12 @@ caught_by = "refusedNotStored"
 base = "restoreEngine"
 caught_by = "noStuckDevice"
 
+# A sampled run of 5000 traces missed this mutant in 1 of 8 runs, so a named
+# scenario catches it. TLC checks it on every state of tinyRecovery.
 [mutants.releaseIgnoresFresh]
 base = "restoreEngine"
-caught_by = "noSilentLoss"
+caught_by = "tests"
+test = "releaseNeedsWarningTest"
 
 [mutants.freshClearsOnFetch]
 base = "restoreEngine"
