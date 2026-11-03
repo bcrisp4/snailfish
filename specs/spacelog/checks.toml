@@ -181,9 +181,13 @@ caught_by = "tests"
 test_module = "spacelogTestThief"
 test = "thiefGrantTest"
 
+# A sampled run of 5000 traces can miss the grant after a verified removal
+# (CI seed 0xb6d0f4003c07dbac), so a named scenario catches it.
 [mutants.regrantRemoved]
-base = "honest"
-caught_by = "noKeyToRemoved"
+base = "honest4"
+caught_by = "tests"
+test_module = "spacelogTest4"
+test = "regrantRemovedTest"
 
 [mutants.epochUnchecked]
 base = "honest"

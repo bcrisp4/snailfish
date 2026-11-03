@@ -169,6 +169,18 @@ module spacelogTest4 {
       .then(fetchOne(1, 0)).then(sendCheckpoint(1, 2))
       .then(fetchOne(2, 0)).then(fetchOne(2, 0))
 
+  // Mutant regrantRemoved ([LOG-8], T8). Device 1 removes device 2 and
+  // verifies the removal. A grant for device 2 is then invalid, so device 1
+  // cannot sign it, and no key of the new epoch reaches device 2. Under the
+  // mutant the grant is valid, and the relay stores it (noKeyToRemoved fails).
+  // Sampling reaches this order too rarely to catch the mutant in each run.
+  run regrantRemovedTest =
+    enrolTwo
+      .then(signEpoch(1, 1, 2)).then(appendId(3))
+      .then(fetchOne(1, 0))
+      .expect(dev(1).log.sp.removed == Set(2) and noKeyToRemoved)
+      .then(signGrant(1, 1, 2)).fail()
+
   // Mutants noBaseRule and relayNoBaseRule ([LOG-7]). Two grants for two new
   // devices on one base. The second grant is valid on the state after the
   // first, so only the base rule refuses it. Two devices are not enough: each
