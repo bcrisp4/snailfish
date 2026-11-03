@@ -296,10 +296,19 @@ actor SyncDevice {
     }
 
     /// Drop a full recovery that did not finish, so the user can start it
-    /// again. The relay holds no record of this device yet.
-    func abandonRecovery() throws {
+    /// again. The relay can hold the grant of this device with no answer on
+    /// this device, for example after a crash during a sync. The keys of a
+    /// granted device must stay, so a sync comes first. A failed sync throws
+    /// and drops nothing.
+    ///
+    /// - Returns: False if the sync found the grant. The recovery is then
+    ///   complete.
+    func abandonRecovery(_ transport: Transport) async throws -> Bool {
+        _ = try await sync(transport)
+        guard try recoveryWaits() else { return false }
         try leaveFailedSetup()
         try? FileManager.default.removeItem(at: recoveringFile)
+        return true
     }
 
     // MARK: Removal (S4, PROTOCOL.md 13.2) and key replacement (13.3)

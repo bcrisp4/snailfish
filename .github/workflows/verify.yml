@@ -93,9 +93,11 @@ jobs:
 
   app:
     # DESIGN.md M6: the Swift sample app on an iOS simulator and on macOS,
-    # with no signing, against a relay process (make test-app). The macOS
-    # keychain tests check the fail-closed path, because an unsigned build
-    # has no keychain entitlement.
+    # with no signing, against a relay process (make test-app): the unit
+    # tests, the UI tests of S4, S5 and the key replacement, and the check
+    # that a Release build has no UI test seam. The macOS keychain tests
+    # check the fail-closed path, because an unsigned build has no keychain
+    # entitlement.
     runs-on: macos-15
     timeout-minutes: 60
     steps:

@@ -39,6 +39,8 @@ reads the changes of the other:
 - `POST /py/recover?key=K`: recover the space onto a new demo device with
   the recovery key (S5, PROTOCOL.md 13.4). The new device replaces the
   device of `setup`.
+- `POST /py/block?id=D` and `POST /py/unblock?id=D`: block or unblock the
+  device D on the user page, as the user does (S4, PROTOCOL.md 12.4).
 
 Usage: approver.py RELAY_URL INVITE_LINK USER PORT_FILE
 
@@ -146,6 +148,16 @@ class PyDevice:
         )
         return ""
 
+    def block(self, device_id: str, *, on: bool) -> str:
+        """Block or unblock a device with the form of the user page."""
+        if self.browser.csrf() is None:
+            self.browser.sign_in(self.user)
+        path = "/u/block" if on else "/u/unblock"
+        status, _, body = self.browser.form(path, [("kind", "device"), ("id", device_id)])
+        if status != 303:
+            raise ValueError(f"{path}: {status} {body.decode()}")
+        return ""
+
     def invite(self) -> str:
         """Start an enrollment in a thread, and return its QR payload."""
         dev = self.device()
@@ -219,6 +231,8 @@ def main() -> None:
                 elif method == "POST" and u.path == "/py/recover":
                     py.recover(q["key"])
                     body = ""
+                elif method == "POST" and u.path in ("/py/block", "/py/unblock"):
+                    body = py.block(q["id"], on=u.path == "/py/block")
                 elif method == "POST" and u.path == "/py/setup":
                     body = py.setup()
                 elif method == "POST" and u.path == "/py/edit":

@@ -14,7 +14,10 @@ final class WebSignIn: NSObject, ASWebAuthenticationPresentationContextProviding
     private var session: ASWebAuthenticationSession?
 
     func redirect(for url: URL) async throws -> URL {
-        try await withCheckedThrowingContinuation { cont in
+        #if DEBUG
+            if let seam = UITestSeam.current { return try await seam.approve(url) }
+        #endif
+        return try await withCheckedThrowingContinuation { cont in
             let s = ASWebAuthenticationSession(url: url, callbackURLScheme: redirectScheme) { url, error in
                 if let url {
                     cont.resume(returning: url)

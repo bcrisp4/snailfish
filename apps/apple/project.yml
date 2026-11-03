@@ -62,12 +62,28 @@ targets:
         TEST_HOST[sdk=iphonesimulator*]: $(BUILT_PRODUCTS_DIR)/Tasks.app/Tasks
         TEST_HOST[sdk=macosx*]: $(BUILT_PRODUCTS_DIR)/Tasks.app/Contents/MacOS/Tasks
         BUNDLE_LOADER: $(TEST_HOST)
+  # The app flows through the screens (S4, S5, T9). The app gets the test
+  # seam of Tasks/UITestSeam.swift, which only Debug builds contain.
+  TasksUITests:
+    type: bundle.ui-testing
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - path: TasksUITests
+    dependencies:
+      - target: Tasks
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).tasks.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        TEST_TARGET_NAME: Tasks
 schemes:
   Tasks:
     build:
       targets:
         Tasks: all
         TasksTests: [test]
+        TasksUITests: [test]
     test:
-      targets: [TasksTests]
+      targets: [TasksTests, TasksUITests]
       gatherCoverageData: false

@@ -14,13 +14,23 @@ final class Transport: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
         return URLSession(configuration: c, delegate: self, delegateQueue: nil)
     }()
 
+    #if DEBUG
+        private let fault = UITestSeam.current?.offlineAfterFirstAppend == true ? FaultState() : nil
+    #endif
+
     func send(_ req: Request) async throws -> (UInt16, [Header], Data) {
         guard let url = URL(string: req.url) else { throw URLError(.badURL) }
         var r = URLRequest(url: url)
         r.httpMethod = req.method
         for h in req.headers { r.addValue(h.value, forHTTPHeaderField: h.name) }
         if !req.body.isEmpty { r.httpBody = req.body }
+        #if DEBUG
+            try fault?.before()
+        #endif
         let (data, resp) = try await session.data(for: r)
+        #if DEBUG
+            try fault?.after(path: url.path)
+        #endif
         guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         let headers = http.allHeaderFields.compactMap { k, v -> Header? in
             guard let k = k as? String, let v = v as? String else { return nil }

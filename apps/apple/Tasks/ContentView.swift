@@ -189,6 +189,7 @@ struct SyncSettings: View {
                         Button("Scan the code of my other device") {
                             then { model.joinSpace(scan: true) }
                         }
+                        .accessibilityIdentifier("join-scan")
                         Button("Show a code for my other device") {
                             then { model.joinSpace(scan: false) }
                         }
@@ -222,12 +223,14 @@ struct SyncSettings: View {
                             TextField("Recovery key from your paper", text: $recoveryKey)
                                 .autocorrectionDisabled()
                                 .noAutocapitalization()
+                                .accessibilityIdentifier("recover-again-key")
                             Button("Recover again") {
                                 let w = web.web
                                 let key = recoveryKey
                                 then { model.recoverAgain(recoveryKey: key) { try await w.redirect(for: $0) } }
                             }
                             .disabled(recoveryKey.isEmpty)
+                            .accessibilityIdentifier("recover-again")
                         }
                     }
                     Section("Lost or stolen device") {
@@ -256,6 +259,7 @@ struct SyncSettings: View {
                     }
                     Section("Sync now") {
                         Button("Sync now") { Task { await model.syncNow() } }
+                            .accessibilityIdentifier("sync-now")
                     }
                 }
                 Section("Measurements") {
@@ -292,6 +296,7 @@ struct FlowSheet: View {
                 EmptyView()
             case .working(let text):
                 ProgressView(text)
+                    .accessibilityIdentifier("flow-working")
             case .showing(let payload, let code):
                 Text("Scan this code on your other device").font(.headline)
                 QRView(text: payload)
@@ -307,7 +312,15 @@ struct FlowSheet: View {
                 ProgressView("Waiting for the other device")
             case .scanning(let trusted):
                 Text("Scan the code on your other device").font(.headline)
-                ScanView { model.scanned($0, trusted: trusted) }
+                #if DEBUG
+                    if UITestSeam.current != nil {
+                        PayloadEntry { model.scanned($0, trusted: trusted) }
+                    } else {
+                        ScanView { model.scanned($0, trusted: trusted) }
+                    }
+                #else
+                    ScanView { model.scanned($0, trusted: trusted) }
+                #endif
             case .comparing(let code):
                 Text("Does the other device show this code?").font(.headline)
                 Text(code)
@@ -333,8 +346,12 @@ struct FlowSheet: View {
             case .newRecoveryKey(let key):
                 ReplaceKeyView(key: key) { model.replaceRecoveryKey(current: $0, new: key) }
             }
-            if !isRecovery {
+            // The recovery key of a new space must reach the paper (S1). A
+            // replacement changes nothing until the user replaces the key.
+            if case .recoveryKey = model.step {
+            } else {
                 Button("Cancel", role: .cancel) { model.cancelFlow() }
+                    .accessibilityIdentifier("flow-cancel")
             }
         }
         .padding()
@@ -407,16 +424,19 @@ struct ReplaceKeyView: View {
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
                 .noAutocapitalization()
+                .accessibilityIdentifier("replace-typed")
             TextField("Your current recovery key", text: $current)
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
                 .noAutocapitalization()
+                .accessibilityIdentifier("replace-current")
             if wrong { Text("The new key does not match. Check your paper.").foregroundStyle(.red) }
             Button("Replace the key") {
                 if RecoveryCheck.matches(typed: typed, shown: key) { replace(current) } else { wrong = true }
             }
             .buttonStyle(.borderedProminent)
             .disabled(current.isEmpty)
+            .accessibilityIdentifier("replace-key")
         }
     }
 }

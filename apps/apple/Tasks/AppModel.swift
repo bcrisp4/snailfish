@@ -66,7 +66,10 @@ final class AppModel: ObservableObject {
         let args = UserDefaults.standard
         let fm = FileManager.default
         let support = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-        let dataDir = args.string(forKey: "data-dir")
+        var dataDir = args.string(forKey: "data-dir")
+        #if DEBUG
+            if let seam = UITestSeam.current { dataDir = seam.dataDir.path }
+        #endif
         let root = dataDir.map { URL(fileURLWithPath: $0) } ?? support.appendingPathComponent("Tasks", isDirectory: true)
         // One keychain service for each `-data-dir`: two devices of one space
         // on one Mac must not share a key item. The default directory has no
@@ -82,8 +85,16 @@ final class AppModel: ObservableObject {
         #endif
         let log = Measurements(file: logDir.appendingPathComponent("measure.jsonl"))
         let keychain = KeychainKeyStore(service: service)
-        let device = try SyncDevice(
-            root: root, keyStore: keychain, deleteKeys: { try keychain.delete(account: $0) }, measurements: log)
+        var keyStore: KeyStore = keychain
+        var deleteKeys: (String) throws -> Void = { try keychain.delete(account: $0) }
+        #if DEBUG && os(macOS)
+            if UITestSeam.current != nil {
+                let files = try FileKeyStore(dir: root.appendingPathComponent("uitest-keys"))
+                keyStore = files
+                deleteKeys = { try files.delete(account: $0) }
+            }
+        #endif
+        let device = try SyncDevice(root: root, keyStore: keyStore, deleteKeys: deleteKeys, measurements: log)
         return AppModel(device: device, measurements: log)
     }
 
@@ -198,22 +209,45 @@ final class AppModel: ObservableObject {
         try await recoverSpace(
             device: device, relayURL: relay, name: deviceName(), recoveryKey: recoveryKey,
             transport: transport, browser: browser)
+        try await waitForGrant()
+    }
+
+    /// Sync until the verified log holds the grant of this device, then show
+    /// the removal. A lost answer or a `stale_base` refusal leaves the grant
+    /// for a later sync, so the flow waits and the user can cancel it. A
+    /// status that another sync does not change ends the flow.
+    private func waitForGrant() async throws {
         step = .working("Checking the log")
-        _ = try await device.sync(transport, background: false)
-        let devices = try await device.activeDevices()
-        guard devices.contains(where: \.thisDevice) else {
-            throw SetupError.message("the relay did not grant this device: \(status)")
+        while true {
+            let cause: String
+            do {
+                let st = try await device.sync(transport, background: false)
+                if try await device.activeDevices().contains(where: \.thisDevice) { break }
+                guard st == .ok || st == .relayUnavailable else {
+                    throw SetupError.message("the relay did not grant this device: \(try await device.statusText())")
+                }
+                cause = try await device.statusText()
+            } catch let e as URLError {
+                cause = e.localizedDescription
+            }
+            step = .working("Waiting for the grant of this device (last sync: \(cause))")
+            try await Task.sleep(nanoseconds: 5_000_000_000)
         }
         _ = try await device.recoveryWaits()
-        step = .removal(devices)
+        step = .removal(try await device.activeDevices())
     }
 
     /// Start a full recovery again after it stopped before the grant (the
-    /// engine keeps the recovery key in memory only).
+    /// engine keeps the recovery key in memory only). If the relay granted
+    /// this device already, the flow continues with the removal.
     func recoverAgain(recoveryKey: String, browser: @escaping (URL) async throws -> URL) {
         run("recover") { [self] in
-            try await device.abandonRecovery()
-            try await recoverFlow(recoveryKey: recoveryKey, browser: browser)
+            step = .working("Checking the log")
+            if try await device.abandonRecovery(transport) {
+                try await recoverFlow(recoveryKey: recoveryKey, browser: browser)
+            } else {
+                step = .removal(try await device.activeDevices())
+            }
         }
     }
 
