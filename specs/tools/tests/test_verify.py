@@ -522,7 +522,11 @@ def quint_dir(tmp_path: Path) -> Path:
 
 def run_check(cwd: Path, backend: str, argv: tuple[str, ...], *, expect_pass: bool, catches: str = "") -> bool:
     c = verify.Check("c", ("quint", *argv), cwd, expect_pass, backend=backend, catches=catches)
-    return verify.execute(c)[1]
+    _, ok, output = verify.execute(c)
+    # pytest shows the output of a failed test only. Without it, a quint that
+    # cannot start on a CI runner looks like a wrong verdict.
+    print(output)
+    return ok
 
 
 @pytest.mark.skipif(not HAS_QUINT, reason="quint is not installed")
