@@ -291,15 +291,18 @@ def recover(
         "app_id": APP_ID,
     }
     data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        engine = sf.Engine.open_recovery(
+            str(data_dir / "engine"),
+            sf.SpaceRef(**space),
+            keys,
+            recovery_key,
+            name,
+            key_store(data_dir),
+        )
+    except sf.SnailfishError.Invalid as e:
+        raise RecoveryError(str(e)) from e
     write_private(data_dir / "space.json", json.dumps(space))
-    engine = sf.Engine.open_recovery(
-        str(data_dir / "engine"),
-        sf.SpaceRef(**space),
-        keys,
-        recovery_key,
-        name,
-        key_store(data_dir),
-    )
     dev = Device(data_dir, engine=engine)
     status = dev.sync(send)
     if not any(d.this_device for d in dev.engine.active_devices()):

@@ -214,7 +214,16 @@ def test_all_devices_lost_full_recovery(relay: Relay, tmp_path: Path) -> None:
     )
     assert second.returncode != 0
     assert "SpaceExistsError" in second.stderr
+    # A mistyped key fails with a message and leaves no device. A key that
+    # is not the key of the space fails at the relay.
     n = tmp_path / "n"
+    r = recover(relay, n, key[:-1])
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr, r.stderr
+    assert not (n / "space.json").exists()
+    r = recover(relay, tmp_path / "other", sf.new_recovery_key())
+    assert r.returncode != 0
+    assert "not the current recovery key" in r.stdout + r.stderr
     r = recover(relay, n, key)
     assert r.returncode == 0, r.stdout + r.stderr
     sync_ok(n)
