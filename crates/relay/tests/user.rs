@@ -1274,10 +1274,20 @@ fn block_of_a_group_refuses_its_devices_until_unblock_and_removal_is_final() {
             .handle(&fx.signed("GET", &path, "after=0&limit=10", b"", who))
     };
     assert_eq!(fetch("B").status, 200);
+    let group_form = |label: &str| {
+        format!(
+            r#"name="kind" value="group"><input type="hidden" name="id" value="1"><button>{label}</button>"#
+        )
+    };
+    let page = b.home();
+    assert!(page.contains(&group_form("Block")), "{page}");
+    assert!(!page.contains(&group_form("Unblock")), "{page}");
     assert_eq!(
         b.form("/u/block", &[("kind", "group"), ("id", "1")]).status,
         303
     );
+    let page = b.home();
+    assert!(page.contains(&group_form("Unblock")), "{page}");
     let r = fetch("B");
     assert_eq!((r.status, error_code(&r).as_str()), (403, "blocked"));
     assert_eq!(fetch("A").status, 200);
@@ -1296,6 +1306,18 @@ fn block_of_a_group_refuses_its_devices_until_unblock_and_removal_is_final() {
         b.form("/u/block", &[("kind", "group"), ("id", "9")]).status,
         400
     );
+    let unknown = snailfish_protocol::encoding::encode_id("d_", &[9; 32]);
+    assert_eq!(
+        b.form("/u/block", &[("kind", "device"), ("id", &unknown)])
+            .status,
+        400
+    );
+    // An unblock removes a row only, so an unknown group is no error.
+    assert_eq!(
+        b.form("/u/unblock", &[("kind", "group"), ("id", "9")])
+            .status,
+        303
+    );
     assert_eq!(
         b.form("/u/unblock", &[("kind", "group"), ("id", "1")])
             .status,
@@ -1309,6 +1331,8 @@ fn block_of_a_group_refuses_its_devices_until_unblock_and_removal_is_final() {
         303
     );
     assert_eq!(error_code(&fetch("B")), "blocked");
+    // A reports epoch 1 before the removal.
+    report_ok(&fx, "A", 4, 1);
     // A removes B (the epoch record of the access vectors).
     let removal = fx.h["access"]
         .as_array()
@@ -1335,13 +1359,43 @@ fn block_of_a_group_refuses_its_devices_until_unblock_and_removal_is_final() {
     let page = b.home();
     assert!(!page.contains("is blocked"), "{page}");
     assert!(page.contains("has not reported key epoch 2"), "{page}");
-    let status = format!("{}/device-status", fx.space_path(fx.tenant(), fx.log()));
-    let report = br#"{"state":"ok","outbox":0,"oldest":null,"applied":5,"epoch":2}"#;
-    assert_eq!(
-        fx.relay
-            .handle(&fx.signed("POST", &status, "", report, "A"))
-            .status,
-        200
-    );
+    report_ok(&fx, "A", 5, 2);
     assert!(!b.home().contains("Open security actions"));
+}
+
+/// Send an `ok` device status report of `who` with `applied` and `epoch`.
+fn report_ok(fx: &Fx, who: &str, applied: u64, epoch: u64) {
+    let path = format!("{}/device-status", fx.space_path(fx.tenant(), fx.log()));
+    let body =
+        format!(r#"{{"state":"ok","outbox":0,"oldest":null,"applied":{applied},"epoch":{epoch}}}"#);
+    let r = fx
+        .relay
+        .handle(&fx.signed("POST", &path, "", body.as_bytes(), who));
+    assert_eq!(r.status, 200);
+}
+
+/// [VER-10], `PROTOCOL.md` 12.4, D10 item 2, with a synthetic level 2: the
+/// page lists each active device below the highest relay level as one that
+/// blocks a raise. Without this, the user would not learn which device to
+/// update before a raise.
+#[test]
+fn page_lists_the_devices_that_block_a_level_raise() {
+    let mut fx = Fx::new();
+    fx.reopen_with(|c| {
+        c.levels = snailfish_protocol::space::Levels {
+            max: 2,
+            retired: &[],
+        };
+    });
+    fx.setup_space(fx.tenant());
+    let (mut b, _) = signed_in(&fx);
+    let page = b.home();
+    assert!(
+        page.contains("device &quot;Phone&quot; in com.example.tasks blocks a raise of the protocol level to 2"),
+        "{page}"
+    );
+    assert!(
+        !page.contains("&quot;Laptop&quot; in com.example.tasks blocks"),
+        "{page}"
+    );
 }

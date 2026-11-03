@@ -481,3 +481,51 @@ fn overlay_applies_earlier_records_of_the_request() {
     assert!(over.is_removed(&c.id) && over.device_key(&c.id).is_none());
     assert_eq!(over.active_devices().len(), 2);
 }
+
+/// [LOG-8] [VER-7] [VER-8] `PROTOCOL.md` 10.6, `specs/levels/test.qnt::removalThenRaiseTest`,
+/// with a synthetic level 2 (D5): the overlay of one append request applies
+/// earlier device records, an epoch record and a level record to the later
+/// envelopes. Without this, a relay would judge the second record of one
+/// request by the levels before the first record.
+#[test]
+fn overlay_applies_earlier_level_records_of_the_request() {
+    let two = Levels {
+        max: 2,
+        retired: &[],
+    };
+    let (r1, a, b, c) = (recovery_party(1), party(1), party(2), party(3));
+    let mut sp = Space::new(&r1, &a, 1, two);
+    sp.push(&sp.grant(&a, false, &b, 1));
+    sp.push(&sp.grant(&a, false, &c, 1));
+    let mut over = snailfish_protocol::space::Overlay::new(&sp.s);
+    // Each envelope names the head after the envelopes before it, so `tip`
+    // applies the same records as `over` to build them.
+    let mut tip = Space {
+        s: sp.s.clone(),
+        keys: sp.keys.clone(),
+        levels: two,
+    };
+    let mut send = |tip: &mut Space, env: &Envelope| {
+        let v = check_append_at(&over, env, Mode::Verify, &two);
+        if let Verdict::Store(acc) = &v {
+            over.apply((**acc).clone());
+            tip.push(env);
+        }
+        v
+    };
+    let env = tip.level("snailfish.device.v1", &a, 2);
+    assert!(matches!(send(&mut tip, &env), Verdict::Store(_)));
+    let env = tip.level("snailfish.device.v1", &b, 2);
+    assert!(matches!(send(&mut tip, &env), Verdict::Store(_)));
+    // C is still at level 1.
+    let env = tip.level("snailfish.level.v1", &a, 2);
+    assert!(invalid(&send(&mut tip, &env)));
+    let (env, key) = tip.epoch(&a, &[&c], &[&a, &b], &r1);
+    assert!(matches!(send(&mut tip, &env), Verdict::Store(_)));
+    tip.keys.push(key);
+    let env = tip.level("snailfish.level.v1", &a, 2);
+    assert!(matches!(send(&mut tip, &env), Verdict::Store(_)));
+    // A grant below the new write level is invalid.
+    let env = tip.grant(&a, false, &party(4), 1);
+    assert!(invalid(&send(&mut tip, &env)));
+}

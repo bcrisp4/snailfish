@@ -45,7 +45,9 @@ MUTANTS_TMPDIR ?= $(shell mount | grep -q ' on $(RAMDISK) ' && echo $(RAMDISK))
 # A full TMPDIR makes a build or a test fail. cargo-mutants counts that as an
 # unviable or a caught mutant, so a full disk hides missed mutants. A run with
 # 4 jobs used 3 GB, about 0.6 GB for each build directory. Require 2 GB for
-# each job and the baseline.
+# each job and the baseline. The nextest `mutants` profile kills the other
+# tests at the first failure, so their tempfile directories stay in TMPDIR,
+# about 5 MB for each mutant. check_mutants fails a run that filled TMPDIR.
 MUTANTS_MIN_FREE_GB ?= $$(( ($(MUTANTS_JOBS) + 1) * 2 ))
 MUTANTS_TARGETS := rust-mutants rust-mutants-diff
 ifneq ($(MUTANTS_TMPDIR),)
@@ -154,6 +156,9 @@ define check_mutants
 	  missed=$$(wc -l < mutants.out/missed.txt 2>/dev/null | tr -d ' '); missed=$${missed:-0}; \
 	  if [ $$rc -ne 0 ] && [ $$rc -ne 2 ] && [ $$rc -ne 3 ]; then \
 	    echo "FAIL: cargo mutants exit $$rc"; exit $$rc; fi; \
+	  if grep -lq 'No space left on device' mutants.out/log/*.log 2>/dev/null; then \
+	    echo "FAIL: TMPDIR became full, so some caught or unviable mutants are not valid." \
+	      "A SIGKILL of a test leaves its .tmp* directory. Delete them and run again."; exit 1; fi; \
 	  if [ "$$missed" -ne 0 ]; then echo "FAIL: $$missed missed mutants"; exit 2; fi; \
 	  echo "ok: no missed mutants"
 endef

@@ -89,6 +89,27 @@ fn serve_refuses_an_empty_authority() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("--authority"));
 }
 
+/// `PROTOCOL.md` 12.6: a `--trusted-proxy` entry that is not an IP address
+/// stops the start. Without this, a typing error would drop the proxy, and
+/// every client behind it would share one rate limit bucket. The listen
+/// address cannot bind, so a relay that accepts the entry exits too, with
+/// another error.
+#[test]
+fn serve_refuses_a_trusted_proxy_that_is_not_an_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(BIN)
+        .args(["serve", "--data"])
+        .arg(dir.path())
+        .args(["--listen", "256.0.0.1:1"])
+        .args(["--authority", "sync.example.net"])
+        .args(["--trusted-proxy", "127.0.0.1,proxy.example.net"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--trusted-proxy: proxy.example.net"), "{err}");
+}
+
 /// Without this, `user add` could exit 0 and print no invite link, and the
 /// operator would have no way to give the user a passkey.
 #[test]
