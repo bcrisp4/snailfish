@@ -64,9 +64,14 @@ caught_by = "servesStored"
 base = "bounded"
 caught_by = "securityNotBlocked"
 
+# A sampled run of 5000 traces can miss the thief flood before the removal
+# (CI seed 0x397f96de5ba9a198), so a named scenario catches it. TLC checks it
+# on every state of tinyThief.
 [mutants.noSecurityLimit]
 base = "thief"
-caught_by = "honestSecurityStored"
+caught_by = "tests"
+test_module = "quotaTestThief"
+test = "thiefLimitedTest"
 
 [mutants.noReserve]
 base = "reserveSmall"
