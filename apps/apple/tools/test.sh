@@ -21,12 +21,19 @@ done
 # The Debug build must show them, or the check finds nothing.
 # The Rust library of bindings/swift has arm64 only, and a Release build
 # builds every architecture by default.
-xcodebuild build -project Tasks.xcodeproj -scheme Tasks -configuration Release \
-  -destination "platform=macOS,arch=arm64" -derivedDataPath "$dd" "${unsigned[@]}" ARCHS=arm64
-grep -rqa SNAILFISH_UITEST_APPROVER "$dd/Build/Products/Debug/Tasks.app" \
-  || { echo "FAIL: the Debug build has no UI test seam, so the Release check finds nothing"; exit 1; }
-if grep -rqa SNAILFISH_UITEST "$dd/Build/Products/Release/Tasks.app"; then
-  echo "FAIL: the Release build contains the UI test seam"
-  exit 1
-fi
-echo "ok: the Release build has no UI test seam"
+for dest in "$dest_ios" "platform=macOS,arch=arm64"; do
+  xcodebuild build -project Tasks.xcodeproj -scheme Tasks -configuration Release \
+    -destination "$dest" -derivedDataPath "$dd" "${unsigned[@]}" ARCHS=arm64
+done
+for products in Debug Debug-iphonesimulator; do
+  grep -rqa SNAILFISH_UITEST_APPROVER "$dd/Build/Products/$products/Tasks.app" \
+    || { echo "FAIL: $products has no UI test seam, so the Release check finds nothing"; exit 1; }
+done
+for products in Release Release-iphonesimulator; do
+  test -d "$dd/Build/Products/$products/Tasks.app" || { echo "FAIL: no $products build"; exit 1; }
+  if grep -rqa SNAILFISH_UITEST "$dd/Build/Products/$products/Tasks.app"; then
+    echo "FAIL: the $products build contains the UI test seam"
+    exit 1
+  fi
+done
+echo "ok: the Release builds have no UI test seam"

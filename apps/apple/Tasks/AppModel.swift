@@ -222,12 +222,13 @@ final class AppModel: ObservableObject {
             let cause: String
             do {
                 let st = try await device.sync(transport, background: false)
+                try Task.checkCancellation()
                 if try await device.activeDevices().contains(where: \.thisDevice) { break }
-                guard st == .ok || st == .relayUnavailable else {
+                guard ([.ok, .relayUnavailable, .restoreHold, .quota] as [Status]).contains(st) else {
                     throw SetupError.message("the relay did not grant this device: \(try await device.statusText())")
                 }
                 cause = try await device.statusText()
-            } catch let e as URLError {
+            } catch let e as URLError where e.code != .cancelled {
                 cause = e.localizedDescription
             }
             step = .working("Waiting for the grant of this device (last sync: \(cause))")

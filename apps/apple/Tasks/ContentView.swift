@@ -348,8 +348,7 @@ struct FlowSheet: View {
             }
             // The recovery key of a new space must reach the paper (S1). A
             // replacement changes nothing until the user replaces the key.
-            if case .recoveryKey = model.step {
-            } else {
+            if canCancel {
                 Button("Cancel", role: .cancel) { model.cancelFlow() }
                     .accessibilityIdentifier("flow-cancel")
             }
@@ -361,6 +360,11 @@ struct FlowSheet: View {
         #if os(macOS)
             .frame(minWidth: 420, minHeight: 420)
         #endif
+    }
+
+    private var canCancel: Bool {
+        if case .recoveryKey = model.step { return false }
+        return true
     }
 
     private var isRecovery: Bool {

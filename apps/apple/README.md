@@ -48,7 +48,7 @@ If a signed build fails, find the error in this table:
 
 ## Smoke test on a real iPhone
 
-The UI tests replace the passkey and the camera, and the simulator does not use Tailscale. This check covers those parts only. The iPhone must reach the relay at an HTTPS URL, for example a Tailscale `ts.net` name, because a passkey works only on its domain.
+The UI tests replace the passkey and the camera, and the simulator does not use Tailscale. This check covers those parts only. `make app-ios-device` builds the Debug configuration, so the app on the iPhone contains the UI test seam. The seam is off unless the launch environment sets `SNAILFISH_UITEST_APPROVER`. The iPhone must reach the relay at an HTTPS URL, for example a Tailscale `ts.net` name, because a passkey works only on its domain.
 
 1. Start the relay with the public authority and origin of its HTTPS URL.
 2. Run `snailfish-relay user add sam`, and open the invite link on the iPhone to register a passkey.

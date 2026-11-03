@@ -55,7 +55,6 @@
         private let lock = NSLock()
         private var offline = false
 
-        /// Throws if the transport is offline.
         func before() throws {
             if lock.withLock({ offline }) { throw URLError(.notConnectedToInternet) }
         }
