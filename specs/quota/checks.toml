@@ -6,7 +6,10 @@ invariants = ["withinQuota", "noLostChange", "servesStored", "securityNotBlocked
               "withinReserve", "honestSecurityStored"]
 test_modules = ["quotaTestThief"]
 fast_config = "bounded"
-witness_configs = ["bounded", "thief"]
+# The block can come at any step, so the thief seldom reaches its limit in
+# thief: 0 to 5 of 5000 traces (CI seed missed it on 443234d). tinyThief has a
+# limit of 1 and reaches it in about 20 traces of each run.
+witness_configs = ["bounded", "thief", "tinyThief"]
 witness_steps = 20
 
 [deep]
