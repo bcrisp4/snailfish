@@ -135,14 +135,20 @@ actor SyncDevice {
     /// True while `sync` waits for the relay. The actor can run other calls
     /// then.
     private var syncing = false
+    /// True if the relay answered a request of the last sync with a 5xx
+    /// status. The engine reports a 5xx and `unknown_device` (403) with one
+    /// status, `paused: relay unavailable`.
+    private var serverError = false
 
     func sync(_ transport: Transport, background: Bool = false) async throws -> Status {
         guard let engine else { throw SetupError.syncOff }
         syncing = true
         defer { syncing = false }
+        serverError = false
         let exchange = try engine.startSync()
         while let req = try exchange.nextRequest() {
             let (status, headers, body) = try await transport.send(req)
+            if status >= 500 { serverError = true }
             try exchange.handleResponse(status: status, headers: headers, body: body)
         }
         repairs = try engine.takeRepairs()
@@ -298,14 +304,16 @@ actor SyncDevice {
     /// Drop a full recovery that did not finish, so the user can start it
     /// again. The relay can hold the grant of this device with no answer on
     /// this device, for example after a crash during a sync. The keys of a
-    /// granted device must stay, so a sync comes first. A failed sync throws
-    /// and drops nothing.
+    /// granted device must stay, so a sync comes first. A failed sync or a
+    /// relay error answer throws and drops nothing, because then the relay
+    /// did not say that it does not know this device.
     ///
     /// - Returns: False if the sync found the grant. The recovery is then
     ///   complete.
     func abandonRecovery(_ transport: Transport) async throws -> Bool {
         _ = try await sync(transport)
         guard try recoveryWaits() else { return false }
+        if serverError { throw SetupError.message("the relay answered with an error: try again later") }
         try leaveFailedSetup()
         try? FileManager.default.removeItem(at: recoveringFile)
         return true

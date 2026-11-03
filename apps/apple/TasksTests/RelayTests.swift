@@ -60,27 +60,6 @@ final class SideUI: EnrollmentUI, @unchecked Sendable {
     func confirmAgain() async -> Bool { false }
 }
 
-/// One device of the Python demo, driven through the `/py/` requests of
-/// apps/apple/tools/approver.py.
-struct PythonDevice: Sendable {
-    let base: String
-
-    @discardableResult
-    func call(_ method: String, _ path: String, _ query: [String: String] = [:]) async throws -> String {
-        var c = URLComponents(string: base + "/py/" + path)!
-        if !query.isEmpty { c.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) } }
-        var r = URLRequest(url: c.url!)
-        r.httpMethod = method
-        r.timeoutInterval = 90
-        let (data, resp) = try await URLSession.shared.data(for: r)
-        let text = String(decoding: data, as: UTF8.self)
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
-            throw SetupError.message("python device \(method) \(path): \(text)")
-        }
-        return text
-    }
-}
-
 /// The new device side of an enrollment with a Python demo device. Each side
 /// gets the code of the other, and says yes only if the codes match ([ENR-7]).
 final class PythonCompareUI: EnrollmentUI, @unchecked Sendable {
@@ -132,16 +111,7 @@ final class RelayTests: XCTestCase {
     /// The browser step: the approver signs in and allows the request, and
     /// returns the redirect URL to the private-use scheme.
     private func browser(_ approver: String) -> (URL) async throws -> URL {
-        { url in
-            var c = URLComponents(string: approver + "/approve")!
-            c.queryItems = [URLQueryItem(name: "url", value: url.absoluteString)]
-            let (data, resp) = try await URLSession.shared.data(from: c.url!)
-            let text = String(decoding: data, as: UTF8.self)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200, let u = URL(string: text) else {
-                throw SetupError.message("approver: \(text)")
-            }
-            return u
-        }
+        { try await UITestSeam.approve($0, approver: approver) }
     }
 
     private func sorted(_ d: SyncDevice) async throws -> [TaskItem] {

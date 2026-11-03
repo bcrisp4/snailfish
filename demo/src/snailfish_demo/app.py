@@ -37,6 +37,14 @@ FIELDS = ("title", "done")
 BATCH = 500
 
 
+# A `stale_base` refusal of the grant or a paused relay leaves the grant for
+# a later sync (PROTOCOL.md 13.4), so `recover` syncs again. The Swift app
+# waits until the user cancels. The CLI has no cancel, so it stops after
+# these syncs.
+RECOVER_SYNCS = 5
+RECOVER_WAIT_SECONDS = 1
+
+
 class Transport(Protocol):
     """Sends one engine request. The app owns HTTP, TLS and retries."""
 
@@ -305,10 +313,23 @@ def recover(
     write_private(data_dir / "space.json", json.dumps(space))
     dev = Device(data_dir, engine=engine)
     status = dev.sync(send)
-    if not any(d.this_device for d in dev.engine.active_devices()):
-        dev.close()
-        raise RecoveryError(f"no grant for this device: {status}")
-    return dev
+    for _ in range(RECOVER_SYNCS - 1):
+        if any(d.this_device for d in dev.engine.active_devices()):
+            return dev
+        paused = (
+            status.is_ok()
+            or status.is_relay_unavailable()
+            or status.is_restore_hold()
+            or status.is_quota()
+        )
+        if not paused:
+            break
+        time.sleep(RECOVER_WAIT_SECONDS)
+        status = dev.sync(send)
+    if any(d.this_device for d in dev.engine.active_devices()):
+        return dev
+    dev.close()
+    raise RecoveryError(f"no grant for this device: {status}")
 
 
 class RecoveryError(Exception):

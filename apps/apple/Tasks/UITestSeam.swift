@@ -37,8 +37,9 @@
         }()
 
         /// The browser step: the approver signs in, allows the request, and
-        /// returns the redirect URL to the private-use scheme.
-        func approve(_ url: URL) async throws -> URL {
+        /// returns the redirect URL to the private-use scheme. RelayTests
+        /// use it too.
+        static func approve(_ url: URL, approver: String) async throws -> URL {
             var c = URLComponents(string: approver + "/approve")!
             c.queryItems = [URLQueryItem(name: "url", value: url.absoluteString)]
             let (data, resp) = try await URLSession.shared.data(from: c.url!)

@@ -15,7 +15,7 @@ final class WebSignIn: NSObject, ASWebAuthenticationPresentationContextProviding
 
     func redirect(for url: URL) async throws -> URL {
         #if DEBUG
-            if let seam = UITestSeam.current { return try await seam.approve(url) }
+            if let seam = UITestSeam.current { return try await UITestSeam.approve(url, approver: seam.approver) }
         #endif
         return try await withCheckedThrowingContinuation { cont in
             let s = ASWebAuthenticationSession(url: url, callbackURLScheme: redirectScheme) { url, error in
