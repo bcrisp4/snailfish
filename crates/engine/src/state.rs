@@ -206,6 +206,7 @@ fn migrate_m7(db: &Connection) -> Result<(), EngineError> {
            envelope TEXT,
            state TEXT NOT NULL
          );
+         CREATE INDEX log_type ON log (payload_type);
          PRAGMA user_version = 6;
          COMMIT;",
     )?;

@@ -235,6 +235,10 @@ final class AppModel: ObservableObject {
             if try await device.removalToConfirm() != nil {
                 message = "The device list changed. Confirm the devices that stay again."
                 step = .removal(try await device.activeDevices())
+            } else if try await device.removalPending() {
+                step = .none
+                let st = try await device.statusText()
+                message = "The removal is not finished: \(st). The next sync sends it again."
             } else {
                 step = .none
                 message = "The devices are removed, and the key is new."
@@ -259,7 +263,18 @@ final class AppModel: ObservableObject {
             _ = try await device.sync(transport, background: false)
             _ = try await device.sync(transport, background: false)
             step = .none
-            message = "The recovery key is replaced. Keep the new paper and destroy the old one."
+            // The old key stays current until the relay stores the recovery
+            // record, so the user keeps the old paper until then.
+            if try await device.recoveryKeyNeeded() {
+                message = "Another device changed the space first, so the recovery key is not replaced. "
+                    + "Keep your current paper, and replace the key again."
+            } else if try await device.removalPending() {
+                let st = try await device.statusText()
+                message = "The replacement is not finished: \(st). Keep your current paper. "
+                    + "The next sync sends it again."
+            } else {
+                message = "The recovery key is replaced. Keep the new paper and destroy the old one."
+            }
         }
     }
 

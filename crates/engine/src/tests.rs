@@ -3928,7 +3928,15 @@ fn stale_recovery_grant_is_signed_again() {
     let (st, h, body) = w.send(&held);
     assert!(String::from_utf8_lossy(&body).contains("stale_base"));
     sync.handle_response(&mut en, st, &h, &body).unwrap();
+    // The rest of this sync sends no status report: the status route takes
+    // no recovery ID, and its refusal would read as a wrong recovery key.
+    while let Some(req) = sync.next_request(&mut en).unwrap() {
+        assert!(!req.url.ends_with("status"), "{}", req.url);
+        let (st, h, body) = w.send(&req);
+        sync.handle_response(&mut en, st, &h, &body).unwrap();
+    }
     drop(sync);
+    assert_eq!(en.status(), Status::Ok);
     assert_eq!(en.grants_to_confirm().unwrap(), Vec::<String>::new());
     w.exchange(&mut en);
     assert_eq!(en.status(), Status::Ok);
@@ -4211,4 +4219,32 @@ fn rotation_after_a_superseded_recovery_key_is_dropped() {
     assert!(!ea.removal_pending().unwrap());
     assert_eq!(ea.current_epoch().unwrap(), 2, "only the rotation of B");
     w.recovery_key = by_b;
+}
+
+/// T9, `PROTOCOL.md` 13.3: after the recovery record of A lands, B grants
+/// C before the rotation of A. A rotation removes no device, so A signs it
+/// on the new list with no question. Without this, the rotation waits for a
+/// confirmation that no list can give, and the holder of the old recovery
+/// key reads every later change.
+#[test]
+fn rotation_signs_after_a_new_device_joins() {
+    let (mut w, a, b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    let new = Engine::new_recovery_key().unwrap();
+    ea.replace_recovery_key(&w.recovery_key.clone(), &new)
+        .unwrap();
+    w.exchange(&mut ea);
+    assert!(ea.removal_pending().unwrap(), "the rotation waits");
+    w.exchange(&mut eb);
+    queue_grant(&eb, "C");
+    w.exchange(&mut eb);
+    w.exchange(&mut ea);
+    assert_eq!(ea.removal_to_confirm().unwrap(), None);
+    assert!(!ea.removal_pending().unwrap());
+    assert_eq!(ea.current_epoch().unwrap(), 2);
+    assert_eq!(ea.status(), Status::Ok);
+    w.recovery_key = new;
 }

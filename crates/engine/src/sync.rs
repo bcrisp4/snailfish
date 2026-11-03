@@ -171,6 +171,12 @@ impl Sync {
                     next
                 }
                 Phase::Report => Some(Sent::Status),
+                // PROTOCOL.md 8.2: the status route takes no recovery ID, so a
+                // device of a full recovery reports after its grant.
+                Phase::DeviceReport if engine.recovering()? => {
+                    self.phase = Phase::Done;
+                    continue;
+                }
                 Phase::DeviceReport => {
                     let now = engine.now();
                     let (applied, outbox, oldest) = state::report_fields(&engine.db, now)?;

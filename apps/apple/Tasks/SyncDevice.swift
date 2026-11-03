@@ -321,6 +321,17 @@ actor SyncDevice {
         try engine?.removalToConfirm()
     }
 
+    /// True while a removal or a rotation waits for the verified log.
+    func removalPending() throws -> Bool {
+        try engine?.removalPending() ?? false
+    }
+
+    /// True if the recovery record got `stale_base`, so the replacement
+    /// needs the current recovery key again (13.3 step 6).
+    func recoveryKeyNeeded() throws -> Bool {
+        try engine?.recoveryKeyNeeded() ?? false
+    }
+
     /// Replace the recovery key after the user typed the new key back.
     func replaceRecoveryKey(current: String, new: String) throws {
         guard let engine else { throw SetupError.syncOff }

@@ -112,6 +112,30 @@ def test_remove_needs_the_user_confirmation(relay: Relay, tmp_path: Path) -> Non
     assert own_id(b) in devices(a)
 
 
+def test_remove_after_another_device_removed_one_of_them(relay: Relay, tmp_path: Path) -> None:
+    """[LOG-7], PROTOCOL.md 13.2: B removes C first. A asked to remove C
+    and D on its older log, so the engine drops C and asks again for D.
+    The CLI confirms D alone and removes it, and does not stop with "not an
+    active device"."""
+    a, b, _ = two_devices(relay, tmp_path)
+    c, d = tmp_path / "c", tmp_path / "d"
+    for n in (c, d):
+        (tc, tout), (nc, nout) = enroll(relay, a, n)
+        assert (tc, nc) == (0, 0), tout + nout
+        sync_ok(n)
+    sync_ok(a)
+    sync_ok(b)
+    c_id, d_id = own_id(c), own_id(d)
+    r = demo(b, "remove", "--confirm", "yes", c_id)
+    assert r.returncode == 0, r.stdout + r.stderr
+    r = demo(a, "remove", "--confirm", "yes", c_id, d_id)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.count("devices that stay:") == 2, r.stdout
+    left = devices(a)
+    assert c_id not in left
+    assert d_id not in left
+
+
 def test_recovery_key_replacement(relay: Relay, tmp_path: Path) -> None:
     """T9, `specs/spacelog/test.qnt::recoveryReplaceTest`, PROTOCOL.md 13.3:
     the old key signs the recovery record, then A rotates the key. The old

@@ -336,8 +336,11 @@ def remove(dev: Device, removed: list[str], send: Transport, confirm: ConfirmSta
             return dev.engine.status()
         dev.engine.remove_devices(removed)
         status = dev.sync(send)
-        if dev.engine.removal_to_confirm() is None:
+        # The engine drops each device that another removal took first.
+        again = dev.engine.removal_to_confirm()
+        if again is None:
             return status
+        removed = again
 
 
 # How long an enrollment waits between two reads of the session. The relay

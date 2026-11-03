@@ -140,7 +140,7 @@ fn client_ip<'a>(
         .last()
         .and_then(|v| v.rsplit(',').next())
         .and_then(|a| a.trim().parse::<IpAddr>().ok())
-        .unwrap_or(peer)
+        .map_or(peer, |a| a.to_canonical())
 }
 
 async fn handler(relay: Relay, limit: Arc<RateLimit>, req: HttpRequest<Body>) -> HttpResponse {
@@ -309,6 +309,11 @@ mod tests {
         assert_eq!(client_ip(proxy, &[proxy], std::iter::empty()), proxy);
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
         assert_eq!(client_ip(mapped, &[proxy], hdr.into_iter()), client);
+        // An IPv4-mapped client is an IPv4 client, not one /64 of IPv6.
+        assert_eq!(
+            client_ip(proxy, &[proxy], ["::ffff:100.64.1.2"].into_iter()),
+            client
+        );
     }
 
     #[test]

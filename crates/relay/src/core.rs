@@ -820,7 +820,8 @@ impl Relay {
         let sp = self.open_space(tenant, log, signer.as_ref())?;
         let keys = load_devices(&sp.conn)?;
         let removed = load_removed(&sp.conn)?;
-        let current = if recovery {
+        // Only a request by a recovery ID reads the recovery records.
+        let current = if recovery && signer.is_some_and(|(_, r)| r) {
             current_recovery(&sp.conn)?
         } else {
             None
@@ -923,7 +924,11 @@ impl Relay {
         )?;
         let earlier = today;
         let reserve = self.cfg.security_reserve;
-        {
+        // The stored records go to the tables after the checks, so the
+        // checks read the log as it was before the request, and the overlay
+        // adds the records of the request once.
+        let mut stored = Vec::new();
+        let added = {
             let base = SqlView::new(&tx, log_id, false);
             let mut view = snailfish_protocol::space::Overlay::new(&base);
             for item in items {
@@ -961,7 +966,6 @@ impl Relay {
                         AppendResult::Refused("quota".into())
                     }
                     Verdict::Store(acc) => {
-                        insert_entry(&tx, &acc, &raw.envelope.payload_type, &raw.json)?;
                         if acc.record.change_id().is_some() {
                             used = used.saturating_add(len);
                         }
@@ -971,6 +975,7 @@ impl Relay {
                         }
                         let position = acc.position;
                         view.apply(*acc);
+                        stored.push((raw.envelope.payload_type, raw.json));
                         AppendResult::Stored(position)
                     }
                     Verdict::Known(p) => AppendResult::Known(p),
@@ -978,6 +983,10 @@ impl Relay {
                     Verdict::Refused(r) => AppendResult::Refused(r.code().to_owned()),
                 });
             }
+            view.into_added()
+        };
+        for (acc, (ptype, json)) in added.iter().zip(&stored) {
+            insert_entry(&tx, acc, ptype, json)?;
         }
         tx.execute(
             "UPDATE usage SET bytes = ?1 WHERE id = 1",

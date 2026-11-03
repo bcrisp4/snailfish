@@ -184,6 +184,9 @@ const SPACE_DDL: &str = "CREATE TABLE IF NOT EXISTS space (
                  INSERT OR IGNORE INTO usage (id, bytes)
                     SELECT 1, COALESCE(SUM(length(CAST(envelope AS BLOB))), 0) FROM entries
                     WHERE payload_type LIKE 'snailfish.change.%';
+                 -- The epoch and the recovery ID come from the security
+                 -- records, which are few in a log of changes.
+                 CREATE INDEX IF NOT EXISTS entries_type ON entries (payload_type);
                  CREATE TABLE IF NOT EXISTS removed (
                     device_id BLOB PRIMARY KEY,
                     position INTEGER NOT NULL

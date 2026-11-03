@@ -215,9 +215,11 @@ struct RemovalRow {
 impl RemovalRow {
     /// True if the user must confirm the list again ([LOG-7]): after the
     /// engine found other active devices, or after `stale_base` with other
-    /// active devices in the verified log.
+    /// active devices in the verified log. A rotation removes no device, so
+    /// the user has no list to confirm.
     fn waits_for_user(&self, list: &str) -> bool {
-        self.state == CONFIRM || (self.state == STALE && self.confirmed != list)
+        self.after_recovery.is_none()
+            && (self.state == CONFIRM || (self.state == STALE && self.confirmed != list))
     }
 }
 
@@ -301,8 +303,9 @@ pub(crate) fn security_to_send(e: &mut Engine) -> Result<Vec<(Item, String)>, En
     if row.state == CONFIRM {
         return Ok(out);
     }
-    // [LOG-7]: sign only on the list that the user confirmed.
-    if list != row.confirmed {
+    // [LOG-7]: sign only on the list that the user confirmed. A rotation
+    // keeps every active device, so it signs on the current list.
+    if row.after_recovery.is_none() && list != row.confirmed {
         e.db.execute("UPDATE removal SET state = ?1", [CONFIRM])?;
         return Ok(out);
     }
