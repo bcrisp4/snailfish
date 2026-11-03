@@ -98,9 +98,9 @@ final class AppFlowTests: XCTestCase {
 
         openSettings(app)
         tap(app, "replace-recovery-key")
-        XCTAssertTrue(app.staticTexts["new-recovery-key"].waitForExistence(timeout: timeout))
+        XCTAssertTrue(texts(app)["new-recovery-key"].waitForExistence(timeout: timeout))
         tap(app, "flow-cancel")
-        XCTAssertTrue(app.staticTexts["new-recovery-key"].waitForNonExistence(timeout: timeout))
+        XCTAssertTrue(texts(app)["new-recovery-key"].waitForNonExistence(timeout: timeout))
 
         let new = replaceRecoveryKey(app, current: old)
         waitForMessage(app, "The recovery key is replaced. Keep the new paper and destroy the old one.")
@@ -128,7 +128,7 @@ final class AppFlowTests: XCTestCase {
         recover(app, key: key)
         removeDevice(app, "A", devices: 2)
         waitForMessage(app, "The devices are removed, and the key is new.")
-        XCTAssertTrue(app.staticTexts["before the fire"].waitForExistence(timeout: timeout))
+        XCTAssertTrue(texts(app)["before the fire"].waitForExistence(timeout: timeout))
         let lost = try await py.call("POST", "sync")
         XCTAssertTrue(lost.contains("REMOVED"), lost)
     }
@@ -144,7 +144,7 @@ final class AppFlowTests: XCTestCase {
         let data = UUID().uuidString
         let app = launch(data: data, fault: "offline-after-first-append")
         recover(app, key: key)
-        let working = app.descendants(matching: .any)["flow-working"]
+        let working = ui(app)["flow-working"]
         waitFor(working, "label CONTAINS 'Waiting for the grant of this device' OR value CONTAINS 'Waiting for the grant of this device'")
         tap(app, "flow-cancel")
 
@@ -201,7 +201,7 @@ final class AppFlowTests: XCTestCase {
         tap(app, "join-scan")
         type(app, "scan-payload", payload)
         tap(app, "scan-use")
-        let code = app.staticTexts["compare-code"]
+        let code = texts(app)["compare-code"]
         XCTAssertTrue(code.waitForExistence(timeout: timeout))
         let theirs = try await py.call("POST", "compare", ["code": text(code)])
         XCTAssertEqual(theirs, text(code))
@@ -217,7 +217,7 @@ final class AppFlowTests: XCTestCase {
     private func turnOnSync(_ app: XCUIApplication) -> String {
         openSettings(app)
         tap(app, "turn-on-sync")
-        let shown = app.staticTexts["recovery-key"]
+        let shown = texts(app)["recovery-key"]
         XCTAssertTrue(shown.waitForExistence(timeout: timeout))
         let key = text(shown)
         type(app, "recovery-typed", key)
@@ -232,7 +232,7 @@ final class AppFlowTests: XCTestCase {
     private func replaceRecoveryKey(_ app: XCUIApplication, current: String) -> String {
         openSettings(app)
         tap(app, "replace-recovery-key")
-        let shown = app.staticTexts["new-recovery-key"]
+        let shown = texts(app)["new-recovery-key"]
         XCTAssertTrue(shown.waitForExistence(timeout: timeout))
         let new = text(shown)
         type(app, "replace-typed", new)
@@ -251,12 +251,12 @@ final class AppFlowTests: XCTestCase {
     /// the list of the devices that stay, and remove it. `devices` is the
     /// number of active devices that the screen must list.
     private func removeDevice(_ app: XCUIApplication, _ name: String, devices: Int) {
-        let toggle = app.descendants(matching: .any)["remove-\(name)"]
+        let toggle = ui(app)["remove-\(name)"]
         XCTAssertTrue(toggle.waitForExistence(timeout: timeout))
-        let toggles = app.descendants(matching: .any).matching(
+        let toggles = ui(app).matching(
             NSPredicate(format: "identifier BEGINSWITH 'remove-' AND NOT identifier IN {'remove-confirm', 'remove-devices'}"))
         XCTAssertEqual(toggles.count, devices, toggles.debugDescription)
-        let stays = app.staticTexts["• \(name)"]
+        let stays = texts(app)["• \(name)"]
         XCTAssertTrue(stays.exists)
         #if os(iOS)
             // The switch is at the trailing edge of the toggle row.
@@ -275,13 +275,31 @@ final class AppFlowTests: XCTestCase {
     private func syncNow(_ app: XCUIApplication) {
         openSettings(app)
         tap(app, "sync-now")
-        app.buttons["Done"].firstMatch.tap()
+        tap(app, "Done")
     }
 
     // MARK: Elements
 
+    /// The elements of the app. On macOS only the windows, because a
+    /// toolbar button also has a Touch Bar element, and a click refuses it.
+    private func ui(_ app: XCUIApplication) -> XCUIElementQuery {
+        #if os(macOS)
+            app.windows.descendants(matching: .any)
+        #else
+            app.descendants(matching: .any)
+        #endif
+    }
+
+    private func texts(_ app: XCUIApplication) -> XCUIElementQuery {
+        #if os(macOS)
+            app.windows.staticTexts
+        #else
+            app.staticTexts
+        #endif
+    }
+
     private func element(_ app: XCUIApplication, _ id: String) -> XCUIElement {
-        let e = app.descendants(matching: .any)[id].firstMatch
+        let e = ui(app)[id].firstMatch
         #if os(iOS)
             // A form has no element for a row far below the screen. A tap
             // scrolls to an element that exists.
@@ -327,13 +345,13 @@ final class AppFlowTests: XCTestCase {
 
     /// Wait for the status bar text "Sync: <status>".
     private func waitForStatus(_ app: XCUIApplication, _ status: String, file: StaticString = #filePath, line: UInt = #line) {
-        waitFor(app.staticTexts["sync-status"], "label BEGINSWITH 'Sync: \(status)' OR value BEGINSWITH 'Sync: \(status)'", file: file, line: line)
+        waitFor(texts(app)["sync-status"], "label BEGINSWITH 'Sync: \(status)' OR value BEGINSWITH 'Sync: \(status)'", file: file, line: line)
     }
 
     /// Wait for the alert of the app message that contains `text`, and close
     /// it.
     private func waitForMessage(_ app: XCUIApplication, _ text: String, file: StaticString = #filePath, line: UInt = #line) {
-        let m = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", text, text)).firstMatch
+        let m = texts(app).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", text, text)).firstMatch
         XCTAssertTrue(m.waitForExistence(timeout: timeout), "no message \(text)", file: file, line: line)
         tap(app, "OK")
     }
