@@ -38,7 +38,7 @@ impl Dev {
             self.outbox.is_empty(),
             "a snapshot needs an empty app outbox"
         );
-        e.write_snapshot(&self.applied, &export(self)).unwrap();
+        assert!(e.write_snapshot(&self.applied, &export(self)).unwrap());
     }
 
     /// Check each new snapshot with `can_import` ([CMP-5]).
@@ -356,13 +356,59 @@ fn snapshot_over_the_relay_limit_is_not_written() {
     a.enqueue(&mut ea);
     w.exchange(&mut ea);
     a.pull(&ea).unwrap();
-    ea.write_snapshot(&a.applied, &[1; 2000]).unwrap();
+    assert!(ea.write_snapshot(&a.applied, &[1; 2000]).unwrap());
     assert_eq!(ea.status(), Status::Ok);
     assert_eq!(crate::compact::pending_records(&ea.db).unwrap().len(), 1);
     w.exchange(&mut ea);
-    ea.write_snapshot(&a.applied, &[1; 5000]).unwrap();
+    assert!(!ea.write_snapshot(&a.applied, &[1; 5000]).unwrap());
     assert!(matches!(ea.status(), Status::Degraded { ref cause } if cause.contains("4096")));
     assert_eq!(crate::compact::pending_records(&ea.db).unwrap(), vec![]);
+}
+
+/// `specs/compaction/test.qnt::sealDropsOldTest` ([CMP-20], `PROTOCOL.md`
+/// 14.5): two removals make epochs 2 and 3, with a change in each epoch.
+/// After a snapshot covers every change, a grant of the engine seals epoch
+/// 3, the needed one, and epoch 1, the app key. It leaves out epoch 2, and
+/// the relay stores it.
+#[test]
+fn grant_after_compaction_seals_only_the_needed_epochs() {
+    let (mut w, mut a, b) = World::new();
+    let mut ea = w.engine(&a);
+    let eb = w.engine(&b);
+    w.exchange(&mut ea);
+    ea.remove_devices(&[eb.device_id()]).unwrap();
+    w.exchange(&mut ea);
+    a.edit(&ea, b"in epoch 2");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    let keys_c = queue_grant(&ea, "C");
+    w.exchange(&mut ea);
+    let c_id = Engine::open(&w.root.join("c"), w.space(), &keys_c)
+        .unwrap()
+        .device_id();
+    ea.remove_devices(&[c_id]).unwrap();
+    w.exchange(&mut ea);
+    assert_eq!(ea.current_epoch().unwrap(), 3);
+    a.edit(&ea, b"in epoch 3");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    a.write_snapshot(&mut ea);
+    w.exchange(&mut ea);
+    Dev::check_snapshots(&mut ea);
+    w.exchange(&mut ea);
+    assert!(ea.usable_snapshot().unwrap().is_some());
+    queue_grant(&ea, "D");
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Ok);
+    let head = ea.verified_head().unwrap().position;
+    let grant = state::envelope_at(&ea.db, head).unwrap().unwrap();
+    let env = snailfish_protocol::envelope::Envelope::parse(grant.as_bytes()).unwrap();
+    let rec = snailfish_protocol::records::parse_payload(&env.payload_type, &env.payload).unwrap();
+    let snailfish_protocol::records::Body::Grant { keys, .. } = rec.body else {
+        panic!("the head is the grant")
+    };
+    assert_eq!(keys[0].epochs, [1, 3]);
 }
 
 /// `specs/compaction/test.qnt::repairStubsTest` ([LOG-11], [CMP-17]): the
@@ -389,9 +435,11 @@ fn uncovered_stub_stops_the_engine() {
     let mut ea = w.engine(&a);
     w.exchange(&mut ea);
     a.edit(&ea, b"a1");
+    a.edit(&ea, b"a2");
     a.enqueue(&mut ea);
     w.exchange(&mut ea);
-    // The relay drops the envelope of the change at 3 with no snapshot.
+    // The relay drops the envelope of the change at 3 with no snapshot. The
+    // change at 4 stays in full.
     let tenants = w.relay_data().join("tenants");
     let t = std::fs::read_dir(tenants)
         .unwrap()
@@ -412,6 +460,10 @@ fn uncovered_stub_stops_the_engine() {
     let mut eb2 = Engine::open(tmp.path(), w.space(), &w.keys[1]).unwrap();
     w.exchange(&mut eb2);
     assert_eq!(eb2.status(), Status::MissingRecords);
+    // The app gets no change past the stub that failed the check.
+    let mut app = w.dev("b2");
+    assert_eq!(app.pull(&eb2).unwrap(), 0);
+    assert_eq!(app.applied.position, 0);
     let mut eb2 = {
         drop(eb2);
         Engine::open(tmp.path(), w.space(), &w.keys[1]).unwrap()
@@ -469,7 +521,7 @@ fn first_sync_slo() {
     println!("pushed: {:.1} s", clock.elapsed().as_secs_f64());
     let head = ea.verified_head().unwrap();
     ea.changes_after(&head, 1).unwrap();
-    ea.write_snapshot(&head, &vec![7; 10 << 20]).unwrap();
+    assert!(ea.write_snapshot(&head, &vec![7; 10 << 20]).unwrap());
     exchange_all(&w, &mut ea);
     let snaps = ea.unchecked_snapshots().unwrap();
     assert_eq!(snaps.len(), 1);

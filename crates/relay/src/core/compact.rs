@@ -43,8 +43,8 @@ pub(super) fn compaction_state(c: &Connection, staged: bool) -> Result<Compactio
     let mut rows: Vec<(u64, String, String)> = Vec::new();
     for t in tables {
         let mut st = c.prepare(&format!(
-            "SELECT position, payload_type, envelope FROM {t}
-             WHERE payload_type != 'snailfish.change.v1' ORDER BY position"
+            "SELECT position, payload_type, envelope FROM {t} WHERE {} ORDER BY position",
+            compaction::replay_sql()
         ))?;
         let mut q = st.query([])?;
         while let Some(r) = q.next()? {

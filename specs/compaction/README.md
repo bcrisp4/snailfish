@@ -4,7 +4,7 @@
 
 ## Abstractions
 
-- One space. Devices 1 and 2 are active from the genesis record. Device 3 joins through a grant: a new device, or a full recovery with the recovery key (S5).
+- One space. Devices 1 and 2 are active from the genesis record. Devices 3 and 4 join through grants: a new device, or a full recovery with the recovery key (S5). A grant seals epoch 1 and the needed epochs ([CMP-20]), because each engine opens the key of epoch 1 as its app key.
 - `canon` is the log in full (ghost state). The relay log and each device log are prefixes of it with their own stub marks. The model has no fork: a rollback puts the space on hold, and only a repair to the full log ends the hold. specs/delivery and specs/epochs model forks and holds.
 - A change is an int id. The app state is a set of ids (merge contract). A snapshot holds the app state of its author.
 - The applied position is the position of the last applied change, or the state position of an imported snapshot ([CMP-10]).
@@ -29,7 +29,7 @@
 | Engine stubs after its own accept [CMP-13] (finding C5) | `deviceCompact` |
 | `is_covered` [CMP-14] | `isCovered`, `reset`, mutant `resetKeepsCovered`, test `offlineResetTest` |
 | Stub check [CMP-15] (finding C2) | `stubValid`, `fetch`, invariants `stubsCovered`, `noMissingRecords` |
-| ResetRequired and the import [CMP-16] [DLV-12] (findings C3, C4) | `resetRequired`, `reset`, mutants `resetOnStubOnly`, `resetDropsOutbox`, tests `newDeviceTest`, `snapshotStubNoResetTest` |
+| ResetRequired and the import [CMP-16] [DLV-12] (findings C3, C4) | `resetRequired`, `reset`, mutants `resetOnStubOnly` (test `compactionTestLate::resetBeforeFrontierTest`), `resetDropsOutbox`, tests `newDeviceTest`, `snapshotStubNoResetTest` |
 | Repair with stubs [CMP-17] [LOG-11] | `rollback`, `repair`, mutant `repairNoCoverCheck`, tests `repairStubsTest`, `badRepairTest` |
 | Snapshot reserve [CMP-18] | `writeSnapshot`, `accept`, mutant `snapshotNoReserve`, test `quotaTest` |
 | Stubs outside the quota [CMP-19] | `used`, mutant `stubsCount`, test `quotaTest` |
@@ -69,7 +69,7 @@ A fetch page can hold stubs before the snapshot record that covers them, for exa
 
 ## Results
 
-`make verify MODEL=compaction` passes in about 70 seconds: 8 configs, 20,000 traces of up to 50 steps each (sampled, not a proof). Each mutant fails its invariant or its named test. Each witness is reached.
+`make verify MODEL=compaction` passes in about 70 seconds: 8 configs, 20,000 traces of up to 50 steps each (sampled, not a proof). Two scenario modules: `compactionTest` and `compactionTestLate`. Each mutant fails its invariant or its named test. Each witness is reached.
 
 ## Not covered
 

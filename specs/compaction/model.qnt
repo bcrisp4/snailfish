@@ -110,7 +110,8 @@ module compaction {
     "stubsCount",           // stubs count against the quota
   )
   pure val INIT: Set[Dev] = Set(1, 2)
-  pure val DEVS: Set[Dev] = Set(1, 2, 3)
+  pure val LATE: Set[Dev] = Set(3, 4)
+  pure val DEVS: Set[Dev] = INIT.union(LATE)
   pure val ACC_SIZE: int = 1
   pure val CHG_SIZE: int = 1
 
@@ -251,8 +252,9 @@ module compaction {
       (e.kind == Chg or e.kind == Snap) and not(e.stub) and not(covers(log, u, p, bug))
     }).map(p => at(log, p).epoch).union(Set(currentEpoch(log)))
   pure def neededEpochs(log: List[Entry], bug: str): Set[int] = neededWith(log, usable(log, bug), bug)
+  // A grant also seals epoch 1: each engine opens it as its app key.
   pure def sealFor(log: List[Entry], bug: str): Set[int] =
-    if (bug == "sealCurrentOnly") Set(currentEpoch(log)) else neededEpochs(log, bug)
+    if (bug == "sealCurrentOnly") Set(currentEpoch(log)) else neededEpochs(log, bug).union(Set(1))
 
   // The keys of a device: epoch 1 from the genesis record, the sealed epochs
   // of its grant, and each epoch record that keeps it.
@@ -397,7 +399,7 @@ module compaction {
       unreadable: s.unreadable or (u > 0 and not(keysOf(s.canon, d).contains(snap.epoch))),
       events: s.events.union(Set(EvReset)).union(if (u > 0) Set(EvResetImport) else Set())
         .union(if (covered != Set()) Set(EvCoveredDropped) else Set())
-        .union(if (u > 0 and d == 3) Set(EvNewDeviceImport) else Set()) }
+        .union(if (u > 0 and LATE.contains(d)) Set(EvNewDeviceImport) else Set()) }
   }
 
   // [CMP-3] The app writes a snapshot of its state at the applied position,
@@ -475,19 +477,20 @@ module compaction {
     s' = { ...s, devs: s.devs.set(d, { ...dev(d), log: log2 }), events: ev(EvDeviceCompact) },
   }
 
-  // A grant adds device 3: a new device from a trusted device, or a full
-  // recovery with the recovery key (S5). [CMP-20] It seals the keys that the
-  // full records still need. The device starts with a new state file.
-  action grant: bool = {
-    val e = { ...blank, kind: Grant, dev: 3, sealed: sealFor(s.relay, BUG) }
+  // A grant adds device 3 or 4: a new device from a trusted device, or a
+  // full recovery with the recovery key (S5). [CMP-20] It seals the keys
+  // that the full records still need. The device starts with a new state
+  // file.
+  action grant(x: Dev): bool = {
+    val e = { ...blank, kind: Grant, dev: x, sealed: sealFor(s.relay, BUG) }
     val wasAccepted = usable(s.relay, BUG) > 0
     all {
-      not(s.hold), not(everActive(s.relay).contains(3)),
-      INIT.exists(d => active(d)) or FAULTS.contains("destroy"),
+      not(s.hold), LATE.contains(x), not(everActive(s.relay).contains(x)),
+      DEVS.exists(d => active(d)) or FAULTS.contains("destroy"),
       s.relay.length() < MAX_LEN,
       s' = { ...s, canon: s.canon.append(withCache(s.canon, e, BUG)), relay: s.relay.append(withCache(s.canon, e, BUG)),
         // The app keeps its local edits as outbox rows.
-        devs: s.devs.set(3, { ...dev(3), log: List(genesis), applied: 0, fresh: true }),
+        devs: s.devs.set(x, { ...dev(x), log: List(genesis), applied: 0, fresh: true }),
         events: s.events.union(Set(EvGrant)).union(if (wasAccepted) Set(EvAcceptedAfterGrant) else Set()) },
     }
   }
@@ -579,7 +582,7 @@ module compaction {
     { nondet d = DEVS.oneOf() nondet p = 1.to(MAX_LEN).oneOf() accept(d, p) },
     relayCompact,
     { nondet d = DEVS.oneOf() deviceCompact(d) },
-    grant,
+    { nondet x = LATE.oneOf() grant(x) },
     { nondet d = DEVS.oneOf() nondet x = DEVS.oneOf() remove(d, x) },
     { nondet d = DEVS.oneOf() destroy(d) },
     { nondet d = DEVS.oneOf() backupApp(d) },

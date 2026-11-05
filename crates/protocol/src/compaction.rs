@@ -147,6 +147,20 @@ pub fn stub_kind(payload_type: &str) -> Kind {
     }
 }
 
+/// An SQL condition on a `payload_type` column: the rows that [`replay`]
+/// takes, the security, snapshot and accept records. It is a list, so the
+/// index on the payload type of a store serves it.
+#[must_use]
+pub fn replay_sql() -> String {
+    let mut list: Vec<String> = crate::records::SECURITY_TYPES
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect();
+    list.push("'snailfish.snapshot.v1'".into());
+    list.push("'snailfish.accept.v1'".into());
+    format!("payload_type IN ({})", list.join(", "))
+}
+
 /// The compaction state of a log from its records that are not changes, in
 /// position order: `(position, payload type, envelope JSON)`, with an empty
 /// envelope for a stub. Changes do not move the usable snapshot, so the
@@ -496,6 +510,20 @@ mod tests {
         assert!(stub_valid(false, 7, 9, 3));
         assert!(!stub_valid(false, 9, 9, 3));
         assert!(!stub_valid(false, 2, 0, 0));
+    }
+
+    /// [CMP-6]: the replay rows are every record type of level 1 except a
+    /// change, so a store that selects by this list misses no accept.
+    #[test]
+    fn replay_sql_names_every_type_but_a_change() {
+        let sql = replay_sql();
+        for t in crate::records::RECORD_TYPES {
+            assert_eq!(
+                sql.contains(&format!("'{t}'")),
+                t != "snailfish.change.v1",
+                "{t}"
+            );
+        }
     }
 
     #[test]

@@ -129,7 +129,7 @@ pub(crate) fn sign_grant(
     device: &Device,
     signer: &Signer<'_>,
 ) -> Result<String, EngineError> {
-    let (epochs, all) = crate::removal::all_keys(e)?;
+    let (epochs, all) = crate::removal::sealed_keys(e)?;
     let sealed = keys::seal_key_set(&device.keys.seal[..], &e.log_id, &device.id, &epochs, &all)
         .map_err(|err| EngineError::Invalid(format!("seal: {err}")))?;
     let set = KeySet {

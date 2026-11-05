@@ -727,7 +727,8 @@ class Device:
 
     def write_snapshot(self) -> bool:
         """Write a snapshot of the state at the applied position, only with
-        an empty app outbox ([CMP-3]). Returns true if it wrote one."""
+        an empty app outbox ([CMP-3]). Returns true if the engine queued it:
+        false for a state over the relay limit, which sets `degraded`."""
         with self.transaction():
             if self.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone():
                 return False
@@ -735,8 +736,7 @@ class Device:
             state = self.export_state()
         if applied.position == 0:
             return False
-        self.engine.write_snapshot(applied, state)
-        return True
+        return self.engine.write_snapshot(applied, state)
 
     def pull(self) -> int:
         """Apply the changes after the applied position ([DLV-10], [DLV-11]).

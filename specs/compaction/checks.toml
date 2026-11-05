@@ -4,6 +4,7 @@ model = "model.qnt"
 module = "compaction"
 tests = "test.qnt"
 test_module = "compactionTest"
+test_modules = ["compactionTestLate"]
 
 invariants = [
   "appConsistent", "noDoubleApply", "outboxPending", "stubsCovered", "noMissingRecords",
@@ -98,9 +99,13 @@ caught_by = "securityFull"
 base = "honest"
 caught_by = "securityFull"
 
+# The harm needs three epochs before a device joins, which sampling seldom
+# reaches, so a named scenario catches it.
 [mutants.resetOnStubOnly]
 base = "honest"
-caught_by = "readsNeeded"
+caught_by = "tests"
+test_module = "compactionTestLate"
+test = "resetBeforeFrontierTest"
 
 [mutants.resetKeepsCovered]
 base = "restore"

@@ -1124,7 +1124,7 @@ An engine checks each stub of its verified log after a fetch reaches the relay h
 - A snapshot stub is valid if the log has a usable snapshot at another position. A stub holds no state position, so this is the only check that a device can make.
 - Each other stub is invalid.
 
-An invalid stub stops the engine with `stopped: missing records`.
+An invalid stub stops the engine with `stopped: missing records`. Until a stub passes the check, `changes_after` returns no change, because the stub can hide a lost change.
 
 ### 14.4 Stubs on the relay
 
@@ -1136,7 +1136,7 @@ The operator path (`snailfish-relay` status output) reports the stub count and t
 
 The needed epochs at position n are the current epoch after the entry at n - 1, and the epoch of each change and snapshot record before n that the usable snapshot of the log up to n - 1 does not cover ([CMP-20]). A grant or a recovery record at n must hold a key set with each needed epoch, and no epoch above the current epoch (10.6 step 13). A key set with more epochs is valid, because an accept record between the base of the record and its position can move the frontier.
 
-The engine seals the needed epochs of its verified head.
+The engine seals the needed epochs of its verified head, and epoch 1, because it opens the key of epoch 1 as its app key and checks it against the commitment of the genesis record.
 
 ### 14.6 Snapshot reserve
 
@@ -1145,7 +1145,7 @@ The snapshot reserve is 2 x (`max_snapshot_bytes` + 65,536) bytes. A snapshot or
 ### 14.7 Engine
 
 - `snapshot_due` is true if the verified log holds 1,000 changes, or 1,048,576 bytes of change ciphertext, after the state position of the newest valid snapshot (position 0 if none), or an epoch record with a non-empty `removed` list after that snapshot ([CMP-9]). An engine with a non-empty outbox, or a stopped or paused engine, gives false.
-- `write_snapshot(applied, state)` encrypts the state with the current key and the AAD of 7.2, with the applied position as `state`, and appends the record. If the payload would be larger than `max_snapshot_bytes`, the engine writes nothing and reports `degraded` ([CMP-3]).
+- `write_snapshot(applied, state)` encrypts the state with the current key and the AAD of 7.2, with the applied position as `state`, and appends the record. If the payload would be larger than `max_snapshot_bytes`, or its append body larger than `max_request_bytes`, the engine writes nothing, reports `degraded` and returns false ([CMP-3]).
 - `unchecked_snapshots` gives each valid snapshot in full that is not accepted, with a state position at or after the frontier, that the app applied past, that decrypts, and that the engine has not checked. A snapshot that does not decrypt is reported as `degraded` once ([CMP-5]).
 - `accept_snapshot(position, ok)` appends an accept record with the app applied position if `ok` is true, and marks the snapshot as checked in both cases ([CMP-5]).
 - `usable_snapshot` decrypts the usable snapshot. `genesis_base` is position 0 with `digest(0)`. `is_covered(change_id)` is true if the verified log holds the change ID, in full or as a stub, at or before the frontier ([CMP-14]).

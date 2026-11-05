@@ -326,7 +326,10 @@ def main(argv: list[str] | None = None) -> int:
             dev.edit_many(args.count, args.prefix)
         elif args.cmd == "snapshot":
             if not dev.write_snapshot():
-                print("no snapshot: the app outbox holds a change, or nothing is applied")
+                print(
+                    "no snapshot: the app outbox holds a change, nothing is applied, "
+                    "or the state is larger than the relay limit"
+                )
                 return 1
         elif args.cmd == "sync":
             with httpx.Client(timeout=30) as client:

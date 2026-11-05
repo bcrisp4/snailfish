@@ -183,8 +183,8 @@ actor SyncDevice {
             taken = (at, try store.exportState())
         }
         guard let (at, state) = taken else { return false }
-        try engine.writeSnapshot(applied: at, state: state)
-        return true
+        // False for a state over the relay limit: the engine reports `degraded`.
+        return try engine.writeSnapshot(applied: at, state: state)
     }
 
     /// Apply the changes after the applied position ([DLV-10], [DLV-11]).

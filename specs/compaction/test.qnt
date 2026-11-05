@@ -35,7 +35,7 @@ module compactionTest {
   // [CMP-16] [CMP-8] A new device imports the usable snapshot, then pulls the
   // later changes. [CMP-6] The grant does not end the acceptance.
   run newDeviceTest =
-    bothAccepted.then(relayCompact).then(edit(2)).then(push(2, 3)).then(grant).then(fetch(3))
+    bothAccepted.then(relayCompact).then(edit(2)).then(push(2, 3)).then(grant(3)).then(fetch(3))
       .expect(resetRequired(dev(3), BUG) and wAcceptedAfterGrant)
       .then(reset(3))
       .expect(dev(3).applied == 3 and dev(3).app == Set(1, 2))
@@ -80,15 +80,15 @@ module compactionTest {
   // removal. The grant must seal the key of epoch 1 with epoch 2.
   run sealNeededTest =
     bothAccepted.then(relayCompact).then(edit(1)).then(push(1, 3))
-      .then(remove(1, 2)).then(grant)
+      .then(remove(1, 2)).then(grant(3))
       .expect(at(s.relay, 9).sealed == Set(1, 2) and readsNeeded)
 
   // [CMP-20] After the frontier passes each epoch 1 record, a grant seals
   // only epoch 2.
   run sealDropsOldTest =
     twoChanges.then(remove(1, 2)).then(edit(1)).then(push(1, 3)).then(fetch(1)).then(pull(1))
-      .then(writeSnapshot(1, true)).then(fetch(1)).then(accept(1, 6)).then(grant)
-      .expect(at(s.relay, 8).sealed == Set(2) and readsNeeded)
+      .then(writeSnapshot(1, true)).then(fetch(1)).then(accept(1, 6)).then(grant(3))
+      .expect(at(s.relay, 8).sealed == Set(1, 2) and readsNeeded)
 
   // [CMP-11] [CMP-16] A snapshot stub after the applied position does not
   // raise ResetRequired: device 2 wrote an older snapshot after the usable one.
@@ -133,4 +133,25 @@ module compactionTest {
       .then(push(1, 2))
       .expect(s.events.contains(EvStoredAfterCompaction) and withinQuota)
   }
+}
+
+// Two late devices: the second joins after two removals (finding C4).
+module compactionTestLate {
+  import compaction(MAX_IDS = 3, MAX_LEN = 12, QUOTA = 20, RESERVE = 6, SNAP_SIZE = 2,
+    FAULTS = Set(), BUG = "none").* from "./model"
+
+  // [CMP-16] [DLV-12] C4: a device that joins after two removals gets the
+  // keys of epochs 1 and 3. The change of epoch 2 is before the frontier, so
+  // the new device must import the snapshot before any stub exists, and not
+  // pull that change.
+  run resetBeforeFrontierTest =
+    init.then(edit(1)).then(push(1, 1)).then(remove(1, 2))
+      .then(edit(1)).then(push(1, 2)).then(grant(3)).then(remove(1, 3))
+      .then(fetch(1)).then(pull(1)).then(pull(1)).then(writeSnapshot(1, true))
+      .then(fetch(1)).then(accept(1, 7)).then(grant(4))
+      .expect(at(s.relay, 9).sealed == Set(1, 3))
+      .then(fetch(4))
+      .expect(resetRequired(dev(4), BUG))
+      .then(reset(4))
+      .expect(readsNeeded and dev(4).app == Set(1, 2))
 }

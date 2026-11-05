@@ -38,10 +38,10 @@ fn to_u64(n: i64) -> Result<u64, EngineError> {
 /// The compaction state of the verified log (`PROTOCOL.md` 14.1).
 pub(crate) fn compaction_state(db: &Connection) -> Result<Compaction, EngineError> {
     let rows: Vec<(i64, String, String)> = {
-        let mut st = db.prepare(
-            "SELECT position, payload_type, envelope FROM log
-             WHERE payload_type != 'snailfish.change.v1' ORDER BY position",
-        )?;
+        let mut st = db.prepare(&format!(
+            "SELECT position, payload_type, envelope FROM log WHERE {} ORDER BY position",
+            compaction::replay_sql()
+        ))?;
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?
     };
@@ -196,8 +196,8 @@ impl Engine {
     /// [`EngineError::Storage`].
     pub fn snapshot_due(&self) -> Result<bool, EngineError> {
         let busy: i64 = self.db.query_row(
-            "SELECT (SELECT count(*) FROM outbox) + (SELECT count(*) FROM records)",
-            [],
+            "SELECT (SELECT count(*) FROM outbox WHERE state != ?1) + (SELECT count(*) FROM records)",
+            [crate::state::REFUSED],
             |r| r.get(0),
         )?;
         if busy > 0
@@ -242,8 +242,9 @@ impl Engine {
     ///
     /// [`EngineError::Invalid`] if the applied position is not on the
     /// verified log, or is 0. [`EngineError::Storage`]. A state larger than
-    /// `max_snapshot_bytes` writes nothing and sets `degraded`.
-    pub fn write_snapshot(&mut self, applied: &Applied, state: &[u8]) -> Result<(), EngineError> {
+    /// `max_snapshot_bytes` writes nothing, sets `degraded` and returns
+    /// false. True if the snapshot waits for the next sync.
+    pub fn write_snapshot(&mut self, applied: &Applied, state: &[u8]) -> Result<bool, EngineError> {
         let head = self.base()?;
         if applied.position == 0
             || applied.position > head.position
@@ -285,9 +286,10 @@ impl Engine {
                     limits.max_snapshot_bytes
                 ),
             };
-            return Ok(());
+            return Ok(false);
         }
-        self.add_record("snapshot", "snailfish.snapshot.v1", &payload)
+        self.add_record("snapshot", "snailfish.snapshot.v1", &payload)?;
+        Ok(true)
     }
 
     /// Queue a snapshot payload as it is, for a test of a snapshot that
@@ -470,11 +472,18 @@ fn removes_a_device(db: &Connection, position: u64) -> Result<bool, EngineError>
     Ok(matches!(r.body, Body::Epoch { removed, .. } if !removed.is_empty()))
 }
 
-/// [CMP-13] [CMP-16] for `changes_after`: `ResetRequired` if the applied
-/// position is before the frontier. At or after the frontier, if the
-/// verified log holds an own accept that counts for the usable snapshot,
-/// replace the covered records with stubs.
-pub(crate) fn before_changes(e: &Engine, applied: u64) -> Result<(), EngineError> {
+/// [CMP-13] [CMP-15] [CMP-16] for `changes_after`: false while a stub waits
+/// for the stub check. `ResetRequired` if the applied position is before
+/// the frontier. At or after the frontier, if the verified log holds an own
+/// accept that counts for the usable snapshot, replace the covered records
+/// with stubs.
+pub(crate) fn before_changes(e: &Engine, applied: u64) -> Result<bool, EngineError> {
+    // [CMP-15]: a stub that the stub check has not passed can hide a lost
+    // change, so the app gets no change until a fetch to the relay head
+    // checks it. An invalid stub keeps it so (`stopped: missing records`).
+    if stubs_from(&e.db)?.is_some() {
+        return Ok(false);
+    }
     let c = compaction_state(&e.db)?;
     let f = c.frontier();
     if applied < f {
@@ -494,5 +503,5 @@ pub(crate) fn before_changes(e: &Engine, applied: u64) -> Result<(), EngineError
         tx.execute("UPDATE meta SET stubbed = ?1", [to_i64(f)?])?;
         tx.commit()?;
     }
-    Ok(())
+    Ok(true)
 }

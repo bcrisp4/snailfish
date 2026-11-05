@@ -1111,12 +1111,13 @@ impl Engine {
     }
 
     /// Write a snapshot of the app state at the applied position. The app
-    /// calls it only with an empty app outbox ([CMP-3]).
+    /// calls it only with an empty app outbox ([CMP-3]). False if the state
+    /// is larger than the relay limit: the engine then reports `degraded`.
     ///
     /// # Errors
     ///
     /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
-    pub fn write_snapshot(&self, applied: &Applied, state: &[u8]) -> Result<()> {
+    pub fn write_snapshot(&self, applied: &Applied, state: &[u8]) -> Result<bool> {
         Ok(self
             .inner
             .lock()

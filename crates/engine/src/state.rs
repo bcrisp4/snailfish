@@ -949,7 +949,9 @@ pub(crate) fn changes_after(
     drop(tx);
     // [CMP-16] [CMP-13]: ResetRequired before the frontier, local stubs
     // after it.
-    crate::compact::before_changes(e, applied.position)?;
+    if !crate::compact::before_changes(e, applied.position)? {
+        return Ok(Vec::new());
+    }
     let tx = Transaction::new_unchecked(&e.db, TransactionBehavior::Deferred)?;
     let mut st = tx.prepare(
         "SELECT position, digest, envelope, change_id FROM log
