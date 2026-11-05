@@ -193,9 +193,12 @@ test = "regrantRemovedTest"
 base = "honest"
 caught_by = "logChangeEpoch"
 
+# A sampled run of 5000 traces can miss a write after a verified epoch record
+# (CI seed 0xefb4cced753b6ebc), so a named scenario catches it.
 [mutants.staleWriteEpoch]
 base = "honest"
-caught_by = "writeEpochCurrent"
+caught_by = "tests"
+test = "removalTest"
 
 [mutants.resignReusesKey]
 base = "honest4"
