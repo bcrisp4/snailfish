@@ -30,7 +30,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_request_bytes: 4 * 1024 * 1024,
+            // One append body holds a snapshot of `max_snapshot_bytes` in
+            // base64 (`PROTOCOL.md` 10.4).
+            max_request_bytes: 24 * 1024 * 1024,
             max_change_bytes: 64 * 1024,
             max_snapshot_bytes: 16 * 1024 * 1024,
             max_append_envelopes: 100,
@@ -304,12 +306,50 @@ pub struct Stub {
     pub hash: Hash32,
 }
 
+impl Stub {
+    /// The stub object of `PROTOCOL.md` 10.7: `type`, then `change_id` for a
+    /// change, then `hash`.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let s = |v: &str| Value::String(v.to_owned()).to_string();
+        match &self.change_id {
+            Some(cid) => format!(
+                "{{\"type\":{},\"change_id\":{},\"hash\":{}}}",
+                s(&self.payload_type),
+                s(cid),
+                s(&encode_b64(&self.hash))
+            ),
+            None => format!(
+                "{{\"type\":{},\"hash\":{}}}",
+                s(&self.payload_type),
+                s(&encode_b64(&self.hash))
+            ),
+        }
+    }
+}
+
+/// One entry that a relay or an engine writes into a fetch response or a
+/// repair body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutEntry {
+    /// The stored envelope JSON text.
+    Envelope(String),
+    /// A stub.
+    Stub(Stub),
+}
+
+impl From<String> for OutEntry {
+    fn from(json: String) -> Self {
+        Self::Envelope(json)
+    }
+}
+
 /// One entry of a fetch response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchEntry {
     /// The full envelope.
     Envelope(RawEnvelope),
-    /// A stub. The M3 relay sends none.
+    /// A stub ([CMP-1]).
     Stub(Stub),
 }
 
@@ -332,7 +372,7 @@ pub struct Fetch {
 ///
 /// Refuses a stored text that is not JSON.
 pub fn fetch_response(
-    entries: &[(u64, String)],
+    entries: &[(u64, OutEntry)],
     head: &Head,
     has_more: bool,
     hold: bool,
@@ -345,15 +385,22 @@ pub fn fetch_response(
     Ok(out.into_bytes())
 }
 
-/// The JSON text of a list of envelope entries (`PROTOCOL.md` 10.7 and
-/// 10.9), without the brackets.
-fn entry_list(entries: &[(u64, String)]) -> Result<String, WireError> {
+/// The JSON text of a list of entries (`PROTOCOL.md` 10.7 and 10.9),
+/// without the brackets.
+fn entry_list(entries: &[(u64, OutEntry)]) -> Result<String, WireError> {
     let mut parts = Vec::with_capacity(entries.len());
-    for (pos, env) in entries {
-        // The text came from a parsed envelope, so it is JSON. Check it, so
-        // that a damaged row cannot break the body syntax.
-        serde_json::from_str::<&RawValue>(env).map_err(|e| bad(e.to_string()))?;
-        parts.push(format!("{{\"position\":{pos},\"envelope\":{env}}}"));
+    for (pos, e) in entries {
+        match e {
+            OutEntry::Envelope(env) => {
+                // The text came from a parsed envelope, so it is JSON. Check
+                // it, so that a damaged row cannot break the body syntax.
+                serde_json::from_str::<&RawValue>(env).map_err(|e| bad(e.to_string()))?;
+                parts.push(format!("{{\"position\":{pos},\"envelope\":{env}}}"));
+            }
+            OutEntry::Stub(s) => {
+                parts.push(format!("{{\"position\":{pos},\"stub\":{}}}", s.to_json()));
+            }
+        }
     }
     Ok(parts.join(","))
 }
@@ -627,7 +674,7 @@ pub fn parse_repair_finish(body: &[u8]) -> Result<RepairFinish, WireError> {
 /// # Errors
 ///
 /// Refuses an envelope text that is not JSON.
-pub fn repair_start_body(base: &Head, entries: &[(u64, String)]) -> Result<Vec<u8>, WireError> {
+pub fn repair_start_body(base: &Head, entries: &[(u64, OutEntry)]) -> Result<Vec<u8>, WireError> {
     Ok(format!(
         "{{\"base\":{},\"entries\":[{}]}}",
         head_json(base),
@@ -643,7 +690,7 @@ pub fn repair_start_body(base: &Head, entries: &[(u64, String)]) -> Result<Vec<u
 /// Refuses an envelope text that is not JSON.
 pub fn repair_chunk_body(
     session: &[u8; 16],
-    entries: &[(u64, String)],
+    entries: &[(u64, OutEntry)],
 ) -> Result<Vec<u8>, WireError> {
     Ok(format!(
         "{{\"session\":\"{}\",\"entries\":[{}]}}",
@@ -870,16 +917,33 @@ mod tests {
             position: 2,
             digest: [1; 32],
         };
-        let body = fetch_response(&[(1, e.clone()), (2, e.clone())], &h, true, true).unwrap();
+        let stub = Stub {
+            payload_type: "snailfish.change.v1".into(),
+            change_id: Some("c_00".into()),
+            hash: [2; 32],
+        };
+        let body = fetch_response(
+            &[
+                (1, e.clone().into()),
+                (2, e.clone().into()),
+                (3, OutEntry::Stub(stub.clone())),
+            ],
+            &h,
+            true,
+            true,
+        )
+        .unwrap();
         let f = parse_fetch(&body).unwrap();
         assert_eq!(f.head, h);
         assert!(f.has_more);
         assert!(f.hold);
         let no_hold = fetch_response(&[], &h, false, false).unwrap();
         assert!(!parse_fetch(&no_hold).unwrap().hold);
-        assert_eq!(f.entries.len(), 2);
+        assert_eq!(f.entries.len(), 3);
         assert!(matches!(&f.entries[1], (2, FetchEntry::Envelope(r)) if r.json == e));
-        assert!(fetch_response(&[(1, "{".into())], &h, false, false).is_err());
+        // [CMP-1]: a written stub reads back with its fields.
+        assert_eq!(f.entries[2], (3, FetchEntry::Stub(stub)));
+        assert!(fetch_response(&[(1, "{".to_owned().into())], &h, false, false).is_err());
 
         let stub = format!(
             r#"{{"entries":[{{"position":1,"stub":{{"type":"snailfish.change.v1","change_id":"c_00","hash":"{}"}}}}],"head":{{"position":1,"digest":"{}"}},"has_more":false}}"#,
@@ -959,7 +1023,8 @@ mod tests {
             position: 4,
             digest: [9; 32],
         };
-        let start = repair_start_body(&head, &[(5, e.clone()), (6, e.clone())]).unwrap();
+        let start =
+            repair_start_body(&head, &[(5, e.clone().into()), (6, e.clone().into())]).unwrap();
         let p = parse_repair_start(&start, 2).unwrap();
         assert_eq!(p.base, head);
         assert_eq!(p.entries.len(), 2);
@@ -971,7 +1036,7 @@ mod tests {
         );
 
         let sid = [0xab; 16];
-        let chunk = repair_chunk_body(&sid, &[(7, e.clone())]).unwrap();
+        let chunk = repair_chunk_body(&sid, &[(7, e.clone().into())]).unwrap();
         let c = parse_repair_chunk(&chunk, 1).unwrap();
         assert_eq!(c.session, sid);
         assert_eq!(c.entries.len(), 1);

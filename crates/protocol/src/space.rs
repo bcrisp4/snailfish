@@ -10,6 +10,7 @@
 //! The functions do no I/O. The caller gives the log state through
 //! [`SpaceView`], for example from SQLite.
 
+use crate::compaction::{self, Compaction};
 use crate::encoding::Hash32;
 use crate::envelope::Envelope;
 use crate::hash::{digest_next, digest0, entry_hash};
@@ -46,10 +47,6 @@ impl Levels {
     }
 }
 
-/// The record types that compaction adds (M8). The check refuses them as
-/// `unsupported` until then.
-const COMPACTION_TYPES: [&str; 2] = ["snailfish.snapshot.v1", "snailfish.accept.v1"];
-
 /// The log state that the check reads.
 pub trait SpaceView {
     /// The log ID of the space.
@@ -81,6 +78,11 @@ pub trait SpaceView {
     /// The position of the last security record ([LOG-7]). 0 for an empty
     /// log.
     fn last_security(&self) -> u64;
+    /// The record hash of the snapshot record at `position`, in full or as a
+    /// stub. `None` if the entry is not a snapshot.
+    fn snapshot_hash(&self, position: u64) -> Option<Hash32>;
+    /// The compaction state of the log (`PROTOCOL.md` section 14).
+    fn compaction(&self) -> Compaction;
 }
 
 /// Who checks the record.
@@ -92,6 +94,8 @@ pub enum Mode {
         signer: Hash32,
         /// `max_change_bytes` of `PROTOCOL.md` 10.4.
         max_change_bytes: usize,
+        /// `max_snapshot_bytes` of `PROTOCOL.md` 10.4 ([CMP-3]).
+        max_snapshot_bytes: usize,
         /// The space is on restore hold ([LOG-14]).
         hold: bool,
     },
@@ -236,14 +240,6 @@ pub fn check_append(view: &impl SpaceView, env: &Envelope, mode: Mode) -> Verdic
     check_append_at(view, env, mode, &Levels::CURRENT)
 }
 
-/// True if `epochs` is `1, 2, .., current`: a grant or a recovery record
-/// seals every epoch key (`PROTOCOL.md` 10.6 step 13).
-#[must_use]
-pub fn all_epochs(epochs: &[u64], current: u64) -> bool {
-    u64::try_from(epochs.len()).is_ok_and(|n| n == current)
-        && epochs.iter().zip(1u64..).all(|(e, want)| *e == want)
-}
-
 /// True if a level record to `level` is valid: above the write level, and
 /// no active device below it ([VER-8]). `lowest` is the lowest device
 /// level of the active devices.
@@ -305,12 +301,19 @@ fn judge(
     levels: &Levels,
 ) -> Result<Accepted, Refusal> {
     if let Mode::Relay {
-        max_change_bytes, ..
+        max_change_bytes,
+        max_snapshot_bytes,
+        ..
     } = mode
-        && matches!(record.body, Body::Change { .. })
-        && env.payload.len() > max_change_bytes
     {
-        return Err(Refusal::TooLarge);
+        let limit = match record.body {
+            Body::Change { .. } => max_change_bytes,
+            Body::Snapshot { .. } => max_snapshot_bytes,
+            _ => usize::MAX,
+        };
+        if env.payload.len() > limit {
+            return Err(Refusal::TooLarge);
+        }
     }
     if record.log != view.log_id() {
         return Err(invalid("log: the record names another log"));
@@ -337,21 +340,18 @@ fn judge(
     {
         return Err(Refusal::BadBase);
     }
-    if !security_base_ok(
-        record.is_security(),
-        record.base.position,
-        view.last_security(),
-    ) {
+    // Only a security record reads the last security record: a store scans
+    // for it, and a change is the common append.
+    if record.is_security() && !security_base_ok(true, record.base.position, view.last_security()) {
         return Err(Refusal::StaleBase);
     }
     let ptype = env.payload_type.as_str();
     let level_above =
         matches!(record.body, Body::Device { level } | Body::Level { level } if level > levels.max);
-    if !levels.holds(view.write_level(), ptype) || COMPACTION_TYPES.contains(&ptype) || level_above
-    {
+    if !levels.holds(view.write_level(), ptype) || level_above {
         return Err(Refusal::Unsupported);
     }
-    if let Body::Change { epoch, .. } = &record.body
+    if let Body::Change { epoch, .. } | Body::Snapshot { epoch, .. } = &record.body
         && *epoch != view.epoch()
     {
         return Err(Refusal::WrongEpoch);
@@ -391,8 +391,8 @@ fn state_rule(view: &impl SpaceView, record: &Record) -> Result<(), Refusal> {
             if device.level < view.write_level() {
                 return Err(invalid("grant: the device level is below the write level"));
             }
-            if keys.iter().any(|k| !all_epochs(&k.epochs, epoch)) {
-                return Err(invalid("grant: the key set must hold each epoch"));
+            if !keys_ok(view, keys) {
+                return Err(invalid("grant: the key set must hold each needed epoch"));
             }
         }
         Body::Epoch {
@@ -434,8 +434,8 @@ fn state_rule(view: &impl SpaceView, record: &Record) -> Result<(), Refusal> {
             if view.recovery_known(&rid) {
                 return Err(invalid("recovery: the new recovery ID is not new"));
             }
-            if keys.iter().any(|k| !all_epochs(&k.epochs, epoch)) {
-                return Err(invalid("recovery: the key set must hold each epoch"));
+            if !keys_ok(view, keys) {
+                return Err(invalid("recovery: the key set must hold each needed epoch"));
             }
         }
         Body::Device { level } => {
@@ -457,9 +457,59 @@ fn state_rule(view: &impl SpaceView, record: &Record) -> Result<(), Refusal> {
                 ));
             }
         }
+        Body::Snapshot { .. } | Body::Accept { .. } => compaction_rule(view, record)?,
         _ => {}
     }
     Ok(())
+}
+
+/// The state rule of a snapshot and of an accept record (`PROTOCOL.md` 10.6
+/// step 13).
+fn compaction_rule(view: &impl SpaceView, record: &Record) -> Result<(), Refusal> {
+    match &record.body {
+        Body::Snapshot { state, .. } => {
+            // [CMP-3]: the state position is before the record, and the state
+            // digest is the log digest there.
+            if !base_in_range(state.position, view.head())
+                || view.digest_at(state.position) != Some(state.digest)
+            {
+                return Err(invalid(
+                    "snapshot: the state is not an entry before the record",
+                ));
+            }
+        }
+        Body::Accept {
+            snapshot_position,
+            snapshot_hash,
+            applied,
+        } => {
+            if view.snapshot_hash(*snapshot_position) != Some(*snapshot_hash) {
+                return Err(invalid(
+                    "accept: no snapshot with this hash at the position",
+                ));
+            }
+            if applied.position > record.base.position
+                || view.digest_at(applied.position) != Some(applied.digest)
+            {
+                return Err(invalid(
+                    "accept: the applied position is not an entry at or before the base",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The key set rule of a grant or a recovery record ([CMP-20], `PROTOCOL.md`
+/// 14.5): one key set with each needed epoch and no epoch above the current.
+fn keys_ok(view: &impl SpaceView, keys: &[records::KeySet]) -> bool {
+    let epoch = view.epoch();
+    let needed = view.compaction().needed_epochs(epoch);
+    keys.len() == 1
+        && keys
+            .iter()
+            .all(|k| compaction::epochs_ok(&k.epochs, &needed, epoch))
 }
 
 /// Check a genesis record for a new space with log ID `log_id`
@@ -709,6 +759,10 @@ pub struct MemorySpace {
     pub last_security: u64,
     /// The space state of 10.2.
     pub state: State,
+    /// The record hash of each snapshot, in full or as a stub, by position.
+    pub snapshots: std::collections::BTreeMap<u64, Hash32>,
+    /// The compaction state (section 14).
+    pub compaction: Compaction,
 }
 
 impl MemorySpace {
@@ -731,7 +785,98 @@ impl MemorySpace {
         if a.record.is_security() {
             self.last_security = a.position;
         }
+        if matches!(a.record.body, Body::Snapshot { .. }) {
+            self.snapshots.insert(a.position, a.record_hash);
+        }
         self.state.apply(&a.record);
+        let active = self.state.devices.keys().copied().collect();
+        self.compaction
+            .apply(a.position, compaction::kind(&a.record), &active);
+    }
+
+    /// Apply a stub at the next position ([CMP-1]).
+    pub fn apply_stub(&mut self, s: &StubEntry) {
+        self.digests.push(s.digest);
+        if let Some(cid) = s.change_id {
+            self.changes.insert(cid, (s.position, s.record_hash));
+        }
+        if s.payload_type == "snailfish.snapshot.v1" {
+            self.snapshots.insert(s.position, s.record_hash);
+        }
+        let active = self.state.devices.keys().copied().collect();
+        self.compaction
+            .apply(s.position, compaction::stub_kind(&s.payload_type), &active);
+    }
+}
+
+/// A stub at a position, with its log digest (`PROTOCOL.md` 10.7, [CMP-1]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StubEntry {
+    /// The position.
+    pub position: u64,
+    /// The payload type of the record.
+    pub payload_type: String,
+    /// The change ID of a change.
+    pub change_id: Option<[u8; 16]>,
+    /// The record hash.
+    pub record_hash: Hash32,
+    /// The log digest at the position.
+    pub digest: Hash32,
+}
+
+impl StubEntry {
+    /// The stub of the next position after `prev`, the digest at the
+    /// position before it.
+    #[must_use]
+    pub fn new(
+        position: u64,
+        payload_type: &str,
+        change_id: Option<[u8; 16]>,
+        record_hash: Hash32,
+        prev: &Hash32,
+    ) -> Self {
+        let digest = digest_next(
+            prev,
+            position,
+            &entry_hash(payload_type, change_id.as_ref(), &record_hash),
+        );
+        Self {
+            position,
+            payload_type: payload_type.to_owned(),
+            change_id,
+            record_hash,
+            digest,
+        }
+    }
+}
+
+/// One entry of an [`Overlay`]: a record that the check accepted, or a
+/// staged stub of a repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Staged {
+    /// A record in full.
+    Full(Box<Accepted>),
+    /// A stub.
+    Stub(StubEntry),
+}
+
+impl Staged {
+    /// The position.
+    #[must_use]
+    pub fn position(&self) -> u64 {
+        match self {
+            Self::Full(a) => a.position,
+            Self::Stub(s) => s.position,
+        }
+    }
+
+    /// The log digest at the position.
+    #[must_use]
+    pub fn digest(&self) -> Hash32 {
+        match self {
+            Self::Full(a) => a.digest,
+            Self::Stub(s) => s.digest,
+        }
     }
 }
 
@@ -778,6 +923,12 @@ impl SpaceView for MemorySpace {
     fn epoch(&self) -> u64 {
         self.state.epoch
     }
+    fn snapshot_hash(&self, position: u64) -> Option<Hash32> {
+        self.snapshots.get(&position).copied()
+    }
+    fn compaction(&self) -> Compaction {
+        self.compaction.clone()
+    }
 }
 
 /// A [`SpaceView`] with records of the current request on top of a stored
@@ -785,7 +936,7 @@ impl SpaceView for MemorySpace {
 /// state after the earlier ones (`PROTOCOL.md` 10.6).
 pub struct Overlay<'a, V: SpaceView> {
     inner: &'a V,
-    added: Vec<Accepted>,
+    staged: Vec<Staged>,
 }
 
 impl<'a, V: SpaceView> Overlay<'a, V> {
@@ -793,23 +944,52 @@ impl<'a, V: SpaceView> Overlay<'a, V> {
     pub fn new(inner: &'a V) -> Self {
         Self {
             inner,
-            added: Vec::new(),
+            staged: Vec::new(),
         }
     }
 
     /// Add a record that the check accepted.
     pub fn apply(&mut self, a: Accepted) {
-        self.added.push(a);
+        self.staged.push(Staged::Full(Box::new(a)));
     }
 
-    /// The added records, in order.
+    /// Add a stub of a repair at the next position.
+    pub fn apply_stub(&mut self, s: StubEntry) {
+        self.staged.push(Staged::Stub(s));
+    }
+
+    /// Add a staged entry of a repair chain at the next position.
+    pub fn push(&mut self, s: Staged) {
+        self.staged.push(s);
+    }
+
+    /// The added records in full, in order.
     #[must_use]
     pub fn into_added(self) -> Vec<Accepted> {
-        self.added
+        self.staged
+            .into_iter()
+            .filter_map(|s| match s {
+                Staged::Full(a) => Some(*a),
+                Staged::Stub(_) => None,
+            })
+            .collect()
+    }
+
+    /// The added records and stubs, in order.
+    #[must_use]
+    pub fn into_staged(self) -> Vec<Staged> {
+        self.staged
+    }
+
+    fn added(&self) -> impl DoubleEndedIterator<Item = &Accepted> + '_ {
+        self.staged.iter().filter_map(|s| match s {
+            Staged::Full(a) => Some(a.as_ref()),
+            Staged::Stub(_) => None,
+        })
     }
 
     fn effects(&self) -> impl DoubleEndedIterator<Item = Effect> + '_ {
-        self.added.iter().map(|a| effect(&a.record))
+        self.added().map(|a| effect(&a.record))
     }
 
     fn removed_here(&self, id: &Hash32) -> bool {
@@ -823,23 +1003,22 @@ impl<V: SpaceView> SpaceView for Overlay<'_, V> {
         self.inner.log_id()
     }
     fn head(&self) -> u64 {
-        self.added
+        self.staged
             .last()
-            .map_or_else(|| self.inner.head(), |a| a.position)
+            .map_or_else(|| self.inner.head(), Staged::position)
     }
     fn digest_at(&self, position: u64) -> Option<Hash32> {
-        self.added
+        self.staged
             .iter()
-            .find(|a| a.position == position)
-            .map(|a| a.digest)
+            .find(|s| s.position() == position)
+            .map(Staged::digest)
             .or_else(|| self.inner.digest_at(position))
     }
     fn device_key(&self, id: &Hash32) -> Option<[u8; 32]> {
         if self.removed_here(id) {
             return None;
         }
-        self.added
-            .iter()
+        self.added()
             .find_map(|a| a.new_device.filter(|(d, _)| d == id).map(|(_, k)| k))
             .or_else(|| self.inner.device_key(id))
     }
@@ -893,10 +1072,15 @@ impl<V: SpaceView> SpaceView for Overlay<'_, V> {
                 .any(|e| matches!(e, Effect::Recovery { id: r, .. } if &r == id))
     }
     fn change(&self, change_id: &[u8; 16]) -> Option<(u64, Hash32)> {
-        self.added
+        self.staged
             .iter()
-            .find(|a| a.record.change_id() == Some(change_id))
-            .map(|a| (a.position, a.record_hash))
+            .find_map(|s| match s {
+                Staged::Full(a) => {
+                    (a.record.change_id() == Some(change_id)).then_some((a.position, a.record_hash))
+                }
+                Staged::Stub(st) => (st.change_id.as_ref() == Some(change_id))
+                    .then_some((st.position, st.record_hash)),
+            })
             .or_else(|| self.inner.change(change_id))
     }
     fn write_level(&self) -> u64 {
@@ -918,11 +1102,55 @@ impl<V: SpaceView> SpaceView for Overlay<'_, V> {
             .unwrap_or_else(|| self.inner.epoch())
     }
     fn last_security(&self) -> u64 {
-        self.added
-            .iter()
+        self.added()
             .rev()
             .find(|a| a.record.is_security())
             .map_or_else(|| self.inner.last_security(), |a| a.position)
+    }
+    fn snapshot_hash(&self, position: u64) -> Option<Hash32> {
+        self.staged
+            .iter()
+            .find_map(|s| match s {
+                Staged::Full(a) if a.position == position => {
+                    matches!(a.record.body, Body::Snapshot { .. }).then_some(a.record_hash)
+                }
+                Staged::Stub(st) if st.position == position => {
+                    (st.payload_type == "snailfish.snapshot.v1").then_some(st.record_hash)
+                }
+                _ => None,
+            })
+            .or_else(|| self.inner.snapshot_hash(position))
+    }
+    fn compaction(&self) -> Compaction {
+        let mut c = self.inner.compaction();
+        let mut active: std::collections::BTreeSet<Hash32> =
+            self.inner.active_devices().into_iter().collect();
+        for s in &self.staged {
+            match s {
+                Staged::Full(a) => {
+                    match effect(&a.record) {
+                        Effect::Device { id, .. } => {
+                            active.insert(id);
+                        }
+                        Effect::Epoch { removed, .. } => {
+                            for d in &removed {
+                                active.remove(d);
+                            }
+                        }
+                        _ => {}
+                    }
+                    c.apply(a.position, compaction::kind(&a.record), &active);
+                }
+                Staged::Stub(st) => {
+                    c.apply(
+                        st.position,
+                        compaction::stub_kind(&st.payload_type),
+                        &active,
+                    );
+                }
+            }
+        }
+        c
     }
 }
 
@@ -990,17 +1218,6 @@ mod tests {
             prop_assert_eq!(base_in_range(base, head), (1..=head).contains(&base));
         }
 
-        /// `PROTOCOL.md` 10.6 step 13: a grant or a recovery record must seal
-        /// exactly the epochs 1 to the current epoch, in order.
-        #[test]
-        fn all_epochs_is_one_to_current(
-            epochs in proptest::collection::vec(0u64..6, 0..6),
-            current in 0u64..6,
-        ) {
-            let want: Vec<u64> = (1..=current).collect();
-            prop_assert_eq!(all_epochs(&epochs, current), epochs == want);
-        }
-
         /// [VER-8]: a raise goes above the write level, and no active device
         /// is below the new level.
         #[test]
@@ -1056,24 +1273,6 @@ mod proofs {
         let last: u64 = kani::any();
         assert!(security_base_ok(false, base, last));
         assert!(security_base_ok(true, base, last) == (base >= last));
-    }
-
-    /// `PROTOCOL.md` 10.6 step 13: for every list of up to 3 epochs and
-    /// every current epoch, `all_epochs` accepts exactly 1 to current.
-    /// Bound: 3 elements.
-    #[kani::proof]
-    #[kani::unwind(5)]
-    fn all_epochs_exact() {
-        let xs: [u64; 3] = kani::any();
-        let len: usize = kani::any_where(|&n| n <= 3);
-        let current: u64 = kani::any();
-        let e = &xs[..len];
-        if all_epochs(e, current) {
-            assert!(len as u64 == current);
-            for (i, x) in e.iter().enumerate() {
-                assert!(*x == i as u64 + 1);
-            }
-        }
     }
 
     /// [VER-8]: for every 64-bit input, a valid raise is above the write

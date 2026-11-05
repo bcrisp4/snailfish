@@ -377,6 +377,89 @@ impl Fx {
         .to_json(&idtext)
     }
 
+    /// A signed record of `signer` with the payload `payload`.
+    pub fn sign(&self, signer: &str, payload_type: &str, payload: Vec<u8>) -> String {
+        let (sk, _, idtext) = self.key(signer);
+        let sig = sk.sign_record(payload_type, &payload);
+        Envelope {
+            payload_type: payload_type.to_owned(),
+            payload,
+            sig,
+        }
+        .to_json(&idtext)
+    }
+
+    /// The relay head of the space, read through a fetch.
+    pub fn head(&self, handle: &str) -> snailfish_protocol::wire::Head {
+        wire::parse_fetch(&self.fetch(handle, 0, 1).body)
+            .unwrap()
+            .head
+    }
+
+    /// A snapshot by `signer` on the relay head, with the state position
+    /// `state` of the log (`PROTOCOL.md` 6.2). The ciphertext is not a real
+    /// encryption: the relay never decrypts it.
+    pub fn snapshot(
+        &self,
+        handle: &str,
+        signer: &str,
+        state: u64,
+        state_digest: [u8; 32],
+    ) -> String {
+        use snailfish_protocol::records::Position;
+        let head = self.head(handle);
+        let (_, _, idtext) = self.key(signer);
+        let author = snailfish_protocol::encoding::decode_id::<32>(&idtext, "d_").unwrap();
+        let log = snailfish_protocol::encoding::decode_id::<16>(self.log(), "l_").unwrap();
+        let payload = snailfish_protocol::write::snapshot(
+            &log,
+            &author,
+            &Position {
+                position: head.position,
+                digest: head.digest,
+            },
+            1,
+            &Position {
+                position: state,
+                digest: state_digest,
+            },
+            &[7; 48],
+        );
+        self.sign(signer, "snailfish.snapshot.v1", payload)
+    }
+
+    /// An accept record by `signer` on the relay head for the snapshot at
+    /// `snap` with the record hash `hash` and the applied position `applied`.
+    pub fn accept(
+        &self,
+        handle: &str,
+        signer: &str,
+        snap: u64,
+        hash: [u8; 32],
+        applied: (u64, [u8; 32]),
+    ) -> String {
+        use snailfish_protocol::records::Position;
+        let head = self.head(handle);
+        let (_, _, idtext) = self.key(signer);
+        let author = snailfish_protocol::encoding::decode_id::<32>(&idtext, "d_").unwrap();
+        let log = snailfish_protocol::encoding::decode_id::<16>(self.log(), "l_").unwrap();
+        let payload = snailfish_protocol::write::accept(
+            &log,
+            &author,
+            &Position {
+                position: head.position,
+                digest: head.digest,
+            },
+            snap,
+            &hash,
+            &Position {
+                position: applied.0,
+                digest: applied.1,
+            },
+        );
+        self.sign(signer, "snailfish.accept.v1", payload)
+    }
+
     /// The path of the `tenant.db` file of a handle.
     pub fn tenant_db(&self, handle: &str) -> PathBuf {
         let d = rusqlite::Connection::open(self.dir.path().join("directory.db")).unwrap();
@@ -539,6 +622,14 @@ impl Fx {
             .unwrap();
         c.execute("DELETE FROM devices WHERE position > ?1", [n])
             .unwrap();
+        // An older space file has the usage of its own log.
+        c.execute(
+            "UPDATE usage SET bytes = (SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))), 0)
+             FROM entries WHERE payload_type IN
+               ('snailfish.change.v1', 'snailfish.snapshot.v1', 'snailfish.accept.v1'))",
+            [],
+        )
+        .unwrap();
     }
 
     /// A signed POST to a route under the space path.

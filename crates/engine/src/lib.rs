@@ -10,6 +10,7 @@
 //! the keys at [`Engine::open`] from its key store.
 
 pub mod codec;
+mod compact;
 pub mod enroll;
 pub mod keystore;
 mod removal;
@@ -32,7 +33,7 @@ pub use removal::ActiveDevice;
 pub use sync::Sync;
 
 /// The schema version of the engine state file ([VER-14]).
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The protocol levels that this engine can write ([VER-6]).
 pub const MAX_LEVEL: u64 = 1;
@@ -158,6 +159,9 @@ pub enum Status {
     /// relay refuses each request of the device, and the engine reads no
     /// later record.
     Removed,
+    /// `stopped: missing records`: the verified log holds a stub that no
+    /// usable snapshot covers ([CMP-15]).
+    MissingRecords,
     /// `stopped: setup failed`: the relay refused to create the space
     /// (`bad_setup` or `space_limit`, `PROTOCOL.md` 10.5). The app signs in
     /// again and gives the engine a new setup token.
@@ -186,6 +190,7 @@ impl Status {
             Self::SetupFailed { .. } => "stopped: setup failed",
             Self::Blocked => "paused: blocked",
             Self::Removed => "stopped: removed",
+            Self::MissingRecords => "stopped: missing records",
         }
     }
 }
@@ -298,6 +303,19 @@ pub struct Change {
     pub change_id: Vec<u8>,
     /// The decrypted app change bytes.
     pub change_bytes: Vec<u8>,
+}
+
+/// A snapshot for the app (`PROTOCOL.md` 14.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The position of the snapshot record.
+    pub position: u64,
+    /// The state position: the applied position of the export.
+    pub state_position: u64,
+    /// The log digest at the state position.
+    pub state_digest: [u8; 32],
+    /// The decrypted app state ([CMP-2]).
+    pub state_bytes: Vec<u8>,
 }
 
 /// The engine for one space on one device.
@@ -474,7 +492,7 @@ impl Engine {
             .find(|(e, _)| **e == 1)
             .map(|(_, k)| k)
             .ok_or_else(|| bad("no key of epoch 1"))?;
-        let Some((_, genesis)) = state::log_range(&self.db, 1, 1)?.into_iter().next() else {
+        let Some(genesis) = state::envelope_at(&self.db, 1)? else {
             return Err(bad("no genesis record"));
         };
         let g = snailfish_protocol::envelope::Envelope::parse(genesis.as_bytes())

@@ -15,9 +15,30 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = wire::parse_genesis(data);
     if let Ok(f) = wire::parse_fetch(data) {
-        for (_, e) in f.entries {
-            if let wire::FetchEntry::Envelope(r) = e {
-                assert!(snailfish_protocol::envelope::Envelope::parse(r.json.as_bytes()).is_ok());
+        for (p, e) in f.entries {
+            match e {
+                wire::FetchEntry::Envelope(r) => {
+                    assert!(
+                        snailfish_protocol::envelope::Envelope::parse(r.json.as_bytes()).is_ok()
+                    );
+                }
+                // [CMP-1]: a stub that the reader takes reads back the same
+                // from the JSON of its writer.
+                wire::FetchEntry::Stub(s) => {
+                    let head = wire::Head {
+                        position: p,
+                        digest: [0; 32],
+                    };
+                    let body = wire::fetch_response(
+                        &[(p, wire::OutEntry::Stub(s.clone()))],
+                        &head,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+                    let back = wire::parse_fetch(&body).unwrap();
+                    assert_eq!(back.entries[0].1, wire::FetchEntry::Stub(s));
+                }
             }
         }
     }

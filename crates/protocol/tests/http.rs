@@ -271,6 +271,8 @@ fn append_cases_give_the_go_results() {
     let h = load();
     let base = space(&h);
     let max_change = usize::try_from(h["limits"]["max_change_bytes"].as_u64().unwrap()).unwrap();
+    let max_snapshot =
+        usize::try_from(h["limits"]["max_snapshot_bytes"].as_u64().unwrap()).unwrap();
     let max_env = h["limits"]["max_append_envelopes"].as_u64().unwrap();
     let cases = h["append"].as_array().unwrap();
     assert!(cases.len() >= 18);
@@ -293,6 +295,7 @@ fn append_cases_give_the_go_results() {
                     Mode::Relay {
                         signer,
                         max_change_bytes: max_change,
+                        max_snapshot_bytes: max_snapshot,
                         hold: false,
                     },
                 ) {

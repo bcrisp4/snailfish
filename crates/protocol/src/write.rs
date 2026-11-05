@@ -218,6 +218,46 @@ pub fn change(
     .into_bytes()
 }
 
+/// A `snailfish.snapshot.v1` payload (`PROTOCOL.md` 6.2, [CMP-3]).
+#[must_use]
+pub fn snapshot(
+    log: &[u8; 16],
+    author: &Hash32,
+    base: &Position,
+    epoch: u64,
+    state: &Position,
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    format!(
+        r#"{{{},"epoch":{},"state":{},"ciphertext":"{}"}}"#,
+        common(log, &Author::Device(*author), base),
+        epoch,
+        position(state),
+        encode_b64(ciphertext)
+    )
+    .into_bytes()
+}
+
+/// A `snailfish.accept.v1` payload (`PROTOCOL.md` 6.2, [CMP-5]).
+#[must_use]
+pub fn accept(
+    log: &[u8; 16],
+    author: &Hash32,
+    base: &Position,
+    snapshot_position: u64,
+    snapshot_hash: &Hash32,
+    applied: &Position,
+) -> Vec<u8> {
+    format!(
+        r#"{{{},"snapshot":{{"position":{},"hash":"{}"}},"applied":{}}}"#,
+        common(log, &Author::Device(*author), base),
+        snapshot_position,
+        encode_b64(snapshot_hash),
+        position(applied)
+    )
+    .into_bytes()
+}
+
 /// A `snailfish.checkpoint.v1` statement (`PROTOCOL.md` 6.3, [ENR-8]).
 #[must_use]
 pub fn checkpoint(log: &[u8; 16], author: &Hash32, at: &Position) -> Vec<u8> {
@@ -279,6 +319,30 @@ mod tests {
             prop_assert_eq!(r.author, Author::Device(author));
             prop_assert_eq!(r.base, base);
             prop_assert_eq!(r.body, Body::Change { epoch, change_id: cid, ciphertext: ct });
+        }
+
+        /// [CMP-3] [CMP-5]: a written snapshot and accept record parse back
+        /// to the same fields.
+        #[test]
+        fn snapshot_and_accept_round_trip(
+            log in any::<[u8; 16]>(),
+            author in any::<[u8; 32]>(),
+            pos in 1u64..(1 << 53),
+            digest in any::<[u8; 32]>(),
+            epoch in 1u64..(1 << 53),
+            sp in 1u64..(1 << 53),
+            hash in any::<[u8; 32]>(),
+            ct in proptest::collection::vec(any::<u8>(), 40..80),
+        ) {
+            let base = Position { position: pos, digest };
+            let state = Position { position: sp, digest: hash };
+            let p = snapshot(&log, &author, &base, epoch, &state, &ct);
+            let r = parse_payload("snailfish.snapshot.v1", &p).unwrap();
+            prop_assert_eq!((r.log, r.author, r.base), (log, Author::Device(author), base));
+            prop_assert_eq!(r.body, Body::Snapshot { epoch, state, ciphertext: ct });
+            let p = accept(&log, &author, &base, sp, &hash, &state);
+            let r = parse_payload("snailfish.accept.v1", &p).unwrap();
+            prop_assert_eq!(r.body, Body::Accept { snapshot_position: sp, snapshot_hash: hash, applied: state });
         }
 
         /// [ENR-8]: a written checkpoint parses back to the same fields.

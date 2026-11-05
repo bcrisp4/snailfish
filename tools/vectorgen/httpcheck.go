@@ -246,6 +246,15 @@ func checkHTTPWith(h *httpJ, w *world, mut string) error {
 			return fmt.Errorf("no invalid case with error %s", need)
 		}
 	}
+	if len(h.Compaction) < 6 {
+		return fmt.Errorf("compaction: %d cases", len(h.Compaction))
+	}
+	for i := range h.Compaction {
+		c := h.Compaction[i]
+		if err := replayCompaction(sp, envs, &c, keys, h.Limits, true); err != nil {
+			return fmt.Errorf("compaction %s: %w", c.Name, err)
+		}
+	}
 	_ = bytes.Equal
 	return nil
 }

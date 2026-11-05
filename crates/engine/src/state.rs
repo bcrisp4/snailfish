@@ -11,7 +11,8 @@ use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::hash::digest0;
 use snailfish_protocol::keys;
 use snailfish_protocol::records::{Body, Position};
-use snailfish_protocol::space::{Accepted, SpaceView, State};
+use snailfish_protocol::space::{Accepted, SpaceView, State, StubEntry};
+use snailfish_protocol::wire::{OutEntry, Stub};
 use snailfish_protocol::{envelope, write};
 
 use crate::{
@@ -81,7 +82,7 @@ pub(crate) fn open(
 
 /// The schema steps. Step `i` moves a state file from version `i` to
 /// version `i + 1` in one transaction ([VER-15]).
-pub(crate) const MIGRATIONS: [&str; 6] = [
+pub(crate) const MIGRATIONS: [&str; 7] = [
     "BEGIN IMMEDIATE;
      CREATE TABLE relay_info (id INTEGER PRIMARY KEY CHECK (id = 1), body BLOB NOT NULL);
      PRAGMA user_version = 1;
@@ -181,6 +182,23 @@ pub(crate) const MIGRATIONS: [&str; 6] = [
      CREATE INDEX log_type ON log (payload_type);
      PRAGMA user_version = 6;
      COMMIT;",
+    // M8: the snapshot and accept records that wait for the relay, the
+    // snapshots that the app checked, the first stub that the stub check
+    // has not seen, and the frontier of the last local compaction
+    // (`PROTOCOL.md` 14.3 and 14.7). A stub is a log row with an empty
+    // envelope.
+    "BEGIN IMMEDIATE;
+     CREATE TABLE records (
+       seq INTEGER PRIMARY KEY AUTOINCREMENT,
+       record_hash BLOB NOT NULL UNIQUE,
+       kind TEXT NOT NULL,
+       envelope TEXT NOT NULL
+     );
+     CREATE TABLE checked (position INTEGER PRIMARY KEY);
+     ALTER TABLE meta ADD COLUMN stubs_from INTEGER;
+     ALTER TABLE meta ADD COLUMN stubbed INTEGER NOT NULL DEFAULT 0;
+     PRAGMA user_version = 7;
+     COMMIT;",
 ];
 
 fn migrate(db: &Connection) -> Result<(), EngineError> {
@@ -189,7 +207,7 @@ fn migrate(db: &Connection) -> Result<(), EngineError> {
     for step in MIGRATIONS.iter().skip(found) {
         db.execute_batch(step)?;
     }
-    const { assert!(SCHEMA_VERSION == 6) };
+    const { assert!(SCHEMA_VERSION == 7) };
     Ok(())
 }
 
@@ -296,13 +314,17 @@ pub(crate) fn enqueue(e: &mut Engine, rows: &[OutboxRow]) -> Result<EnqueueResul
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        // [DLV-5]: a stub that holds the change_id has no bytes to compare,
+        // so the row has no effect.
         let in_log: Option<Option<Vec<u8>>> = tx
             .query_row(
-                "SELECT content_hash FROM log WHERE change_id = ?1",
+                "SELECT CASE WHEN envelope = '' THEN NULL ELSE content_hash END, envelope = ''
+                 FROM log WHERE change_id = ?1",
                 [&cid[..]],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get::<_, bool>(1)?)),
             )
-            .optional()?;
+            .optional()?
+            .map(|(h, stub): (Option<Vec<u8>>, bool)| if stub { Some(hash.to_vec()) } else { h });
         match (in_outbox, in_log) {
             (Some((h, state)), _) => {
                 if h != hash || state == REFUSED {
@@ -470,7 +492,8 @@ pub(crate) fn current_epoch(db: &Connection) -> Result<u64, EngineError> {
 /// is complete.
 pub(crate) fn security_state(db: &Connection) -> Result<State, EngineError> {
     let mut st = db.prepare(&format!(
-        "SELECT envelope FROM log WHERE {NOT_SECURITY} ORDER BY position"
+        "SELECT envelope FROM log WHERE {} ORDER BY position",
+        snailfish_protocol::records::security_sql()
     ))?;
     let mut q = st.query([])?;
     let mut state = State::default();
@@ -589,18 +612,74 @@ pub(crate) fn log_range(
     db: &Connection,
     first: u64,
     last: u64,
-) -> Result<Vec<(u64, String)>, EngineError> {
+) -> Result<Vec<(u64, OutEntry)>, EngineError> {
     let mut st = db.prepare(
-        "SELECT position, envelope FROM log WHERE position BETWEEN ?1 AND ?2 ORDER BY position",
+        "SELECT position, envelope, payload_type, change_id, record_hash FROM log
+         WHERE position BETWEEN ?1 AND ?2 ORDER BY position",
     )?;
     let rows = st.query_map([to_i64(first)?, to_i64(last)?], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<Vec<u8>>>(3)?,
+            r.get::<_, Vec<u8>>(4)?,
+        ))
     })?;
     rows.map(|r| {
-        let (p, e) = r?;
-        Ok((to_u64(p)?, e))
+        let (p, env, ptype, cid, rh) = r?;
+        // [CMP-1]: a stub goes as a stub, for example in a repair ([LOG-11]).
+        let entry = if env.is_empty() {
+            let change_id = cid
+                .map(|c| {
+                    <[u8; 16]>::try_from(c)
+                        .map(|c| snailfish_protocol::encoding::encode_id("c_", &c))
+                        .map_err(|_| EngineError::Storage("a stored change_id".into()))
+                })
+                .transpose()?;
+            OutEntry::Stub(Stub {
+                payload_type: ptype,
+                change_id,
+                hash: to_hash(&rh)?,
+            })
+        } else {
+            OutEntry::Envelope(env)
+        };
+        Ok((to_u64(p)?, entry))
     })
     .collect()
+}
+
+/// The envelope text of the entry at `position`, `None` for a stub.
+pub(crate) fn envelope_at(db: &Connection, position: u64) -> Result<Option<String>, EngineError> {
+    Ok(db
+        .query_row(
+            "SELECT envelope FROM log WHERE position = ?1 AND envelope != ''",
+            [to_i64(position)?],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Store a verified stub ([CMP-1]). An own change that the stub holds
+/// leaves the outbox: the verified log holds the `change_id` ([DLV-6],
+/// [DLV-8]).
+pub(crate) fn store_stub(tx: &Transaction<'_>, s: &StubEntry) -> Result<(), EngineError> {
+    tx.execute(
+        "INSERT INTO log (position, payload_type, change_id, record_hash, digest, envelope)
+         VALUES (?1, ?2, ?3, ?4, ?5, '')",
+        params![
+            to_i64(s.position)?,
+            s.payload_type,
+            s.change_id.map(|c| c.to_vec()),
+            &s.record_hash[..],
+            &s.digest[..],
+        ],
+    )?;
+    if let Some(cid) = s.change_id {
+        tx.execute("DELETE FROM outbox WHERE change_id = ?1", [&cid[..]])?;
+    }
+    Ok(())
 }
 
 /// The verified digest at a position, outside a transaction.
@@ -708,12 +787,33 @@ impl SpaceView for DbSpace<'_> {
     fn epoch(&self) -> u64 {
         self.state.epoch
     }
+    fn snapshot_hash(&self, position: u64) -> Option<Hash32> {
+        let p = i64::try_from(position).ok()?;
+        self.tx
+            .query_row(
+                "SELECT record_hash FROM log WHERE position = ?1 AND payload_type = 'snailfish.snapshot.v1'",
+                [p],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|h| h.try_into().ok())
+    }
+    fn compaction(&self) -> snailfish_protocol::compaction::Compaction {
+        // On a read error the state is empty: every key set needs each epoch
+        // of the log, and a fetched grant with fewer epochs stops the engine.
+        crate::compact::compaction_state(self.tx).unwrap_or_default()
+    }
     fn last_security(&self) -> u64 {
         // Fail closed: on a read error every security record is stale, so
         // the fetch stops instead of accepting a record that [LOG-7] refuses.
         self.tx
             .query_row(
-                &format!("SELECT COALESCE(MAX(position), 0) FROM log WHERE {NOT_SECURITY}"),
+                &format!(
+                    "SELECT COALESCE(MAX(position), 0) FROM log WHERE {}",
+                    snailfish_protocol::records::security_sql()
+                ),
                 [],
                 |r| r.get::<_, i64>(0),
             )
@@ -722,11 +822,6 @@ impl SpaceView for DbSpace<'_> {
             .unwrap_or(u64::MAX)
     }
 }
-
-/// An SQL condition: the row is a security record ([VER-5], [LOG-7]).
-const NOT_SECURITY: &str = "payload_type NOT LIKE 'snailfish.change.%' \
-     AND payload_type NOT LIKE 'snailfish.snapshot.%' \
-     AND payload_type NOT LIKE 'snailfish.accept.%'";
 
 fn digest_at(
     db: &Connection,
@@ -851,9 +946,15 @@ pub(crate) fn changes_after(
     if digest_at(&tx, &e.log_id, applied.position)? != Some(applied.digest) {
         return Err(EngineError::ResetRequired);
     }
+    drop(tx);
+    // [CMP-16] [CMP-13]: ResetRequired before the frontier, local stubs
+    // after it.
+    crate::compact::before_changes(e, applied.position)?;
+    let tx = Transaction::new_unchecked(&e.db, TransactionBehavior::Deferred)?;
     let mut st = tx.prepare(
         "SELECT position, digest, envelope, change_id FROM log
          WHERE position > ?1 AND change_id IS NOT NULL AND content_hash IS NOT NULL
+           AND envelope != ''
          ORDER BY position LIMIT ?2",
     )?;
     let rows: Vec<(i64, Vec<u8>, String, Vec<u8>)> = st
@@ -1219,7 +1320,8 @@ pub(crate) fn fill_content(tx: &Connection, e: &Engine) -> Result<Option<u64>, E
     let rows: Vec<(i64, String)> = {
         let mut st = tx.prepare(
             "SELECT position, envelope FROM log
-             WHERE change_id IS NOT NULL AND content_hash IS NULL ORDER BY position",
+             WHERE change_id IS NOT NULL AND content_hash IS NULL AND envelope != ''
+             ORDER BY position",
         )?;
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?

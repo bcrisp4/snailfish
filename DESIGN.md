@@ -463,7 +463,7 @@ Rules:
 - A tenant handle is a random 128-bit value. The relay makes one handle for each tenant, stores it in `directory.db` and in the tenant file, and gives it to each device of the tenant. It needs no server key. At restore, the relay rebuilds the handle map in `directory.db` from the tenant files, so every handle stays valid. [STO-10]
 - An append runs in one transaction in the space file: the signature and permission checks, the space quota check and the append. [STO-11]
 - The relay checks a block in the tenant file before it opens the space file. The two files have no shared transaction. A request that starts before a block can still finish, and a block affects availability only. [STO-12]
-- After the relay replaces records with stubs, it runs `PRAGMA incremental_vacuum` on that space file. Only that space waits for it. [STO-13]
+- After the relay replaces records with stubs, it runs `VACUUM` on that space file, because a stub leaves the pages of the log table mostly empty and `incremental_vacuum` frees only whole free pages. Only that space waits for it. [STO-13]
 - The relay limits the spaces per tenant and the stored bytes per space. The product of the two limits bounds the storage of one tenant. The relay reserves capacity in each space for security records and two snapshots. [STO-14]
 - The security record reserve is 16 MiB by default, outside the space quota. One person writes about 150 KB of security records in 10 years: about 20 grants of 4 KB, 10 epoch records and 50 device records. The relay refuses more than 10 security records from one device in one day, so a stolen device cannot fill the reserve before the block. The relay operator can raise the reserve. [STO-15]
 

@@ -5,10 +5,12 @@
 use std::path::PathBuf;
 
 use serde_json::Value;
+use snailfish_protocol::compaction::Compaction;
 use snailfish_protocol::encoding::decode_id;
 use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::repair::{ChainError, Item, check_chain};
-use snailfish_protocol::space::{MemorySpace, Overlay, Refusal, SpaceView, check_genesis};
+use snailfish_protocol::space::{MemorySpace, Overlay, Refusal, SpaceView, Staged, check_genesis};
+use snailfish_protocol::wire::Stub;
 
 fn vectors() -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/protocol.json");
@@ -67,13 +69,13 @@ fn lost_entries_pass_and_activate_their_grant() {
     let got: Vec<(u64, [u8; 32])> = chain
         .accepted
         .iter()
-        .map(|a| (a.position, a.digest))
+        .map(|a| (a.position(), a.digest()))
         .collect();
     assert_eq!(got, [(2, digest(&v, 2)), (3, digest(&v, 3))]);
-    assert_eq!(
-        chain.accepted[0].new_device.map(|d| d.0),
-        Some(device_id(&v, "B"))
-    );
+    let Staged::Full(grant) = &chain.accepted[0] else {
+        panic!("the grant is a full record")
+    };
+    assert_eq!(grant.new_device.map(|d| d.0), Some(device_id(&v, "B")));
     assert_eq!(s.head(), 1);
 }
 
@@ -92,7 +94,13 @@ fn first_failure_stops_the_check() {
     let first = check_chain(&s, &[3], &[Item::Envelope(&e3)]);
     assert_eq!(first.failure, Some((0, ChainError::Position)));
 
-    let stub = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub]);
+    // [LOG-11]: a stub of a type that compaction never makes fails at once.
+    let grant_stub = Stub {
+        payload_type: "snailfish.grant.v1".into(),
+        change_id: None,
+        hash: [7; 32],
+    };
+    let stub = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub(&grant_stub)]);
     assert_eq!(stub.failure, Some((1, ChainError::Stub)));
     assert_eq!(stub.failure.unwrap().1.code(), "uncovered_stub");
 
@@ -105,7 +113,7 @@ fn first_failure_stops_the_check() {
     let mut forged = e2.clone();
     forged.sig[0] ^= 1;
     let sig = check_chain(&s, &[2], &[Item::Envelope(&forged)]);
-    assert_eq!(sig.accepted, [] as [snailfish_protocol::space::Accepted; 0]);
+    assert_eq!(sig.accepted, Vec::<Staged>::new());
     assert!(matches!(
         sig.failure,
         Some((0, ChainError::Invalid(Refusal::InvalidRecord(_))))
@@ -172,6 +180,12 @@ impl SpaceView for Shifted {
     fn last_security(&self) -> u64 {
         7
     }
+    fn snapshot_hash(&self, p: u64) -> Option<[u8; 32]> {
+        self.0.snapshot_hash(p)
+    }
+    fn compaction(&self) -> Compaction {
+        self.0.compaction()
+    }
 }
 
 /// The overlay reads the space state of the log until an added record
@@ -193,9 +207,9 @@ fn overlay_reads_the_log_state_until_an_added_record_changes_it() {
         &[Item::Envelope(&e2), Item::Envelope(&e3)],
     );
     let mut added = chain.accepted.into_iter();
-    over.apply(added.next().unwrap());
+    over.push(added.next().unwrap());
     assert_eq!(over.last_security(), 2, "the grant at 2");
-    over.apply(added.next().unwrap());
+    over.push(added.next().unwrap());
     assert_eq!(over.last_security(), 2, "a change is not a security record");
     assert_eq!(over.head(), 3);
 }

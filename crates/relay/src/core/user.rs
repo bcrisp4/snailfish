@@ -1168,15 +1168,24 @@ fn tenant_devices(
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?;
         let state = super::security_state(&sc, false)?;
+        // [CMP-7]: the devices with no accept of the newest snapshot that
+        // is not accepted block compaction.
+        let cmp = super::compact::compaction_state(&sc, false)?;
+        let pending = cmp.pending().map(|(_, s)| s.accepters.clone());
         for (raw, ptype, env) in rows {
             let id = encode_id("d_", &raw);
             let name = device_name(&ptype, &env, &id).unwrap_or_else(|| "?".to_owned());
             let status = read_status(tc, &sp.log, &id, sp.head)?;
-            let level = Hash32::try_from(raw)
-                .ok()
+            let hash = Hash32::try_from(raw).ok();
+            let level = hash
                 .and_then(|h| state.device_levels.get(&h).copied())
                 .unwrap_or(1);
+            let blocks_compaction = pending
+                .as_ref()
+                .zip(hash)
+                .is_some_and(|(acc, h)| !acc.contains(&h));
             out.push(DeviceRow {
+                blocks_compaction,
                 blocked: is_blocked(tc, &id)?,
                 id,
                 name,
@@ -1271,6 +1280,11 @@ fn devices_html(devices: &[DeviceRow], now: u64, hidden: &str) -> String {
             .as_ref()
             .map_or_else(String::new, |st| st.time.to_string());
         let block = block_form("device", &dv.id, dv.blocked, hidden);
+        let status = if dv.blocks_compaction {
+            format!("{status} <span class=\"warn\">blocks compaction</span>")
+        } else {
+            status
+        };
         let _ = write!(
             html,
             "<tr><td>{}</td><td>{}</td><td>{status}</td><td>{when}</td><td><code>{}</code></td><td>{block}</td></tr>",
@@ -1657,6 +1671,9 @@ struct DeviceRow {
     level: u64,
     /// The current epoch of the space of the device.
     epoch: u64,
+    /// The device has no accept of the newest snapshot that is not accepted
+    /// ([CMP-7]).
+    blocks_compaction: bool,
 }
 
 /// The last status report of a device (10.11).

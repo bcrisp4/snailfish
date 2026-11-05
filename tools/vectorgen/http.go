@@ -137,6 +137,7 @@ type httpJ struct {
 	Recovery      []httpDeviceJ   `json:"recovery"`
 	Access        []accessJ       `json:"access"`
 	AppendReserve []reserveJ      `json:"append_reserve"`
+	Compaction    []cmpCaseJ      `json:"compaction"`
 }
 
 type statusRespJ struct {
@@ -767,6 +768,9 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 	if err := buildReserve(h, b, w, sp, mustChange); err != nil {
 		return nil, err
 	}
+	if err := buildCompaction(h, b, w, sp, envs, mustChange); err != nil {
+		return nil, fmt.Errorf("compaction: %w", err)
+	}
 
 	if err := buildSetup(h, b, w); err != nil {
 		return nil, err
@@ -860,9 +864,13 @@ func buildRepair(h *httpJ, b *logBuilder, w *world, envs []string, keys map[stri
 		{"known-change-id-in-entries", 2, false, []st{
 			{"start", A, now, start(2, d[2], ent(3), ent(4), at(5, b.entries[3].Envelope)), "422 invalid_record"},
 		}, 2},
+		// [LOG-11]: a change stub passes the chain check. The finish refuses it,
+		// because no usable snapshot covers it. A grant stub fails at once.
 		{"stub", 1, false, []st{
-			{"start", A, now, start(1, d[1], stubChange), "422 uncovered_stub"},
 			{"start", A, now, start(1, d[1], ent(2), stubGrant), "422 uncovered_stub"},
+			{"start", A, now, start(1, d[1], stubChange), "201 next 3"},
+			{"chunk", A, now + 10, chunk(ent(3), ent(4)), "200 next 5"},
+			{"finish", A, now + 20, finish(4, d[4]), "422 uncovered_stub"},
 		}, 1},
 		{"wrong-tip", 1, false, []st{
 			{"start", A, now, start(1, d[1], ent(2), ent(3), ent(4)), "201 next 5"},

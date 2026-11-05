@@ -1399,3 +1399,52 @@ fn page_lists_the_devices_that_block_a_level_raise() {
         "{page}"
     );
 }
+
+/// [CMP-7], `specs/compaction/test.qnt::blockedTest`: after a snapshot and
+/// the accept of the laptop, the page marks the phone with "blocks
+/// compaction". After the accept of the phone the mark goes, and the
+/// operator path shows the stubs and the frontier ([CMP-19]).
+#[test]
+fn page_marks_the_device_that_blocks_compaction() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let at4 = fx.head(fx.tenant());
+    assert_eq!(at4.position, 4);
+    let snap = fx.snapshot(fx.tenant(), "A", 4, at4.digest);
+    let hash = snailfish_protocol::envelope::Envelope::parse(snap.as_bytes())
+        .unwrap()
+        .record_hash();
+    let append = |signer: &str, env: &str| {
+        let body = format!(r#"{{"envelopes":[{env}]}}"#);
+        let r = fx.post(fx.tenant(), "append", body.as_bytes(), signer);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(
+            String::from_utf8_lossy(&r.body).contains("stored"),
+            "{}",
+            String::from_utf8_lossy(&r.body)
+        );
+    };
+    append("A", &snap);
+    let acc_a = fx.accept(fx.tenant(), "A", 5, hash, (4, at4.digest));
+    append("A", &acc_a);
+    let (mut b, _) = signed_in(&fx);
+    let page = b.home();
+    let marks = page.matches("blocks compaction").count();
+    assert_eq!(marks, 1, "{page}");
+    let phone = page.find("Phone").unwrap();
+    let mark = page.find("blocks compaction").unwrap();
+    assert!(mark > phone, "the mark is in the row of the phone: {page}");
+    let before = snailfish_relay::ops::space_status(fx.dir.path(), "sam", fx.log()).unwrap();
+    assert_eq!((before.stubs, before.frontier), (0, 0));
+
+    let acc_b = fx.accept(fx.tenant(), "B", 5, hash, (4, at4.digest));
+    append("B", &acc_b);
+    assert!(!b.home().contains("blocks compaction"));
+    let after = snailfish_relay::ops::space_status(fx.dir.path(), "sam", fx.log()).unwrap();
+    assert_eq!((after.stubs, after.frontier), (2, 4));
+    // The changes at 2 and 4 are stubs, so only the snapshot and the accept
+    // records count.
+    assert_eq!(after.used, (snap.len() + acc_a.len() + acc_b.len()) as u64);
+    // Two change stubs of 10.7: type, change ID and hash.
+    assert_eq!(after.stub_bytes, 2 * 133);
+}

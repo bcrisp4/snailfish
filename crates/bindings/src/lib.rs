@@ -199,6 +199,7 @@ pub enum Status {
     SetupFailed { cause: String },
     Blocked,
     Removed,
+    MissingRecords,
 }
 
 /// The status text of DESIGN.md "Sync status", without its cause.
@@ -363,6 +364,30 @@ pub struct Change {
     pub change_id: Vec<u8>,
     /// The app change bytes.
     pub change_bytes: Vec<u8>,
+}
+
+/// A snapshot for the app (`PROTOCOL.md` 14.7).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Snapshot {
+    /// The position of the snapshot record.
+    pub position: u64,
+    /// The state position: the applied position of the export.
+    pub state_position: u64,
+    /// The 32-byte log digest at the state position.
+    pub state_digest: Vec<u8>,
+    /// The app state ([CMP-2]).
+    pub state_bytes: Vec<u8>,
+}
+
+impl Snapshot {
+    fn from_engine(s: snailfish_engine::Snapshot) -> Self {
+        Self {
+            position: s.position,
+            state_position: s.state_position,
+            state_digest: s.state_digest.to_vec(),
+            state_bytes: s.state_bytes,
+        }
+    }
 }
 
 /// A new space with its first device.
@@ -1074,6 +1099,85 @@ impl Engine {
                 change_bytes: c.change_bytes,
             })
             .collect())
+    }
+
+    /// True if the app should write a snapshot (`PROTOCOL.md` 14.7).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn snapshot_due(&self) -> Result<bool> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.snapshot_due()?)
+    }
+
+    /// Write a snapshot of the app state at the applied position. The app
+    /// calls it only with an empty app outbox ([CMP-3]).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
+    pub fn write_snapshot(&self, applied: &Applied, state: &[u8]) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .write_snapshot(&applied.to_engine()?, state)?)
+    }
+
+    /// The snapshots for the app to check with `can_import` ([CMP-5]).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn unchecked_snapshots(&self) -> Result<Vec<Snapshot>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .unchecked_snapshots()?
+            .into_iter()
+            .map(Snapshot::from_engine)
+            .collect())
+    }
+
+    /// The answer of `can_import` for a snapshot ([CMP-5]).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn accept_snapshot(&self, position: u64, ok: bool) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .accept_snapshot(position, ok)?)
+    }
+
+    /// The usable snapshot, for the reset after `ResetRequired` ([CMP-8]).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn usable_snapshot(&self) -> Result<Option<Snapshot>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .usable_snapshot()?
+            .map(Snapshot::from_engine))
+    }
+
+    /// True if the usable snapshot holds the edit of `change_id` ([CMP-14]).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn is_covered(&self, change_id: &[u8]) -> Result<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .is_covered(change_id)?)
     }
 
     /// Take the repairs of the relay log that this engine made since the

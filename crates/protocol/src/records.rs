@@ -220,6 +220,26 @@ pub const RECORD_TYPES: [&str; 9] = [
     "snailfish.accept.v1",
 ];
 
+/// The security record types of [`RECORD_TYPES`] (`PROTOCOL.md` 10.2,
+/// [VER-5]). A store selects them by this list, so its index on the payload
+/// type serves the query.
+pub const SECURITY_TYPES: [&str; 6] = [
+    "snailfish.genesis.v1",
+    "snailfish.grant.v1",
+    "snailfish.epoch.v1",
+    "snailfish.recovery.v1",
+    "snailfish.device.v1",
+    "snailfish.level.v1",
+];
+
+/// An SQL condition on a `payload_type` column: the row is a security
+/// record of [`SECURITY_TYPES`].
+#[must_use]
+pub fn security_sql() -> String {
+    let list: Vec<String> = SECURITY_TYPES.iter().map(|t| format!("'{t}'")).collect();
+    format!("payload_type IN ({})", list.join(", "))
+}
+
 /// Classify a payload type (`PROTOCOL.md` 6.4).
 #[must_use]
 pub fn classify(payload_type: &str) -> TypeClass {
@@ -966,6 +986,23 @@ mod proofs {
     /// change and an unknown security record could be skipped ([VER-4]).
     #[kani::proof]
     #[kani::unwind(8)]
+    fn security_types_are_the_record_types_outside_the_content_families() {
+        // [VER-5]: a stored security record that the list misses would leave
+        // the space state replay of a store without it.
+        for t in RECORD_TYPES {
+            let content = ["snailfish.change", "snailfish.snapshot", "snailfish.accept"]
+                .iter()
+                .any(|f| is_family(t, f));
+            assert_eq!(SECURITY_TYPES.contains(&t), !content, "{t}");
+        }
+        assert_eq!(
+            security_sql(),
+            "payload_type IN ('snailfish.genesis.v1', 'snailfish.grant.v1', 'snailfish.epoch.v1', \
+             'snailfish.recovery.v1', 'snailfish.device.v1', 'snailfish.level.v1')"
+        );
+    }
+
+    #[test]
     fn is_family_needs_a_dot_after_the_family() {
         let bytes: [u8; 4] = kani::any();
         let len: usize = kani::any_where(|&n| n <= 4);

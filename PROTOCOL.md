@@ -503,13 +503,13 @@ The append refusals of 10.6 are results inside a `200` response, not error respo
 ### 10.4 `GET /v1/info`
 
 ```json
-{"levels":[1],"limits":{"max_request_bytes":4194304,"max_change_bytes":65536,"max_snapshot_bytes":16777216,"max_append_envelopes":100,"max_fetch_entries":500},"time":1767225600}
+{"levels":[1],"limits":{"max_request_bytes":25165824,"max_change_bytes":65536,"max_snapshot_bytes":16777216,"max_append_envelopes":100,"max_fetch_entries":500},"time":1767225600}
 ```
 
 | Field | Content |
 | --- | --- |
 | `levels` | The protocol levels that the relay accepts ([VER-6], [VER-11]) |
-| `limits.max_request_bytes` | The largest request body, except for the repair allowance of 10.9 |
+| `limits.max_request_bytes` | The largest request body, except for the repair allowance of 10.9. It is at least 4/3 x `max_snapshot_bytes` + 65,536, so one append body holds a snapshot of the largest size in base64 |
 | `limits.max_change_bytes` | The largest decoded payload of a change record |
 | `limits.max_snapshot_bytes` | The largest decoded payload of a snapshot record ([CMP-3]) |
 | `limits.max_append_envelopes` | The most envelopes in one append request, and the most entries in one repair request |
@@ -1128,7 +1128,7 @@ An invalid stub stops the engine with `stopped: missing records`.
 
 ### 14.4 Stubs on the relay
 
-After an append request or a repair finish, in the same transaction, the relay replaces each covered record (14.2) with a stub ([CMP-12]). It keeps the position, the payload type, the change ID and the record hash, and deletes the envelope. The log digests do not change. After the commit, the relay runs `PRAGMA wal_checkpoint(TRUNCATE)` and `PRAGMA incremental_vacuum` on the space file ([STO-2], [STO-13]).
+After an append request or a repair finish, in the same transaction, the relay replaces each covered record (14.2) with a stub ([CMP-12]). It keeps the position, the payload type, the change ID and the record hash, and deletes the envelope. The log digests do not change. After the commit, the relay runs `VACUUM` and then `PRAGMA wal_checkpoint(TRUNCATE)` on the space file ([STO-2], [STO-13]).
 
 The operator path (`snailfish-relay` status output) reports the stub count and the stub bytes of each space ([CMP-19]). The stub bytes are the byte length of the stub JSON of 10.7.
 

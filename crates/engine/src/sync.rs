@@ -15,7 +15,7 @@ use snailfish_protocol::encoding::encode_id;
 use snailfish_protocol::request::{self, Params, Target};
 use snailfish_protocol::setup;
 use snailfish_protocol::space::{self, Mode, Verdict};
-use snailfish_protocol::wire::{self, AppendResult, FetchEntry, Head, Limits};
+use snailfish_protocol::wire::{self, AppendResult, FetchEntry, Head, Limits, OutEntry};
 
 use crate::state::{self, DbSpace, Own};
 use crate::{Engine, EngineError, Header, MAX_LEVEL, Request, Status};
@@ -43,6 +43,8 @@ pub(crate) enum Item {
     Epoch,
     /// The pending recovery record (13.3).
     Recovery,
+    /// A pending snapshot or accept record, by its record hash (14.7).
+    Record(snailfish_protocol::encoding::Hash32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,8 +53,8 @@ enum Sent {
     Create,
     Fetch,
     Append(Vec<(Item, String)>),
-    RepairStart(Vec<(u64, String)>),
-    RepairChunk(Vec<(u64, String)>),
+    RepairStart(Vec<(u64, OutEntry)>),
+    RepairChunk(Vec<(u64, OutEntry)>),
     RepairFinish,
     Status,
     // The body of the device status report.
@@ -67,7 +69,7 @@ struct RepairRun {
     /// The verified head: the tip of the finish.
     tip: Head,
     session: Option<[u8; 16]>,
-    chunks: VecDeque<Vec<(u64, String)>>,
+    chunks: VecDeque<Vec<(u64, OutEntry)>>,
     /// A repair from the position before the own grant, after the relay
     /// answered a fetch with `unknown_device` ([LOG-12]).
     late: bool,
@@ -228,10 +230,16 @@ impl Sync {
             items.extend(crate::removal::security_to_send(engine)?);
             items
         } else {
-            state::pending(engine, usize::MAX)?
+            let mut items: Vec<(Item, String)> = state::pending(engine, usize::MAX)?
                 .into_iter()
                 .map(|p| (Item::Change(p.change_id), p.envelope))
-                .collect()
+                .collect();
+            items.extend(
+                crate::compact::pending_records(&engine.db)?
+                    .into_iter()
+                    .map(|(h, env)| (Item::Record(h), env)),
+            );
+            items
         };
         let (batches, too_large) = batch(items, &self.limits);
         // A change that no request body can hold is refused for ever
@@ -473,6 +481,13 @@ impl Sync {
                 self.phase = Phase::Done;
                 Ok(())
             }
+            // [CMP-15]: the stub stays unchecked, so each later fetch stops
+            // again until a usable snapshot covers it.
+            Err(Answer::MissingRecords) => {
+                engine.status = Status::MissingRecords;
+                self.phase = Phase::DeviceReport;
+                Ok(())
+            }
             Err(Answer::Engine(e)) => Err(e),
         }
     }
@@ -631,6 +646,10 @@ impl Sync {
                 return Err(stop(format!("the relay head digest at {head} differs")));
             }
         }
+        if !f.has_more && !shorter && !stubs_valid(&tx).map_err(Answer::Engine)? {
+            tx.commit().map_err(|e| Answer::Engine(e.into()))?;
+            return Err(Answer::MissingRecords);
+        }
         let checked = check_checkpoint(engine, &tx)?;
         // PROTOCOL.md 13.4 step 7: the grant of a full recovery is in the
         // verified log, so the device is active and opens its keys.
@@ -752,7 +771,7 @@ impl Sync {
     /// The answer to a repair start or chunk: the relay staged the chunk.
     fn repair_answer(
         &mut self,
-        chunk: &[(u64, String)],
+        chunk: &[(u64, OutEntry)],
         body: &[u8],
         start: bool,
     ) -> Result<(), Answer> {
@@ -808,6 +827,10 @@ impl Sync {
                     crate::removal::answer(engine, item, &r).map_err(Answer::Engine)?;
                     continue;
                 }
+                Item::Record(h) => {
+                    record_answer(engine, h, &r).map_err(Answer::Engine)?;
+                    continue;
+                }
             };
             match r {
                 // [DLV-8]: the envelope stays until a fetch shows it.
@@ -847,6 +870,51 @@ impl Sync {
     }
 }
 
+/// [CMP-15]: check the stubs that the fetches stored since the last check,
+/// once a fetch reaches the relay head. A page can hold stubs before the
+/// snapshot that covers them. False if a stub fails: it stays unchecked.
+fn stubs_valid(tx: &Transaction<'_>) -> Result<bool, EngineError> {
+    let Some(from) = crate::compact::stubs_from(tx)? else {
+        return Ok(true);
+    };
+    if crate::compact::invalid_stub(tx, from)?.is_some() {
+        return Ok(false);
+    }
+    crate::compact::set_stubs_from(tx, None)?;
+    Ok(true)
+}
+
+/// The answer for a pending snapshot or accept record (14.7). A stored
+/// record leaves the table when a fetch shows it. A transient refusal keeps
+/// it. A permanent refusal drops it and sets `degraded`.
+fn record_answer(
+    engine: &mut Engine,
+    hash: &snailfish_protocol::encoding::Hash32,
+    r: &AppendResult,
+) -> Result<(), EngineError> {
+    match r {
+        AppendResult::Stored(_) | AppendResult::Known(_) | AppendResult::Conflict(_) => {}
+        AppendResult::Refused(code) if code == "bad_base" || code == "on_hold" => {
+            if code == "on_hold" {
+                engine.status = Status::RestoreHold;
+            }
+        }
+        AppendResult::Refused(code) if code == "quota" => engine.status = Status::Quota,
+        // An epoch record came first: the snapshot uses an old key. Drop it.
+        // `snapshot_due` stays true, so the app writes a new one ([CMP-9]).
+        AppendResult::Refused(code) if code == "wrong_epoch" => {
+            crate::compact::refuse_record(&engine.db, hash)?;
+        }
+        AppendResult::Refused(code) => {
+            crate::compact::refuse_record(&engine.db, hash)?;
+            engine.status = Status::Degraded {
+                cause: format!("refused: {code}"),
+            };
+        }
+    }
+    Ok(())
+}
+
 pub(crate) type Batches = VecDeque<Vec<(Item, String)>>;
 
 /// The method, path, query, body and signature flag of a request.
@@ -858,17 +926,17 @@ type Target5 = (&'static str, String, String, Vec<u8>, bool);
 /// in chunk bodies. An entry that does not fit goes alone: the relay
 /// accepts the repair allowance for it.
 pub(crate) fn repair_chunks(
-    entries: Vec<(u64, String)>,
+    entries: Vec<(u64, OutEntry)>,
     base: &Head,
     limits: &Limits,
-) -> VecDeque<Vec<(u64, String)>> {
+) -> VecDeque<Vec<(u64, OutEntry)>> {
     let max_count = usize::try_from(limits.max_append_envelopes.max(1)).unwrap_or(usize::MAX);
     let max_bytes = usize::try_from(limits.max_request_bytes).unwrap_or(usize::MAX);
     // The bodies with no entry. A session ID has a fixed length.
     let start_empty = wire::repair_start_body(base, &[]).map_or(0, |b| b.len());
     let chunk_empty = wire::repair_chunk_body(&[0; 16], &[]).map_or(0, |b| b.len());
     let mut out = VecDeque::new();
-    let mut cur: Vec<(u64, String)> = Vec::new();
+    let mut cur: Vec<(u64, OutEntry)> = Vec::new();
     let mut size = start_empty;
     for (pos, env) in entries {
         let len = entry_len(pos, &env);
@@ -886,11 +954,17 @@ pub(crate) fn repair_chunks(
     out
 }
 
-/// The length of one entry in a repair body: `{"position":N,"envelope":E}`.
-fn entry_len(pos: u64, env: &str) -> usize {
-    format!("{{\"position\":{pos},\"envelope\":}}")
-        .len()
-        .saturating_add(env.len())
+/// The length of one entry in a repair body: `{"position":N,"envelope":E}`
+/// or `{"position":N,"stub":S}`.
+fn entry_len(pos: u64, entry: &OutEntry) -> usize {
+    match entry {
+        OutEntry::Envelope(env) => format!("{{\"position\":{pos},\"envelope\":}}")
+            .len()
+            .saturating_add(env.len()),
+        OutEntry::Stub(s) => format!("{{\"position\":{pos},\"stub\":}}")
+            .len()
+            .saturating_add(s.to_json().len()),
+    }
 }
 
 /// Split items into append requests of at most `max_append_envelopes`
@@ -966,9 +1040,22 @@ fn verify_entry(
     if Some(*pos) != head.checked_add(1) {
         return Err(stop(format!("the relay sent position {pos} after {head}")));
     }
-    let FetchEntry::Envelope(raw) = entry else {
-        // [CMP-15]: M2 has no snapshot, so no stub is valid.
-        return Err(stop(format!("a stub at position {pos} with no snapshot")));
+    let raw = match entry {
+        FetchEntry::Envelope(raw) => raw,
+        FetchEntry::Stub(s) => {
+            // [CMP-1]: the stub fields give the digest. The stub check of
+            // 14.3 runs when the fetch reaches the relay head ([CMP-15]).
+            let st = snailfish_protocol::repair::stub_entry(view, *pos, s)
+                .map_err(|e| stop(format!("a stub at position {pos}: {}", e.code())))?;
+            state::store_stub(tx, &st).map_err(Answer::Engine)?;
+            if crate::compact::stubs_from(tx)
+                .map_err(Answer::Engine)?
+                .is_none()
+            {
+                crate::compact::set_stubs_from(tx, Some(*pos)).map_err(Answer::Engine)?;
+            }
+            return Ok(None);
+        }
     };
     let accepted = if *pos == 1 {
         let a = space::check_genesis(&raw.envelope, &log_id, None)
@@ -1029,6 +1116,7 @@ fn verify_entry(
         return Err(Answer::Removed);
     }
     state::drop_setup(tx, &accepted.record_hash).map_err(Answer::Engine)?;
+    crate::compact::drop_record(tx, &accepted.record_hash).map_err(Answer::Engine)?;
     if let Some((id, _)) = accepted.new_device {
         // [LOG-7]: the verified log holds a grant for this device, so the
         // grant outbox needs no grant for it.
@@ -1041,6 +1129,8 @@ enum Answer {
     Unreadable,
     Stop(Stop),
     Removed,
+    /// A stub that no usable snapshot covers ([CMP-15]).
+    MissingRecords,
     Engine(EngineError),
 }
 
