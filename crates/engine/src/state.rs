@@ -79,137 +79,117 @@ pub(crate) fn open(
     Ok(())
 }
 
+/// The schema steps. Step `i` moves a state file from version `i` to
+/// version `i + 1` in one transaction ([VER-15]).
+pub(crate) const MIGRATIONS: [&str; 6] = [
+    "BEGIN IMMEDIATE;
+     CREATE TABLE relay_info (id INTEGER PRIMARY KEY CHECK (id = 1), body BLOB NOT NULL);
+     PRAGMA user_version = 1;
+     COMMIT;",
+    "BEGIN IMMEDIATE;
+     CREATE TABLE meta (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       log_id BLOB NOT NULL,
+       device_id BLOB NOT NULL,
+       caught_up INTEGER NOT NULL
+     );
+     CREATE TABLE outbox (
+       seq INTEGER PRIMARY KEY AUTOINCREMENT,
+       change_id BLOB NOT NULL UNIQUE,
+       content_hash BLOB NOT NULL,
+       ciphertext BLOB NOT NULL,
+       envelope TEXT,
+       state TEXT NOT NULL,
+       cause TEXT
+     );
+     CREATE TABLE log (
+       position INTEGER PRIMARY KEY,
+       payload_type TEXT NOT NULL,
+       change_id BLOB UNIQUE,
+       record_hash BLOB NOT NULL,
+       digest BLOB NOT NULL,
+       envelope TEXT NOT NULL,
+       content_hash BLOB
+     );
+     CREATE TABLE devices (id BLOB PRIMARY KEY, sign BLOB NOT NULL);
+     CREATE TABLE space (id INTEGER PRIMARY KEY CHECK (id = 1), level INTEGER NOT NULL);
+     CREATE TABLE setup (
+       seq INTEGER PRIMARY KEY,
+       record_hash BLOB NOT NULL UNIQUE,
+       envelope TEXT NOT NULL
+     );
+     PRAGMA user_version = 2;
+     COMMIT;",
+    // A file from before M3 is not new: its engine already fetched.
+    "BEGIN IMMEDIATE;
+     ALTER TABLE meta ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0;
+     CREATE TABLE repairs (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       first INTEGER NOT NULL,
+       tip INTEGER NOT NULL
+     );
+     PRAGMA user_version = 3;
+     COMMIT;",
+    // M4: the grants of an enrollment, and the checkpoint that a new
+    // device checks before it uploads anything ([ENR-9]).
+    "BEGIN IMMEDIATE;
+     CREATE TABLE grants (
+       device_id BLOB PRIMARY KEY,
+       device TEXT NOT NULL,
+       confirmed TEXT NOT NULL,
+       by_recovery INTEGER NOT NULL,
+       envelope TEXT,
+       state TEXT NOT NULL
+     );
+     CREATE TABLE enrollment (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       position INTEGER NOT NULL,
+       digest BLOB NOT NULL,
+       trusted BLOB NOT NULL,
+       device TEXT NOT NULL
+     );
+     PRAGMA user_version = 4;
+     COMMIT;",
+    // M5: the setup token of the first device (PROTOCOL.md 12.3), and
+    // the fields of the device status report (10.11). An old outbox row
+    // keeps a NULL queue time: the migration has no relay clock offset,
+    // so report_fields stamps it with the corrected time.
+    "BEGIN IMMEDIATE;
+     CREATE TABLE setup_token (id INTEGER PRIMARY KEY CHECK (id = 1), token BLOB NOT NULL);
+     ALTER TABLE meta ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE meta ADD COLUMN report BLOB;
+     ALTER TABLE meta ADD COLUMN report_time INTEGER;
+     ALTER TABLE outbox ADD COLUMN queued INTEGER;
+     PRAGMA user_version = 5;
+     COMMIT;",
+    // M7: the pending epoch record of a removal or a rotation, and the
+    // pending recovery record (`PROTOCOL.md` 13.2 and 13.3).
+    "BEGIN IMMEDIATE;
+     CREATE TABLE removal (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       removed TEXT NOT NULL,
+       confirmed TEXT NOT NULL,
+       after_recovery BLOB,
+       state TEXT NOT NULL
+     );
+     CREATE TABLE recovery_record (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       new_id BLOB NOT NULL,
+       envelope TEXT,
+       state TEXT NOT NULL
+     );
+     CREATE INDEX log_type ON log (payload_type);
+     PRAGMA user_version = 6;
+     COMMIT;",
+];
+
 fn migrate(db: &Connection) -> Result<(), EngineError> {
-    let found = refuse_newer(db)?;
-    if found < 1 {
-        db.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE relay_info (id INTEGER PRIMARY KEY CHECK (id = 1), body BLOB NOT NULL);
-             PRAGMA user_version = 1;
-             COMMIT;",
-        )?;
-    }
-    if found < 2 {
-        db.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE meta (
-               id INTEGER PRIMARY KEY CHECK (id = 1),
-               log_id BLOB NOT NULL,
-               device_id BLOB NOT NULL,
-               caught_up INTEGER NOT NULL
-             );
-             CREATE TABLE outbox (
-               seq INTEGER PRIMARY KEY AUTOINCREMENT,
-               change_id BLOB NOT NULL UNIQUE,
-               content_hash BLOB NOT NULL,
-               ciphertext BLOB NOT NULL,
-               envelope TEXT,
-               state TEXT NOT NULL,
-               cause TEXT
-             );
-             CREATE TABLE log (
-               position INTEGER PRIMARY KEY,
-               payload_type TEXT NOT NULL,
-               change_id BLOB UNIQUE,
-               record_hash BLOB NOT NULL,
-               digest BLOB NOT NULL,
-               envelope TEXT NOT NULL,
-               content_hash BLOB
-             );
-             CREATE TABLE devices (id BLOB PRIMARY KEY, sign BLOB NOT NULL);
-             CREATE TABLE space (id INTEGER PRIMARY KEY CHECK (id = 1), level INTEGER NOT NULL);
-             CREATE TABLE setup (
-               seq INTEGER PRIMARY KEY,
-               record_hash BLOB NOT NULL UNIQUE,
-               envelope TEXT NOT NULL
-             );
-             PRAGMA user_version = 2;
-             COMMIT;",
-        )?;
-    }
-    if found < 3 {
-        // A file from before M3 is not new: its engine already fetched.
-        db.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE meta ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0;
-             CREATE TABLE repairs (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               first INTEGER NOT NULL,
-               tip INTEGER NOT NULL
-             );
-             PRAGMA user_version = 3;
-             COMMIT;",
-        )?;
-    }
-    if found < 4 {
-        // M4: the grants of an enrollment, and the checkpoint that a new
-        // device checks before it uploads anything ([ENR-9]).
-        db.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE grants (
-               device_id BLOB PRIMARY KEY,
-               device TEXT NOT NULL,
-               confirmed TEXT NOT NULL,
-               by_recovery INTEGER NOT NULL,
-               envelope TEXT,
-               state TEXT NOT NULL
-             );
-             CREATE TABLE enrollment (
-               id INTEGER PRIMARY KEY CHECK (id = 1),
-               position INTEGER NOT NULL,
-               digest BLOB NOT NULL,
-               trusted BLOB NOT NULL,
-               device TEXT NOT NULL
-             );
-             PRAGMA user_version = 4;
-             COMMIT;",
-        )?;
-    }
-    if found < 5 {
-        // M5: the setup token of the first device (PROTOCOL.md 12.3), and
-        // the fields of the device status report (10.11). An old outbox row
-        // keeps a NULL queue time: the migration has no relay clock offset,
-        // so report_fields stamps it with the corrected time.
-        db.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE setup_token (id INTEGER PRIMARY KEY CHECK (id = 1), token BLOB NOT NULL);
-             ALTER TABLE meta ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE meta ADD COLUMN report BLOB;
-             ALTER TABLE meta ADD COLUMN report_time INTEGER;
-             ALTER TABLE outbox ADD COLUMN queued INTEGER;
-             PRAGMA user_version = 5;
-             COMMIT;",
-        )?;
-    }
-    if found < 6 {
-        migrate_m7(db)?;
+    let found = usize::try_from(refuse_newer(db)?)
+        .map_err(|_| EngineError::Storage("negative schema version".into()))?;
+    for step in MIGRATIONS.iter().skip(found) {
+        db.execute_batch(step)?;
     }
     const { assert!(SCHEMA_VERSION == 6) };
-    Ok(())
-}
-
-/// M7: the pending epoch record of a removal or a rotation, and the
-/// pending recovery record (`PROTOCOL.md` 13.2 and 13.3).
-fn migrate_m7(db: &Connection) -> Result<(), EngineError> {
-    db.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE removal (
-           id INTEGER PRIMARY KEY CHECK (id = 1),
-           removed TEXT NOT NULL,
-           confirmed TEXT NOT NULL,
-           after_recovery BLOB,
-           state TEXT NOT NULL
-         );
-         CREATE TABLE recovery_record (
-           id INTEGER PRIMARY KEY CHECK (id = 1),
-           new_id BLOB NOT NULL,
-           envelope TEXT,
-           state TEXT NOT NULL
-         );
-         CREATE INDEX log_type ON log (payload_type);
-         PRAGMA user_version = 6;
-         COMMIT;",
-    )?;
     Ok(())
 }
 
