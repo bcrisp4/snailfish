@@ -183,7 +183,7 @@ The fields of each type follow the common fields, in this order.
 | `snailfish.device.v1` | device ID | `level` (integer from 1 to 65535) |
 | `snailfish.level.v1` | device ID | `level` (integer from 1 to 65535) |
 | `snailfish.change.v1` | device ID | `epoch` (integer from 1), `change_id` (change ID text), `ciphertext` (binary of at least 40 bytes) |
-| `snailfish.snapshot.v1` | device ID | `epoch` (integer from 1), `state` (position), `ciphertext` (binary of at least 40 bytes) |
+| `snailfish.snapshot.v1` | device ID | `epoch` (integer from 1), `state` (position, from 1), `ciphertext` (binary of at least 40 bytes) |
 | `snailfish.accept.v1` | device ID | `snapshot` (snapshot reference), `applied` (position) |
 
 - In a genesis record, `author` must equal the recovery ID of `recovery`. A verifier can therefore find the author key in the record itself ([WIR-2]).
@@ -558,27 +558,31 @@ The request `keyid` is an active device, or the current recovery ID of the space
 The relay checks each envelope in this order:
 
 1. If the envelope or the payload breaks section 4 or 6, the result is `refused` with `invalid_record`.
-2. If the log holds a change with the same `change_id` and the same record hash, the result is `known` with its position. If the record hash differs, the result is `conflict` with the position of the stored change ([WIR-6]). The relay checks this before every other refusal, so a stored change is never refused ([DLV-5], [DLV-7]).
+2. If the log holds a change with the same `change_id` and the same record hash, in full or as a stub, the result is `known` with its position. If the record hash differs, the result is `conflict` with the position of the stored change ([WIR-6]). The relay checks this before every other refusal, so a stored change is never refused ([DLV-5], [DLV-7]).
 3. If the space is on restore hold and the record is not a security record (10.2), the result is `refused` with `on_hold` ([LOG-14]).
-4. If the decoded payload of a change is larger than `max_change_bytes`, the result is `refused` with `too_large`.
+4. If the decoded payload of a change is larger than `max_change_bytes`, or the decoded payload of a snapshot is larger than `max_snapshot_bytes`, the result is `refused` with `too_large`.
 5. If `log` differs from `{log}`, the result is `refused` with `invalid_record`.
 6. If `author` is a device ID that differs from the request `keyid`, the result is `refused` with `not_author`.
 7. If `author` is a device ID that is not an active device, or a recovery ID that is not the current recovery ID of the space (10.2), the result is `refused` with `not_active`. For a device ID, step 6 and 8.6 step 7 make this step unreachable on the relay, except for a request by the recovery ID.
 8. If the signature does not verify with the signing key of `author` (section 7.1), the result is `refused` with `invalid_record`. The signing key of the current recovery ID is the `recovery.sign` key of the genesis record or of the last recovery record.
 9. If the base is not position 1 or later, or not before the new position, or its digest differs from the log digest at that position, the result is `refused` with `bad_base` ([LOG-6]).
 10. If the record is a security record and the log holds a security record after its base, the result is `refused` with `stale_base` ([LOG-7]). Changes after the base do not cause this refusal.
-11. If the set of the write level does not hold the record type (section 6.2), or the record type is `snailfish.snapshot.v1` or `snailfish.accept.v1`, the result is `refused` with `unsupported` ([VER-9]). Snapshots and accept records come with compaction (M8). A level record or a device record with a level above the highest level of the relay is also `unsupported`.
-12. If a change names an epoch other than the current epoch, the result is `refused` with `wrong_epoch`.
+11. If the set of the write level does not hold the record type (section 6.2), the result is `refused` with `unsupported` ([VER-9]). A level record or a device record with a level above the highest level of the relay is also `unsupported`.
+12. If a change or a snapshot names an epoch other than the current epoch, the result is `refused` with `wrong_epoch`.
 13. If the record breaks the state rule of its type, the result is `refused` with `invalid_record`:
-    - A grant names a device that is active or removed, or a level below the write level, or its key set does not hold each epoch from 1 to the current epoch.
+    - A grant names a device that is active or removed, or a level below the write level, or its key set does not hold each needed epoch (14.5), or it holds an epoch above the current epoch.
     - An epoch record: `epoch` is not the current epoch plus 1, a device in `removed` is not active, `removed` holds the author, `stay` differs from the active devices without `removed`, or the key set to a recovery ID is not to the current recovery ID.
-    - A recovery record: the new recovery ID is the current recovery ID or an earlier one, or its key set does not hold each epoch from 1 to the current epoch.
+    - A recovery record: the new recovery ID is the current recovery ID or an earlier one, or its key set does not hold each needed epoch (14.5), or it holds an epoch above the current epoch.
+    - A snapshot: the state position is not before the new position, or `state.digest` differs from the log digest at the state position ([CMP-3]).
+    - An accept record: the log does not hold a snapshot record, in full or as a stub, at `snapshot.position` with the record hash `snapshot.hash`, or `applied` is after the base position, or `applied.digest` differs from the log digest at `applied.position`. An applied position of 0 has `digest(0)`.
     - A device record: `level` is not above the device level of the author.
     - A level record: `level` is not above the write level, or an active device has a device level below `level` ([VER-8]).
 14. If the record is a security record, and the stored security record bytes of the space plus the byte length of its envelope JSON exceed the security record reserve, the result is `refused` with `reserve` ([STO-15]). The reserve is 16 MiB (16,777,216 bytes) by default. The relay operator can raise it.
 15. If the record is a security record, and the request `keyid` sent 10 security records that the relay stored in this space in the current relay day, the result is `refused` with `security_limit` ([STO-15]). A relay day is the relay time divided by 86,400, rounded down.
-16. If the record is a change, and the stored change bytes of the space plus the byte length of its envelope JSON exceed the space quota, the result is `refused` with `quota` ([QTA-1]). The byte length of an envelope is the length of its JSON text exactly as the request holds it, which is also the text that the relay stores (10.7). The stored change bytes are the sum of these lengths for every change in the log, also a change that an earlier envelope of the same request stored. Security records do not count, and this step never refuses one ([QTA-3]).
+16. If the record is a change, and the stored bytes of the space plus the byte length of its envelope JSON exceed the space quota, the result is `refused` with `quota` ([QTA-1]). If the record is a snapshot or an accept record, the limit is the space quota plus the snapshot reserve of 14.6 ([CMP-18]). The byte length of an envelope is the length of its JSON text exactly as the request holds it, which is also the text that the relay stores (10.7). The stored bytes are the sum of these lengths for every change, snapshot and accept record that the log holds in full, also a record that an earlier envelope of the same request stored. Security records and stubs do not count, and this step never refuses a security record ([QTA-3], [CMP-19]).
 17. Otherwise the relay appends the record at the next position. Positions are dense ([LOG-1]). The relay stores the log digest of the new entry (section 5). The result is `stored` with the position.
+
+After the last envelope, in the same transaction, the relay replaces each record that the usable snapshot covers with a stub (14.4, [CMP-12]).
 
 - `head` is the last position and its log digest after the transaction.
 - A known envelope earlier in the same request counts: a second copy in one request is `known`.
@@ -588,7 +592,7 @@ The relay checks each envelope in this order:
 - After `quota`, the engine keeps the envelope in its outbox, reports `paused: quota`, and sends it again at each later sync ([QTA-4]). The relay serves fetches at a full quota ([QTA-2]).
 - After `on_hold`, the engine keeps the envelope in its outbox and reports `paused: restore hold`. It sends the envelope again after the hold ends.
 - After `stale_base`, the engine fetches and checks the space state again ([LOG-7]). If the verified log holds a grant for the device of a refused grant, the engine drops the refused grant. Otherwise, if the active devices equal the list that the user confirmed, the engine signs the grant again with a new base. Otherwise it asks the user to confirm again. A grant that the recovery key signed needs the recovery key again, so the engine always asks for it.
-- The engine applies steps 5 and 7 to 13 to each fetched record, with the highest level of the engine in step 11. A fetched record that fails one of them stops the engine with `stopped: fork` ([FRK-1]). The engine verifies the signature (step 8) before it changes any state for the record ([WIR-2]).
+- The engine applies steps 5 and 7 to 13 to each fetched record, with the highest level of the engine in step 11. A snapshot that fails the size limit of step 4 is valid, but the engine does not import it and reports `degraded`. A fetched record that fails one of them stops the engine with `stopped: fork` ([FRK-1]). The engine verifies the signature (step 8) before it changes any state for the record ([WIR-2]).
 - The engine splits its envelopes into requests that fit `max_append_envelopes` and `max_request_bytes`. A change whose append body alone is larger than `max_request_bytes` is refused for ever with `too_large`, and the engine does not send it ([DLV-9]).
 
 ### 10.7 `GET /v1/t/{tenant}/s/{log}/entries`
@@ -602,7 +606,7 @@ Query: `after` (integer from 0) and `limit` (integer from 1 to `max_fetch_entrie
 ```
 
 - `entries` holds the entries from position `after + 1`, in position order, with no gap, at most `limit` entries.
-- An entry holds the stored envelope in full, or a stub. M3 has no compaction, so the M3 relay sends no stubs. A stub has `type`, `change_id` (only for a change) and `hash`, the record hash ([CMP-1]).
+- An entry holds the stored envelope in full, or a stub (section 14). A stub has `type`, `change_id` (only for a change) and `hash`, the record hash ([CMP-1]).
 - The relay sends each envelope object as it stored it. The record hash does not depend on the layout ([WIR-3]).
 - `head` is the last position of the log and its log digest. `has_more` is true if the log holds entries after the last entry of the response.
 - `hold` is true while the space is on restore hold ([LOG-14]). The relay always sends `hold`. A reader treats a missing `hold` as false.
@@ -676,7 +680,7 @@ The relay checks the body size first, as for every route (10.3 `too_large`). The
 
 1. 8.6 steps 1 to 4.
 2. If the body breaks this section, return `bad_request`.
-3. If the base equals the relay head (position and digest), run the chain check, entry by entry, until the first failure. Otherwise no entry passes. Each entry must have the next position after the base or after the entry before it. An envelope must pass steps 1, 2, 5 and 7 to 13 of 10.6 against the log and the entries before it, with step 2 as for a fetched record: a known `change_id` fails the check. The size limit of step 4 and the hold of step 3 do not apply, because the record was in the log before. A stub fails the check with `uncovered_stub`, because M3 has no snapshot ([LOG-11]).
+3. If the base equals the relay head (position and digest), run the chain check, entry by entry, until the first failure. Otherwise no entry passes. Each entry must have the next position after the base or after the entry before it. An envelope must pass steps 1, 2, 5 and 7 to 13 of 10.6 against the log and the entries before it, with step 2 as for a fetched record: a known `change_id` fails the check. The size limit of step 4 and the hold of step 3 do not apply, because the record was in the log before. A stub of a change or a snapshot passes this step: the relay computes its entry hash and digest from the stub fields. A stub of each other type fails with `uncovered_stub`. The finish checks each staged stub ([LOG-11]).
 4. 8.6 steps 5 to 9. Step 7 accepts a device that is active in the log or in the entries that passed step 3 ([LOG-12]).
 5. If the base differs from the relay head (position or digest), return `bad_repair`.
 6. If another device holds a session that has not expired, return `repair_busy`.
@@ -689,8 +693,9 @@ A finish request runs 8.6 steps 1 to 4, returns `bad_request` for a body that br
 
 1. If the session is unknown or expired, if the request signer is not the device of the session, or if the relay head changed since the start, return `bad_repair`.
 2. If `tip` differs from the last staged entry (position or digest), return `bad_repair`.
-3. If a staged stub is not covered by the usable snapshot of the staged range, return `uncovered_stub`. M3 stages no stub, so this step finds none.
-4. Move the staged entries into the log in one transaction, end the session and delete its staged entries. The response holds the new head.
+3. If a staged stub fails the stub check of 14.3 against the log with the staged entries, return `uncovered_stub` ([LOG-11], [CMP-17]).
+
+4. Move the staged entries into the log in one transaction, end the session and delete its staged entries. Then replace each covered record with a stub (14.4). The response holds the new head.
 
 - A request that fails a check changes no stored state, except the nonce of 8.6 step 9.
 - The chain check runs before the request signature check, so a caller that knows the tenant handle and the log ID can make the relay verify up to `max_append_envelopes` record signatures for one request. The tenant handle has 128 random bits ([STO-10]).
@@ -995,6 +1000,7 @@ Write rules ([USR-7]):
 - Limit: a sign-in start tells the caller whether a user name has a passkey, because the options name its credentials. The rate limit of 12.6 slows a search for names.
 - A device in a machine group is a device ID that is active in a space of the tenant. A group name is 1 to 64 UTF-8 bytes.
 - A block names a device ID that is active in a space of the tenant, or a machine group. A block of a group blocks each device that the group holds, also a device that the user adds later. A block stays after a removal. An unblock removes the row only ([STO-12]).
+- "Blocks compaction" ([CMP-7]): for the valid snapshot in full at the highest position that is not accepted (14.1), the page marks each active device that has no accept record that counts for it. The user can update or remove that device.
 - Open security actions (DESIGN.md "Monitoring and alerting" item 10): a blocked device that is still active in a space, a device with a device level below the highest relay level ([VER-10]), and, after an epoch record, each device that stays and whose last report names an older epoch. The relay sends one webhook message for each new action (12.5).
 
 | Code | HTTP status | Cause |
@@ -1048,7 +1054,7 @@ This section gives the engine procedures for a removal, a recovery key replaceme
 - The engine opens the key of each epoch from the key set to its own device: in the genesis record or its grant for the epochs up to its grant, and in each later epoch record. It checks each key against the commitment of the genesis or epoch record of that epoch (section 7.3).
 - An epoch record that removes the own device stops the engine with `stopped: removed`. The engine keeps the keys that it holds. It reads no later record.
 - A new change uses the key of the current epoch of the verified log.
-- A grant seals the keys of each epoch from 1 to the current epoch to the new device (10.6 step 13).
+- A grant seals the keys of each needed epoch (14.5) to the new device (10.6 step 13).
 
 ### 13.2 Removal
 
@@ -1066,7 +1072,7 @@ The engine signs the record with its own device key, or with the recovery key if
 1. The app asks the engine for a new recovery key. The engine makes 16 random bytes and returns the display form of section 9. The engine keeps no copy.
 2. The app shows the key. The user writes it down and types it back. The app compares the typed copy.
 3. The user types the current recovery key. The app gives the engine the current key and the new key.
-4. The engine derives both key pairs (section 9). It signs a recovery record with the current recovery key. The record holds the new recovery keys, the possession proof, and one key set to the new recovery ID with each epoch from 1 to the current epoch.
+4. The engine derives both key pairs (section 9). It signs a recovery record with the current recovery key. The record holds the new recovery keys, the possession proof, and one key set to the new recovery ID with each needed epoch (14.5).
 5. After the recovery record is in the verified log, the engine signs a rotation: an epoch record with an empty `removed` list, by its own device key. T9 needs this rotation, because the holder of the old key can open each earlier key set.
 6. After `stale_base` or `not_active` for the recovery record, the engine drops it and asks for the current recovery key again. `not_active` means that another recovery record came first and retired the key that signed this one.
 
@@ -1078,8 +1084,70 @@ A full recovery adds a device to a space that has no trusted device left (S5).
 2. If a space has the app ID of the app, the app asks for the recovery key of that space. It does not make a new space.
 3. The engine derives the recovery keys. It fetches the log from position 0 with requests that the recovery ID signs (8.2). It verifies each record from the genesis record. It has no checkpoint, so it cannot detect a log that the relay cut short (T7).
 4. If the current recovery ID of the verified log differs from the derived recovery ID, the engine stops with an error that the app shows as a wrong recovery key. The relay refuses each request of a recovery ID that is not current with `unknown_device`.
-5. The engine opens the key of each epoch from the key sets to the recovery ID: in the genesis record, in each epoch record, and in the last recovery record.
+5. The engine opens the key of each epoch from the key sets to the recovery ID: in the genesis record, in each epoch record, and in the last recovery record. The key of an epoch that only covered records use can be missing (14.5).
 6. The engine signs a grant for its own device with the recovery key, on the verified head, and appends it in a request that the recovery ID signs. After `stale_base`, it fetches and signs again.
 7. After the grant is in the verified log, the device is active. The engine forgets the recovery key. The user removes the old devices with the procedure of 13.2.
 
-Edits that never reached the relay are lost (S5).
+The app then imports the usable snapshot through `ResetRequired` (14.7). Edits that never reached the relay are lost (S5).
+
+## 14. Compaction
+
+This section gives the exact compaction rules (DESIGN.md "Log compaction", `specs/compaction`). The relay and every engine compute them from the log content only, so they reach the same result ([CMP-6]).
+
+### 14.1 Usable snapshot
+
+The rules use the space state of 10.2. "Active at position q" means active after the entry at q.
+
+1. A snapshot record at position p is valid if the relay stored it: its author was active at p - 1 ([CMP-4]) and it passed 10.6 step 13. A later removal does not change this.
+2. An accept record at position r counts for the snapshot at p if its `snapshot.position` is p, r is after p, and its `applied.position` is at or after the state position of the snapshot.
+3. The snapshot at p is accepted if a position q after p exists where each device that is active at q has an accept record that counts for p at a position from p + 1 to q ([CMP-6]).
+4. The frontier is the highest state position of an accepted snapshot that the log holds in full. 0 means no frontier ([CMP-8]).
+5. The usable snapshot is the accepted snapshot in full with the frontier as its state position, and the highest position of those.
+
+A stub of a snapshot is never usable, because the relay makes a stub only of a covered snapshot (14.2).
+
+### 14.2 Covered records
+
+The usable snapshot at position u, with the frontier f, covers ([CMP-11]):
+
+- each change record at a position at or before f,
+- each other snapshot record with a state position below f,
+- each other snapshot record with the state position f at a position before u.
+
+It never covers a security record or an accept record ([CMP-20]).
+
+### 14.3 Stub check
+
+An engine checks each stub of its verified log after a fetch reaches the relay head (`has_more` false), because a page can hold stubs before the snapshot that covers them ([CMP-15]).
+
+- A change stub is valid if the log has a frontier and the stub position is at or before it.
+- A snapshot stub is valid if the log has a usable snapshot at another position. A stub holds no state position, so this is the only check that a device can make.
+- Each other stub is invalid.
+
+An invalid stub stops the engine with `stopped: missing records`.
+
+### 14.4 Stubs on the relay
+
+After an append request or a repair finish, in the same transaction, the relay replaces each covered record (14.2) with a stub ([CMP-12]). It keeps the position, the payload type, the change ID and the record hash, and deletes the envelope. The log digests do not change. After the commit, the relay runs `PRAGMA wal_checkpoint(TRUNCATE)` and `PRAGMA incremental_vacuum` on the space file ([STO-2], [STO-13]).
+
+The operator path (`snailfish-relay` status output) reports the stub count and the stub bytes of each space ([CMP-19]). The stub bytes are the byte length of the stub JSON of 10.7.
+
+### 14.5 Needed epochs
+
+The needed epochs at position n are the current epoch after the entry at n - 1, and the epoch of each change and snapshot record before n that the usable snapshot of the log up to n - 1 does not cover ([CMP-20]). A grant or a recovery record at n must hold a key set with each needed epoch, and no epoch above the current epoch (10.6 step 13). A key set with more epochs is valid, because an accept record between the base of the record and its position can move the frontier.
+
+The engine seals the needed epochs of its verified head.
+
+### 14.6 Snapshot reserve
+
+The snapshot reserve is 2 x (`max_snapshot_bytes` + 65,536) bytes. A snapshot or an accept record can take the stored bytes of the space up to the space quota plus the reserve. A change stops at the space quota (10.6 step 16, [CMP-18]).
+
+### 14.7 Engine
+
+- `snapshot_due` is true if the verified log holds 1,000 changes, or 1,048,576 bytes of change ciphertext, after the state position of the newest valid snapshot (position 0 if none), or an epoch record with a non-empty `removed` list after that snapshot ([CMP-9]). An engine with a non-empty outbox, or a stopped or paused engine, gives false.
+- `write_snapshot(applied, state)` encrypts the state with the current key and the AAD of 7.2, with the applied position as `state`, and appends the record. If the payload would be larger than `max_snapshot_bytes`, the engine writes nothing and reports `degraded` ([CMP-3]).
+- `unchecked_snapshots` gives each valid snapshot in full that is not accepted, with a state position at or after the frontier, that the app applied past, that decrypts, and that the engine has not checked. A snapshot that does not decrypt is reported as `degraded` once ([CMP-5]).
+- `accept_snapshot(position, ok)` appends an accept record with the app applied position if `ok` is true, and marks the snapshot as checked in both cases ([CMP-5]).
+- `usable_snapshot` decrypts the usable snapshot. `genesis_base` is position 0 with `digest(0)`. `is_covered(change_id)` is true if the verified log holds the change ID, in full or as a stub, at or before the frontier ([CMP-14]).
+- `changes_after(applied)` raises `ResetRequired` if the applied position is before the frontier ([CMP-16], [DLV-12]).
+- After `changes_after` with an applied position at or after the frontier, if the verified log holds an own accept record that counts for the usable snapshot, the engine replaces its covered records with stubs ([CMP-13]).

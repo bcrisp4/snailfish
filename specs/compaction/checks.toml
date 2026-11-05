@@ -1,0 +1,133 @@
+# Checks for the compaction model. specs/tools/verify.py reads this file.
+
+model = "model.qnt"
+module = "compaction"
+tests = "test.qnt"
+test_module = "compactionTest"
+
+invariants = [
+  "appConsistent", "noDoubleApply", "outboxPending", "stubsCovered", "noMissingRecords",
+  "securityFull", "usableReadable", "readsNeeded", "noNeedlessReset", "noLostChange", "withinQuota", "noStuckDevice",
+]
+
+witness_configs = ["honest", "removal", "restore", "rollback", "unreadable", "destroy", "quota"]
+witness_steps = 40
+
+fast_config = "honest"
+
+[deep]
+config = "tiny"
+invariants = ["stubsCovered", "securityFull", "appConsistent", "noNeedlessReset"]
+max_steps = 8
+
+[defaults]
+MAX_IDS = "3"
+MAX_LEN = "12"
+QUOTA = "20"
+RESERVE = "6"
+SNAP_SIZE = "2"
+FAULTS = "Set()"
+BUG = '"none"'
+
+# ---------------------------------------------------------------- configs
+
+# Two devices, a later grant, removals, snapshots and stubs. No faults.
+[configs.honest]
+
+[configs.removal]
+MAX_LEN = "14"
+
+# App DB restores and engine state losses (T14).
+[configs.restore]
+FAULTS = 'Set("appRestore", "engineLoss")'
+
+# Relay rollbacks with repair sessions, and a device that stages a stub
+# that no snapshot covers.
+[configs.rollback]
+FAULTS = 'Set("rollback", "badRepair")'
+
+[configs.unreadable]
+FAULTS = 'Set("unreadable")'
+
+# S5: both first devices are destroyed. Device 3 recovers the space.
+[configs.destroy]
+FAULTS = 'Set("destroy")'
+
+# A quota that two changes fill.
+[configs.quota]
+QUOTA = "2"
+RESERVE = "6"
+MAX_IDS = "4"
+
+[configs.tiny]
+MAX_IDS = "2"
+MAX_LEN = "7"
+
+# ---------------------------------------------------------------- mutants
+
+[mutants.compactBeforeAccept]
+base = "honest"
+caught_by = "stubsCovered"
+
+# A sampled run seldom reaches a grant after an acceptance with stubs and a
+# fetch by the new device, so a named scenario catches it.
+[mutants.acceptCountsNow]
+base = "honest"
+caught_by = "tests"
+test = "newDeviceTest"
+
+# Needs an accepted snapshot, then the removal of its author, then stubs.
+[mutants.validNeedsActiveNow]
+base = "honest"
+caught_by = "tests"
+test = "removalTest"
+
+[mutants.acceptUnreadable]
+base = "unreadable"
+caught_by = "usableReadable"
+
+[mutants.acceptEarly]
+base = "honest"
+caught_by = "noNeedlessReset"
+
+[mutants.stubSecurity]
+base = "honest"
+caught_by = "securityFull"
+
+[mutants.stubAccept]
+base = "honest"
+caught_by = "securityFull"
+
+[mutants.resetOnStubOnly]
+base = "honest"
+caught_by = "readsNeeded"
+
+[mutants.resetKeepsCovered]
+base = "restore"
+caught_by = "outboxPending"
+
+[mutants.resetDropsOutbox]
+base = "restore"
+caught_by = "appConsistent"
+
+[mutants.snapshotWithOutbox]
+base = "honest"
+caught_by = "appConsistent"
+
+[mutants.sealCurrentOnly]
+base = "honest"
+caught_by = "readsNeeded"
+
+[mutants.repairNoCoverCheck]
+base = "rollback"
+caught_by = "stubsCovered"
+
+[mutants.snapshotNoReserve]
+base = "quota"
+caught_by = "tests"
+test = "quotaTest"
+
+[mutants.stubsCount]
+base = "quota"
+caught_by = "tests"
+test = "quotaTest"

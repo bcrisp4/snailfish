@@ -45,6 +45,7 @@ The rule check verifies references, not semantics. The drift check requires a re
 | [enrollment](enrollment/README.md) | ProVerif (symbolic, Dolev-Yao): numeric comparison, commit before reveal, signed confirmation, grant and checkpoint, app key sealing. Run with `make verify-crypto`. |
 | [removal](removal/README.md) | ProVerif (symbolic, Dolev-Yao): the epoch record after a removal and after a recovery record, the key sealing to the devices that stay and to the current recovery key. Run with `make verify-crypto`. |
 | [signin](signin/README.md) | ProVerif (symbolic, Dolev-Yao): invite links, passkey sign-in, the PKCE code, the setup token bound to the device key, and tenant isolation. Run with `make verify-crypto`. |
+| [compaction](compaction/README.md) | Snapshots, accept records, the frontier, the usable snapshot, stubs on the relay and on each device, ResetRequired and the import, key sealing after compaction, repair with stubs, the snapshot reserve. |
 | [quota](quota/README.md) | Space quota refusal, the outbox after a refusal, fetches and security records at a full quota, the security record reserve and the daily limit. |
 
 ## Exclusions
