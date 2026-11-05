@@ -58,8 +58,14 @@ struct ContentView: View {
                 if step != .none, sheet == nil { sheet = .flow }
                 if step == .none, sheet == .flow { sheet = nil }
             }
+            // SwiftUI drops an alert that starts while a flow sheet is about
+            // to close, for example when a flow fails at once. The alert
+            // waits until the sheet state is nil.
             .alert(
-                model.message ?? "", isPresented: Binding(get: { model.message != nil }, set: { _ in model.message = nil })
+                model.message ?? "",
+                isPresented: Binding(
+                    get: { model.message != nil && !(sheet == .flow && model.step == .none) },
+                    set: { _ in model.message = nil })
             ) {
                 Button("OK") {}
             }
