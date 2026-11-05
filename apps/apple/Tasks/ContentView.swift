@@ -55,8 +55,15 @@ struct ContentView: View {
                 }
             }
             .onChange(of: model.step) { _, step in
-                if step != .none, sheet == nil { sheet = .flow }
                 if step == .none, sheet == .flow { sheet = nil }
+            }
+            // The flow sheet opens only for a step that lasts 0.3 s. A flow
+            // that fails at once then shows its alert with no sheet. SwiftUI
+            // drops an alert that starts while a sheet opens and closes.
+            .task(id: model.step != .none) {
+                guard model.step != .none else { return }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if !Task.isCancelled, model.step != .none, sheet == nil { sheet = .flow }
             }
             .alert(
                 model.message ?? "", isPresented: Binding(get: { model.message != nil }, set: { _ in model.message = nil })

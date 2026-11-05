@@ -1842,6 +1842,34 @@ fn version_1_state_file_migrates() {
     assert_eq!(e.outbox_len().unwrap(), 0);
 }
 
+/// [VER-15]: a state file at each older schema version migrates forward
+/// and keeps its relay info. A step that runs twice fails to open the file.
+#[test]
+fn every_older_state_file_migrates() {
+    let (w, _, _) = World::new();
+    for version in 1..crate::state::MIGRATIONS.len() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let db = Connection::open(tmp.path().join(STATE_FILE)).unwrap();
+            for step in &crate::state::MIGRATIONS[..version] {
+                db.execute_batch(step).unwrap();
+            }
+            db.execute("INSERT INTO relay_info VALUES (1, x'7b7d')", [])
+                .unwrap();
+        }
+        let e = Engine::open(tmp.path(), w.space(), &w.keys[1])
+            .unwrap_or_else(|err| panic!("version {version}: {err}"));
+        let v: i64 =
+            e.db.pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+        assert_eq!(v, SCHEMA_VERSION, "version {version}");
+        let body: Vec<u8> =
+            e.db.query_row("SELECT body FROM relay_info", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(body, b"{}", "version {version}");
+    }
+}
+
 /// [DLV-4]: `enqueue_many` takes exactly [`MAX_ENQUEUE`] rows.
 #[test]
 fn enqueue_takes_500_rows() {

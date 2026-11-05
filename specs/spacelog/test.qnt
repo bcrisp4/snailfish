@@ -83,7 +83,7 @@ module spacelogTest {
       .then(signChange(1))
       .then(appendId(5))
       .expect(happened(EvNewEpochChange))
-      .expect(noKeyToRemoved and removedKeyIsolation and authorActive)
+      .expect(noKeyToRemoved and removedKeyIsolation and authorActive and writeEpochCurrent)
       // Device 2 verified the removal. It cannot sign a grant.
       .then(signGrant(2, 2, 3)).fail()
 

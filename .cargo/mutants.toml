@@ -31,6 +31,8 @@ exclude_re = [
   "replace \\| with \\^ in decode_id",
   "replace \\| with \\^ in display",
   "replace \\| with \\^ in parse",
+  "replace \\| with \\^ in symbols_display",
+  "replace \\| with \\^ in symbols_read",
   # SQLite open flags are distinct bits, so `|` and `^` give the same value.
   "replace \\| with \\^ in open",
   # serde calls `expecting` only for a value type that the visitor does not
@@ -88,6 +90,11 @@ exclude_re = [
   # from the wall clock, so the nextest `mutants` profile omits it, and
   # `make check` runs it. full_map_drops_only_full_buckets covers the bucket.
   "http.rs:.*: delete ! in handler",
+  # Equivalent mutant: the engine reads the setup genesis record only at
+  # verified head 0, and checks its hash only at position 1. The verified
+  # log never shrinks, so a setup row that stays after its record is
+  # verified changes no behaviour. drop_setup only frees the space.
+  "replace drop_setup -> Result<\\(\\), EngineError> with Ok\\(\\(\\)\\)",
 ]
 
 # A TIMEOUT is a mutant that makes a loop never end, for example `n /= 10`
