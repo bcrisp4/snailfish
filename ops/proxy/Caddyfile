@@ -5,18 +5,20 @@
 #   snailfish-relay serve --listen 127.0.0.1:8080 --trusted-proxy 127.0.0.1 \
 #     --authority sync.example.net --metrics-listen 127.0.0.1:9464
 #
-# Replace sync.example.net with the public domain. It must be the same value
-# as --authority, because devices sign the authority of each request.
+# Set SNAILFISH_DOMAIN to the public domain. It must be the same value as
+# --authority, because devices sign the authority of each request. Set
+# SNAILFISH_ACME_EMAIL for the certificate account. ops/compose sets both,
+# and SNAILFISH_UPSTREAM to the relay container.
 {
 	# Caddy writes an access log only for a site with a `log` directive.
 	# This file has no `log` directive, because an access log holds client
 	# IP addresses.
-	email admin@example.net
+	email {$SNAILFISH_ACME_EMAIL}
 }
 
 # Caddy gets and renews a certificate for this name, serves TLS on port 443,
 # and redirects HTTP on port 80 to HTTPS.
-sync.example.net {
+{$SNAILFISH_DOMAIN} {
 	# Above max_request_bytes (default 24 MiB) plus the 1,024-byte repair
 	# allowance. The relay applies the exact limit and returns its own error.
 	request_body {
@@ -25,7 +27,7 @@ sync.example.net {
 
 	# Only the public listener. Do not add a route to the metrics listener
 	# (127.0.0.1:9464): Prometheus scrapes it directly.
-	reverse_proxy 127.0.0.1:8080 {
+	reverse_proxy {$SNAILFISH_UPSTREAM:127.0.0.1:8080} {
 		# Pass the Host header of the client. Caddy does this by default.
 		# The line makes it explicit.
 		header_up Host {host}

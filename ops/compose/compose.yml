@@ -1,0 +1,58 @@
+# The relay and a Caddy reverse proxy on one host (docs/self-host.md).
+#
+# Caddy gets the TLS certificate for SNAILFISH_DOMAIN and forwards each
+# request to the relay. The relay trusts X-Forwarded-For only from the fixed
+# address of the Caddy container (PROTOCOL.md 12.6). The metrics listener is
+# published on the loopback address of the host only.
+
+name: snailfish
+
+services:
+  relay:
+    build: ../..
+    image: snailfish-relay:local
+    restart: unless-stopped
+    environment:
+      SNAILFISH_AUTHORITY: ${SNAILFISH_DOMAIN:?set SNAILFISH_DOMAIN in .env}
+      SNAILFISH_TRUSTED_PROXY: 172.30.0.2
+      SNAILFISH_METRICS_LISTEN: 0.0.0.0:9464
+      SNAILFISH_SPACE_BYTES: ${SNAILFISH_SPACE_BYTES:-268435456}
+      SNAILFISH_MAX_SPACES: ${SNAILFISH_MAX_SPACES:-32}
+    volumes:
+      - data:/data
+      - secrets:/secrets
+    ports:
+      - "127.0.0.1:9464:9464"
+    networks:
+      relay:
+        ipv4_address: 172.30.0.3
+
+  caddy:
+    image: caddy:2.11.7
+    restart: unless-stopped
+    environment:
+      SNAILFISH_DOMAIN: ${SNAILFISH_DOMAIN}
+      SNAILFISH_ACME_EMAIL: ${SNAILFISH_ACME_EMAIL:?set SNAILFISH_ACME_EMAIL in .env}
+      SNAILFISH_UPSTREAM: relay:8080
+    volumes:
+      - ../proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - relay
+    networks:
+      relay:
+        ipv4_address: 172.30.0.2
+
+networks:
+  relay:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  data:
+  secrets:
+  caddy_data:
