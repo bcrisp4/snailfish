@@ -43,6 +43,12 @@
 | --- | --- | --- |
 | F1 | The app can delete the old state file before the comparison, and so lose each own change that only the old file holds. The sampled check found it in the `tiny` and `honest` configs. | [FRK-7]: the app keeps the old state file until its outbox holds each change of the comparison. `dropOld` requires the recovery. |
 
+## Model bounds
+
+- Sampled: 20,000 traces of up to 50 steps for each of `honest`, `snapshots` and `tiny` (5,000 in CI).
+- Apalache: `tiny` (2 devices, 3 IDs) to 6 steps.
+- TLC: every reachable state of `tiny`. The 4 mutants fail there.
+
 ## Known limits
 
 | Limit | Config |

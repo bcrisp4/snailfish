@@ -1,5 +1,5 @@
 module forkrepairTest {
-  import forkrepair(MAX_IDS = 6, SNAPSHOTS = false, BUG = "none").* from "./model"
+  import forkrepair(DEVS = Set(1, 2, 3), MAX_IDS = 6, SNAPSHOTS = false, BUG = "none").* from "./model"
 
   // The relay forks after change 1. Device 2 writes change 2 on branch 1 and
   // its app applies it back, so its app outbox row is gone. Device 1 writes
@@ -61,7 +61,7 @@ module forkrepairTest {
 }
 
 module forkrepairTestSnap {
-  import forkrepair(MAX_IDS = 6, SNAPSHOTS = true, BUG = "none").* from "./model"
+  import forkrepair(DEVS = Set(1, 2, 3), MAX_IDS = 6, SNAPSHOTS = true, BUG = "none").* from "./model"
 
   // [CMP-21] Device 2 writes change 2 on branch 1, applies it, writes a
   // snapshot and replaces change 2 with a stub. After the fork repair from

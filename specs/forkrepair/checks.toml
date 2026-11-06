@@ -15,10 +15,14 @@ fast_config = "honest"
 
 [deep]
 config = "tiny"
+# Apalache at 6 steps takes about 2 minutes on an M5 Max. 8 steps ran for
+# more than 10 minutes, and 8 steps with three devices for more than 34.
+# TLC below checks every reachable state of tiny at any depth.
 invariants = ["noLostChange", "noDoubleApply", "noResurrect"]
-max_steps = 8
+max_steps = 6
 
 [defaults]
+DEVS = "Set(1, 2, 3)"
 MAX_IDS = "5"
 SNAPSHOTS = "false"
 BUG = '"none"'
@@ -34,6 +38,7 @@ SNAPSHOTS = "true"
 MAX_IDS = "6"
 
 [configs.tiny]
+DEVS = "Set(1, 2)"
 MAX_IDS = "3"
 
 # ---------------------------------------------------------------- known limits
@@ -65,4 +70,4 @@ caught_by = "noResurrect"
 config = "tiny"
 invariants = ["noLostChange", "noDoubleApply", "noResurrect"]
 mutants = ["skipOld", "freshIds", "noReset", "uploadAfterDelete"]
-why = "Three devices, at most three change and snapshot IDs, one fork, no snapshots."
+why = "Two devices, at most three change IDs, one fork, no snapshots."

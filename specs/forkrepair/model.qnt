@@ -3,7 +3,7 @@
 // marker ([LOG-13]). specs/forkrepair/README.md has the coverage map.
 //
 // Abstractions:
-//  - One space, three devices. Every device is active from the genesis
+//  - One space, two or three devices (DEVS). Every device is active from the genesis
 //    record. Grants, epochs and keys are outside this model.
 //  - A log entry is a change or a snapshot, with a unique int `cid` that
 //    stands for its entry hash. Prefix equality of cids stands for digest
@@ -67,6 +67,7 @@ module forkrepair {
     events: Set[Event],
   }
 
+  const DEVS: Set[Dev]           // the devices, from 1
   const MAX_IDS: int
   const SNAPSHOTS: bool
   const BUG: str
@@ -77,7 +78,6 @@ module forkrepair {
     "noReset",           // [FRK-8] the app does not handle ResetRequired after the recovery
     "uploadAfterDelete", // [LOG-13] a device that sees the deletion marker uploads its log again
   )
-  pure val DEVS: Set[Dev] = Set(1, 2, 3)
 
   pure def cids(log: List[Entry]): List[int] = log.foldl(List(), (xs, e) => xs.append(e.cid))
   pure def isPrefix(a: List[int], b: List[int]): bool =

@@ -40,16 +40,28 @@ fn bad(msg: impl Into<String>) -> WireError {
     WireError(msg.into())
 }
 
-/// The lines of `bytes`: each line ends with LF, no line is empty, and the
-/// last byte is LF. `None` otherwise.
+/// True if `bytes` is LF-terminated lines with no empty line: it ends with
+/// LF, it does not start with LF, and it holds no two LF bytes in a row.
+#[must_use]
+pub fn well_formed(bytes: &[u8]) -> bool {
+    let mut prev = b'\n';
+    for &b in bytes {
+        if b == b'\n' && prev == b'\n' {
+            return false;
+        }
+        prev = b;
+    }
+    !bytes.is_empty() && prev == b'\n'
+}
+
+/// The lines of `bytes`, without their LF, if [`well_formed`] holds.
 #[must_use]
 pub fn split_lines(bytes: &[u8]) -> Option<Vec<&[u8]>> {
-    let body = bytes.strip_suffix(b"\n")?;
-    let lines: Vec<&[u8]> = body.split(|b| *b == b'\n').collect();
-    if lines.iter().any(|l| l.is_empty()) {
+    if !well_formed(bytes) {
         return None;
     }
-    Some(lines)
+    let body = bytes.strip_suffix(b"\n")?;
+    Some(body.split(|b| *b == b'\n').collect())
 }
 
 /// The header line, without its LF.
@@ -287,32 +299,25 @@ mod tests {
 mod proofs {
     use super::*;
 
-    /// Section 15: for each byte string of up to 6 bytes, `split_lines`
-    /// returns lines only if the string ends with LF and holds no empty
-    /// line, and each line holds no LF.
+    /// Section 15: for each byte string of up to 5 bytes, `well_formed`
+    /// holds only if the string ends with LF, does not start with LF, and
+    /// holds no two LF bytes in a row. `split_lines` builds a `Vec`, which
+    /// CBMC cannot finish ("CBMC failed" at 6 bytes), so the property test
+    /// `split_lines_round_trip` covers it.
     #[kani::proof]
-    #[kani::unwind(8)]
-    fn split_lines_is_exact() {
-        let bytes: [u8; 6] = kani::any();
+    #[kani::unwind(7)]
+    fn well_formed_is_exact() {
+        let bytes: [u8; 5] = kani::any();
         let len: usize = kani::any();
-        kani::assume(len <= 6);
+        kani::assume(len <= 5);
         let b = &bytes[..len];
-        if let Some(lines) = split_lines(b) {
-            assert!(len > 0 && b[len - 1] == b'\n');
-            let mut total = 0;
-            for l in &lines {
-                assert!(!l.is_empty());
-                assert!(!l.contains(&b'\n'));
-                total += l.len() + 1;
-            }
-            assert!(total == len);
-        } else {
-            assert!(
-                len == 0
-                    || b[len - 1] != b'\n'
-                    || b[0] == b'\n'
-                    || b.windows(2).any(|w| w == b"\n\n")
-            );
+        let mut double = false;
+        let mut i = 1;
+        while i < len {
+            double |= b[i] == b'\n' && b[i - 1] == b'\n';
+            i += 1;
         }
+        let want = len > 0 && b[len - 1] == b'\n' && b[0] != b'\n' && !double;
+        assert!(well_formed(b) == want);
     }
 }
