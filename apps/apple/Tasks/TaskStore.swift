@@ -180,6 +180,13 @@ final class TaskStore {
             [.blob(changeID), .blob(bytes), .int(seq)])
     }
 
+    /// [FRK-8]: an own change of the old engine state keeps its old change
+    /// ID, and the outbox can hold a row with that ID already.
+    func addOutboxIfAbsent(_ changeID: Data, _ bytes: Data) throws {
+        guard try db.query("SELECT 1 FROM outbox WHERE change_id = ?", [.blob(changeID)]).isEmpty else { return }
+        try addOutbox(changeID, bytes)
+    }
+
     /// Write an outbox row for each field that exists ([MRG-5]). The caller
     /// runs it in the transaction that turns on sync.
     func outboxEveryField(newChangeID: () throws -> Data) throws {

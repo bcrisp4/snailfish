@@ -41,6 +41,19 @@ reads the changes of the other:
   device of `setup`.
 - `POST /py/block?id=D` and `POST /py/unblock?id=D`: block or unblock the
   device D on the user page, as the user does (S4, PROTOCOL.md 12.4).
+- `GET /py/head`: the verified head position of the demo device.
+- `POST /py/cut?keep=N&log=L&wait=1`: a storage fault. The relay loses the
+  entries of log L after position N, with no restore and no hold, so the
+  next device that writes makes a fork ([FRK-1]). The default log is the
+  log of the demo device. The relay process keeps running, because it opens
+  the space file for each request. With `wait=1`, the cut waits until a
+  device reports an applied position after N and an empty engine outbox
+  (PROTOCOL.md 10.11). Its app then applied its own change back, so only
+  its engine state holds that change.
+- `POST /py/delete`: delete the space on the relay ([FRK-4]). The answer is
+  the status, `stopped: deleted` on success.
+- `POST /py/import`: import the log of the demo device into the relay
+  ([FRK-5]).
 
 Usage: approver.py RELAY_URL INVITE_LINK USER PORT_FILE
 
@@ -55,10 +68,13 @@ import os
 import queue
 import secrets
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -142,6 +158,50 @@ class PyDevice:
             d,
             "P",
             key,
+            SOFT_REDIRECT,
+            lambda authorize_url: self.browser.approve(authorize_url, self.user),
+            self.send,
+        )
+        return ""
+
+    def cut(self, keep: int, log_id: str | None, *, wait: bool) -> str:
+        """Delete the entries after `keep` in the relay space file of the log."""
+        admin = shlex.split(os.environ["SNAILFISH_RELAY_ADMIN"])
+        data = Path(admin[admin.index("--data") + 1])
+        log_id = log_id or self.device().space.log_id
+        with closing(sqlite3.connect(data / "directory.db")) as d:
+            (tenant,) = d.execute(
+                "SELECT tenant_id FROM users WHERE name = ?", (self.user,)
+            ).fetchone()
+        tenant_dir = data / "tenants" / tenant
+        deadline = time.monotonic() + WAIT_SECONDS
+        while wait:
+            with closing(sqlite3.connect(tenant_dir / "tenant.db")) as t:
+                reported = t.execute(
+                    "SELECT 1 FROM device_status WHERE log_id = ? AND applied > ? AND outbox = 0",
+                    (log_id, keep),
+                ).fetchone()
+            if reported:
+                break
+            if time.monotonic() > deadline:
+                raise ValueError(f"no device reported an applied position after {keep}")
+            time.sleep(0.1)
+        with closing(sqlite3.connect(tenant_dir / "tenant.db")) as t:
+            (file_name,) = t.execute(
+                "SELECT file_name FROM spaces WHERE log_id = ?", (log_id,)
+            ).fetchone()
+        # mode=rw: a wrong path fails, and does not make an empty file.
+        space_file = f"file:{tenant_dir / 'spaces' / file_name}.db?mode=rw"
+        with closing(sqlite3.connect(space_file, uri=True)) as c, c:
+            c.execute("DELETE FROM entries WHERE position > ?", (keep,))
+            c.execute("DELETE FROM devices WHERE position > ?", (keep,))
+        return ""
+
+    def import_space(self) -> str:
+        """Import the log of the demo device into the same relay."""
+        app.import_space(
+            self.device(),
+            self.relay_url,
             SOFT_REDIRECT,
             lambda authorize_url: self.browser.approve(authorize_url, self.user),
             self.send,
@@ -233,6 +293,14 @@ def main() -> None:
                     body = ""
                 elif method == "POST" and u.path in ("/py/block", "/py/unblock"):
                     body = py.block(q["id"], on=u.path == "/py/block")
+                elif method == "GET" and u.path == "/py/head":
+                    body = str(py.device().engine.verified_head().position)
+                elif method == "POST" and u.path == "/py/cut":
+                    body = py.cut(int(q["keep"]), q.get("log"), wait=q.get("wait") == "1")
+                elif method == "POST" and u.path == "/py/delete":
+                    body = str(app.delete_space(py.device(), py.send))
+                elif method == "POST" and u.path == "/py/import":
+                    body = py.import_space()
                 elif method == "POST" and u.path == "/py/setup":
                     body = py.setup()
                 elif method == "POST" and u.path == "/py/edit":
@@ -264,6 +332,8 @@ def main() -> None:
                 ValueError,
                 queue.Empty,
                 app.RecoveryError,
+                app.ImportError_,
+                sqlite3.Error,
                 sf.SnailfishError,
                 subprocess.CalledProcessError,
             ) as e:

@@ -15,6 +15,8 @@ import Snailfish
 ///   keeps its tasks.
 /// - `measure.jsonl`: the sync delay log (`Measurements`), unless the
 ///   caller puts the log in another place.
+/// - `engine-old/` and `rejoined`: the old engine state and the commit point
+///   of the new engine during a fork repair ([FRK-6], [FRK-7]).
 ///
 /// The keys are in the key store, never in this directory.
 actor SyncDevice {
@@ -37,6 +39,20 @@ actor SyncDevice {
     /// the grant of this device. The engine keeps the recovery key in memory
     /// only, so after a restart the user starts the recovery again.
     private nonisolated var recoveringFile: URL { root.appendingPathComponent("recovering") }
+    /// The engine state before an enrollment again ([FRK-6]). It stays until
+    /// the app outbox holds each own change that only it holds ([FRK-7]),
+    /// because a delete before that point loses these changes (model finding
+    /// F1).
+    nonisolated var oldEngineDir: URL { root.appendingPathComponent("engine-old", isDirectory: true) }
+    /// Exists after the enrollment again wrote the new engine state, until
+    /// the old state is gone. `Engine.open` makes a new state file in an
+    /// empty directory, so the app opens `engine/` only after this commit
+    /// point.
+    private nonisolated var rejoinedFile: URL { root.appendingPathComponent("rejoined") }
+    private nonisolated var rejoining: Bool { FileManager.default.fileExists(atPath: oldEngineDir.path) }
+    /// The number of own changes that the last fork recovery put in the app
+    /// outbox ([FRK-8]).
+    private(set) var recovered: Int?
 
     init(
         root: URL, keyStore: KeyStore, deleteKeys: @escaping (String) throws -> Void,
@@ -54,9 +70,11 @@ actor SyncDevice {
             // A file of an earlier build, or of a crash before the exclusion.
             try Self.excludeFromBackup(spaceFile)
             space = sp
-            let e = try Engine.open(dataDir: engineDir.path, space: sp, keyStore: keyStore)
-            engine = e
-            store.deviceID = try e.deviceId()
+            if !rejoining || FileManager.default.fileExists(atPath: rejoinedFile.path) {
+                let e = try Engine.open(dataDir: engineDir.path, space: sp, keyStore: keyStore)
+                engine = e
+                store.deviceID = try e.deviceId()
+            }
         }
         try excludeEngineFromBackup()
         // [DLV-2]: give the outbox rows to the engine at every startup.
@@ -90,11 +108,22 @@ actor SyncDevice {
 
     var syncOn: Bool { engine != nil }
 
+    /// True after `prepareRejoin` until the enrollment again writes the new
+    /// engine state. Sync is off, and the user joins again from the source.
+    var rejoinWaits: Bool { engine == nil && rejoining }
+
+    /// True while the old engine state waits for the fork recovery of a
+    /// sync ([FRK-7]).
+    var forkRecoveryWaits: Bool { rejoining }
+
     func tasks() throws -> [TaskItem] { try store.tasks() }
 
     /// Apply an edit and write its outbox row in one transaction, then give
     /// the outbox to the engine ([DLV-2]).
     func edit(task: String, field: String, value: JSONValue) throws {
+        // With no engine, an edit gets no outbox row. An enrollment again
+        // writes no [MRG-5] rows, so the edit would never reach the space.
+        if rejoinWaits { throw SetupError.message("join again from the source device first") }
         let cid = try engine?.newChangeId()
         try store.edit(task: task, field: field, value: value, changeID: cid)
         if let cid { measurements.edit(changeID: cid) }
@@ -152,6 +181,15 @@ actor SyncDevice {
             try exchange.handleResponse(status: status, headers: headers, body: body)
         }
         repairs = try engine.takeRepairs()
+        if rejoining {
+            // [FRK-7]: the first exchange of the new engine opens its app
+            // key at the checkpoint. No pull comes before the outbox holds
+            // the own changes of the old state, because the pull raises
+            // ResetRequired and the reset applies only the outbox rows.
+            let st = try engine.status()
+            guard st == .ok else { return st }
+            try recoverFork(engine)
+        }
         try pull(background: background)
         try flushOutboxNow()
         flushError = nil
@@ -260,7 +298,7 @@ actor SyncDevice {
     }
 
     func statusText() throws -> String {
-        guard let engine else { return "sync off" }
+        guard let engine else { return rejoinWaits ? "stopped: fork (join again from the source)" : "sync off" }
         let s = try engine.status()
         var text = Snailfish.statusText(status: s)
         switch s {
@@ -441,6 +479,106 @@ actor SyncDevice {
         try FileManager.default.removeItem(at: engineDir)
         try excludeEngineFromBackup()
         if let account { try deleteKeys(account) }
+    }
+}
+
+// MARK: Fork repair (DESIGN.md "Fork repair", PROTOCOL.md 10.12, 10.13)
+
+extension SyncDevice {
+    /// [FRK-4], [LOG-13]: delete the space on the relay. The sync comes
+    /// first, because the statement names the verified head. Each device
+    /// keeps its data. Returns `.deleted` on success. It follows
+    /// `delete_space` in demo/src/snailfish_demo/app.py.
+    func deleteSpace(_ transport: Transport) async throws -> Status {
+        guard let engine else { throw SetupError.syncOff }
+        _ = try await sync(transport)
+        let (status, headers, body) = try await transport.send(try engine.deleteRequest())
+        try engine.handleDeleteResponse(status: status, headers: headers, body: body)
+        return try engine.status()
+    }
+
+    /// [FRK-5]: import the verified log into `target` with the setup token
+    /// of a sign-in with the device keys of the engine (PROTOCOL.md 10.13).
+    /// The device then uses `target`.
+    func importSpace(target: SpaceRef, setupToken: String, transport: Transport) async throws {
+        guard let space else { throw SetupError.syncOff }
+        try await runImport(target: target, setupToken: setupToken, transport: transport)
+        guard target != space else { return }
+        // Another relay or tenant: the engine signs for its space reference.
+        // The old engine must close first, because it holds the directory
+        // lock.
+        engine = nil
+        try openEngine(target) { _ in }
+    }
+
+    private func runImport(target: SpaceRef, setupToken: String, transport: Transport) async throws {
+        guard let engine else { throw SetupError.syncOff }
+        let imp = try engine.importSpace(target: target, setupToken: setupToken)
+        while let req = try imp.nextRequest() {
+            let (status, headers, body) = try await transport.send(req)
+            try imp.handleResponse(status: status, headers: headers, body: body)
+        }
+        guard try imp.finished() else { throw SetupError.message("the import ended before the relay made the space") }
+    }
+
+    /// [FRK-6]: keep the old keys and the old engine state before this
+    /// device enrolls again. The enrollment writes new keys and a new state.
+    /// The app database stays. After an earlier attempt that did not finish,
+    /// the old state is in place already, and the key item can hold the keys
+    /// of that attempt, so the keys are not copied again.
+    func prepareRejoin() throws {
+        guard let space else { throw SetupError.syncOff }
+        guard !syncing else { throw SetupError.message("a sync is running: try again") }
+        if !rejoining { try keepOldKeys(keyStore: keyStore, logId: space.logId) }
+        // The engine holds the directory lock and the state file.
+        engine = nil
+        let fm = FileManager.default
+        do {
+            try fm.removeItem(at: rejoinedFile)
+        } catch let e as CocoaError where e.code == .fileNoSuchFile {}
+        if !rejoining {
+            try fm.moveItem(at: engineDir, to: oldEngineDir)
+        } else {
+            try fm.removeItem(at: engineDir)
+        }
+        try excludeEngineFromBackup()
+    }
+
+    /// [FRK-6]: finish the enrollment again. Unlike `finishJoin`, the app
+    /// keeps its database: the outbox and the applied position. The next
+    /// pull then raises ResetRequired, and the reset applies each outbox row
+    /// again ([FRK-8]).
+    func finishRejoin(space sp: SpaceRef, keys: DeviceKeys, joined: Joined) throws {
+        guard rejoining else { throw SetupError.message("no old engine state: start the enrollment again") }
+        try installEnrollment(dataDir: engineDir.path, space: sp, keys: keys, joined: joined, keyStore: keyStore)
+        try openEngine(sp) { _ in }
+        try Data().write(to: rejoinedFile, options: .atomic)
+    }
+
+    /// [FRK-7], [FRK-8]: write an outbox row with the old change ID for each
+    /// own change that only the old state holds, in one transaction. The old
+    /// state goes only after the commit. A crash before that point runs the
+    /// comparison again with the same result. It follows `recover_fork` in
+    /// demo/src/snailfish_demo/app.py.
+    private func recoverFork(_ engine: Engine) throws {
+        guard let space else { return }
+        let rows = try Self.forkChanges(engine, oldDir: oldEngineDir, space: space, keyStore: keyStore)
+        try store.db.transaction {
+            for r in rows { try store.addOutboxIfAbsent(r.changeId, r.changeBytes) }
+        }
+        try FileManager.default.removeItem(at: oldEngineDir)
+        try? FileManager.default.removeItem(at: rejoinedFile)
+        try deleteKeys(space.logId + ".old")
+        recovered = rows.count
+    }
+
+    /// The old engine is closed when this function returns, so its directory
+    /// lock is free before the delete.
+    private static func forkChanges(
+        _ engine: Engine, oldDir: URL, space: SpaceRef, keyStore: KeyStore
+    ) throws -> [OutboxRow] {
+        let old = try Engine.openOld(dataDir: oldDir.path, space: space, keyStore: keyStore)
+        return try engine.forkChanges(old: old)
     }
 }
 

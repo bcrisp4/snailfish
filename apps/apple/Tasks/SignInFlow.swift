@@ -117,20 +117,40 @@ func signInAgain(
     device: SyncDevice, relayURL: String, transport: Transport, browser: (URL) async throws -> URL
 ) async throws {
     guard let engine = await device.engine else { throw SetupError.syncOff }
+    let token = try await engineToken(engine: engine, relayURL: relayURL, transport: transport, browser: browser)
+    try engine.setSetupToken(token: token.token)
+}
+
+/// A setup token for the device keys of `engine` on `relayURL` (PROTOCOL.md
+/// 12.3). It follows `_engine_token` in demo/src/snailfish_demo/app.py.
+func engineToken(
+    engine: Engine, relayURL: String, transport: Transport, browser: (URL) async throws -> URL
+) async throws -> SetupToken {
     let si = try SignIn(relayUrl: relayURL, redirectUri: redirectURI)
     guard let authorize = URL(string: si.authorizeUrl()) else { throw SetupError.message("bad authorize URL") }
     let redirect = try await browser(authorize).absoluteString
     let now = { UInt64(Date().timeIntervalSince1970) }
-    var (status, headers, body) = try await transport.send(
+    let (status, headers, body) = try await transport.send(
         try si.tokenRequestForEngine(redirect: redirect, engine: engine, now: now()))
-    let token: SetupToken
     do {
-        token = try si.readToken(status: status, headers: headers, body: body)
+        return try si.readToken(status: status, headers: headers, body: body)
     } catch SnailfishError.Invalid(let message) where message.contains("expired") {
         // PROTOCOL.md 8.5: after `expired`, send once more with the relay time.
-        (status, headers, body) = try await transport.send(
+        let (status, headers, body) = try await transport.send(
             try si.tokenRequestForEngine(redirect: redirect, engine: engine, now: now()))
-        token = try si.readToken(status: status, headers: headers, body: body)
+        return try si.readToken(status: status, headers: headers, body: body)
     }
-    try engine.setSetupToken(token: token.token)
+}
+
+/// Import the verified log of this device into the relay at `relayURL`
+/// after the deletion of the space there ([FRK-5], PROTOCOL.md 10.13). The
+/// user signs in, and the engine signs the token request with its own
+/// device keys. It follows `import_space` in demo/src/snailfish_demo/app.py.
+func importSpace(
+    device: SyncDevice, relayURL: String, transport: Transport, browser: (URL) async throws -> URL
+) async throws {
+    guard let engine = await device.engine, let space = await device.space else { throw SetupError.syncOff }
+    let token = try await engineToken(engine: engine, relayURL: relayURL, transport: transport, browser: browser)
+    let target = SpaceRef(relayUrl: relayURL, tenant: token.tenant, logId: space.logId, appId: appID)
+    try await device.importSpace(target: target, setupToken: token.token, transport: transport)
 }
