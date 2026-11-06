@@ -19,7 +19,10 @@ fast_config = "honest"
 [deep]
 config = "tiny"
 invariants = ["stubsCovered", "securityFull", "appConsistent", "noNeedlessReset"]
-max_steps = 8
+# 4 steps take 82 minutes on an M5 Max, above the CI job limit on a slower
+# runner. The exhaustive TLC entries below check every reachable state of
+# two smaller configs.
+max_steps = 3
 
 [defaults]
 MAX_IDS = "3"
@@ -63,6 +66,14 @@ MAX_IDS = "4"
 [configs.tiny]
 MAX_IDS = "2"
 MAX_LEN = "7"
+
+[configs.tlcIds]
+MAX_IDS = "2"
+MAX_LEN = "5"
+
+[configs.tlcLen]
+MAX_IDS = "1"
+MAX_LEN = "6"
 
 # ---------------------------------------------------------------- mutants
 
@@ -136,3 +147,26 @@ test = "quotaTest"
 base = "quota"
 caught_by = "tests"
 test = "quotaTest"
+
+# ---------------------------------------------------------------- exhaustive (TLC)
+# TLC checks every reachable state of a small config, at any depth. Each listed
+# mutant must also fail on the same config, so the config is big enough to
+# matter.
+
+[[exhaustive]]
+config = "tlcIds"
+invariants = [
+  "appConsistent", "noDoubleApply", "outboxPending", "stubsCovered", "noMissingRecords",
+  "securityFull", "usableReadable", "readsNeeded", "noNeedlessReset", "noLostChange", "withinQuota", "noStuckDevice",
+]
+mutants = ["compactBeforeAccept", "acceptEarly", "stubSecurity", "sealCurrentOnly"]
+why = "Two change IDs, a log of 5 entries: about 4.6 million states, 3 minutes. stubAccept and snapshotWithOutbox need a longer log, and the full tier catches them."
+
+[[exhaustive]]
+config = "tlcLen"
+invariants = [
+  "appConsistent", "noDoubleApply", "outboxPending", "stubsCovered", "noMissingRecords",
+  "securityFull", "usableReadable", "readsNeeded", "noNeedlessReset", "noLostChange", "withinQuota", "noStuckDevice",
+]
+mutants = ["compactBeforeAccept", "acceptEarly", "stubSecurity", "sealCurrentOnly"]
+why = "One change ID, a log of 6 entries: about 4.6 million states, 4 minutes. stubAccept and snapshotWithOutbox need a longer log, and the full tier catches them."

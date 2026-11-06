@@ -71,6 +71,14 @@ A fetch page can hold stubs before the snapshot record that covers them, for exa
 
 `make verify MODEL=compaction` passes in about 70 seconds: 8 configs, 20,000 traces of up to 50 steps each (sampled, not a proof). Two scenario modules: `compactionTest` and `compactionTestLate`. Each mutant fails its invariant or its named test. Each witness is reached.
 
+`make verify-deep MODEL=compaction` runs these checks:
+
+- Apalache on `tiny` (2 change IDs, a log of 7 entries), to 3 steps, for `stubsCovered`, `securityFull`, `appConsistent` and `noNeedlessReset`. The bound is 3 because 4 steps take 82 minutes on an M5 Max, above the CI job limit on a slower runner. At 8 steps Apalache used 24 GB at step 5.
+- TLC on `tlcIds` (2 change IDs, a log of 5 entries) and `tlcLen` (1 change ID, a log of 6 entries): every reachable state, about 4.6 million each, for all 12 invariants. On each config the mutants `compactBeforeAccept`, `acceptEarly`, `stubSecurity` and `sealCurrentOnly` fail.
+- `stubAccept` and `snapshotWithOutbox` need a longer log than the TLC configs allow. The sampled tier catches them.
+
+No result covers a log longer than these bounds outside the sampled traces.
+
 ## Not covered
 
 - Forks and fork repair after compaction ([CMP-21], FRK rules): M9.
