@@ -1447,4 +1447,12 @@ fn page_marks_the_device_that_blocks_compaction() {
     assert_eq!(after.used, (snap.len() + acc_a.len() + acc_b.len()) as u64);
     // Two change stubs of 10.7: type, change ID and hash.
     assert_eq!(after.stub_bytes, 2 * 133);
+    // `snailfish-relay space-status` prints this text, and the demo parses it.
+    assert_eq!(
+        after.to_string(),
+        format!(
+            "used: {} bytes\nstubs: 2 (266 bytes)\nfrontier: 4\n",
+            after.used
+        )
+    );
 }
