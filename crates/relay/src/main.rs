@@ -141,6 +141,11 @@ struct ServeArgs {
         default_value = ""
     )]
     trusted_proxy: Vec<String>,
+    /// The address of the metrics listener, for example `127.0.0.1:9464`.
+    /// Empty turns the metrics off. Do not expose it through the proxy
+    /// (DESIGN.md "Monitoring and alerting").
+    #[arg(long, env = "SNAILFISH_METRICS_LISTEN", default_value = "")]
+    metrics_listen: String,
 }
 
 impl ServeArgs {
@@ -303,10 +308,11 @@ async fn main() -> ExitCode {
             };
             let mut c = config(&a);
             let listen = args.listen.clone();
+            let metrics = args.metrics_listen.clone();
             if let Err(e) = args.apply(&mut c) {
                 return fail(&e);
             }
-            serve(c, &listen).await
+            serve(c, &listen, &metrics).await
         }
     }
 }
@@ -339,7 +345,7 @@ fn user_command(config: Config, action: UserAction) -> ExitCode {
     }
 }
 
-async fn serve(config: Config, listen: &str) -> ExitCode {
+async fn serve(config: Config, listen: &str, metrics: &str) -> ExitCode {
     // Held until the process ends, so `restore` cannot run beside it.
     let _lock = match ops::serve_lock(&config.data_dir) {
         Ok(l) => l,
@@ -368,6 +374,18 @@ async fn serve(config: Config, listen: &str) -> ExitCode {
             () = term => {}
         }
     };
+    if !metrics.is_empty() {
+        let ml = match tokio::net::TcpListener::bind(metrics).await {
+            Ok(l) => l,
+            Err(e) => return fail(&format!("cannot listen for metrics: {e}")),
+        };
+        let app = snailfish_relay::http::metrics_router(relay.clone());
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(ml, app).await {
+                eprintln!("snailfish-relay: metrics listener: {e}");
+            }
+        });
+    }
     tokio::spawn(snailfish_relay::webhook::run(relay.clone()));
     let app = router(relay).into_make_service_with_connect_info::<std::net::SocketAddr>();
     match axum::serve(listener, app)

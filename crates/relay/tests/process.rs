@@ -40,6 +40,7 @@ fn health(url: &str) -> bool {
 fn serve_answers_health_and_the_health_command_reports_failure() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
+    let mport = free_port();
     let url = format!("http://127.0.0.1:{port}/v1/health");
     assert!(!health(&url), "nothing listens yet");
     let mut server = Server(
@@ -47,6 +48,7 @@ fn serve_answers_health_and_the_health_command_reports_failure() {
             .args(["serve", "--data"])
             .arg(dir.path())
             .args(["--listen", &format!("127.0.0.1:{port}")])
+            .args(["--metrics-listen", &format!("127.0.0.1:{mport}")])
             .args(["--authority", "relay.test"])
             .stderr(Stdio::piped())
             .spawn()
@@ -70,6 +72,12 @@ fn serve_answers_health_and_the_health_command_reports_failure() {
     );
     // A 404 is not a healthy answer.
     assert!(!health(&format!("http://127.0.0.1:{port}/v1/nothing")));
+    // DESIGN.md "Monitoring and alerting": the metrics are on their own
+    // listener only. Without this, a proxy in front of the public port
+    // would publish them.
+    assert!(health(&format!("http://127.0.0.1:{mport}/metrics")));
+    assert!(!health(&format!("http://127.0.0.1:{port}/metrics")));
+    assert!(!health(&format!("http://127.0.0.1:{mport}/v1/health")));
     assert!(!health("https://127.0.0.1/v1/health"));
 }
 

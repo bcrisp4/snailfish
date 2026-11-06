@@ -314,12 +314,21 @@ pub fn open(path: &Path, kind: Kind, create: bool) -> Result<Connection, StoreEr
         }
         // An older schema migrates forward: every statement of the DDL is
         // `IF NOT EXISTS`, and each version only adds tables ([VER-14]).
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Every statement of the DDL is `IF NOT EXISTS`, so a second creator
-        // that waited for the lock repeats it without harm.
-        tx.execute_batch(kind.ddl())?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        tx.commit()?;
+        let migrated = (|| -> Result<(), rusqlite::Error> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Every statement of the DDL is `IF NOT EXISTS`, so a second
+            // creator that waited for the lock repeats it without harm.
+            tx.execute_batch(kind.ddl())?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()
+        })();
+        if let Err(e) = migrated {
+            if version != 0 {
+                crate::metrics::MIGRATION_FAILURES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Err(e.into());
+        }
     }
     Ok(conn)
 }

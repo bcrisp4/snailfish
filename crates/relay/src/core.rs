@@ -33,6 +33,7 @@ pub mod compact;
 mod enroll;
 mod lifecycle;
 mod setup;
+mod stats;
 pub mod user;
 
 pub use user::Quotas;
@@ -202,6 +203,7 @@ impl Response {
     /// A JSON error response for the edge (`PROTOCOL.md` 10.3).
     #[must_use]
     pub fn error(status: u16, code: &str, message: &str, time: u64) -> Self {
+        crate::metrics::record_error(code);
         Self {
             status,
             body: wire::error_body(code, message),
@@ -264,12 +266,14 @@ fn internal() -> ApiError {
 
 impl From<StoreError> for ApiError {
     fn from(_: StoreError) -> Self {
+        crate::metrics::STORAGE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         internal()
     }
 }
 
 impl From<rusqlite::Error> for ApiError {
     fn from(_: rusqlite::Error) -> Self {
+        crate::metrics::STORAGE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         internal()
     }
 }
@@ -974,7 +978,7 @@ impl Relay {
             let mut view = snailfish_protocol::space::Overlay::new(&base);
             for item in items {
                 let Ok(raw) = item else {
-                    results.push(AppendResult::Refused("invalid_record".into()));
+                    results.push(with_metrics(AppendResult::Refused("invalid_record".into())));
                     continue;
                 };
                 let mode = Mode::Relay {
@@ -986,7 +990,7 @@ impl Relay {
                 let verdict = check_append_at(&view, &raw.envelope, mode, &self.cfg.levels);
                 base.take_error()?;
                 let len = raw.json.len() as u64;
-                results.push(match verdict {
+                results.push(with_metrics(match verdict {
                     Verdict::Store(acc) if let Some(code) = budget.refusal(&acc.record, len) => {
                         AppendResult::Refused(code.into())
                     }
@@ -1000,7 +1004,7 @@ impl Relay {
                     Verdict::Known(p) => AppendResult::Known(p),
                     Verdict::Conflict(p) => AppendResult::Conflict(p),
                     Verdict::Refused(r) => AppendResult::Refused(r.code().to_owned()),
-                });
+                }));
             }
             view.into_added()
         };
@@ -1235,6 +1239,14 @@ impl Relay {
         }
         Ok(out)
     }
+}
+
+/// Count a refused envelope in the metrics (signal 2).
+fn with_metrics(r: AppendResult) -> AppendResult {
+    if let AppendResult::Refused(code) = &r {
+        crate::metrics::record_refusal(code);
+    }
+    r
 }
 
 /// Store the security record count of `signer` in the relay day `day`

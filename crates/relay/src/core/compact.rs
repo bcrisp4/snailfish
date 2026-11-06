@@ -127,7 +127,15 @@ pub(super) fn compact(tx: &Connection) -> Result<u64, StoreError> {
 /// a failure here loses nothing.
 pub(super) fn reclaim(c: &Connection) {
     let _ = c.execute_batch("VACUUM");
-    let _ = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    // [STO-2]: a reader can block the checkpoint. The next compaction tries
+    // again, and the metrics count the delay.
+    if c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .is_ok_and(|busy| busy != 0)
+    {
+        crate::metrics::CHECKPOINT_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The stub of a stored row with an empty envelope.
