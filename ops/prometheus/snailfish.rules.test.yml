@@ -1,0 +1,191 @@
+# promtool tests of snailfish.rules.yml. Run `make test-rules`.
+# Each alert has a case that fires it and a case at or below its threshold
+# that does not fire it.
+rule_files:
+  - snailfish.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # SnailfishDown: 3 failed probes at a 5 minute interval fire the alert.
+  - interval: 5m
+    input_series:
+      - series: 'probe_success{job="snailfish-health", instance="https://sync.example.net/v1/health"}'
+        values: "1 1 0 0 0"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SnailfishDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: snailfish-health
+              instance: https://sync.example.net/v1/health
+            exp_annotations:
+              summary: The relay health route failed 3 probes in a row.
+              description: The blackbox probe of https://sync.example.net/v1/health failed for 15 minutes. Devices cannot sync. Read the relay process status and its logs.
+
+  # SnailfishDown: 2 failed probes, then a success, do not fire the alert.
+  # Also no alert before 3 probes exist.
+  - interval: 5m
+    input_series:
+      - series: 'probe_success{job="snailfish-health", instance="https://sync.example.net/v1/health"}'
+        values: "0 0 1 0 0"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SnailfishDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: SnailfishDown
+        exp_alerts: []
+
+  # SnailfishHigh5xxRate: 6% of requests get a 5xx for more than 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'snailfish_requests_total{class="2xx", instance="relay:9464"}'
+        values: "0+94x40"
+      - series: 'snailfish_requests_total{class="5xx", instance="relay:9464"}'
+        values: "0+6x40"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SnailfishHigh5xxRate
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: SnailfishHigh5xxRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: relay:9464
+            exp_annotations:
+              summary: More than 5% of relay requests get a 5xx response.
+              description: "For 15 minutes, 6% of the requests to relay:9464 got a 5xx response. Read the relay logs for the error classes."
+
+  # SnailfishHigh5xxRate: exactly 5% of requests get a 5xx. No alert.
+  - interval: 1m
+    input_series:
+      - series: 'snailfish_requests_total{class="2xx", instance="relay:9464"}'
+        values: "0+95x40"
+      - series: 'snailfish_requests_total{class="5xx", instance="relay:9464"}'
+        values: "0+5x40"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: SnailfishHigh5xxRate
+        exp_alerts: []
+
+  # SnailfishSpaceAboveQuota: one space above 95% fires. The 80% gauge and a
+  # value of 0 do not.
+  - interval: 1m
+    input_series:
+      - series: 'snailfish_spaces_above_quota{ratio="0.8", instance="relay:9464"}'
+        values: "2 2 2"
+      - series: 'snailfish_spaces_above_quota{ratio="0.95", instance="relay:9464"}'
+        values: "0 0 1"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SnailfishSpaceAboveQuota
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: SnailfishSpaceAboveQuota
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: relay:9464
+            exp_annotations:
+              summary: A space uses more than 95% of its quota.
+              description: "1 spaces on relay:9464 use more than 95% of their quota. At the quota, the relay refuses appends. Find the user in snailfish_tenant_stored_bytes. Raise the quota with `snailfish-relay quota <user>`, or ask the user to delete data."
+
+  # SnailfishSpaceAboveReserve
+  - interval: 1m
+    input_series:
+      - series: 'snailfish_spaces_above_reserve{ratio="0.5", instance="relay:9464"}'
+        values: "0 0 1"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SnailfishSpaceAboveReserve
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: SnailfishSpaceAboveReserve
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: relay:9464
+            exp_annotations:
+              summary: A space uses more than 50% of its security record reserve.
+              description: "1 spaces on relay:9464 use more than 50% of their security record reserve. When the reserve is full, the relay refuses security records, for example a device removal."
+
+  # SnailfishSpaceManyStubs: exactly 1 million does not fire. One more fires.
+  - interval: 1m
+    input_series:
+      - series: 'snailfish_space_stubs_max{instance="relay:9464"}'
+        values: "1000000 1000001"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: SnailfishSpaceManyStubs
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: SnailfishSpaceManyStubs
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: relay:9464
+            exp_annotations:
+              summary: A space holds more than 1 million stubs.
+              description: "The largest space on relay:9464 holds 1M stubs. Stubs make fetches and compaction slower. Ask the user to compact the space."
+
+  # SnailfishDiskFull: exactly 10% free does not fire. 9% free fires.
+  - interval: 1m
+    input_series:
+      - series: 'snailfish_data_size_bytes{instance="relay:9464"}'
+        values: "1000 1000"
+      - series: 'snailfish_data_free_bytes{instance="relay:9464"}'
+        values: "100 90"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: SnailfishDiskFull
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: SnailfishDiskFull
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: relay:9464
+            exp_annotations:
+              summary: The relay data disk has less than 10% free space.
+              description: "The data disk of relay:9464 has 9% free space. SQLite fails writes on a full disk. Add disk space or remove old backups."
+
+  # SnailfishStorageError: one error fires. A flat counter does not.
+  - interval: 1m
+    input_series:
+      - series: 'snailfish_storage_errors_total{instance="relay:9464"}'
+        values: "0x10 1x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SnailfishStorageError
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: SnailfishStorageError
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: relay:9464
+            exp_annotations:
+              summary: The relay storage layer reported an error.
+              description: "The relay on relay:9464 counted 1 storage errors in 15 minutes. Read the relay logs for the error class and the disk health."
+
+  # SnailfishMigrationFailed: one failure fires. A flat counter does not.
+  - interval: 1m
+    input_series:
+      - series: 'snailfish_migration_failures_total{instance="relay:9464"}'
+        values: "0x10 1x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SnailfishMigrationFailed
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: SnailfishMigrationFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: relay:9464
+            exp_annotations:
+              summary: A relay schema migration failed.
+              description: "The relay on relay:9464 counted 1 failed schema migrations in 15 minutes. The affected space stays unavailable. Read the relay logs and restore from a backup if necessary."

@@ -35,7 +35,8 @@ env:
 
 jobs:
   check:
-    # The gate for each commit: Rust lint, tests, licences, runner tests and the fast Quint tier.
+    # The gate for each commit: Rust lint, tests, licences, runner tests, the
+    # Prometheus rule tests (make test-rules) and the fast Quint tier.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
