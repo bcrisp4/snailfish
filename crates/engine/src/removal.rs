@@ -130,10 +130,21 @@ fn current_recovery_keys(db: &Connection) -> Result<Keys, EngineError> {
     }
 }
 
-/// The key of each epoch from 1 to the current epoch, for a grant or a
-/// recovery record that seals every epoch (`PROTOCOL.md` 10.6 step 13).
-pub(crate) fn all_keys(e: &Engine) -> Result<(Vec<u64>, Vec<[u8; 32]>), EngineError> {
-    let epochs: Vec<u64> = (1..=e.current_epoch()?).collect();
+/// The epochs of a grant or a recovery record at the verified head
+/// (`PROTOCOL.md` 14.5, [CMP-20]): the needed epochs, and epoch 1, because
+/// each engine opens the key of epoch 1 as its app key and checks it
+/// against the genesis record. In order.
+pub(crate) fn needed_epochs(e: &Engine) -> Result<Vec<u64>, EngineError> {
+    let current = e.current_epoch()?;
+    let mut need = crate::compact::compaction_state(&e.db)?.needed_epochs(current);
+    need.insert(1);
+    Ok(need.into_iter().collect())
+}
+
+/// The key of each needed epoch, for a grant or a recovery record
+/// (`PROTOCOL.md` 10.6 step 13, 14.5).
+pub(crate) fn sealed_keys(e: &Engine) -> Result<(Vec<u64>, Vec<[u8; 32]>), EngineError> {
+    let epochs = needed_epochs(e)?;
     let mut out = Vec::with_capacity(epochs.len());
     for ep in &epochs {
         out.push(
@@ -585,7 +596,7 @@ impl Engine {
             sign: next.sign.public(),
             seal: Box::new(keys::seal_public(&next.seal_seed)),
         };
-        let (epochs, k) = all_keys(self)?;
+        let (epochs, k) = sealed_keys(self)?;
         let set = seal(self, Author::Recovery(next.id), &new_keys, &epochs, &k)?;
         let proof = next.sign.sign_raw(&recovery::proof_message(
             &self.log_id,
@@ -696,7 +707,7 @@ impl Engine {
             ));
         }
         let keys_by_epoch = recovery_keys(&self.db, &self.log_id, r)?;
-        let epochs: Vec<u64> = (1..=view.epoch).collect();
+        let epochs = needed_epochs(self)?;
         let mut k = Vec::with_capacity(epochs.len());
         for ep in &epochs {
             k.push(*keys_by_epoch.get(ep).ok_or_else(|| {

@@ -308,6 +308,66 @@ final class RelayTests: XCTestCase {
         return s
     }
 
+    /// M8 across the two implementations (`specs/compaction/test.qnt`
+    /// `compactTest`, `newDeviceTest`, [CMP-2], [CMP-5], [CMP-16]): the
+    /// Python device writes a snapshot, and the Swift app checks it with its
+    /// own `canImport` and accepts it. After both accepts the relay makes
+    /// stubs. A second Swift device imports the Python snapshot through
+    /// `ResetRequired`. Then the Swift app writes a snapshot that the
+    /// Python device accepts, and it becomes the usable snapshot.
+    func testSnapshotAcrossImplementations() async throws {
+        let relay = try env("SNAILFISH_RELAY_URL")
+        let py = PythonDevice(base: try env("SNAILFISH_APPROVER"))
+        let s = try await pythonSpaceWithSwift(py, relay: relay)
+        try await s.edit(task: "s1", field: "title", value: .string("from swift"))
+        _ = try await s.sync(transport)
+        _ = try await py.call("POST", "sync")
+        let wrote = try await py.call("POST", "snapshot")
+        XCTAssertEqual(wrote, "ok")
+        // Push, check, push the accepts, fetch.
+        for _ in 0..<2 {
+            _ = try await py.call("POST", "sync")
+            let v = try await s.sync(transport)
+            XCTAssertEqual(v, .ok)
+        }
+        _ = try await py.call("POST", "sync")
+        let pyUsable = try await py.call("GET", "usable")
+        XCTAssertNotEqual(pyUsable, "", "the Python snapshot is accepted")
+        let swiftUsable = try await s.engine?.usableSnapshot()?.position
+        XCTAssertEqual(swiftUsable.map(String.init), pyUsable)
+
+        // A new Swift device starts before the frontier, so it imports the
+        // snapshot that Python wrote.
+        let s2 = try device("s2")
+        let payload = try await py.call("POST", "invite")
+        let joined = try await join(
+            device: s2, relayURL: relay, name: "S2", scanned: payload, transport: transport, ui: PythonCompareUI(py))
+        XCTAssertEqual(joined, "")
+        _ = try await py.call("GET", "invite/result")
+        let v2 = try await s2.sync(transport)
+        XCTAssertEqual(v2, .ok)
+        let want = try await s.tasks()
+        let got = try await s2.tasks()
+        XCTAssertEqual(got, want)
+        XCTAssertEqual(Set(got.map(\.id)), ["p1", "s1"])
+
+        // The Swift app writes a snapshot that Python and the second Swift
+        // device accept.
+        try await s.edit(task: "s2", field: "title", value: .string("after the snapshot"))
+        _ = try await s.sync(transport)
+        let swiftWrote = try await s.writeSnapshot()
+        XCTAssertTrue(swiftWrote)
+        for _ in 0..<2 {
+            _ = try await s.sync(transport)
+            _ = try await py.call("POST", "sync")
+            _ = try await s2.sync(transport)
+        }
+        _ = try await s.sync(transport)
+        _ = try await py.call("POST", "sync")
+        let newUsable = try await py.call("GET", "usable")
+        XCTAssertNotEqual(newUsable, pyUsable, "the Swift snapshot is the usable snapshot")
+    }
+
     /// T9 and S4 across the two implementations (PROTOCOL.md 13.2, 13.3):
     /// the Swift app replaces the recovery key and rotates the key. The
     /// Python device opens the key set that Swift sealed to it, and Swift

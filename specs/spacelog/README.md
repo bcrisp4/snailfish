@@ -148,7 +148,7 @@ The access vectors (`vectors/http.json` `access`) check the request side of a re
 - The possession proof of a recovery record. The model treats the new recovery key as fresh. `crates/protocol` checks the proof in the parser.
 - A full recovery that also replaces the recovery key in the same run. The two actions compose, and each has its own scenario.
 - Repair sessions, deletion and the restore hold (the delivery model has those).
-- Log compaction: snapshots, stubs and accept records.
+- Log compaction: snapshots, stubs and accept records. See [specs/compaction](../compaction/README.md).
 - Key secrecy as such. The model tracks which keys each record seals to which devices.
 - Hashes and the exact digest chain.
 - Liveness.

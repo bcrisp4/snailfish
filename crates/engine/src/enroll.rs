@@ -129,7 +129,7 @@ pub(crate) fn sign_grant(
     device: &Device,
     signer: &Signer<'_>,
 ) -> Result<String, EngineError> {
-    let (epochs, all) = crate::removal::all_keys(e)?;
+    let (epochs, all) = crate::removal::sealed_keys(e)?;
     let sealed = keys::seal_key_set(&device.keys.seal[..], &e.log_id, &device.id, &epochs, &all)
         .map_err(|err| EngineError::Invalid(format!("seal: {err}")))?;
     let set = KeySet {
@@ -277,7 +277,7 @@ impl Engine {
 
     /// The current recovery ID of the space, from the genesis record.
     fn recovery_id(&self) -> Result<Option<Hash32>, EngineError> {
-        let Some((_, g)) = state::log_range(&self.db, 1, 1)?.into_iter().next() else {
+        let Some(g) = state::envelope_at(&self.db, 1)? else {
             return Ok(None);
         };
         Ok(snailfish_protocol::space::genesis_recovery_of(&g).map(|(r, _)| r))

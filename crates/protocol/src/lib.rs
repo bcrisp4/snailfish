@@ -6,6 +6,7 @@
 //! models in `specs/` are the source of truth for its behaviour. `PROTOCOL.md`
 //! gives the exact bytes.
 
+pub mod compaction;
 pub mod encoding;
 pub mod enroll;
 pub mod envelope;

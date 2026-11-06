@@ -191,6 +191,52 @@ final class TaskStore {
         }
     }
 
+    /// The app state with its merge metadata, in the snapshot form of the
+    /// demo ([CMP-2], [MRG-4]): `{"v":1,"fields":[[task, field, value JSON,
+    /// wall, counter, device], ...]}`, sorted by task and field.
+    func exportState() throws -> Data {
+        let rows: [[Any]] = try db.query(
+            "SELECT task, field, value, wall, counter, device FROM fields ORDER BY task, field"
+        ).map { [$0.text(0), $0.text(1), $0.text(2), $0.int(3), $0.int(4), $0.text(5)] }
+        let body: [String: Any] = ["v": changeFormat, "fields": rows]
+        return try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
+    }
+
+    /// Check a snapshot state without a change to the app database ([CMP-2]).
+    static func canImport(_ state: Data) -> Bool {
+        (try? parseState(state)) != nil
+    }
+
+    private static func parseState(_ state: Data) throws -> [(TaskChange, String)] {
+        guard let d = try JSONSerialization.jsonObject(with: state) as? [String: Any],
+            d["v"] as? Int == changeFormat, let rows = d["fields"] as? [[Any]]
+        else { throw UnknownFormat() }
+        return try rows.map { r in
+            guard r.count == 6, let task = r[0] as? String, let field = r[1] as? String, fields.contains(field),
+                let value = r[2] as? String,
+                (try? JSONSerialization.jsonObject(with: Data(value.utf8), options: [.fragmentsAllowed])) != nil,
+                let wall = (r[3] as? NSNumber)?.int64Value, let counter = (r[4] as? NSNumber)?.int64Value,
+                let device = r[5] as? String
+            else { throw UnknownFormat() }
+            let c = TaskChange(
+                task: task, field: field, value: JSONValue(json: value),
+                stamp: Stamp(wall: wall, counter: counter, device: device))
+            return (c, value)
+        }
+    }
+
+    /// Replace the synced data with a snapshot state, inside the caller's
+    /// transaction ([CMP-2]).
+    func importState(_ state: Data) throws {
+        try db.exec("DELETE FROM fields;")
+        for (c, value) in try Self.parseState(state) {
+            try db.query(
+                "INSERT INTO fields (task, field, value, wall, counter, device) VALUES (?, ?, ?, ?, ?, ?)",
+                [.text(c.task), .text(c.field), .text(value), .int(c.stamp.wall), .int(c.stamp.counter), .text(c.stamp.device)])
+            try observe(c.stamp)
+        }
+    }
+
     func outboxRows() throws -> [OutboxRow] {
         try db.query("SELECT change_id, change_bytes FROM outbox ORDER BY seq").map {
             OutboxRow(changeId: $0.blob(0), changeBytes: $0.blob(1))

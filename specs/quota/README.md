@@ -36,7 +36,7 @@ The six witnesses are a thief at its daily limit, a removal after a flood, a quo
 
 ## Not covered
 
-- Log compaction. Stubs do not count against the quota, and compaction lowers the usage (S7). The model has only the operator quota raise. Compaction comes with M8.
+- Log compaction. Stubs do not count against the quota, and compaction lowers the usage (S7). [specs/compaction](../compaction/README.md) checks this and the snapshot reserve. This model has only the operator quota raise.
 - The day boundary of the daily limit. One run is one relay day.
 - The 16 MiB default. The thief config scales the reserve to the limit.
 - The space count limit ([QTA-5], `specs/coverage.toml`).

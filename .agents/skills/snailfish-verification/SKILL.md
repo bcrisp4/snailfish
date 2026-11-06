@@ -56,6 +56,9 @@ This skill holds the project rules. The quint-lang and quint-modeling skills hol
 | A `nondet x = S.oneOf()` with an empty `S` disables the action. | Put the guard `S != Set()` first, or pass the value as an action argument. |
 | `Map.set(k, v)` on a missing key is undefined. | Use `put`, or pre-populate the map in `init`. |
 | Ghost state (`env`) that a fault destroys must not count as "held". | Keep ghost sets for "stored", "exposed" and "reverted", and define invariants on them. |
+| A `step` with all `nondet` bindings before one `any` runs 1,000 to 70,000 times slower: when the chosen branch is disabled, the simulator searches the product of every nondet set (specs/compaction). | Bind each `nondet` inside its own branch, as `spacelog` does. |
+| A `val` inside a `def` is evaluated again at each use. | Compute a costly value once and pass it as an argument to a helper `def` or `action`. |
+| Apalache refuses `a.to(b)` with a bound that is not constant. | Filter a constant range: `1.to(MAX_LEN).filter(p => a <= p and p <= b)`. Use `foldl` in place of `slice`. |
 
 ## Rust verification pitfalls
 

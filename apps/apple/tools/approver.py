@@ -241,6 +241,11 @@ def main() -> None:
                 elif method == "POST" and u.path == "/py/sync":
                     status = py.device().sync(py.send)
                     body = "ok" if status.is_ok() else str(status)
+                elif method == "POST" and u.path == "/py/snapshot":
+                    body = "ok" if py.device().write_snapshot() else "no"
+                elif method == "GET" and u.path == "/py/usable":
+                    snap = py.device().engine.usable_snapshot()
+                    body = "" if snap is None else str(snap.position)
                 elif method == "GET" and u.path == "/py/tasks":
                     body = json.dumps(py.device().tasks())
                 elif method == "POST" and u.path == "/py/invite":

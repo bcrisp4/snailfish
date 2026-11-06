@@ -15,19 +15,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
+use snailfish_protocol::compaction::Compaction;
 use snailfish_protocol::encoding::{Hash32, decode_id, encode_id};
 use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::records::{self, Body};
 use snailfish_protocol::repair::{self as chain, ChainError, Item};
 use snailfish_protocol::request::{self, AUTHORITY_HEADER, RequestError, Target, Verified};
 use snailfish_protocol::space::{
-    Accepted, Effect, Levels, Mode, SpaceView, State, Verdict, check_append_at, check_genesis,
-    effect, genesis_level,
+    Accepted, Effect, Levels, Mode, SpaceView, Staged, State, Verdict, check_append_at,
+    check_genesis, effect, genesis_level,
 };
-use snailfish_protocol::wire::{self, AppendResult, Head, Limits, RepairItem};
+use snailfish_protocol::wire::{self, AppendResult, Head, Limits, OutEntry, RepairItem};
 
 use crate::store::{self, Kind, StoreError};
 
+pub mod compact;
 mod enroll;
 mod setup;
 pub mod user;
@@ -900,20 +902,25 @@ impl Relay {
         let items = wire::parse_append(&req.body, limits.max_append_envelopes)
             .map_err(|e| api(400, "bad_request", e.0))?;
         let max_change_bytes = usize::try_from(limits.max_change_bytes).unwrap_or(usize::MAX);
+        let max_snapshot_bytes = usize::try_from(limits.max_snapshot_bytes).unwrap_or(usize::MAX);
+        // [CMP-18]: snapshots and accept records can use the snapshot
+        // reserve above the quota.
+        let snapshot_limit =
+            quota.saturating_add(compact::snapshot_reserve(limits.max_snapshot_bytes));
         // [STO-11]: the checks and the appends of all envelopes share one
         // transaction in the space file.
         let tx = sc.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut results = Vec::with_capacity(items.len());
-        let mut used: u64 =
+        let used: u64 =
             from_i64(tx.query_row("SELECT bytes FROM usage WHERE id = 1", [], |r| r.get(0))?)?;
-        let mut security: u64 = from_i64(tx.query_row(
+        let security: u64 = from_i64(tx.query_row(
             "SELECT bytes FROM security_usage WHERE id = 1",
             [],
             |r| r.get(0),
         )?)?;
         let signer = request::keyid_text(&v.keyid, v.recovery);
         let day = to_i64(now / 86_400)?;
-        let mut today: u64 = from_i64(
+        let today: u64 = from_i64(
             tx.query_row(
                 "SELECT n FROM security_counts WHERE signer = ?1 AND day = ?2",
                 params![signer, day],
@@ -923,7 +930,14 @@ impl Relay {
             .unwrap_or(0),
         )?;
         let earlier = today;
-        let reserve = self.cfg.security_reserve;
+        let mut budget = Budget {
+            used,
+            security,
+            today,
+            quota,
+            snapshot_limit,
+            reserve: self.cfg.security_reserve,
+        };
         // The stored records go to the tables after the checks, so the
         // checks read the log as it was before the request, and the overlay
         // adds the records of the request once.
@@ -939,40 +953,18 @@ impl Relay {
                 let mode = Mode::Relay {
                     signer: v.keyid,
                     max_change_bytes,
+                    max_snapshot_bytes,
                     hold,
                 };
                 let verdict = check_append_at(&view, &raw.envelope, mode, &self.cfg.levels);
                 base.take_error()?;
                 let len = raw.json.len() as u64;
                 results.push(match verdict {
-                    // 10.6 step 14 ([STO-15]): the security record reserve.
-                    Verdict::Store(acc)
-                        if acc.record.is_security() && security.saturating_add(len) > reserve =>
-                    {
-                        AppendResult::Refused("reserve".into())
-                    }
-                    // 10.6 step 15 ([STO-15], T10): the daily limit of the
-                    // request keyid.
-                    Verdict::Store(acc)
-                        if acc.record.is_security() && today >= SECURITY_PER_DAY =>
-                    {
-                        AppendResult::Refused("security_limit".into())
-                    }
-                    // 10.6 step 16 ([QTA-1], [QTA-3]): only a change counts,
-                    // with the length of its envelope text as stored.
-                    Verdict::Store(acc)
-                        if acc.record.change_id().is_some() && used.saturating_add(len) > quota =>
-                    {
-                        AppendResult::Refused("quota".into())
+                    Verdict::Store(acc) if let Some(code) = budget.refusal(&acc.record, len) => {
+                        AppendResult::Refused(code.into())
                     }
                     Verdict::Store(acc) => {
-                        if acc.record.change_id().is_some() {
-                            used = used.saturating_add(len);
-                        }
-                        if acc.record.is_security() {
-                            security = security.saturating_add(len);
-                            today = today.saturating_add(1);
-                        }
+                        budget.take(&acc.record, len);
                         let position = acc.position;
                         view.apply(*acc);
                         stored.push((raw.envelope.payload_type, raw.json));
@@ -988,20 +980,29 @@ impl Relay {
         for (acc, (ptype, json)) in added.iter().zip(&stored) {
             insert_entry(&tx, acc, ptype, json)?;
         }
+        let Budget { used, today, .. } = budget;
         tx.execute(
             "UPDATE usage SET bytes = ?1 WHERE id = 1",
             params![to_i64(used)?],
         )?;
+        // [CMP-12]: only an accept record or a removal can make a snapshot
+        // accepted, so only they can make stubs.
+        let stubs = if added
+            .iter()
+            .any(|a| matches!(a.record.body, Body::Accept { .. } | Body::Epoch { .. }))
+        {
+            compact::compact(&tx)?
+        } else {
+            0
+        };
         if today != earlier {
-            tx.execute(
-                "INSERT INTO security_counts (signer, day, n) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (signer, day) DO UPDATE SET n = excluded.n",
-                params![signer, day, to_i64(today)?],
-            )?;
-            tx.execute("DELETE FROM security_counts WHERE day < ?1", params![day])?;
+            save_today(&tx, &signer, day, today)?;
         }
         let head = read_head(&tx)?;
         tx.commit()?;
+        if stubs != 0 {
+            compact::reclaim(&sc);
+        }
         Ok((200, wire::append_response(&results, &head)))
     }
 
@@ -1025,11 +1026,18 @@ impl Relay {
         let mut rows = Vec::new();
         {
             let mut st = tx.prepare(
-                "SELECT position, envelope FROM entries WHERE position > ?1 ORDER BY position LIMIT ?2",
+                "SELECT position, envelope, payload_type, change_id, record_hash FROM entries
+                 WHERE position > ?1 ORDER BY position LIMIT ?2",
             )?;
             let mut q = st.query(params![to_i64(after)?, to_i64(limit)?])?;
             while let Some(r) = q.next()? {
-                rows.push((from_i64(r.get(0)?)?, r.get::<_, String>(1)?));
+                let env: String = r.get(1)?;
+                let entry = if env.is_empty() {
+                    compact::stub_of(r.get(2)?, r.get(3)?, r.get(4)?)?
+                } else {
+                    OutEntry::Envelope(env)
+                };
+                rows.push((from_i64(r.get(0)?)?, entry));
             }
         }
         let last = rows.last().map_or(after, |(p, _)| *p);
@@ -1126,7 +1134,10 @@ impl Relay {
             keys.extend(load_staged_devices(&tx)?);
         }
         if let Some(c) = &chain {
-            keys.extend(c.accepted.iter().filter_map(|a| a.new_device));
+            keys.extend(c.accepted.iter().filter_map(|s| match s {
+                Staged::Full(a) => a.new_device,
+                Staged::Stub(_) => None,
+            }));
         }
         let removed = repair_removed(&tx, named.is_some(), chain.as_ref())?;
         let signers = Signers {
@@ -1139,6 +1150,7 @@ impl Relay {
         Self::claim_nonce(&tenant, &v, now)?;
         let live = |x: &Session| now < x.last.saturating_add(SESSION_SECONDS);
         let bad_repair = |why: &str| api(409, "bad_repair", why);
+        let mut stubs = 0;
         let out = match &body {
             RepairBody::Start(st) => {
                 if st.base != head {
@@ -1185,20 +1197,129 @@ impl Relay {
                         "the finish does not end a live session of this device",
                     ));
                 };
-                let staged_tip = staged_tip(&tx)?;
-                if staged_tip != Some(f.tip) {
-                    return Err(bad_repair("the tip is not the last staged entry"));
-                }
-                // Finish step 3 ([LOG-11]): M3 stages no stub, because the
-                // chain check refuses each one, so every staged range is
-                // covered.
-                move_staged(&tx, &x.id, f.tip.position, now)?;
-                (200, wire::repair_finished_body(&read_head(&tx)?))
+                let (reply, n) = finish_repair(&tx, &x.id, &f.tip, now)?;
+                stubs = n;
+                reply
             }
         };
         tx.commit()?;
+        if stubs != 0 {
+            compact::reclaim(&sc);
+        }
         Ok(out)
     }
+}
+
+/// Store the security record count of `signer` in the relay day `day`
+/// ([STO-15]) and drop the counts of earlier days.
+fn save_today(tx: &Connection, signer: &str, day: i64, today: u64) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO security_counts (signer, day, n) VALUES (?1, ?2, ?3)
+         ON CONFLICT (signer, day) DO UPDATE SET n = excluded.n",
+        params![signer, day, to_i64(today)?],
+    )?;
+    tx.execute("DELETE FROM security_counts WHERE day < ?1", params![day])?;
+    Ok(())
+}
+
+/// The space budget of one append request (`PROTOCOL.md` 10.6 steps 14
+/// to 16), with the records that earlier envelopes of the request stored.
+struct Budget {
+    used: u64,
+    security: u64,
+    today: u64,
+    quota: u64,
+    snapshot_limit: u64,
+    reserve: u64,
+}
+
+impl Budget {
+    /// The refusal of 10.6 steps 14 to 16 for a record with an envelope of
+    /// `len` bytes, or `None`.
+    fn refusal(&self, record: &records::Record, len: u64) -> Option<&'static str> {
+        let security = record.is_security();
+        // Step 14 ([STO-15]): the security record reserve.
+        if security && self.security.saturating_add(len) > self.reserve {
+            return Some("reserve");
+        }
+        // Step 15 ([STO-15], T10): the daily limit of the request keyid.
+        if security && self.today >= SECURITY_PER_DAY {
+            return Some("security_limit");
+        }
+        // Step 16 ([QTA-1], [QTA-3], [CMP-18]): changes, snapshots and accept
+        // records count, with the length of the envelope text as stored.
+        // Snapshots and accept records can use the snapshot reserve.
+        let limit = if record.change_id().is_some() {
+            self.quota
+        } else {
+            self.snapshot_limit
+        };
+        (counted(&record.body) && self.used.saturating_add(len) > limit).then_some("quota")
+    }
+
+    /// Count a stored record.
+    fn take(&mut self, record: &records::Record, len: u64) {
+        if counted(&record.body) {
+            self.used = self.used.saturating_add(len);
+        }
+        if record.is_security() {
+            self.security = self.security.saturating_add(len);
+            self.today = self.today.saturating_add(1);
+        }
+    }
+}
+
+/// True for the records that count against the space quota (10.6 step 16).
+fn counted(body: &Body) -> bool {
+    matches!(
+        body,
+        Body::Change { .. } | Body::Snapshot { .. } | Body::Accept { .. }
+    )
+}
+
+/// Finish steps 2 to 4 of 10.9 after the session check. Returns the reply
+/// and the number of new stubs.
+fn finish_repair(
+    tx: &Connection,
+    session: &[u8; 16],
+    tip: &Head,
+    now: u64,
+) -> ApiResult<((u16, Vec<u8>), u64)> {
+    if staged_tip(tx)?.as_ref() != Some(tip) {
+        return Err(api(
+            409,
+            "bad_repair",
+            "the tip is not the last staged entry",
+        ));
+    }
+    // Step 3 ([LOG-11], [CMP-17]): each staged stub passes the stub check of
+    // 14.3 against the log with the staged entries.
+    if !staged_stubs_valid(tx)? {
+        return Err(api(
+            422,
+            "uncovered_stub",
+            "no usable snapshot of the staged range covers a staged stub",
+        ));
+    }
+    move_staged(tx, session, tip.position, now)?;
+    let stubs = compact::compact(tx)?;
+    Ok(((200, wire::repair_finished_body(&read_head(tx)?)), stubs))
+}
+
+/// Finish step 3 of 10.9: each staged stub passes the stub check of 14.3
+/// against the log with the staged entries ([LOG-11]).
+fn staged_stubs_valid(tx: &Connection) -> Result<bool, StoreError> {
+    let c = compact::compaction_state(tx, true)?;
+    let mut st = tx.prepare("SELECT position, payload_type FROM staging WHERE envelope = ''")?;
+    let mut q = st.query([])?;
+    while let Some(r) = q.next()? {
+        let position = from_i64(r.get(0)?)?;
+        let ptype: String = r.get(1)?;
+        if !c.stub_valid(ptype == "snailfish.change.v1", position) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Parse `after=N&limit=M` (`PROTOCOL.md` 10.7): both required, in this
@@ -1369,7 +1490,7 @@ fn run_chain(view: &impl SpaceView, entries: &[(u64, RepairItem)]) -> chain::Cha
         .iter()
         .map(|(_, e)| match e {
             RepairItem::Envelope(r) => Item::Envelope(&r.envelope),
-            RepairItem::Stub(_) => Item::Stub,
+            RepairItem::Stub(s) => Item::Stub(s),
             RepairItem::Invalid(_) => Item::Invalid,
         })
         .collect();
@@ -1427,8 +1548,10 @@ fn repair_removed(
     } else {
         load_removed(tx)?
     };
-    for a in chain.map_or(&[][..], |c| &c.accepted[..]) {
-        if let Effect::Epoch { removed: r, .. } = effect(&a.record) {
+    for s in chain.map_or(&[][..], |c| &c.accepted[..]) {
+        if let Staged::Full(a) = s
+            && let Effect::Epoch { removed: r, .. } = effect(&a.record)
+        {
             removed.extend(r);
         }
     }
@@ -1527,11 +1650,15 @@ fn move_staged(tx: &Connection, session: &[u8; 16], tip: u64, now: u64) -> Resul
            AND payload_type NOT LIKE 'snailfish.accept.%') WHERE id = 1",
         [],
     )?;
-    // [QTA-1]: the moved changes count against the quota. The usage comes
-    // from the log, so it is right also after a storage fault.
+    // [QTA-1] [CMP-19]: the moved records count against the quota, and
+    // stubs do not. The usage comes from the log, so it is right also after
+    // a storage fault.
     tx.execute(
-        "UPDATE usage SET bytes = (SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))), 0)
-         FROM entries WHERE payload_type LIKE 'snailfish.change.%') WHERE id = 1",
+        &format!(
+            "UPDATE usage SET bytes = (SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))), 0)
+             FROM entries WHERE {}) WHERE id = 1",
+            compact::COUNTED
+        ),
         [],
     )?;
     tx.execute("DELETE FROM staging", [])?;
@@ -1543,35 +1670,56 @@ fn move_staged(tx: &Connection, session: &[u8; 16], tip: u64, now: u64) -> Resul
     Ok(())
 }
 
-/// Stage the accepted entries ([LOG-11]). Returns the next position.
+/// Stage the accepted entries ([LOG-11]). A stub gets an empty envelope.
+/// Returns the next position.
 fn stage(
     c: &Connection,
-    accepted: &[Accepted],
+    accepted: &[Staged],
     entries: &[(u64, RepairItem)],
 ) -> Result<u64, StoreError> {
     let mut next = 0;
-    for (a, (_, item)) in accepted.iter().zip(entries) {
-        let RepairItem::Envelope(raw) = item else {
-            return Err(StoreError::Corrupt(
-                "a passed repair entry is not an envelope",
-            ));
+    for (s, (_, item)) in accepted.iter().zip(entries) {
+        let row = match (s, item) {
+            (Staged::Full(a), RepairItem::Envelope(raw)) => (
+                a.position,
+                raw.envelope.payload_type.clone(),
+                a.record.change_id().copied(),
+                a.record_hash,
+                a.digest,
+                raw.json.clone(),
+                a.new_device,
+            ),
+            (Staged::Stub(st), RepairItem::Stub(_)) => (
+                st.position,
+                st.payload_type.clone(),
+                st.change_id,
+                st.record_hash,
+                st.digest,
+                String::new(),
+                None,
+            ),
+            _ => {
+                return Err(StoreError::Corrupt(
+                    "a passed repair entry differs from its request entry",
+                ));
+            }
         };
+        let (position, ptype, cid, rh, digest, json, dev) = row;
         c.execute(
             "INSERT INTO staging (position, payload_type, change_id, record_hash, digest, envelope, device_id, sign_key)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                to_i64(a.position)?,
-                raw.envelope.payload_type,
-                a.record.change_id().map(<[u8; 16]>::as_slice),
-                a.record_hash.as_slice(),
-                a.digest.as_slice(),
-                raw.json,
-                a.new_device.map(|d| d.0.to_vec()),
-                a.new_device.map(|d| d.1.to_vec()),
+                to_i64(position)?,
+                ptype,
+                cid.as_ref().map(<[u8; 16]>::as_slice),
+                rh.as_slice(),
+                digest.as_slice(),
+                json,
+                dev.map(|d| d.0.to_vec()),
+                dev.map(|d| d.1.to_vec()),
             ],
         )?;
-        next = a
-            .position
+        next = position
             .checked_add(1)
             .ok_or(StoreError::Corrupt("position overflow"))?;
     }
@@ -1741,11 +1889,8 @@ pub(crate) fn security_state(c: &Connection, staged: bool) -> Result<State, Stor
     };
     for t in tables {
         let mut st = c.prepare(&format!(
-            "SELECT envelope FROM {t}
-             WHERE payload_type NOT LIKE 'snailfish.change.%'
-               AND payload_type NOT LIKE 'snailfish.snapshot.%'
-               AND payload_type NOT LIKE 'snailfish.accept.%'
-             ORDER BY position"
+            "SELECT envelope FROM {t} WHERE {} ORDER BY position",
+            records::security_sql()
         ))?;
         let mut q = st.query([])?;
         while let Some(r) = q.next()? {
@@ -1769,6 +1914,9 @@ struct SqlView<'a> {
     // author key, the epoch and the write level, which the tables give, so
     // a change append replays no security record.
     state: std::cell::OnceCell<State>,
+    // The compaction state, built on first use: only a grant or a
+    // recovery record needs it (10.6 step 13).
+    compaction: std::cell::OnceCell<Compaction>,
     // Read the staging table after the log: the chain of a repair chunk
     // continues the staged entries (`PROTOCOL.md` 10.9).
     staged: bool,
@@ -1781,6 +1929,7 @@ impl<'a> SqlView<'a> {
             conn,
             log_id,
             state: std::cell::OnceCell::new(),
+            compaction: std::cell::OnceCell::new(),
             staged,
             error: RefCell::new(None),
         }
@@ -1960,15 +2109,33 @@ impl SpaceView for SqlView<'_> {
         .unwrap_or(0)
     }
 
+    fn snapshot_hash(&self, position: u64) -> Option<Hash32> {
+        self.query(to_i64(position).and_then(|p| {
+            let h: Option<Vec<u8>> = self.first(
+                "SELECT record_hash FROM {t} WHERE position = ?1 AND payload_type = 'snailfish.snapshot.v1'",
+                params![p],
+                |r| r.get(0),
+            )?;
+            Ok(h.and_then(|h| Hash32::try_from(h).ok()))
+        }))
+    }
+
+    fn compaction(&self) -> Compaction {
+        self.compaction
+            .get_or_init(|| {
+                self.query(compact::compaction_state(self.conn, self.staged).map(Some))
+                    .unwrap_or_default()
+            })
+            .clone()
+    }
+
     fn last_security(&self) -> u64 {
         // On a read error the request fails through `take_error`.
         self.query(
-            self.max(
-                "SELECT COALESCE(MAX(position), 0) FROM {t}
-                 WHERE payload_type NOT LIKE 'snailfish.change.%'
-                   AND payload_type NOT LIKE 'snailfish.snapshot.%'
-                   AND payload_type NOT LIKE 'snailfish.accept.%'",
-            )
+            self.max(&format!(
+                "SELECT COALESCE(MAX(position), 0) FROM {{t}} WHERE {}",
+                records::security_sql()
+            ))
             .map(Some),
         )
         .unwrap_or(u64::MAX)

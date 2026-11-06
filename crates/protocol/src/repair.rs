@@ -8,8 +8,10 @@
 //! make active ([LOG-12]), so it needs the passed prefix also when an entry
 //! fails.
 
+use crate::encoding::decode_id;
 use crate::envelope::Envelope;
-use crate::space::{Accepted, Mode, Overlay, Refusal, SpaceView, Verdict, check_append};
+use crate::space::{Mode, Overlay, Refusal, SpaceView, Staged, StubEntry, Verdict, check_append};
+use crate::wire::Stub;
 
 /// One entry of a repair request.
 #[derive(Debug, Clone, Copy)]
@@ -17,7 +19,7 @@ pub enum Item<'a> {
     /// A full envelope.
     Envelope(&'a Envelope),
     /// A stub (`PROTOCOL.md` 10.7).
-    Stub,
+    Stub(&'a Stub),
     /// An envelope that breaks section 4.
     Invalid,
 }
@@ -29,8 +31,8 @@ pub enum ChainError {
     Position,
     /// The envelope fails a check of 10.6: `invalid_record`.
     Invalid(Refusal),
-    /// A stub that no usable snapshot covers: `uncovered_stub` ([LOG-11]).
-    /// M3 has no snapshot, so every stub fails.
+    /// A stub of a type that compaction never makes: `uncovered_stub`
+    /// ([LOG-11]). The finish checks the other stubs (`PROTOCOL.md` 14.3).
     Stub,
 }
 
@@ -50,7 +52,7 @@ impl ChainError {
 #[derive(Debug)]
 pub struct Chain {
     /// The entries that passed, in position order.
-    pub accepted: Vec<Accepted>,
+    pub accepted: Vec<Staged>,
     /// The index and cause of the first failed entry.
     pub failure: Option<(usize, ChainError)>,
 }
@@ -81,10 +83,16 @@ pub fn check_chain(view: &impl SpaceView, positions: &[u64], items: &[Item<'_>])
         }
         let env = match item {
             Item::Envelope(e) => *e,
-            Item::Stub => {
-                failure = Some((i, ChainError::Stub));
-                break;
-            }
+            Item::Stub(s) => match stub_entry(&over, *pos, s) {
+                Ok(st) => {
+                    over.apply_stub(st);
+                    continue;
+                }
+                Err(e) => {
+                    failure = Some((i, e));
+                    break;
+                }
+            },
             Item::Invalid => {
                 failure = Some((
                     i,
@@ -108,9 +116,44 @@ pub fn check_chain(view: &impl SpaceView, positions: &[u64], items: &[Item<'_>])
         }
     }
     Chain {
-        accepted: over.into_added(),
+        accepted: over.into_staged(),
         failure,
     }
+}
+
+/// The stub at `position` after the head of `view` (10.9 start step 3): a
+/// change stub with a new change ID, or a snapshot stub with no change ID.
+///
+/// # Errors
+///
+/// [`ChainError::Stub`] for another type, [`ChainError::Invalid`] for a bad
+/// or known change ID.
+pub fn stub_entry(view: &impl SpaceView, position: u64, s: &Stub) -> Result<StubEntry, ChainError> {
+    let bad = |why: &str| ChainError::Invalid(Refusal::InvalidRecord(why.into()));
+    let change_id = match (s.payload_type.as_str(), &s.change_id) {
+        ("snailfish.change.v1", Some(text)) => {
+            let cid = decode_id::<16>(text, "c_").map_err(|_| bad("stub: bad change_id"))?;
+            if view.change(&cid).is_some() {
+                return Err(ChainError::Invalid(Refusal::DuplicateChange));
+            }
+            Some(cid)
+        }
+        ("snailfish.snapshot.v1", None) => None,
+        ("snailfish.change.v1" | "snailfish.snapshot.v1", _) => {
+            return Err(bad("stub: change_id only on a change stub"));
+        }
+        _ => return Err(ChainError::Stub),
+    };
+    let prev = view
+        .digest_at(view.head())
+        .ok_or_else(|| bad("stub: no digest before it"))?;
+    Ok(StubEntry::new(
+        position,
+        &s.payload_type,
+        change_id,
+        s.hash,
+        &prev,
+    ))
 }
 
 #[cfg(test)]

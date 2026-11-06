@@ -155,7 +155,36 @@ actor SyncDevice {
         try pull(background: background)
         try flushOutboxNow()
         flushError = nil
+        try checkSnapshots()
+        if try engine.snapshotDue() {
+            try writeSnapshot()
+        }
         return try engine.status()
+    }
+
+    /// Check each new snapshot with `canImport`, and accept it ([CMP-5]).
+    func checkSnapshots() throws {
+        guard let engine else { return }
+        for snap in try engine.uncheckedSnapshots() {
+            try engine.acceptSnapshot(position: snap.position, ok: TaskStore.canImport(snap.stateBytes))
+        }
+    }
+
+    /// Write a snapshot of the state at the applied position, only with an
+    /// empty app outbox ([CMP-3]). Returns true if it wrote one.
+    @discardableResult
+    func writeSnapshot() throws -> Bool {
+        guard let engine else { return false }
+        var taken: (Applied, Data)?
+        try store.db.transaction {
+            guard try store.db.query("SELECT 1 FROM outbox LIMIT 1").isEmpty,
+                let at = try store.applied(), at.position > 0
+            else { return }
+            taken = (at, try store.exportState())
+        }
+        guard let (at, state) = taken else { return false }
+        // False for a state over the relay limit: the engine reports `degraded`.
+        return try engine.writeSnapshot(applied: at, state: state)
     }
 
     /// Apply the changes after the applied position ([DLV-10], [DLV-11]).
@@ -205,13 +234,27 @@ actor SyncDevice {
         }
     }
 
-    /// `ResetRequired`: delete the synced data, apply each outbox row again,
-    /// and pull from the start ([DLV-12]). M6 has no snapshot.
+    /// `ResetRequired` (DESIGN.md "Log compaction", [DLV-12]): delete the
+    /// synced data and import the usable snapshot, if any. Then apply each
+    /// outbox row again, unless the snapshot already holds its edit
+    /// ([CMP-14]). The next pull starts after the state position.
     private func reset() throws {
+        guard let engine else { return }
+        let snap = try engine.usableSnapshot()
         try store.db.transaction {
             try store.db.exec("DELETE FROM fields; DELETE FROM applied;")
+            if let snap {
+                try store.importState(snap.stateBytes)
+                try store.db.query(
+                    "INSERT INTO applied (id, position, digest) VALUES (1, ?, ?)",
+                    [.int(Int64(snap.statePosition)), .blob(snap.stateDigest)])
+            }
             for r in try store.outboxRows() {
-                try store.merge(try TaskChange.decode(r.changeBytes))
+                if try engine.isCovered(changeId: r.changeId) {
+                    try store.db.query("DELETE FROM outbox WHERE change_id = ?", [.blob(r.changeId)])
+                } else {
+                    try store.merge(try TaskChange.decode(r.changeBytes))
+                }
             }
         }
     }

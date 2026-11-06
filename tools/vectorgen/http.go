@@ -137,6 +137,7 @@ type httpJ struct {
 	Recovery      []httpDeviceJ   `json:"recovery"`
 	Access        []accessJ       `json:"access"`
 	AppendReserve []reserveJ      `json:"append_reserve"`
+	Compaction    []cmpCaseJ      `json:"compaction"`
 }
 
 type statusRespJ struct {
@@ -201,8 +202,9 @@ func httpTenant() string { return "t_" + hx(testSeed("tenant", "handle")[:16]) }
 // http entry 1 is genesis (protocol entry 1), 3 is the grant to B (protocol
 // entry 2), 100 is a grant to C (protocol entry 8), 101 is an epoch 2 record
 // with key sets to A, B and R1 (protocol entry 9).
-// The M7 cases (entries from 200) take a stored sealed value of the same
-// length: protocol entry 8 for one epoch, entry 11 for two. Their HPKE info
+// The M7 and compaction cases (entries from 200) take a stored sealed value
+// of the same length: protocol entry 8 for one epoch, entry 11 for two, and
+// entry 11 with 32 zero bytes after it for three. Their HPKE info
 // differs, so these key sets do not open. The relay never opens a key set,
 // and protocol.json checks the key sets that a device opens.
 func httpSealer(p *protocolJ) sealer {
@@ -218,6 +220,9 @@ func httpSealer(p *protocolJ) sealer {
 				return storedSealed(p, 8, 0)
 			case 64:
 				return storedSealed(p, 11, 0)
+			case 96:
+				s, err := storedSealed(p, 11, 0)
+				return append(s, make([]byte, 32)...), err
 			}
 		}
 		return nil, fmt.Errorf("no stored key set for http entry %d", entry)
@@ -767,6 +772,9 @@ func buildHTTP(w *world, seal sealer) (*httpJ, error) {
 	if err := buildReserve(h, b, w, sp, mustChange); err != nil {
 		return nil, err
 	}
+	if err := buildCompaction(h, b, w, sp, envs, mustChange); err != nil {
+		return nil, fmt.Errorf("compaction: %w", err)
+	}
 
 	if err := buildSetup(h, b, w); err != nil {
 		return nil, err
@@ -860,9 +868,13 @@ func buildRepair(h *httpJ, b *logBuilder, w *world, envs []string, keys map[stri
 		{"known-change-id-in-entries", 2, false, []st{
 			{"start", A, now, start(2, d[2], ent(3), ent(4), at(5, b.entries[3].Envelope)), "422 invalid_record"},
 		}, 2},
+		// [LOG-11]: a change stub passes the chain check. The finish refuses it,
+		// because no usable snapshot covers it. A grant stub fails at once.
 		{"stub", 1, false, []st{
-			{"start", A, now, start(1, d[1], stubChange), "422 uncovered_stub"},
 			{"start", A, now, start(1, d[1], ent(2), stubGrant), "422 uncovered_stub"},
+			{"start", A, now, start(1, d[1], stubChange), "201 next 3"},
+			{"chunk", A, now + 10, chunk(ent(3), ent(4)), "200 next 5"},
+			{"finish", A, now + 20, finish(4, d[4]), "422 uncovered_stub"},
 		}, 1},
 		{"wrong-tip", 1, false, []st{
 			{"start", A, now, start(1, d[1], ent(2), ent(3), ent(4)), "201 next 5"},

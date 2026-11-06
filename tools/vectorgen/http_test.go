@@ -198,6 +198,20 @@ func TestHTTPVectorsDetectRelayFaults(t *testing.T) {
 		{"no-block", "access blocked-device"},
 		{"removed-as-unknown", "access removed-device"},
 		{"recovery-any-route", "access recovery-id-status"},
+		{"cmp-no-repair-stubs", "repair stub"},
+		{"cmp-no-cover-check", "repair stub"},
+		{"cmp-no-stubs", "compaction compact"},
+		{"cmp-stub-security", "compaction compact"},
+		{"cmp-quota-changes-only", "compaction compact"},
+		{"cmp-any-applied", "compaction blocked-then-counted"},
+		{"cmp-count-now", "compaction grant-after-accept"},
+		{"cmp-no-snapshot-limit", "compaction snapshot-and-accept-checks"},
+		{"cmp-any-snapshot", "compaction snapshot-and-accept-checks"},
+		{"cmp-any-accept", "compaction snapshot-and-accept-checks"},
+		{"cmp-seal-current", "compaction removal-ends-block"},
+		{"cmp-keep-ties", "compaction removal-ends-block"},
+		{"cmp-stub-accept", "compaction removal-ends-block"},
+		{"cmp-no-reserve", "compaction reserve"},
 	} {
 		err := checkHTTPWith(h, w, tc.mut)
 		if err == nil {

@@ -133,7 +133,9 @@ def relay(tmp_path: Path) -> Iterator[Relay]:
     r.stop()
 
 
-def demo(device: Path, *args: str, crash_at: int | None = None) -> subprocess.CompletedProcess[str]:
+def demo(
+    device: Path, *args: str, crash_at: int | None = None, timeout: float = 60
+) -> subprocess.CompletedProcess[str]:
     """Run the demo CLI for one device as a child process."""
     env = dict(os.environ)
     env.pop("SNAILFISH_DEMO_CRASH_AT", None)
@@ -148,7 +150,7 @@ def demo(device: Path, *args: str, crash_at: int | None = None) -> subprocess.Co
         capture_output=True,
         text=True,
         check=False,
-        timeout=60,
+        timeout=timeout,
     )
 
 
@@ -272,7 +274,7 @@ def dump(device: Path) -> dict[str, Any]:
     return json.loads(r.stdout)
 
 
-def sync_ok(device: Path) -> None:
+def sync_ok(device: Path, timeout: float = 60) -> None:
     """Sync one device and require `ok`."""
-    r = demo(device, "sync")
+    r = demo(device, "sync", timeout=timeout)
     assert r.returncode == 0, r.stdout + r.stderr

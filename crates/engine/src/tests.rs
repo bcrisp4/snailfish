@@ -479,15 +479,17 @@ fn newer_schema_is_refused_and_not_changed() {
     drop(w.engine(&a));
     {
         let db = Connection::open(a.dir.join(STATE_FILE)).unwrap();
-        db.pragma_update(None, "user_version", 7).unwrap();
+        db.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
     }
     let before = std::fs::read(a.dir.join(STATE_FILE)).unwrap();
     let err = Engine::open(&a.dir, w.space(), &w.keys[0]).err().unwrap();
-    assert_eq!(err, EngineError::SchemaTooNew { found: 7 });
+    let newer = SCHEMA_VERSION + 1;
+    assert_eq!(err, EngineError::SchemaTooNew { found: newer });
     assert_eq!(
         err.to_string(),
         format!(
-            "the engine state file has schema version 7, and this engine knows {SCHEMA_VERSION}"
+            "the engine state file has schema version {newer}, and this engine knows {SCHEMA_VERSION}"
         )
     );
     assert_eq!(std::fs::read(a.dir.join(STATE_FILE)).unwrap(), before);
@@ -1460,7 +1462,7 @@ fn fetched_duplicate_change_id_stops() {
         &snailfish_protocol::hash::entry_hash("snailfish.change.v1", Some(&cid), &rh),
     );
     let body = snailfish_protocol::wire::fetch_response(
-        &[(head.position + 1, env)],
+        &[(head.position + 1, env.into())],
         &snailfish_protocol::wire::Head {
             position: head.position + 1,
             digest,
@@ -2103,9 +2105,13 @@ fn relay_with_another_genesis_record_stops() {
     .unwrap();
     let req = s.next_request(&mut ea).unwrap().unwrap();
     assert!(req.url.contains("/entries?after=0&"));
-    let page =
-        snailfish_protocol::wire::fetch_response(&[(1, genesis.clone())], &head, false, false)
-            .unwrap();
+    let page = snailfish_protocol::wire::fetch_response(
+        &[(1, genesis.clone().into())],
+        &head,
+        false,
+        false,
+    )
+    .unwrap();
     s.handle_response(&mut ea, 200, &[], &page).unwrap();
     assert!(
         matches!(ea.status(), Status::Fork { ref cause } if cause.contains("genesis")),
@@ -2293,7 +2299,7 @@ fn chunk_sizes(entries: &[(u64, String)], limits: &snailfish_protocol::wire::Lim
         position: 9,
         digest: [7; 32],
     };
-    crate::sync::repair_chunks(entries.to_vec(), &base, limits)
+    crate::sync::repair_chunks(out_entries(entries), &base, limits)
         .iter()
         .map(Vec::len)
         .collect()
@@ -2319,20 +2325,22 @@ fn repair_chunks_fit_the_limits_exactly() {
     l.max_append_envelopes = 5;
     assert_eq!(chunk_sizes(&entries, &l), [5]);
     // The start body of exactly two entries fits; one byte less does not.
-    let two = wire::repair_start_body(&base, &entries[..2]).unwrap().len();
+    let two = wire::repair_start_body(&base, &out_entries(&entries[..2]))
+        .unwrap()
+        .len();
     l.max_request_bytes = two as u64;
     let got = chunk_sizes(&entries, &l);
     assert_eq!(got[0], 2);
     l.max_request_bytes = two as u64 - 1;
     assert_eq!(chunk_sizes(&entries, &l)[0], 1);
     // Later chunks are chunk bodies: exactly two entries fit.
-    let chunk_two = wire::repair_chunk_body(&[0; 16], &entries[2..4])
+    let chunk_two = wire::repair_chunk_body(&[0; 16], &out_entries(&entries[2..4]))
         .unwrap()
         .len();
     l.max_request_bytes = chunk_two.max(two) as u64;
     let sizes = chunk_sizes(&entries, &l);
     assert_eq!(sizes.iter().sum::<usize>(), 5);
-    for (i, c) in crate::sync::repair_chunks(entries.clone(), &base, &l)
+    for (i, c) in crate::sync::repair_chunks(out_entries(&entries), &base, &l)
         .iter()
         .enumerate()
     {
@@ -2493,7 +2501,26 @@ fn fetch_all(w: &World) -> Vec<(u64, String)> {
             .unwrap();
     }
     let head = e.verified_head().unwrap().position;
-    state::log_range(&e.db, 1, head).unwrap()
+    envelopes(state::log_range(&e.db, 1, head).unwrap())
+}
+
+/// The envelope entries of a log range. A test log of these helpers has no
+/// stub.
+fn envelopes(range: Vec<(u64, snailfish_protocol::wire::OutEntry)>) -> Vec<(u64, String)> {
+    range
+        .into_iter()
+        .map(|(p, e)| match e {
+            snailfish_protocol::wire::OutEntry::Envelope(json) => (p, json),
+            snailfish_protocol::wire::OutEntry::Stub(_) => panic!("a stub at {p}"),
+        })
+        .collect()
+}
+
+fn out_entries(entries: &[(u64, String)]) -> Vec<(u64, snailfish_protocol::wire::OutEntry)> {
+    entries
+        .iter()
+        .map(|(p, e)| (*p, e.clone().into()))
+        .collect()
 }
 
 /// [ENR-1] to [ENR-9], `specs/spacelog/test.qnt::grantWithCheckpointTest`:
@@ -2627,9 +2654,13 @@ fn expired_session_and_active_device_fail() {
     let mut te = TrustedEnrollment::new(&ea, None, None).unwrap();
     w.open(&mut ea, &mut te);
     let mut ne = NewEnrollment::new(URL, &w.keys[1], "B", te.payload()).unwrap();
-    RELAY_TIME.fetch_add(600, Ordering::SeqCst);
+    // The relay of this world runs 600 seconds later. The shared relay
+    // time stays, because other tests read it at the same time.
+    let mut later = relay_config(&w.root);
+    later.clock = Arc::new(|| RELAY_TIME.load(Ordering::SeqCst) + 600);
+    w.relay = Relay::open(later).unwrap();
     w.drive(&mut ea, &mut te, &mut ne, (true, true));
-    RELAY_TIME.fetch_sub(600, Ordering::SeqCst);
+    w.relay = Relay::open(relay_config(&w.root)).unwrap();
     for s in [te.state(), ne.state()] {
         assert!(
             matches!(s, EnrollState::Failed { ref cause } if cause.contains("expired")),
@@ -3531,7 +3562,7 @@ fn removal_rotates_the_key_and_stops_the_removed_device() {
 fn serve_next(w: &World, e: &mut Engine, env: String) -> Status {
     let next = e.verified_head().unwrap().position.checked_add(1).unwrap();
     let body = snailfish_protocol::wire::fetch_response(
-        &[(next, env)],
+        &[(next, env.into())],
         &snailfish_protocol::wire::Head {
             position: next,
             digest: [0; 32],
@@ -3872,8 +3903,7 @@ fn full_recovery_grants_a_new_device_that_removes_the_old_ones() {
     w.exchange(&mut en);
     // fetch_all signs as A, which the relay now refuses: read the log of N.
     let head = en.verified_head().unwrap().position;
-    let epochs: Vec<u64> = state::log_range(&en.db, 1, head)
-        .unwrap()
+    let epochs: Vec<u64> = envelopes(state::log_range(&en.db, 1, head).unwrap())
         .into_iter()
         .filter_map(|(_, json)| {
             let env = snailfish_protocol::envelope::Envelope::parse(json.as_bytes()).unwrap();
@@ -4276,3 +4306,5 @@ fn rotation_signs_after_a_new_device_joins() {
     assert_eq!(ea.status(), Status::Ok);
     w.recovery_key = new;
 }
+
+mod compaction;

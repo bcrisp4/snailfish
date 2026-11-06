@@ -57,6 +57,9 @@ type space struct {
 	reserve    int64             // the security record reserve in bytes (10.6 step 14)
 	secUsed    int64             // stored security record bytes (10.6 step 14)
 	secCount   map[string]int    // security records that each request keyid sent in the relay day (10.6 step 15)
+	cmp        []cmpInfo         // section 14 data of each entry
+	changeAt   map[int]string    // position to the change ID text of each change
+	envs       []string          // the stored envelope of each entry, "" for a stub
 	// mut names a deliberate fault. Only the tests of http_test.go set it, to
 	// show that the vectors detect the fault. The generator keeps it "".
 	mut string
@@ -95,6 +98,9 @@ func (sp *space) clone() *space {
 	c.retired = copyMap(sp.retired)
 	c.devLevel = copyMap(sp.devLevel)
 	c.secCount = copyMap(sp.secCount)
+	c.cmp = append([]cmpInfo{}, sp.cmp...)
+	c.changeAt = copyMap(sp.changeAt)
+	c.envs = append([]string{}, sp.envs...)
 	if sp.sess != nil {
 		ss := *sp.sess
 		ss.staged = append([]*record{}, sp.sess.staged...)
@@ -125,6 +131,8 @@ type record struct {
 	m            map[string]any
 	rh           []byte
 	envLen       int64 // byte length of the envelope JSON text as the request holds it
+	stub         bool  // a repair entry that is a stub: only ptype, rh and the change ID
+	raw          string
 }
 
 func parseRecord(env string) (*record, error) {
@@ -137,7 +145,7 @@ func parseRecord(env string) (*record, error) {
 	}
 	v, _ := parseStrict(pe.payload)
 	m := v.(map[string]any)
-	return &record{pe.ptype, pe.payload, pe.sig, m, recordHash(pe.ptype, pe.payload, pe.sig), int64(len(env))}, nil
+	return &record{pe.ptype, pe.payload, pe.sig, m, recordHash(pe.ptype, pe.payload, pe.sig), int64(len(env)), false, env}, nil
 }
 
 func (r *record) str(k string) string { x, _ := r.m[k].(string); return x }
@@ -170,12 +178,20 @@ func (sp *space) push(r *record) int {
 	if id := r.changeID(); id != "" {
 		cid, _ = decodeID(id, "c_", 16)
 		sp.changes[id] = chgRef{hx(r.rh), n}
+		sp.changeAt[n] = id
 	}
-	if r.ptype == "snailfish.change.v1" && (sp.mut != "quota-ignores-request" || !sp.inRequest) {
+	countAll := sp.mut != "cmp-quota-changes-only" || r.ptype == "snailfish.change.v1"
+	if !r.stub && countsBytes(r.ptype) && countAll && (sp.mut != "quota-ignores-request" || !sp.inRequest) {
 		sp.used += r.envLen
 	}
 	eh := entryHash(r.ptype, cid, r.rh)
 	sp.entries = append(sp.entries, spEntry{r.rh, digestN(sp.digestAt(n-1), n, eh)})
+	sp.envs = append(sp.envs, r.raw)
+	if r.stub {
+		sp.cmp = append(sp.cmp, sp.cmpOf(r))
+		return n
+	}
+	defer func() { sp.cmp = append(sp.cmp, sp.cmpOf(r)) }()
 	if isSecurity(r.ptype) {
 		sp.lastSec = n
 		sp.secUsed += r.envLen
@@ -279,7 +295,7 @@ func newSpaceFromEnvelopes(logText string, envs []string) (*space, error) {
 	}
 	sp := &space{logText: logText, logID: logID, active: map[string]ed25519.PublicKey{}, recovery: map[string]ed25519.PublicKey{},
 		changes: map[string]chgRef{}, reports: map[string]report{}, removed: map[string]bool{}, retired: map[string]bool{},
-		devLevel: map[string]int64{}, maxLevel: 1, reserve: defaultReserve, secCount: map[string]int{}}
+		devLevel: map[string]int64{}, maxLevel: 1, reserve: defaultReserve, secCount: map[string]int{}, changeAt: map[int]string{}}
 	for i, env := range envs {
 		n := i + 1
 		r, err := parseRecord(env)
@@ -336,6 +352,7 @@ func (sp *space) appendBatch(keyid, body string, lim limitsJ) ([]result, error) 
 	for _, raw := range req.Envelopes {
 		out = append(out, sp.appendOne(keyid, string(raw), lim))
 	}
+	sp.compact()
 	return out, nil
 }
 
@@ -368,6 +385,9 @@ func (sp *space) appendOne(keyid, env string, lim limitsJ) result {
 	if r.ptype == "snailfish.change.v1" && len(r.payload) > lim.MaxChangeBytes {
 		return refuse("too_large")
 	}
+	if r.ptype == "snailfish.snapshot.v1" && len(r.payload) > lim.MaxSnapshotBytes && sp.mut != "cmp-no-snapshot-limit" {
+		return refuse("too_large")
+	}
 	// 5 to 13
 	if code := sp.checkRules(r, keyid); code != "" {
 		return refuse(code)
@@ -385,12 +405,22 @@ func (sp *space) appendOne(keyid, env string, lim limitsJ) result {
 	if (r.ptype == "snailfish.change.v1" || sp.mut == "quota-checks-security") && sp.quota > 0 && sp.used+r.envLen > sp.quota && sp.mut != "no-quota" {
 		return refuse("quota")
 	}
+	limit := sp.quota + snapshotReserve(lim)
+	if sp.mut == "cmp-no-reserve" {
+		limit = sp.quota
+	}
+	if (r.ptype == "snailfish.snapshot.v1" || r.ptype == "snailfish.accept.v1") && sp.quota > 0 && sp.used+r.envLen > limit {
+		return refuse("quota")
+	}
 	// 17
 	if sec {
 		sp.secCount[keyid]++
 	}
 	return result{status: "stored", pos: sp.push(r)}
 }
+
+// snapshotReserve is the snapshot reserve of PROTOCOL.md 14.6.
+func snapshotReserve(lim limitsJ) int64 { return 2 * (int64(lim.MaxSnapshotBytes) + 65536) }
 
 // defaultReserve is the security record reserve of PROTOCOL.md 10.6 step 14.
 const defaultReserve = 16 << 20
@@ -436,12 +466,11 @@ func (sp *space) checkRules(r *record, keyid string) string {
 	}
 	// 11
 	level, _ := r.m["level"].(int64)
-	if !level1[r.ptype] || r.ptype == "snailfish.snapshot.v1" || r.ptype == "snailfish.accept.v1" ||
-		((r.ptype == "snailfish.level.v1" || r.ptype == "snailfish.device.v1") && level > sp.maxLevel && sp.mut != "level-above-max") {
+	if !level1[r.ptype] || ((r.ptype == "snailfish.level.v1" || r.ptype == "snailfish.device.v1") && level > sp.maxLevel && sp.mut != "level-above-max") {
 		return "unsupported"
 	}
 	// 12
-	if r.ptype == "snailfish.change.v1" {
+	if r.ptype == "snailfish.change.v1" || r.ptype == "snailfish.snapshot.v1" {
 		if e, _ := r.m["epoch"].(int64); e != sp.epoch && sp.mut != "any-epoch" {
 			return "wrong_epoch"
 		}
@@ -460,7 +489,7 @@ func (sp *space) stateOK(r *record, author string) bool {
 	case "snailfish.grant.v1":
 		id, _, level := r.device()
 		return sp.active[id] == nil && (!sp.removed[id] || sp.mut == "regrant-removed") &&
-			level >= sp.writeLevel && len(epochs) == 1 && allEpochs(epochs[0], sp.epoch)
+			level >= sp.writeLevel && sp.keySetOK(epochs)
 	case "snailfish.epoch.v1":
 		e, _ := r.m["epoch"].(int64)
 		removed := map[string]bool{}
@@ -493,7 +522,11 @@ func (sp *space) stateOK(r *record, author string) bool {
 		return e == sp.epoch+1
 	case "snailfish.recovery.v1":
 		rid, _ := r.recoveryKeys()
-		return sp.recovery[rid] == nil && !sp.retired[rid] && len(epochs) == 1 && allEpochs(epochs[0], sp.epoch)
+		return sp.recovery[rid] == nil && !sp.retired[rid] && sp.keySetOK(epochs)
+	case "snailfish.snapshot.v1":
+		return sp.snapshotOK(r) || sp.mut == "cmp-any-snapshot"
+	case "snailfish.accept.v1":
+		return sp.acceptOK(r) || sp.mut == "cmp-any-accept"
 	case "snailfish.device.v1":
 		level, _ := r.m["level"].(int64)
 		return level > sp.devLevel[author]
@@ -624,9 +657,12 @@ func (sp *space) headChanged(ss *repairSession) bool {
 // repairEntry is one entry of a start or chunk body. env is the raw envelope
 // text, or "" for a stub.
 type repairEntry struct {
-	pos  int
-	env  string
-	stub bool
+	pos   int
+	env   string
+	stub  bool
+	ptype string // stub fields
+	cid   string
+	rh    []byte
 }
 
 var sessionRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -675,11 +711,15 @@ func parseRepairBody(body, first string, lim limitsJ) (*reader, []repairEntry, e
 			if isChange {
 				st.id("change_id", "c_", 16)
 			}
-			st.bin("hash", 32, 0)
+			ent.rh = st.bin("hash", 32, 0)
+			if isChange {
+				ent.cid = st.str("change_id")
+			}
 			if st.err != nil {
 				e.fail("stub: %v", st.err)
 			}
 			ent.stub = true
+			ent.ptype = typ
 		} else {
 			e = newReader(it, "position", "envelope")
 			if _, ok := e.m["envelope"].(map[string]any); !ok {
@@ -729,7 +769,18 @@ func (o *space) chain(entries []repairEntry, signer string) ([]*record, string) 
 			if o.mut == "stub-invalid-record" {
 				return out, "invalid_record"
 			}
-			return out, "uncovered_stub"
+			if !isCompactionType(e.ptype) || o.mut == "cmp-no-repair-stubs" {
+				return out, "uncovered_stub"
+			}
+			r := stubRecord(e.ptype, e.cid, e.rh)
+			if id := r.changeID(); id != "" {
+				if _, ok := o.changes[id]; ok {
+					return out, "invalid_record"
+				}
+			}
+			o.push(r)
+			out = append(out, r)
+			continue
 		}
 		r, err := parseRecord(e.env)
 		if err != nil {
@@ -915,11 +966,19 @@ func (sp *space) repairFinish(keyid string, at int64, body string, lim limitsJ) 
 	if (int(tip.n) != last || !bytes.Equal(tip.d, o.digestAt(last))) && sp.mut != "no-tip-check" {
 		return repairErr("bad_repair")
 	}
-	// 3: M3 stages no stub. 4
+	// 3
+	u := o.usable()
+	for p := sp.sess.base + 1; p <= len(o.cmp) && sp.mut != "cmp-no-cover-check"; p++ {
+		if o.cmp[p-1].stub && !o.stubValid(u, p) {
+			return repairErr("uncovered_stub")
+		}
+	}
+	// 4
 	for _, rec := range ss.staged {
 		sp.push(rec)
 	}
 	sp.sess = nil
+	sp.compact()
 	return repairReply{status: 200, head: len(sp.entries)}
 }
 

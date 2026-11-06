@@ -721,3 +721,91 @@ fn access_cases_return_the_vector_error() {
         }
     }
 }
+
+/// `PROTOCOL.md` section 14 through the append and repair routes, against
+/// `specs/compaction/test.qnt` (`compactTest`, `blockedTest`, `removalTest`,
+/// `sealNeededTest`, `quotaTest`, `repairStubsTest`, `badRepairTest`) and
+/// [CMP-3] to [CMP-20], [LOG-11]. After each step the relay serves the stubs
+/// of the Go reference, with the same JSON, and has the same usage.
+#[test]
+fn compaction_cases_return_the_vector_results() {
+    let h = common::load("http.json");
+    let cases = h["compaction"].as_array().unwrap();
+    assert!(cases.len() >= 7);
+    for c in cases {
+        let name = s(&c["name"]);
+        let fx = fresh(&h, s(&h["authority"]), true);
+        if let Some(q) = c["quota"].as_u64().filter(|q| *q > 0) {
+            fx.relay.set_quotas("sam", None, Some(q)).unwrap();
+        }
+        let mut session = String::new();
+        let mut at = fx.now.load(std::sync::atomic::Ordering::SeqCst);
+        for (i, st) in c["steps"].as_array().unwrap().iter().enumerate() {
+            let why = format!("{name} step {i}");
+            let body = st["body"]
+                .as_str()
+                .unwrap_or_default()
+                .replace("{{session}}", &session);
+            match s(&st["kind"]) {
+                "append" => {
+                    let r = fx.post(fx.tenant(), "append", body.as_bytes(), s(&st["signer"]));
+                    assert_eq!(r.status, 200, "{why}: {}", String::from_utf8_lossy(&r.body));
+                    let (got, _) = wire::parse_append_response(&r.body).unwrap();
+                    assert_eq!(got, append_results(st), "{why}");
+                }
+                "cut" => fx.cut_log(fx.tenant(), st["n"].as_u64().unwrap()),
+                route => {
+                    at += 10;
+                    fx.now.store(at, std::sync::atomic::Ordering::SeqCst);
+                    let path = match route {
+                        "start" => "repair",
+                        "chunk" => "repair/chunk",
+                        _ => "repair/finish",
+                    };
+                    let r = fx.post(fx.tenant(), path, body.as_bytes(), s(&st["signer"]));
+                    let got = if r.status >= 400 {
+                        format!("{} {}", r.status, error_code(&r))
+                    } else if r.status == 201 {
+                        let (id, next) = wire::parse_repair_started(&r.body).unwrap();
+                        session = hex::encode(id);
+                        format!("201 next {next}")
+                    } else if route == "chunk" {
+                        format!("200 next {}", wire::parse_repair_next(&r.body).unwrap())
+                    } else {
+                        format!(
+                            "200 head {}",
+                            wire::parse_repair_finished(&r.body).unwrap().position
+                        )
+                    };
+                    assert_eq!(got, s(&st["want"]), "{why}");
+                }
+            }
+            let page = wire::parse_fetch(&fx.fetch(fx.tenant(), 0, 500).body).unwrap();
+            assert_eq!(
+                page.head.position,
+                st["head"]["position"].as_u64().unwrap(),
+                "{why}"
+            );
+            let stubs: Vec<(u64, String)> = page
+                .entries
+                .iter()
+                .filter_map(|(p, e)| match e {
+                    wire::FetchEntry::Stub(x) => Some((*p, x.to_json())),
+                    wire::FetchEntry::Envelope(_) => None,
+                })
+                .collect();
+            let want: Vec<(u64, String)> = st["stubs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| (x["position"].as_u64().unwrap(), s(&x["stub"]).to_owned()))
+                .collect();
+            assert_eq!(stubs, want, "{why}: stubs");
+            assert_eq!(
+                fx.usage(fx.tenant()),
+                st["used"].as_u64().unwrap(),
+                "{why}: usage"
+            );
+        }
+    }
+}

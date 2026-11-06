@@ -5,10 +5,12 @@
 use std::path::PathBuf;
 
 use serde_json::Value;
+use snailfish_protocol::compaction::Compaction;
 use snailfish_protocol::encoding::decode_id;
 use snailfish_protocol::envelope::Envelope;
 use snailfish_protocol::repair::{ChainError, Item, check_chain};
-use snailfish_protocol::space::{MemorySpace, Overlay, Refusal, SpaceView, check_genesis};
+use snailfish_protocol::space::{MemorySpace, Overlay, Refusal, SpaceView, Staged, check_genesis};
+use snailfish_protocol::wire::Stub;
 
 fn vectors() -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors/protocol.json");
@@ -67,13 +69,13 @@ fn lost_entries_pass_and_activate_their_grant() {
     let got: Vec<(u64, [u8; 32])> = chain
         .accepted
         .iter()
-        .map(|a| (a.position, a.digest))
+        .map(|a| (a.position(), a.digest()))
         .collect();
     assert_eq!(got, [(2, digest(&v, 2)), (3, digest(&v, 3))]);
-    assert_eq!(
-        chain.accepted[0].new_device.map(|d| d.0),
-        Some(device_id(&v, "B"))
-    );
+    let Staged::Full(grant) = &chain.accepted[0] else {
+        panic!("the grant is a full record")
+    };
+    assert_eq!(grant.new_device.map(|d| d.0), Some(device_id(&v, "B")));
     assert_eq!(s.head(), 1);
 }
 
@@ -92,7 +94,13 @@ fn first_failure_stops_the_check() {
     let first = check_chain(&s, &[3], &[Item::Envelope(&e3)]);
     assert_eq!(first.failure, Some((0, ChainError::Position)));
 
-    let stub = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub]);
+    // [LOG-11]: a stub of a type that compaction never makes fails at once.
+    let grant_stub = Stub {
+        payload_type: "snailfish.grant.v1".into(),
+        change_id: None,
+        hash: [7; 32],
+    };
+    let stub = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub(&grant_stub)]);
     assert_eq!(stub.failure, Some((1, ChainError::Stub)));
     assert_eq!(stub.failure.unwrap().1.code(), "uncovered_stub");
 
@@ -105,7 +113,7 @@ fn first_failure_stops_the_check() {
     let mut forged = e2.clone();
     forged.sig[0] ^= 1;
     let sig = check_chain(&s, &[2], &[Item::Envelope(&forged)]);
-    assert_eq!(sig.accepted, [] as [snailfish_protocol::space::Accepted; 0]);
+    assert_eq!(sig.accepted, Vec::<Staged>::new());
     assert!(matches!(
         sig.failure,
         Some((0, ChainError::Invalid(Refusal::InvalidRecord(_))))
@@ -172,6 +180,12 @@ impl SpaceView for Shifted {
     fn last_security(&self) -> u64 {
         7
     }
+    fn snapshot_hash(&self, p: u64) -> Option<[u8; 32]> {
+        self.0.snapshot_hash(p)
+    }
+    fn compaction(&self) -> Compaction {
+        self.0.compaction()
+    }
 }
 
 /// The overlay reads the space state of the log until an added record
@@ -193,9 +207,66 @@ fn overlay_reads_the_log_state_until_an_added_record_changes_it() {
         &[Item::Envelope(&e2), Item::Envelope(&e3)],
     );
     let mut added = chain.accepted.into_iter();
-    over.apply(added.next().unwrap());
+    over.push(added.next().unwrap());
     assert_eq!(over.last_security(), 2, "the grant at 2");
-    over.apply(added.next().unwrap());
+    over.push(added.next().unwrap());
     assert_eq!(over.last_security(), 2, "a change is not a security record");
     assert_eq!(over.head(), 3);
+}
+
+/// PROTOCOL.md 10.7 [CMP-1]: a snapshot stub has no change ID, and a change
+/// stub has one. A stub of the other form is `invalid_record`, not
+/// `uncovered_stub`. Without this, a relay would store a stub that names no
+/// change, or tell the device that a well-formed repair is uncovered.
+#[test]
+fn stub_form_depends_on_its_type() {
+    let v = vectors();
+    let s = genesis_only(&v);
+    let e2 = env(&v, 2);
+    let stub = |t: &str, cid: Option<&str>| Stub {
+        payload_type: t.into(),
+        change_id: cid.map(Into::into),
+        hash: [7; 32],
+    };
+    let snap = stub("snailfish.snapshot.v1", None);
+    let ok = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub(&snap)]);
+    assert_eq!(ok.failure, None);
+    assert!(matches!(ok.accepted[1], Staged::Stub(_)));
+    // [CMP-17]: the accept at 5 names the snapshot at 4, which the chain
+    // holds as a stub with the record hash of the snapshot.
+    let rh4: [u8; 32] = hex::decode(v["log"]["entries"][3]["record_hash"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let snap4 = Stub {
+        hash: rh4,
+        ..stub("snailfish.snapshot.v1", None)
+    };
+    let (e3, e5) = (env(&v, 3), env(&v, 5));
+    let accept = check_chain(
+        &s,
+        &[2, 3, 4, 5],
+        &[
+            Item::Envelope(&e2),
+            Item::Envelope(&e3),
+            Item::Stub(&snap4),
+            Item::Envelope(&e5),
+        ],
+    );
+    assert_eq!(accept.failure, None);
+    let cid = v["log"]["entries"][2]["change_id"].as_str().unwrap();
+    for bad in [
+        stub("snailfish.change.v1", None),
+        stub("snailfish.snapshot.v1", Some(cid)),
+    ] {
+        let got = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub(&bad)]);
+        assert!(
+            matches!(
+                got.failure,
+                Some((1, ChainError::Invalid(Refusal::InvalidRecord(_))))
+            ),
+            "{bad:?}: {:?}",
+            got.failure
+        );
+    }
 }

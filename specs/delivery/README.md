@@ -96,13 +96,13 @@ Mutant `noHold` breaks `refusedNotStored`. Sampling of `restoreBase` at 5,000 tr
 - Stubs in a repair session, and the snapshot rule of [LOG-11] (`specs/coverage.toml` `partial`).
 
 - Security records other than grants, epochs, the base rule for security records ([LOG-7], in `specs/spacelog`), enrollment and removal. A grant here only makes a device active.
-- Log compaction: snapshots, stubs, accept records and `is_covered`.
+- Log compaction: snapshots, stubs, accept records and `is_covered`. See [specs/compaction](../compaction/README.md).
 - Fork repair (export, import, enroll again).
 - A malicious relay. The relay in this model is honest, but it can lose data.
 - The bytes of a change. The content of a `change_id` is fixed, so the model does not encode the "same `change_id` with different bytes" refusal in `enqueue_many` [DLV-5], and it does not encode a `Conflict` whose record holds other content. In the design the engine marks such a change as refused, reports `degraded` and the app reverts or splits it, as for a size refusal ([DLV-6]). The `Conflict` case with the same content is encoded. Rust tests `enqueue_dedupes_and_refuses_other_bytes` and `conflict_with_other_bytes_is_refused` check the two cases with other content.
 - The position in the `Known` and `Conflict` replies, and the fetch of the record at that position. The model treats the fetch as always showing the same content.
 - Security records during a restore hold. The relay accepts them, but the model has no security records.
-- The snapshot acceptance rules from review D. They need a compaction model.
+- The snapshot acceptance rules from review D: [specs/compaction](../compaction/README.md).
 - Liveness. The model checks safety only.
 - The configs bind the `BUG` and `FAULTS` consts as strings. A sum type is not possible, because a config module that imports the spec cannot use a constructor of that spec in its own import (Quint error QNT099).
 

@@ -617,6 +617,27 @@ class Device:
         self.flush_outbox()
         return cid
 
+    def edit_many(self, count: int, prefix: str) -> None:
+        """Set the title of tasks `<prefix>-0` to `<prefix>-<count - 1>`, with
+        one app transaction for each batch of edits ([DLV-3])."""
+        for start in range(0, count, BATCH):
+            with self.transaction():
+                seq = self.db.execute("SELECT coalesce(max(seq), 0) FROM outbox").fetchone()[0]
+                for i in range(start, min(start + BATCH, count)):
+                    task = f"{prefix}-{i}"
+                    stamp = self._tick()
+                    self.merge_into_db(task, "title", task, stamp)
+                    seq += 1
+                    self.db.execute(
+                        "INSERT INTO outbox (change_id, change_bytes, seq) VALUES (?, ?, ?)",
+                        (
+                            bytes(self.engine.new_change_id()),
+                            encode_change(task, "title", task, stamp),
+                            seq,
+                        ),
+                    )
+        self.flush_outbox()
+
     def flush_outbox(self) -> None:
         """Give the outbox rows to the engine, in batches ([DLV-2], [DLV-4]).
 
@@ -649,7 +670,73 @@ class Device:
         self.repairs = self.engine.take_repairs()
         self.pull()
         self.flush_outbox()
+        self.check_snapshots()
+        if self.engine.snapshot_due():
+            self.write_snapshot()
         return self.engine.status()
+
+    def export_state(self) -> bytes:
+        """Return the app state with its merge metadata ([CMP-2]).
+
+        Each field keeps its hybrid logical clock stamp, so a later change
+        merges as on a device that applied every change ([MRG-4]).
+        """
+        rows = self.db.execute(
+            "SELECT task, field, value, wall, counter, device FROM fields ORDER BY task, field"
+        ).fetchall()
+        body = {"v": FORMAT, "fields": [list(r) for r in rows]}
+        return json.dumps(body, separators=(",", ":")).encode()
+
+    @staticmethod
+    def can_import(state: bytes) -> bool:
+        """Check a snapshot state without a change to the app database ([CMP-2])."""
+        try:
+            d = json.loads(state)
+            if d.get("v") != FORMAT:
+                return False
+            for task, field, value, wall, counter, device in d["fields"]:
+                json.loads(value)
+                if not (
+                    isinstance(task, str)
+                    and field in FIELDS
+                    and isinstance(wall, int)
+                    and isinstance(counter, int)
+                    and isinstance(device, str)
+                ):
+                    return False
+        except (ValueError, TypeError, KeyError):
+            return False
+        return True
+
+    def _import_state(self, state: bytes) -> None:
+        """Replace the synced data with a snapshot state, inside the caller's
+        transaction ([CMP-2])."""
+        self.db.execute("DELETE FROM fields")
+        for task, field, value, wall, counter, device in json.loads(state)["fields"]:
+            self.db.execute(
+                "INSERT INTO fields (task, field, value, wall, counter, device) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task, field, value, wall, counter, device),
+            )
+            self._observe(Stamp(wall, counter, device))
+
+    def check_snapshots(self) -> None:
+        """Check each new snapshot with `can_import`, and accept it ([CMP-5])."""
+        for snap in self.engine.unchecked_snapshots():
+            self.engine.accept_snapshot(snap.position, self.can_import(bytes(snap.state_bytes)))
+
+    def write_snapshot(self) -> bool:
+        """Write a snapshot of the state at the applied position, only with
+        an empty app outbox ([CMP-3]). Returns true if the engine queued it:
+        false for a state over the relay limit, which sets `degraded`."""
+        with self.transaction():
+            if self.db.execute("SELECT 1 FROM outbox LIMIT 1").fetchone():
+                return False
+            applied = self.applied_position()
+            state = self.export_state()
+        if applied.position == 0:
+            return False
+        return self.engine.write_snapshot(applied, state)
 
     def pull(self) -> int:
         """Apply the changes after the applied position ([DLV-10], [DLV-11]).
@@ -701,13 +788,28 @@ class Device:
         self.db.execute("INSERT INTO applied_log (change_id) VALUES (?)", (cid,))
 
     def reset(self) -> None:
-        """Handle `ResetRequired`: delete the synced data, apply each outbox
-        row again, and pull from the start ([DLV-12]). M2 has no snapshot."""
+        """Handle `ResetRequired` (DESIGN.md "Log compaction", [DLV-12]).
+
+        Delete the synced data and import the usable snapshot, if any. Then
+        apply each outbox row again, unless the snapshot already holds its
+        edit ([CMP-14]). The next pull starts after the state position.
+        """
+        snap = self.engine.usable_snapshot()
         with self.transaction():
             self.db.execute("DELETE FROM fields")
             self.db.execute("DELETE FROM applied")
             self.db.execute("DELETE FROM applied_log")
-            for (b,) in self.db.execute("SELECT change_bytes FROM outbox ORDER BY seq").fetchall():
+            if snap is not None:
+                self._import_state(bytes(snap.state_bytes))
+                self.db.execute(
+                    "INSERT INTO applied (id, position, digest) VALUES (1, ?, ?)",
+                    (snap.state_position, bytes(snap.state_digest)),
+                )
+            rows = self.db.execute("SELECT change_id, change_bytes FROM outbox ORDER BY seq")
+            for c, b in rows.fetchall():
+                if self.engine.is_covered(bytes(c)):
+                    self.db.execute("DELETE FROM outbox WHERE change_id = ?", (bytes(c),))
+                    continue
                 task, field, value, stamp = decode_change(bytes(b))
                 self.merge_into_db(task, field, value, stamp)
 

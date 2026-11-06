@@ -384,11 +384,10 @@ fn drive(
 #[test]
 fn engine_object_syncs_two_devices() {
     let dir = tempfile::tempdir().unwrap();
-    let relay = snailfish_relay::core::Relay::open(snailfish_relay::core::Config::new(
-        dir.path().join("relay"),
-        "sync.example.net",
-    ))
-    .unwrap();
+    let mut cfg = snailfish_relay::core::Config::new(dir.path().join("relay"), "sync.example.net");
+    // A low snapshot limit, so `snapshot_crosses_the_binding` can pass it.
+    cfg.limits.max_snapshot_bytes = 65_536;
+    let relay = snailfish_relay::core::Relay::open(cfg).unwrap();
     let tenant = relay.add_user("sam").unwrap();
     let mut ka = snailfish::new_device_keys().unwrap();
     let kb = snailfish::new_device_keys().unwrap();
@@ -486,6 +485,7 @@ fn engine_object_syncs_two_devices() {
     exchange(&relay, &b);
     assert_eq!(sb.app_key(&setup.log_id), Some(setup.app_key.clone()));
     change_reaches_b(&relay, &a, &b);
+    snapshot_crosses_the_binding(&relay, &a, &b);
 }
 
 /// A change of A reaches B through the relay, and the reset rule of
@@ -528,6 +528,67 @@ fn change_reaches_b(
         Err(snailfish::SnailfishError::ResetRequired)
     ));
     assert_ne!(a.device_id().unwrap(), b.device_id().unwrap());
+}
+
+/// The applied position after the app applies each change of `engine`.
+fn apply_all(engine: &snailfish::Engine) -> snailfish::Applied {
+    let mut at = engine.genesis_base().unwrap();
+    loop {
+        let got = engine.changes_after(&at, 500).unwrap();
+        let Some(last) = got.last() else {
+            return at;
+        };
+        at = snailfish::Applied {
+            position: last.position,
+            digest: last.digest.clone(),
+        };
+    }
+}
+
+/// `PROTOCOL.md` section 14 through the binding ([CMP-3], [CMP-5], [CMP-8],
+/// [CMP-14]): 20 large changes make a snapshot due. A writes one, both apps
+/// accept it, and it becomes the usable snapshot that covers the change at
+/// 3. A state above the relay limit writes nothing.
+fn snapshot_crosses_the_binding(
+    relay: &snailfish_relay::core::Relay,
+    a: &std::sync::Arc<snailfish::Engine>,
+    b: &std::sync::Arc<snailfish::Engine>,
+) {
+    let at3 = b.changes_after(&b.genesis_base().unwrap(), 1).unwrap()[0]
+        .change_id
+        .clone();
+    assert!(!a.snapshot_due().unwrap());
+    let rows: Vec<snailfish::OutboxRow> = (0..20u8)
+        .map(|i| snailfish::OutboxRow {
+            change_id: a.new_change_id().unwrap(),
+            change_bytes: vec![i; 40_000],
+        })
+        .collect();
+    a.enqueue_many(&rows).unwrap();
+    exchange(relay, a);
+    assert!(a.snapshot_due().unwrap());
+    let applied = apply_all(a);
+    assert!(a.write_snapshot(&applied, b"state").unwrap());
+    exchange(relay, a);
+    exchange(relay, b);
+    apply_all(b);
+    for e in [a, b] {
+        let snaps = e.unchecked_snapshots().unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(
+            (snaps[0].state_position, &snaps[0].state_bytes[..]),
+            (applied.position, &b"state"[..])
+        );
+        e.accept_snapshot(snaps[0].position, true).unwrap();
+    }
+    exchange(relay, a);
+    exchange(relay, b);
+    exchange(relay, a);
+    let usable = a.usable_snapshot().unwrap().unwrap();
+    assert_eq!(usable.state_digest, applied.digest);
+    assert!(a.is_covered(&at3).unwrap());
+    assert!(!a.is_covered(&a.new_change_id().unwrap()).unwrap());
+    assert!(!a.write_snapshot(&applied, &vec![0; 70_000]).unwrap());
 }
 
 /// [ENR-7] through the binding: a code mismatch on the new device ends

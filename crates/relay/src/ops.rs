@@ -618,6 +618,48 @@ pub fn hold_report(data: &Path, user: &str, log: &str) -> Result<HoldReport, Ops
     read_report(&tc, &sc, log)
 }
 
+/// The storage of one space for the operator ([CMP-19]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceStatus {
+    /// The bytes that count against the space quota (10.6 step 16).
+    pub used: u64,
+    /// The number of stubs. They do not count against the quota.
+    pub stubs: u64,
+    /// The byte length of the stub JSON of all stubs.
+    pub stub_bytes: u64,
+    /// The frontier of the log (`PROTOCOL.md` 14.1), 0 if none.
+    pub frontier: u64,
+}
+
+impl fmt::Display for SpaceStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "used: {} bytes", self.used)?;
+        writeln!(f, "stubs: {} ({} bytes)", self.stubs, self.stub_bytes)?;
+        writeln!(f, "frontier: {}", self.frontier)
+    }
+}
+
+/// The storage of a space: usage, stubs and frontier ([CMP-19]). Changes
+/// nothing. M9 exports the same numbers as metrics.
+///
+/// # Errors
+///
+/// [`OpsError::Refused`] for an unknown user or space, and a storage
+/// failure.
+pub fn space_status(data: &Path, user: &str, log: &str) -> Result<SpaceStatus, OpsError> {
+    let (_, space) = locate(data, user, log)?;
+    let sc = store::open(&space, Kind::Space, false)?;
+    let usage: i64 = sc.query_row("SELECT bytes FROM usage WHERE id = 1", [], |r| r.get(0))?;
+    let (count, bytes) = crate::core::compact::stub_usage(&sc)?;
+    let frontier = crate::core::compact::frontier(&sc)?;
+    Ok(SpaceStatus {
+        used: u64::try_from(usage).map_err(|_| StoreError::Corrupt("usage is negative"))?,
+        stubs: count,
+        stub_bytes: bytes,
+        frontier,
+    })
+}
+
 /// End the restore hold of a space ([LOG-15]). The relay never ends a hold
 /// by itself. Refuses while a device is "not repaired", unless `force` is
 /// set, because the app database of that device can hold changes that only

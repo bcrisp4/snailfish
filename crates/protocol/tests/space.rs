@@ -59,6 +59,7 @@ fn relay(signer: [u8; 32]) -> Mode {
     Mode::Relay {
         signer,
         max_change_bytes: 65536,
+        max_snapshot_bytes: 16_777_216,
         hold: false,
     }
 }
@@ -145,11 +146,11 @@ fn refusals_follow_the_protocol_order() {
         check_append(&s, &e10, relay(b)),
         Verdict::Refused(Refusal::BadBase)
     );
-    // Snapshot by B with a base inside the log: unsupported in M2.
-    assert_eq!(
+    // [CMP-3] The snapshot of the Go log (state 3) is valid at position 4.
+    assert!(matches!(
         check_append(&s, &env(&v, 4), relay(b)),
-        Verdict::Refused(Refusal::Unsupported)
-    );
+        Verdict::Store(a) if a.position == 4
+    ));
     // A grant of B again, with its original base 1 before the grant at 2
     // ([LOG-7] comes before the active-device check of the grant).
     assert_eq!(
@@ -165,6 +166,7 @@ fn refusals_follow_the_protocol_order() {
     let small = Mode::Relay {
         signer: a,
         max_change_bytes: 10,
+        max_snapshot_bytes: 16_777_216,
         hold: false,
     };
     let mut s2 = s.clone();
@@ -204,7 +206,7 @@ fn writer_gives_go_payload_bytes() {
     use snailfish_protocol::records::{Body, parse_payload};
     use snailfish_protocol::write;
     let v = vectors();
-    for n in [1, 2, 3, 6, 7, 9, 10, 11] {
+    for n in [1, 2, 3, 4, 5, 6, 7, 9, 10, 11] {
         let e = env(&v, n);
         let r = parse_payload(&e.payload_type, &e.payload).unwrap();
         let out = match &r.body {
@@ -270,7 +272,23 @@ fn writer_gives_go_payload_bytes() {
                 change_id,
                 ciphertext,
             ),
-            other => panic!("unexpected {other:?}"),
+            Body::Snapshot {
+                epoch,
+                state,
+                ciphertext,
+            } => write::snapshot(&r.log, r.author.id(), &r.base, *epoch, state, ciphertext),
+            Body::Accept {
+                snapshot_position,
+                snapshot_hash,
+                applied,
+            } => write::accept(
+                &r.log,
+                r.author.id(),
+                &r.base,
+                *snapshot_position,
+                snapshot_hash,
+                applied,
+            ),
         };
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -415,6 +433,7 @@ fn change_size_limit_is_inclusive() {
     let at = |max| Mode::Relay {
         signer: a,
         max_change_bytes: max,
+        max_snapshot_bytes: 16_777_216,
         hold: false,
     };
     stored(check_append(&space, &env, at(env.payload.len())));
@@ -466,6 +485,7 @@ fn hold_refuses_changes_but_not_security_records() {
     let hold = Mode::Relay {
         signer: a,
         max_change_bytes: 65536,
+        max_snapshot_bytes: 16_777_216,
         hold: true,
     };
     let mut g = MemorySpace::new(log);
@@ -575,4 +595,54 @@ fn overlay_reads_the_recovery_key_of_the_log() {
         check_append(&overlay, &grant, Mode::Verify),
         Verdict::Store(_)
     ));
+}
+
+/// [CMP-5] PROTOCOL.md 14.4: an accept names the snapshot by position and
+/// record hash, and its applied position is an entry at or before its base.
+/// The Go log has the snapshot of B at 4. An accept by A with base 4 and
+/// applied position 4 is stored. A wrong snapshot hash and an applied
+/// position after the base are refused. Without this, a relay would count an
+/// accept of another snapshot, or of state that the device never applied.
+#[test]
+fn accept_names_the_snapshot_and_an_applied_entry_up_to_its_base() {
+    use snailfish_protocol::records::Position;
+    use snailfish_protocol::write;
+    let v = vectors();
+    let mut s = setup(&v);
+    let (a, ka) = device(&v, "A");
+    let (b, _) = device(&v, "B");
+    let snap = stored(check_append(&s, &env(&v, 4), relay(b)));
+    s.apply(&snap);
+    let base = Position {
+        position: 4,
+        digest: snap.digest,
+    };
+    let accept = |hash: &[u8; 32], applied: &Position| {
+        let ty = "snailfish.accept.v1";
+        let payload = write::accept(&s.log_id, &a, &base, 4, hash, applied);
+        Envelope {
+            payload_type: ty.to_owned(),
+            sig: ka.sign_record(ty, &payload),
+            payload,
+        }
+    };
+    stored(check_append(
+        &s,
+        &accept(&snap.record_hash, &base),
+        relay(a),
+    ));
+    let mut wrong = snap.record_hash;
+    wrong[0] ^= 1;
+    match check_append(&s, &accept(&wrong, &base), relay(a)) {
+        Verdict::Refused(Refusal::InvalidRecord(why)) => assert!(why.contains("no snapshot")),
+        other => panic!("expected invalid_record, got {other:?}"),
+    }
+    let after = Position {
+        position: 5,
+        digest: snap.digest,
+    };
+    match check_append(&s, &accept(&snap.record_hash, &after), relay(a)) {
+        Verdict::Refused(Refusal::InvalidRecord(why)) => assert!(why.contains("applied position")),
+        other => panic!("expected invalid_record, got {other:?}"),
+    }
 }

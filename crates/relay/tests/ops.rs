@@ -10,6 +10,8 @@ mod common;
 
 use common::{Fx, error_code, s};
 use snailfish_protocol::encoding::encode_b64;
+use snailfish_protocol::hash::{digest_next, entry_hash};
+use snailfish_protocol::wire::OutEntry;
 use snailfish_protocol::wire::{self, AppendResult, Head, StatusReport};
 use snailfish_relay::ops::{self, TipState};
 
@@ -39,7 +41,9 @@ fn report(fx: &Fx, signer: &str, tip: Head, fresh: bool) -> bool {
 }
 
 fn start(fx: &Fx, signer: &str, base: Head, from: usize, to: usize) -> ([u8; 16], u64) {
-    let entries: Vec<(u64, String)> = (from..=to).map(|n| (n as u64, envelope(fx, n))).collect();
+    let entries: Vec<(u64, OutEntry)> = (from..=to)
+        .map(|n| (n as u64, envelope(fx, n).into()))
+        .collect();
     let body = wire::repair_start_body(&base, &entries).unwrap();
     let r = fx.post(fx.tenant(), "repair", &body, signer);
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
@@ -68,7 +72,7 @@ fn restore_hold_repair_and_release() {
 
     let (sid, next) = start(&fx, "A", head_of(&fx, 2), 3, 3);
     assert_eq!(next, 4);
-    let chunk = wire::repair_chunk_body(&sid, &[(4, envelope(&fx, 4))]).unwrap();
+    let chunk = wire::repair_chunk_body(&sid, &[(4, envelope(&fx, 4).into())]).unwrap();
     let r = fx.post(fx.tenant(), "repair/chunk", &chunk, "A");
     assert_eq!(wire::parse_repair_next(&r.body), Ok(5));
     assert_eq!(
@@ -149,7 +153,9 @@ fn device_with_a_lost_grant_repairs_the_log() {
         .handle(&fx.signed("GET", &path, "after=0&limit=10", b"", "B"));
     assert_eq!(error_code(&r), "unknown_device");
     // C has a grant nowhere, so the same entries do not make it active.
-    let entries: Vec<(u64, String)> = (3..=4).map(|n| (n as u64, envelope(&fx, n))).collect();
+    let entries: Vec<(u64, OutEntry)> = (3..=4)
+        .map(|n| (n as u64, envelope(&fx, n).into()))
+        .collect();
     let body = wire::repair_start_body(&head_of(&fx, 2), &entries).unwrap();
     assert_eq!(
         error_code(&fx.post(fx.tenant(), "repair", &body, "C")),
@@ -163,14 +169,16 @@ fn device_with_a_lost_grant_repairs_the_log() {
     assert_eq!(r.status, 200);
 }
 
-/// [LOG-11]: a staged stub is refused, because M3 has no snapshot that
-/// covers it, and nothing is staged.
+/// [LOG-11] [CMP-17], `specs/compaction/test.qnt::badRepairTest`: a change
+/// stub passes the chain check, and the finish refuses it, because no usable
+/// snapshot covers it. The relay log does not change.
 #[test]
 fn staged_stub_is_refused() {
     let fx = Fx::new();
     fx.setup_space(fx.tenant());
     fx.cut_log(fx.tenant(), 3);
     let base = head_of(&fx, 3);
+    let cid = [0u8; 16];
     let body = format!(
         r#"{{"base":{{"position":3,"digest":"{}"}},"entries":[{{"position":4,"stub":{{"type":"snailfish.change.v1","change_id":"c_{}","hash":"{}"}}}}]}}"#,
         encode_b64(&base.digest),
@@ -178,9 +186,21 @@ fn staged_stub_is_refused() {
         encode_b64(&[0; 32]),
     );
     let r = fx.post(fx.tenant(), "repair", body.as_bytes(), "A");
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    let (sid, next) = wire::parse_repair_started(&r.body).unwrap();
+    assert_eq!(next, 5);
+    let tip = Head {
+        position: 4,
+        digest: digest_next(
+            &base.digest,
+            4,
+            &entry_hash("snailfish.change.v1", Some(&cid), &[0; 32]),
+        ),
+    };
+    let fin = wire::repair_finish_body(&wire::RepairFinish { session: sid, tip });
+    let r = fx.post(fx.tenant(), "repair/finish", &fin, "A");
     assert_eq!((r.status, error_code(&r).as_str()), (422, "uncovered_stub"));
-    let rep = ops::hold_report(fx.dir.path(), "sam", fx.log()).unwrap();
-    assert_eq!(rep.repairs, [] as [snailfish_relay::ops::RepairRecord; 0]);
+    assert_eq!(fx.record_hashes(fx.tenant()).len(), 3);
 }
 
 /// [STO-7], [STO-8], [STO-10], [LOG-14]: a backup while the relay runs, then
@@ -266,7 +286,7 @@ fn repair_counts_the_moved_changes_in_the_usage() {
     ops::restore(fx.dir.path(), &dst, true, 1).unwrap();
     fx.restart(common::limits_of(&fx.h));
     assert_eq!(fx.usage(fx.tenant()), before);
-    let body = wire::repair_start_body(&head_of(&fx, 4), &[(5, change)]).unwrap();
+    let body = wire::repair_start_body(&head_of(&fx, 4), &[(5, change.into())]).unwrap();
     let r = fx.post(fx.tenant(), "repair", &body, "A");
     assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
     let (sid, _) = wire::parse_repair_started(&r.body).unwrap();
@@ -389,7 +409,7 @@ fn session_expires_at_the_exact_second() {
         let t0 = fx.now.load(Ordering::SeqCst);
         let (sid, _) = start(&fx, "A", head_of(&fx, 2), 3, 3);
         fx.now.store(t0 + later, Ordering::SeqCst);
-        let chunk = wire::repair_chunk_body(&sid, &[(4, envelope(&fx, 4))]).unwrap();
+        let chunk = wire::repair_chunk_body(&sid, &[(4, envelope(&fx, 4).into())]).unwrap();
         let r = fx.post(fx.tenant(), "repair/chunk", &chunk, "A");
         assert_eq!(
             r.status == 200,
@@ -421,8 +441,11 @@ fn chunk_without_a_session_activates_no_signer() {
     let fx = Fx::new();
     fx.setup_space(fx.tenant());
     fx.cut_log(fx.tenant(), 2);
-    let chunk =
-        wire::repair_chunk_body(&[9; 16], &[(3, envelope(&fx, 3)), (4, envelope(&fx, 4))]).unwrap();
+    let chunk = wire::repair_chunk_body(
+        &[9; 16],
+        &[(3, envelope(&fx, 3).into()), (4, envelope(&fx, 4).into())],
+    )
+    .unwrap();
     let r = fx.post(fx.tenant(), "repair/chunk", &chunk, "B");
     assert_eq!(error_code(&r), "unknown_device");
 }
@@ -526,7 +549,7 @@ fn device_that_the_repair_entries_remove_cannot_repair() {
         "A",
     );
     assert_eq!(r.status, 200);
-    let five: Vec<(u64, String)> = vec![(5, removal)];
+    let five: Vec<(u64, OutEntry)> = vec![(5, removal.into())];
     fx.cut_log(fx.tenant(), 4);
     // The older backup holds B as active and no removal.
     let c = rusqlite::Connection::open(fx.space_file(fx.tenant())).unwrap();

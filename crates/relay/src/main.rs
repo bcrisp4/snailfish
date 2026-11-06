@@ -81,6 +81,14 @@ enum Command {
         /// The log ID text.
         log: String,
     },
+    /// Print the storage of a space: the usage against the quota, the stub
+    /// count and bytes, and the frontier. Changes nothing.
+    SpaceStatus {
+        /// The user name.
+        user: String,
+        /// The log ID text.
+        log: String,
+    },
     /// End the restore hold of a space.
     ReleaseHold {
         /// The user name.
@@ -231,6 +239,13 @@ async fn main() -> ExitCode {
             }
         }
         Command::HoldStatus { user, log } => match ops::hold_report(&data, &user, &log) {
+            Ok(r) => {
+                print!("{r}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Command::SpaceStatus { user, log } => match ops::space_status(&data, &user, &log) {
             Ok(r) => {
                 print!("{r}");
                 ExitCode::SUCCESS

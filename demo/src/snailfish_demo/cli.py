@@ -216,6 +216,10 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("task")
     e.add_argument("field", choices=app.FIELDS)
     e.add_argument("value")
+    m = sub.add_parser("edit-many")
+    m.add_argument("count", type=int)
+    m.add_argument("--prefix", default="bulk")
+    sub.add_parser("snapshot")
     sub.add_parser("sync")
     sub.add_parser("list")
     sub.add_parser("dump")
@@ -318,6 +322,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "edit":
             value: object = args.value == "true" if args.field == "done" else args.value
             dev.edit(args.task, args.field, value)
+        elif args.cmd == "edit-many":
+            dev.edit_many(args.count, args.prefix)
+        elif args.cmd == "snapshot":
+            if not dev.write_snapshot():
+                print(
+                    "no snapshot: the app outbox holds a change, nothing is applied, "
+                    "or the state is larger than the relay limit"
+                )
+                return 1
         elif args.cmd == "sync":
             with httpx.Client(timeout=30) as client:
                 status = dev.sync(http_transport(client, crasher))
@@ -389,6 +402,9 @@ def main(argv: list[str] | None = None) -> int:
                         "head": dev.engine.verified_head().position,
                         "status": str(dev.engine.status()),
                         "log_id": dev.space.log_id,
+                        "snapshot": (
+                            None if (u := dev.engine.usable_snapshot()) is None else u.position
+                        ),
                     },
                     sort_keys=True,
                 )
