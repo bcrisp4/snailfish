@@ -46,7 +46,7 @@ pub const MAX_ENQUEUE: usize = 500;
 /// The most changes of one `changes_after` batch.
 pub const MAX_BATCH: usize = 500;
 
-const STATE_FILE: &str = "engine.sqlite3";
+pub(crate) const STATE_FILE: &str = "engine.sqlite3";
 const LOCK_FILE: &str = "engine.lock";
 
 /// An engine failure. The message holds no secret and no app data.

@@ -166,6 +166,12 @@ class FileKeyStore(sf.KeyStore):
         items[account] = secret.hex()
         write_private(self.path, json.dumps(items))
 
+    def delete(self, account: str) -> None:
+        """Remove the item of `account`, durably, if it exists."""
+        items = self._items()
+        if items.pop(account, None) is not None:
+            write_private(self.path, json.dumps(items))
+
 
 def key_store(data_dir: Path) -> FileKeyStore:
     """Return the key store of the device in `data_dir`."""
@@ -975,11 +981,12 @@ def prepare_rejoin(data_dir: Path, log_id: str) -> None:
     """FRK-6: keep the key item and the state file of the old engine before
     the device enrolls again. The enrollment writes new keys and a new state
     file. The app database stays."""
-    sf.keep_old_keys(key_store(data_dir), log_id)
     old = data_dir / OLD_ENGINE
     if old.exists():
-        # An earlier rejoin stopped before its recovery. Keep that file.
+        # An earlier rejoin stopped before its recovery. The old key item
+        # and state file are in place. A new copy would hold the new keys.
         return
+    sf.keep_old_keys(key_store(data_dir), log_id)
     (data_dir / "engine").rename(old)
 
 
@@ -1026,6 +1033,7 @@ def recover_fork(data_dir: Path, space: sf.SpaceRef, engine: sf.Engine) -> int:
         db.close()
     del old
     shutil.rmtree(old_dir)
+    key_store(data_dir).delete(f"{space.log_id}.old")
     return len(rows)
 
 

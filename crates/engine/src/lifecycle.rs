@@ -208,6 +208,14 @@ impl Engine {
                 "the old engine is of another log".into(),
             ));
         }
+        // Before the checkpoint check ([ENR-9]) the engine has no app key
+        // and its verified log is not the relay log, so the comparison
+        // would give changes that the new log holds.
+        if self.app_key.is_none() || state::checkpoint(&self.db)?.is_some() {
+            return Err(EngineError::Invalid(
+                "sync the new engine once before the comparison".into(),
+            ));
+        }
         let mut st = old.db.prepare(
             "SELECT change_id, envelope FROM log
              WHERE payload_type = 'snailfish.change.v1' AND envelope != '' ORDER BY position",

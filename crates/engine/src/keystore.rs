@@ -194,6 +194,13 @@ pub fn open_old(
     space: SpaceRef,
     store: &dyn KeyStore,
 ) -> Result<Engine, EngineError> {
+    // An empty directory would get a new state file with these keys and
+    // an empty log, and the comparison would then find no change.
+    if !data_dir.join(crate::STATE_FILE).exists() {
+        return Err(EngineError::Invalid(
+            "the old directory holds no engine state file".into(),
+        ));
+    }
     let account = format!("{}{OLD_SUFFIX}", space.log_id);
     let b = store
         .load(&account)

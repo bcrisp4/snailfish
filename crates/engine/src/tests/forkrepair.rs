@@ -99,6 +99,14 @@ fn fork_repair_restores_the_own_changes_of_each_device() {
     let (te, ne) = w.enroll_b(&mut ea, None, (true, true));
     assert_eq!((te, ne), (EnrollState::Done, EnrollState::Done));
     let mut eb2 = Engine::open(&w.root.join("b"), w.space(), &w.keys[1]).unwrap();
+    // Before its first exchange, the new verified log is not the relay
+    // log, so the comparison refuses to run.
+    let early = Engine::open(&w.root.join("b-old"), w.space(), &old_keys).unwrap();
+    assert!(matches!(
+        eb2.fork_changes(&early),
+        Err(EngineError::Invalid(_))
+    ));
+    drop(early);
     w.exchange(&mut eb2);
     assert_eq!(eb2.status(), Status::Ok);
     // FRK-7: the comparison gives X with its old change ID.
@@ -267,4 +275,28 @@ fn import_refusals_reach_the_app() {
         crate::lifecycle::import_file(&file, w.space(), &kc, &token, None),
         Err(EngineError::Invalid(_))
     ));
+}
+
+/// FRK-6: the key item of the old state file survives the enrollment, which
+/// replaces the item of the log. `open_old` refuses a directory with no
+/// state file, which would otherwise open with an empty log and give no
+/// change back.
+#[test]
+fn old_keys_open_only_the_old_state_file() {
+    let (w, a, _b) = World::new();
+    let store = MemStore::new();
+    crate::keystore::KeyStore::store(store.as_ref(), &w.log_id, &[7u8; 96]).unwrap();
+    crate::keystore::keep_old_keys(store.as_ref(), &w.log_id).unwrap();
+    crate::keystore::KeyStore::store(store.as_ref(), &w.log_id, &[8u8; 96]).unwrap();
+    assert_eq!(
+        store.item(&format!("{}.old", w.log_id)),
+        Some(vec![7u8; 96])
+    );
+    let empty = w.root.join("empty");
+    assert!(matches!(
+        crate::keystore::open_old(&empty, w.space(), store.as_ref()),
+        Err(EngineError::Invalid(_))
+    ));
+    assert!(!empty.join(crate::STATE_FILE).exists());
+    drop(a);
 }
