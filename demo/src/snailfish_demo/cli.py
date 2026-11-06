@@ -435,7 +435,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if status.is_ok() else 1
         elif args.cmd == "delete":
             with httpx.Client(timeout=30) as client:
-                status = app.delete_space(dev, http_transport(client, crasher))
+                try:
+                    status = app.delete_space(dev, http_transport(client, crasher))
+                except sf.SnailfishError.Refused as e:
+                    # bad_head: the verified head of this device is not in the
+                    # relay log, for example after a fork (PROTOCOL.md 10.12).
+                    return finish(
+                        f"the relay refused the deletion ({e}): delete it from a device "
+                        "that did not stop, or ask the relay operator to run "
+                        "`snailfish-relay space delete`"
+                    )
             print(f"status: {status}")
             return 0 if status.is_deleted() else 1
         elif args.cmd == "export":

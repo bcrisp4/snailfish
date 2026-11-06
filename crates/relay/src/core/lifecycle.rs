@@ -142,26 +142,20 @@ pub(super) fn delete_space_files(
 
 /// The quota budget of the staged log of an import (10.13 start step 6):
 /// 10.6 steps 14 and 16 against the records before it, without the daily
-/// limit of step 15.
+/// limit of step 15. The `usage` and `security_usage` rows of the temporary
+/// file hold the running totals, so a chunk reads no earlier entry.
 fn import_budget(
     c: &Connection,
     quota: u64,
     snapshot_limit: u64,
     reserve: u64,
 ) -> Result<Budget, StoreError> {
-    let sum = |sql: &str| -> Result<u64, StoreError> {
-        let n: i64 = c.query_row(sql, [], |r| r.get(0))?;
-        from_i64(n)
-    };
-    let counted = compact::COUNTED;
-    let used = sum(&format!(
-        "SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))), 0) FROM staging WHERE envelope != '' AND {counted}"
-    ))?;
-    let security = sum(&format!(
-        "SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))), 0) FROM
-         (SELECT envelope, payload_type FROM entries UNION ALL SELECT envelope, payload_type FROM staging)
-         WHERE envelope != '' AND NOT ({counted})"
-    ))?;
+    let used = from_i64(c.query_row("SELECT bytes FROM usage WHERE id = 1", [], |r| r.get(0))?)?;
+    let security = from_i64(c.query_row(
+        "SELECT bytes FROM security_usage WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )?)?;
     Ok(Budget {
         used,
         security,
@@ -171,6 +165,20 @@ fn import_budget(
         reserve,
         daily: false,
     })
+}
+
+/// Keep the running totals of an import for the next chunk. The finish
+/// computes both again from the log ([QTA-1]).
+fn save_import_budget(c: &Connection, b: &Budget) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE usage SET bytes = ?1 WHERE id = 1",
+        params![to_i64(b.used)?],
+    )?;
+    c.execute(
+        "UPDATE security_usage SET bytes = ?1 WHERE id = 1",
+        params![to_i64(b.security)?],
+    )?;
+    Ok(())
 }
 
 impl Relay {
@@ -506,6 +514,7 @@ impl Relay {
             }
         }
         let next = stage(&tx, &chain.accepted, entries)?;
+        save_import_budget(&tx, &budget)?;
         tx.commit()?;
         Ok(next)
     }

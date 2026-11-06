@@ -43,23 +43,27 @@ fn time_of(headers: &[Header]) -> Option<u64> {
         .and_then(|h| request::parse_time(&h.value))
 }
 
-/// A request signed by `key` with `keyid` at the time `now`.
-#[allow(clippy::too_many_arguments)] // One signed request takes each part.
+/// The key that signs a request, with its `keyid` (`PROTOCOL.md` 8.2).
+struct Signer<'a> {
+    key: &'a SecretKey,
+    keyid: Hash32,
+    recovery: bool,
+}
+
+/// A POST to `path` of `relay_url` that `s` signs at the time `now`.
 fn signed(
     relay_url: &str,
     path: &str,
     body: Vec<u8>,
-    key: &SecretKey,
-    keyid: Hash32,
-    recovery: bool,
+    s: &Signer<'_>,
     now: u64,
 ) -> Result<Request, EngineError> {
     let p = Params {
         created: now,
         expires: now.saturating_add(request::MAX_LIFETIME),
         nonce: keys::random_bytes().map_err(|_| EngineError::Random)?,
-        keyid,
-        recovery,
+        keyid: s.keyid,
+        recovery: s.recovery,
     };
     let auth = authority(relay_url);
     let t = Target {
@@ -69,7 +73,7 @@ fn signed(
         query: "",
     };
     let mut headers = json_headers(&body);
-    for (name, value) in request::sign(key, &t, &body, &p).pairs() {
+    for (name, value) in request::sign(s.key, &t, &body, &p).pairs() {
         headers.push(Header {
             name: name.into(),
             value: value.into(),
@@ -131,9 +135,11 @@ impl Engine {
             &self.space.relay_url,
             &path,
             wire::delete_body(&stmt, None),
-            &self.sign,
-            self.device_id,
-            false,
+            &Signer {
+                key: &self.sign,
+                keyid: self.device_id,
+                recovery: false,
+            },
             now,
         )
     }
@@ -472,9 +478,11 @@ impl Import {
                     &self.space.relay_url,
                     &self.path(""),
                     body,
-                    &self.sign,
-                    self.device_id,
-                    false,
+                    &Signer {
+                        key: &self.sign,
+                        keyid: self.device_id,
+                        recovery: false,
+                    },
                     now,
                 )?
             }
@@ -487,9 +495,11 @@ impl Import {
                     &self.space.relay_url,
                     &self.path("/chunk"),
                     body,
-                    &self.sign,
-                    self.device_id,
-                    false,
+                    &Signer {
+                        key: &self.sign,
+                        keyid: self.device_id,
+                        recovery: false,
+                    },
                     now,
                 )?
             }
@@ -501,16 +511,26 @@ impl Import {
                 });
                 let path = self.path("/finish");
                 match &self.finisher {
-                    Some(r) => {
-                        signed(&self.space.relay_url, &path, body, &r.sign, r.id, true, now)?
-                    }
+                    Some(r) => signed(
+                        &self.space.relay_url,
+                        &path,
+                        body,
+                        &Signer {
+                            key: &r.sign,
+                            keyid: r.id,
+                            recovery: true,
+                        },
+                        now,
+                    )?,
                     None => signed(
                         &self.space.relay_url,
                         &path,
                         body,
-                        &self.sign,
-                        self.device_id,
-                        false,
+                        &Signer {
+                            key: &self.sign,
+                            keyid: self.device_id,
+                            recovery: false,
+                        },
                         now,
                     )?,
                 }
@@ -581,6 +601,7 @@ impl Import {
             Step::Finish => {
                 let head = wire::parse_repair_finished(body).map_err(|_| bad("import finish"))?;
                 if head != self.tip {
+                    self.step = Step::Done;
                     return Err(EngineError::Refused {
                         code: "bad_import".into(),
                     });

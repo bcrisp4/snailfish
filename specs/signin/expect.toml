@@ -1,43 +1,53 @@
 # Expected ProVerif results. One table for each .pv file in this directory.
-# Keys and values follow specs/enrollment/expect.toml. The variable names u_6, d_3 and
-# ch_3 are the names that ProVerif prints for the query variables.
+# Keys and values follow specs/enrollment/expect.toml. The variable names u_7, d_3,
+# r_1 and ch_3 are the names that ProVerif prints for the query variables.
 
 ["signin.pv"]
-"HonestUser(u_6)) ==> event(Approves" = "true"
-"ten(u_6))) ==> event(Approves" = "true"
+"SpaceCreated(ten(u_7),d_3)) && event(HonestUser(u_7)) ==>" = "true"
+"ten(u_7))) ==> event(Approves" = "true"
 "==> event(UserRegisters" = "true"
+"RecoveryUse(ten(u_7),r_1)) && event(HonestUser(u_7)) ==>" = "true"
 "not (event(TokenIssued" = "reachable"
 "not (event(SpaceCreated" = "reachable"
 "not (event(PasskeyRegistered" = "reachable"
+"not (event(RecoveryUse" = "reachable"
 
 ["no_pkce.pv"]
-"HonestUser(u_6)) ==> event(Approves" = "false"
-"ten(u_6))) ==> event(Approves" = "false"
+"SpaceCreated(ten(u_7),d_3)) && event(HonestUser(u_7)) ==>" = "false"
+"ten(u_7))) ==> event(Approves" = "false"
 "==> event(UserRegisters" = "true"
+"RecoveryUse(ten(u_7),r_1)) && event(HonestUser(u_7)) ==>" = "true"
 "not (event(TokenIssued" = "reachable"
 "not (event(SpaceCreated" = "reachable"
 "not (event(PasskeyRegistered" = "reachable"
+"not (event(RecoveryUse" = "reachable"
 
 ["unbound_token.pv"]
-"HonestUser(u_6)) ==> event(Approves" = "false"
-"ten(u_6))) ==> event(Approves" = "true"
+"SpaceCreated(ten(u_7),d_3)) && event(HonestUser(u_7)) ==>" = "false"
+"ten(u_7))) ==> event(Approves" = "true"
 "==> event(UserRegisters" = "true"
+"RecoveryUse(ten(u_7),r_1)) && event(HonestUser(u_7)) ==>" = "true"
 "not (event(TokenIssued" = "reachable"
 "not (event(SpaceCreated" = "reachable"
 "not (event(PasskeyRegistered" = "reachable"
+"not (event(RecoveryUse" = "reachable"
 
 ["no_tenant_check.pv"]
-"HonestUser(u_6)) ==> event(Approves" = "false"
-"ten(u_6))) ==> event(Approves" = "true"
+"SpaceCreated(ten(u_7),d_3)) && event(HonestUser(u_7)) ==>" = "false"
+"ten(u_7))) ==> event(Approves" = "true"
 "==> event(UserRegisters" = "true"
+"RecoveryUse(ten(u_7),r_1)) && event(HonestUser(u_7)) ==>" = "false"
 "not (event(TokenIssued" = "reachable"
 "not (event(SpaceCreated" = "reachable"
 "not (event(PasskeyRegistered" = "reachable"
+"not (event(RecoveryUse" = "reachable"
 
 ["plain_invite.pv"]
-"HonestUser(u_6)) ==> event(Approves" = "false"
-"ten(u_6))) ==> event(Approves" = "true"
+"SpaceCreated(ten(u_7),d_3)) && event(HonestUser(u_7)) ==>" = "false"
+"ten(u_7))) ==> event(Approves" = "true"
 "==> event(UserRegisters" = "false"
+"RecoveryUse(ten(u_7),r_1)) && event(HonestUser(u_7)) ==>" = "false"
 "not (event(TokenIssued" = "reachable"
 "not (event(SpaceCreated" = "reachable"
 "not (event(PasskeyRegistered" = "reachable"
+"not (event(RecoveryUse" = "reachable"

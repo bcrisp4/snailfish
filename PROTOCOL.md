@@ -881,7 +881,7 @@ The relay checks a start request in this order:
 6. Run the chain check from position 0 with `digest(0)` of `{log}` and an empty space state. Position 1 must hold a genesis record that passes the checks of 10.5, with `log` equal to `{log}`. Each later entry passes the repair chain check of 10.9 start step 3 against the entries before it. A security record also passes 10.6 step 14 against the entries before it, and a change, a snapshot or an accept record passes 10.6 step 16 with the quota of the tenant. 10.6 step 15 does not apply, because the records were stored before. If an entry fails, return `invalid_record`, `uncovered_stub`, `bad_import` for a wrong position, or `quota` for steps 14 and 16.
 7. Create the temporary space file and the session, and stage the entries.
 
-A chunk request uses the same order without steps 3 and 5. In step 4, the relay uses the device and the `sign` key of the named session. Before step 6: if the session is unknown or expired, or the request signer is not the device of the session, return `bad_import`. The first entry must have the position `next`, and the chain continues the staged entries.
+A chunk request uses the same order without steps 3 and 5. Before step 4: if the session is unknown or expired, return `bad_import`. In step 4, the relay uses the device and the `sign` key of the named session, so each other `keyid` gets `unknown_device`. The first entry must have the position `next`, and the chain continues the staged entries.
 
 A finish request runs 8.6 steps 1 to 4, returns `bad_request` for a body that breaks this section, and then:
 

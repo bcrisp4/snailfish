@@ -370,16 +370,22 @@ impl Relay {
         std::fs::create_dir_all(cfg.data_dir.join("tenants")).map_err(StoreError::Io)?;
         store::open(&cfg.data_dir.join("directory.db"), Kind::Directory, true)?;
         let auth = user::Auth::open(&cfg)?;
-        let relay = Self {
+        Ok(Self {
             cfg: Arc::new(cfg),
             auth: Arc::new(auth),
-        };
-        relay.sweep()?;
-        Ok(relay)
+        })
     }
 
-    /// The startup work of [STO-5] and [STO-6] in each tenant directory.
-    fn sweep(&self) -> Result<(), StoreError> {
+    /// The startup work of [STO-5] and [STO-6] in each tenant directory:
+    /// delete the files of each import session, finish the rename of an
+    /// imported space, and delete each marked space file. Only `serve` runs
+    /// it, after it holds the serve lock: an operator command opens the
+    /// relay while `serve` runs, and must not end a live import session.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    pub fn sweep(&self) -> Result<(), StoreError> {
         let d = self.directory()?;
         let mut st = d.prepare("SELECT tenant_id FROM tenants")?;
         let ids: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;

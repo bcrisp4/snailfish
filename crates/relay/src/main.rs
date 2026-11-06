@@ -355,6 +355,9 @@ async fn serve(config: Config, listen: &str, metrics: &str) -> ExitCode {
         Ok(r) => r,
         Err(e) => return fail(&e.to_string()),
     };
+    if let Err(e) = relay.sweep() {
+        return fail(&e.to_string());
+    }
     let listener = match tokio::net::TcpListener::bind(listen).await {
         Ok(l) => l,
         Err(e) => return fail(&format!("cannot listen: {e}")),

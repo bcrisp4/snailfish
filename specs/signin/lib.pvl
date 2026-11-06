@@ -50,6 +50,7 @@ const lauthz: bitstring.
 const ltok: bitstring.
 const lput: bitstring.
 const lok: bitstring.
+const lrec: bitstring.
 
 (* Relay storage. *)
 table invites(user, bitstring).
@@ -78,9 +79,10 @@ event AppStarts(pkey, bitstring).
 event AppGetsToken(pkey, tenant).
 event TokenIssued(user, pkey).
 event SpaceCreated(tenant, pkey).
+event RecoveryUse(tenant, pkey).
 
 (* The relay. Each branch is one route. A route reads one TLS request.
-   Rules: [USR-1] [USR-3] [USR-4] [USR-5] [USR-6] *)
+   Rules: [USR-1] [USR-3] [USR-4] [USR-5] [USR-6] [LOG-13] *)
 let Relay(v: variant) =
   (* Passkey registration with an invite token. *)
   (! in(c, x: bitstring);
@@ -129,6 +131,18 @@ let Relay(v: variant) =
      get tokens(=tok, u, bound) in
      if devok(v, d, bound) && tenok(v, t, u) then
      event SpaceCreated(t, d);
+     out(c, senc(lok, kc)))
+  (* A deletion or an import finish that a recovery key signs (PROTOCOL.md
+     10.12, 10.13). The token can name any device of the tenant, because the
+     recovery key signs the request, so only the tenant check applies. The
+     check that the key is the current recovery key of the log is a relay
+     storage rule outside this model. *)
+| (! in(c, x: bitstring);
+     let (=lrec, tok: bitstring, t: tenant, r: pkey, sg: bitstring, kc: bitstring) = tdec(x, skTls) in
+     if checksig(sg, r) = (lrec, tok, t) then
+     get tokens(=tok, u, bound) in
+     if tenok(v, t, u) then
+     event RecoveryUse(t, r);
      out(c, senc(lok, kc))).
 
 (* A native app on the device of an honest user. It opens the system browser
@@ -156,7 +170,10 @@ let App(s: bitstring) =
   event AppGetsToken(d, t);
   out(c, tok);
   new k3: bitstring;
-  out(c, tenc((lput, tok, t, d, sign((lput, tok, t), dsk), k3), tpub(skTls))).
+  out(c, tenc((lput, tok, t, d, sign((lput, tok, t), dsk), k3), tpub(skTls)));
+  new rsk: skey;
+  new k4: bitstring;
+  out(c, tenc((lrec, tok, t, pk(rsk), sign((lrec, tok, t), rsk), k4), tpub(skTls))).
 
 (* An honest user. The relay operator sends the invite token on a private
    channel. A copy of the relay storage is public (T1).
@@ -208,7 +225,14 @@ query u: user, d: pkey, ch: bitstring;
 query u: user, p: pkey;
   event(PasskeyRegistered(u, p)) && event(HonestUser(u)) ==> event(UserRegisters(u, p)).
 
+(* (e) Tenant isolation of the recovery-key routes. A request that a recovery
+   key signs acts in the tenant of an honest user only with a token from a
+   sign-in that this user approved. *)
+query u: user, r: pkey, d: pkey, ch: bitstring;
+  event(RecoveryUse(ten(u), r)) && event(HonestUser(u)) ==> event(Approves(u, ch)) && event(AppStarts(d, ch)).
+
 (* (d) Reachability. A pass of (a) to (c) must not be vacuous. *)
 query u: user, d: pkey; event(TokenIssued(u, d)) && event(HonestUser(u)).
 query u: user, d: pkey, ch: bitstring; event(SpaceCreated(ten(u), d)) && event(HonestUser(u)) && event(AppStarts(d, ch)).
 query u: user, p: pkey; event(PasskeyRegistered(u, p)) && event(HonestUser(u)).
+query u: user, r: pkey; event(RecoveryUse(ten(u), r)) && event(HonestUser(u)).

@@ -19,6 +19,7 @@ ProVerif checks the symbolic security of user sign-in and the native setup hando
 4. The redirect is public, because another app can claim the same URL scheme. The app reads a code that the attacker can replace.
 5. The app exchanges the code and the verifier in a request that its device key signs. The relay binds the setup token to the device key and the user. [USR-5]
 6. The app can leak its setup token. It creates a space with the token in a request that its device key signs. The relay checks the device and the tenant of the token. [USR-6]
+7. A recovery key signs a deletion or an import finish with a setup token of any device of the tenant (PROTOCOL.md 10.12, 10.13). The relay checks the tenant of the token only. [LOG-13]
 
 ## Attacker model
 
@@ -35,9 +36,10 @@ ProVerif checks the symbolic security of user sign-in and the native setup hando
 | (a) `SpaceCreated(ten(u), d)` for an honest `u` needs `Approves(u, ch)` and `AppStarts(d, ch)` | true | Tenant isolation. A space in the tenant of an honest user needs a device whose sign-in that user approved. The attacker account cannot reach it. |
 | (b) `AppGetsToken(d, ten(u))` needs `Approves(u, ch)` and `AppStarts(d, ch)` | true | An injected code cannot move an app into the tenant of the attacker. |
 | (c) `PasskeyRegistered(u, p)` for an honest `u` needs `UserRegisters(u, p)` | true | Only the holder of the invite token registers a passkey, also with a copy of the relay storage. |
-| Reachability of `TokenIssued`, `SpaceCreated` and `PasskeyRegistered` for an honest user | reachable (ProVerif prints "is false") | A full honest run exists, so the passes above are not empty. |
+| (e) `RecoveryUse(ten(u), r)` for an honest `u` needs `Approves(u, ch)` and `AppStarts(d, ch)` | true | A request that a recovery key signs acts in the tenant of an honest user only with a token from a sign-in that this user approved. |
+| Reachability of `TokenIssued`, `SpaceCreated`, `PasskeyRegistered` and `RecoveryUse` for an honest user | reachable (ProVerif prints "is false") | A full honest run exists, so the passes above are not empty. |
 
-Result of `make verify-crypto`: all 30 query results of this directory match `expect.toml`. Each file takes about 0.1 seconds.
+Result of `make verify-crypto`: all 40 query results of this directory match `expect.toml`. Each file takes about 0.1 seconds.
 
 ## Variants
 
@@ -45,11 +47,12 @@ Result of `make verify-crypto`: all 30 query results of this directory match `ex
 | --- | --- | --- | --- |
 | `no_pkce.pv` | The relay does not check the verifier. | The attacker reads the code from the public redirect and exchanges it with its own device key, or injects a code of its own account into the app. | (a), (b) |
 | `unbound_token.pv` | The setup token does not name a device. | The attacker uses a leaked token with its own device key and creates a space in the tenant of the user. | (a) |
-| `no_tenant_check.pv` | Space creation does not check the tenant of the token. | The attacker signs in to its own account, gets a token for its own device and creates a space in the tenant of another user. | (a) |
+| `no_tenant_check.pv` | Space creation and the recovery-key routes do not check the tenant of the token. | The attacker signs in to its own account, gets a token for its own device and creates a space, or deletes one with a recovery key, in the tenant of another user. | (a), (e) |
 | `plain_invite.pv` | The relay stores the invite token, not its hash. | The attacker reads the token from a copy of the relay storage and registers its own passkey for the user. | (a), (c) |
 
 ## Limits
 
+- The current recovery key of a log is a relay storage rule. The model lets any recovery key sign, so (e) checks the tenant binding of the token only.
 - No time. The 7 day invite expiry, the 60 second code expiry and the 10 minute token expiry are not checked.
 - No one-use rule. A ProVerif table row cannot be removed, so the invite token and the code can be read more than once. Rust tests check one use (`specs/coverage.toml` `partial`).
 - The redirect URI binding is not modelled. PKCE alone stops the code interception in the model.

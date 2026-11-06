@@ -232,6 +232,55 @@ fn recovery_key_deletes_with_a_setup_token() {
     assert_eq!(error_code(&r), "deleted");
 }
 
+/// [LOG-13], specs/signin query (e): a setup token of another tenant does
+/// not authorise a recovery-key deletion, so another user cannot delete the
+/// space with a recovery key and the own token.
+#[test]
+fn recovery_deletion_needs_a_token_of_the_same_tenant() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    fx.relay.add_user("eve").unwrap();
+    let token = fx.setup_token("eve", "C");
+    let stmt = statement(&fx, "R1", relay_head(&fx), now(&fx) + 60);
+    let r = delete(&fx, "R1", &stmt, Some(&token));
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "bad_setup"));
+    assert!(fx.space_file(fx.tenant()).exists());
+}
+
+/// An operator command opens the relay while `serve` runs. It must not end
+/// a live import session ([STO-6]): only the `serve` startup sweeps.
+#[test]
+fn operator_command_keeps_a_live_import_session() {
+    let fx = Fx::new();
+    let src = Fx::new();
+    src.setup_space(src.tenant());
+    let (entries, head) = log_entries(&src);
+    let token = fx.setup_token("sam", "A");
+    let body = wire::import_start_body(&token, &keys_of("A"), &entries[..1]).unwrap();
+    let r = fx
+        .relay
+        .handle(&fx.signed("POST", &import_path(&fx, ""), "", &body, "A"));
+    assert_eq!(r.status, 201);
+    let (session, mut next) = wire::parse_repair_started(&r.body).unwrap();
+    // `snailfish-relay quota` opens a second relay on the same directory.
+    let other = Fx::open(&fx.dir, &fx.authority, common::limits_of(&fx.h), &fx.now).unwrap();
+    other.set_quotas("sam", None, None).unwrap();
+    for e in &entries[1..] {
+        let body = wire::repair_chunk_body(&session, std::slice::from_ref(e)).unwrap();
+        let r = fx
+            .relay
+            .handle(&fx.signed("POST", &import_path(&fx, "/chunk"), "", &body, "A"));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        next = wire::parse_repair_next(&r.body).unwrap();
+    }
+    assert_eq!(next, head.position + 1);
+    let body = wire::repair_finish_body(&RepairFinish { session, tip: head });
+    let r = fx
+        .relay
+        .handle(&fx.signed("POST", &import_path(&fx, "/finish"), "", &body, "A"));
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+}
+
 /// [FRK-5] [STO-6]: an import of the export file after a deletion makes
 /// the same log again and removes the marker. The chunks continue one
 /// session (`deletedThenImportedTest`).
