@@ -529,3 +529,179 @@ fn overlay_applies_earlier_level_records_of_the_request() {
     let env = tip.grant(&a, false, &party(4), 1);
     assert!(invalid(&send(&mut tip, &env)));
 }
+
+// ---------------------------------------------------------------- M8
+
+impl Space {
+    /// A grant of `to` by the device `by` with a key set of `epochs` only.
+    fn grant_with(&self, by: &Party, to: &Party, epochs: &[u64]) -> Envelope {
+        let keys: Vec<[u8; 32]> = epochs
+            .iter()
+            .map(|e| self.keys[usize::try_from(e.checked_sub(1).unwrap()).unwrap()])
+            .collect();
+        let ks = key_set(to, false, epochs, &keys);
+        sign(
+            by,
+            "snailfish.grant.v1",
+            write::grant(
+                &LOG,
+                &Author::Device(by.id),
+                &self.head(),
+                &device_obj(to, 1),
+                &ks,
+            ),
+        )
+    }
+
+    /// A snapshot by `by` in `epoch` of the state at position `state`.
+    fn snapshot(&self, by: &Party, state: u64, epoch: u64) -> Envelope {
+        let at = Position {
+            position: state,
+            digest: self.s.digest_at(state).unwrap(),
+        };
+        let payload = write::snapshot(&LOG, &by.id, &self.head(), epoch, &at, &[0; 48]);
+        sign(by, "snailfish.snapshot.v1", payload)
+    }
+
+    /// An accept by `by` of the snapshot at `snap`, applied to the head.
+    fn accept(&self, by: &Party, snap: u64) -> Envelope {
+        let hash = self.s.snapshot_hash(snap).unwrap();
+        let head = self.head();
+        let payload = write::accept(&LOG, &by.id, &head, snap, &hash, &head);
+        sign(by, "snailfish.accept.v1", payload)
+    }
+}
+
+/// `specs/compaction/test.qnt::sealNeededTest`, [CMP-20] `PROTOCOL.md`
+/// 14.5: A removes C (epoch 2), changes in epoch 2 and removes B (epoch 3).
+/// No snapshot covers the change, so a grant must hold epoch 2. Without
+/// this, a new device would get no key for a change that it must apply.
+#[test]
+fn grant_needs_the_epoch_of_an_uncovered_change() {
+    let (mut sp, r1, a, b, c) = three();
+    let (env, key) = sp.epoch(&a, &[&c], &[&a, &b], &r1);
+    sp.push(&env);
+    sp.keys.push(key);
+    sp.push(&sp.change(&a, 2, 1));
+    let (env, key) = sp.epoch(&a, &[&b], &[&a], &r1);
+    sp.push(&env);
+    sp.keys.push(key);
+    let d = party(4);
+    assert!(invalid(&sp.check(&sp.grant_with(&a, &d, &[3]))));
+    assert!(matches!(
+        sp.check(&sp.grant_with(&a, &d, &[2, 3])),
+        Verdict::Store(_)
+    ));
+}
+
+/// A change by A in epoch 1 (4), the removal of C (epoch 2, at 5), a
+/// snapshot of A in epoch 2 of the state at 4 (6) and the accept of A (7).
+/// B has not accepted, so no snapshot is usable.
+fn snapshot_blocked_by_b() -> (Space, Party, Party, Party) {
+    let (mut sp, r1, a, b, c) = three();
+    sp.push(&sp.change(&a, 1, 1));
+    let (env, key) = sp.epoch(&a, &[&c], &[&a, &b], &r1);
+    sp.push(&env);
+    sp.keys.push(key);
+    sp.push(&sp.snapshot(&a, 4, 2));
+    sp.push(&sp.accept(&a, 6));
+    (sp, r1, a, b)
+}
+
+/// Check each envelope of one append request against the overlay, as the
+/// relay does (`PROTOCOL.md` 10.6). `tip` applies the stored ones, so the
+/// next envelope names the head after them.
+fn overlay_send(
+    over: &mut snailfish_protocol::space::Overlay<'_, MemorySpace>,
+    tip: &mut Space,
+    env: &Envelope,
+) -> Verdict {
+    let v = check_append(&*over, env, Mode::Verify);
+    if let Verdict::Store(acc) = &v {
+        over.apply((**acc).clone());
+        tip.push(env);
+    }
+    v
+}
+
+/// [CMP-7] [CMP-20]: in one request, A removes B and then grants D. The
+/// removal makes the snapshot usable, which covers the change in epoch 1,
+/// so the grant needs epochs 2 and 3 only. Without the overlay of the
+/// removal, the relay would refuse the grant of the device that signed it.
+#[test]
+fn overlay_removal_makes_the_snapshot_usable_for_a_later_grant() {
+    let (sp, r1, a, b) = snapshot_blocked_by_b();
+    let mut over = snailfish_protocol::space::Overlay::new(&sp.s);
+    let mut tip = Space {
+        s: sp.s.clone(),
+        keys: sp.keys.clone(),
+        levels: Levels::CURRENT,
+    };
+    let (env, key) = tip.epoch(&a, &[&b], &[&a], &r1);
+    assert!(matches!(
+        overlay_send(&mut over, &mut tip, &env),
+        Verdict::Store(_)
+    ));
+    tip.keys.push(key);
+    let grant = tip.grant_with(&a, &party(4), &[2, 3]);
+    let v = overlay_send(&mut over, &mut tip, &grant);
+    assert!(matches!(v, Verdict::Store(_)), "{v:?}");
+}
+
+/// [CMP-6] [CMP-20]: in one request, A grants D, then B accepts. D is
+/// active from its grant and has not accepted, so the snapshot is not
+/// usable, and a grant of E must still hold epoch 1. Without the overlay of
+/// the grant, the relay would give E a key set without the key of the
+/// change in epoch 1.
+#[test]
+fn overlay_grant_keeps_the_snapshot_blocked_for_a_later_grant() {
+    let (sp, _r1, a, b) = snapshot_blocked_by_b();
+    let mut over = snailfish_protocol::space::Overlay::new(&sp.s);
+    let mut tip = Space {
+        s: sp.s.clone(),
+        keys: sp.keys.clone(),
+        levels: Levels::CURRENT,
+    };
+    let grant_d = tip.grant_with(&a, &party(4), &[1, 2]);
+    assert!(matches!(
+        overlay_send(&mut over, &mut tip, &grant_d),
+        Verdict::Store(_)
+    ));
+    let accept = tip.accept(&b, 6);
+    assert!(matches!(
+        overlay_send(&mut over, &mut tip, &accept),
+        Verdict::Store(_)
+    ));
+    let short = tip.grant_with(&a, &party(5), &[2]);
+    assert!(invalid(&overlay_send(&mut over, &mut tip, &short)));
+    let full = tip.grant_with(&a, &party(5), &[1, 2]);
+    let v = overlay_send(&mut over, &mut tip, &full);
+    assert!(matches!(v, Verdict::Store(_)), "{v:?}");
+}
+
+/// [CMP-5] `PROTOCOL.md` 14.4: an accept can name a snapshot that an earlier
+/// envelope of the same request holds. A change comes first, so the
+/// overlay must find the snapshot by its position.
+#[test]
+fn overlay_accept_names_a_snapshot_of_the_same_request() {
+    let (sp, _r1, a, _b, _c) = three();
+    let mut over = snailfish_protocol::space::Overlay::new(&sp.s);
+    let mut tip = Space {
+        s: sp.s.clone(),
+        keys: sp.keys.clone(),
+        levels: Levels::CURRENT,
+    };
+    let change = tip.change(&a, 1, 1);
+    assert!(matches!(
+        overlay_send(&mut over, &mut tip, &change),
+        Verdict::Store(_)
+    ));
+    let snap = tip.snapshot(&a, 4, 1);
+    assert!(matches!(
+        overlay_send(&mut over, &mut tip, &snap),
+        Verdict::Store(_)
+    ));
+    let accept = tip.accept(&a, 5);
+    let v = overlay_send(&mut over, &mut tip, &accept);
+    assert!(matches!(v, Verdict::Store(_)), "{v:?}");
+}

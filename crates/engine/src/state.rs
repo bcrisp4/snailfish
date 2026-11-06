@@ -729,6 +729,10 @@ pub(crate) struct DbSpace<'a> {
     pub tx: &'a Transaction<'a>,
     pub log_id: [u8; 16],
     pub state: State,
+    /// The first read error of `compaction`. A check that read an empty
+    /// compaction state needs fewer epochs in a key set, so the caller must
+    /// fail the check if this is set (fail closed).
+    pub error: std::cell::RefCell<Option<EngineError>>,
 }
 
 impl<'a> DbSpace<'a> {
@@ -737,6 +741,7 @@ impl<'a> DbSpace<'a> {
             tx,
             log_id,
             state: security_state(tx)?,
+            error: std::cell::RefCell::new(None),
         })
     }
 }
@@ -801,9 +806,10 @@ impl SpaceView for DbSpace<'_> {
             .and_then(|h| h.try_into().ok())
     }
     fn compaction(&self) -> snailfish_protocol::compaction::Compaction {
-        // On a read error the state is empty: every key set needs each epoch
-        // of the log, and a fetched grant with fewer epochs stops the engine.
-        crate::compact::compaction_state(self.tx).unwrap_or_default()
+        crate::compact::compaction_state(self.tx).unwrap_or_else(|e| {
+            self.error.borrow_mut().get_or_insert(e);
+            snailfish_protocol::compaction::Compaction::default()
+        })
     }
     fn last_security(&self) -> u64 {
         // Fail closed: on a read error every security record is stale, so

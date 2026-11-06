@@ -232,6 +232,28 @@ fn stub_form_depends_on_its_type() {
     let ok = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub(&snap)]);
     assert_eq!(ok.failure, None);
     assert!(matches!(ok.accepted[1], Staged::Stub(_)));
+    // [CMP-17]: the accept at 5 names the snapshot at 4, which the chain
+    // holds as a stub with the record hash of the snapshot.
+    let rh4: [u8; 32] = hex::decode(v["log"]["entries"][3]["record_hash"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let snap4 = Stub {
+        hash: rh4,
+        ..stub("snailfish.snapshot.v1", None)
+    };
+    let (e3, e5) = (env(&v, 3), env(&v, 5));
+    let accept = check_chain(
+        &s,
+        &[2, 3, 4, 5],
+        &[
+            Item::Envelope(&e2),
+            Item::Envelope(&e3),
+            Item::Stub(&snap4),
+            Item::Envelope(&e5),
+        ],
+    );
+    assert_eq!(accept.failure, None);
     let cid = v["log"]["entries"][2]["change_id"].as_str().unwrap();
     for bad in [
         stub("snailfish.change.v1", None),

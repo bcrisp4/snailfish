@@ -1094,18 +1094,15 @@ impl<V: SpaceView> SpaceView for Overlay<'_, V> {
             .map_or_else(|| self.inner.last_security(), |a| a.position)
     }
     fn snapshot_hash(&self, position: u64) -> Option<Hash32> {
-        self.staged
-            .iter()
-            .find_map(|s| match s {
-                Staged::Full(a) if a.position == position => {
-                    matches!(a.record.body, Body::Snapshot { .. }).then_some(a.record_hash)
-                }
-                Staged::Stub(st) if st.position == position => {
-                    (st.payload_type == "snailfish.snapshot.v1").then_some(st.record_hash)
-                }
-                _ => None,
-            })
-            .or_else(|| self.inner.snapshot_hash(position))
+        match self.staged.iter().find(|s| s.position() == position) {
+            Some(Staged::Full(a)) => {
+                matches!(a.record.body, Body::Snapshot { .. }).then_some(a.record_hash)
+            }
+            Some(Staged::Stub(st)) => {
+                (st.payload_type == "snailfish.snapshot.v1").then_some(st.record_hash)
+            }
+            None => self.inner.snapshot_hash(position),
+        }
     }
     fn compaction(&self) -> Compaction {
         let mut c = self.inner.compaction();
@@ -1128,11 +1125,7 @@ impl<V: SpaceView> SpaceView for Overlay<'_, V> {
                     c.apply(a.position, compaction::kind(&a.record), &active);
                 }
                 Staged::Stub(st) => {
-                    c.apply(
-                        st.position,
-                        compaction::stub_kind(&st.payload_type),
-                        &active,
-                    );
+                    c.apply(st.position, compaction::Kind::Other, &active);
                 }
             }
         }

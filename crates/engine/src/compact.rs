@@ -37,17 +37,17 @@ fn to_u64(n: i64) -> Result<u64, EngineError> {
 
 /// The compaction state of the verified log (`PROTOCOL.md` 14.1).
 pub(crate) fn compaction_state(db: &Connection) -> Result<Compaction, EngineError> {
-    let rows: Vec<(i64, String, String)> = {
+    let rows: Vec<(i64, String)> = {
         let mut st = db.prepare(&format!(
-            "SELECT position, payload_type, envelope FROM log WHERE {} ORDER BY position",
+            "SELECT position, envelope FROM log WHERE {} ORDER BY position",
             compaction::replay_sql()
         ))?;
-        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?
     };
     let mut parsed = Vec::with_capacity(rows.len());
-    for (p, t, e) in &rows {
-        parsed.push((to_u64(*p)?, t.as_str(), e.as_str()));
+    for (p, e) in &rows {
+        parsed.push((to_u64(*p)?, e.as_str()));
     }
     let (mut cmp, starts) = compaction::replay(parsed).map_err(storage)?;
     for (i, (epoch, start)) in starts.iter().enumerate() {
@@ -494,10 +494,11 @@ pub(crate) fn before_changes(e: &Engine, applied: u64) -> Result<bool, EngineErr
         .and_then(|u| c.snapshots.get(&u))
         .is_some_and(|s| s.accepters.contains(&e.device_id));
     // `stubbed` is the frontier of the last local compaction, so a call
-    // with no new frontier scans nothing.
+    // with no new frontier scans nothing. The frontier never goes back, so
+    // a different frontier is a new one.
     let stubbed: i64 =
         e.db.query_row("SELECT stubbed FROM meta", [], |r| r.get(0))?;
-    if own_accept && to_u64(stubbed)? < f {
+    if own_accept && to_u64(stubbed)? != f {
         let tx = Transaction::new_unchecked(&e.db, TransactionBehavior::Immediate)?;
         stub_covered(&tx, &c)?;
         tx.execute("UPDATE meta SET stubbed = ?1", [to_i64(f)?])?;

@@ -40,20 +40,19 @@ pub(super) fn compaction_state(c: &Connection, staged: bool) -> Result<Compactio
     } else {
         &["entries"]
     };
-    let mut rows: Vec<(u64, String, String)> = Vec::new();
+    let mut rows: Vec<(u64, String)> = Vec::new();
     for t in tables {
         let mut st = c.prepare(&format!(
-            "SELECT position, payload_type, envelope FROM {t} WHERE {} ORDER BY position",
+            "SELECT position, envelope FROM {t} WHERE {} ORDER BY position",
             compaction::replay_sql()
         ))?;
         let mut q = st.query([])?;
         while let Some(r) = q.next()? {
-            rows.push((from_i64(r.get(0)?)?, r.get(1)?, r.get(2)?));
+            rows.push((from_i64(r.get(0)?)?, r.get(1)?));
         }
     }
     let (mut cmp, starts) =
-        compaction::replay(rows.iter().map(|(p, t, e)| (*p, t.as_str(), e.as_str())))
-            .map_err(corrupt)?;
+        compaction::replay(rows.iter().map(|(p, e)| (*p, e.as_str()))).map_err(corrupt)?;
     for (i, (epoch, start)) in starts.iter().enumerate() {
         let end = starts
             .get(i.saturating_add(1))

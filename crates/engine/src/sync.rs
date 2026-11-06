@@ -1078,7 +1078,11 @@ fn verify_entry(
         }
         a
     } else {
-        match space::check_append(view, &raw.envelope, Mode::Verify) {
+        let verdict = space::check_append(view, &raw.envelope, Mode::Verify);
+        if let Some(e) = view.error.borrow_mut().take() {
+            return Err(Answer::Engine(e));
+        }
+        match verdict {
             Verdict::Store(a) => *a,
             Verdict::Refused(r) => return Err(stop(format!("position {pos}: {r}"))),
             Verdict::Known(_) | Verdict::Conflict(_) => {

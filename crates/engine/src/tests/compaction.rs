@@ -666,6 +666,11 @@ fn unchecked_snapshots_lists_only_what_the_app_must_check() {
     a.write_snapshot(&mut ea);
     w.exchange(&mut ea);
     w.exchange(&mut eb);
+    assert_eq!(
+        eb.unchecked_snapshots().unwrap(),
+        vec![],
+        "the app of B has not applied a2"
+    );
     b.pull(&eb).unwrap();
     assert_eq!(Dev::check_snapshots(&mut ea), 1);
     assert_eq!(Dev::check_snapshots(&mut eb), 1);
@@ -753,6 +758,129 @@ fn refused_snapshot_is_kept_or_dropped_by_its_code() {
         ea.status()
     );
     assert_eq!(crate::compact::pending_records(&ea.db).unwrap(), vec![]);
+}
+
+/// PROTOCOL.md 14.7 [LOG-6]: `bad_base` for a queued snapshot is
+/// transient. The relay goes back to position 2 after the fetch and before
+/// the append, so the base of the snapshot (3) is not in its log. The
+/// engine keeps the snapshot and reports no restore hold.
+#[test]
+fn snapshot_with_a_lost_base_waits() {
+    let (mut w, mut a, _b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    assert!(ea.write_snapshot(&a.applied, b"s").unwrap());
+    let mut sync = ea.start_sync();
+    while let Some(req) = sync.next_request(&mut ea).unwrap() {
+        let append = req.url.ends_with("/append");
+        if append {
+            w.cut_relay(2);
+        }
+        let (st, h, body) = w.send(&req);
+        sync.handle_response(&mut ea, st, &h, &body).unwrap();
+        if append {
+            break;
+        }
+    }
+    assert_eq!(ea.status(), Status::Ok);
+    assert_eq!(crate::compact::pending_records(&ea.db).unwrap().len(), 1);
+}
+
+/// [CMP-13], `specs/compaction/model.qnt` `deviceCompact`: an engine makes
+/// stubs only after its own accept. D joins after the compaction, and a
+/// relay fault gives it the change at 3 in full. D never accepted the
+/// snapshot, so it keeps the record in full after its reset.
+#[test]
+fn device_without_an_own_accept_makes_no_stubs() {
+    let (mut w, mut a, mut ea, _b, _eb) = compacted();
+    let full: String = state::envelope_at(&ea.db, 3).unwrap().unwrap();
+    a.pull(&ea).unwrap();
+    let mut keys_d = queue_grant(&ea, "D");
+    // D holds the app key, as after its checkpoint check (ENR-9).
+    keys_d.app_key = w.keys[0].app_key;
+    w.exchange(&mut ea);
+    Connection::open(relay_space_file(&w))
+        .unwrap()
+        .execute(
+            "UPDATE entries SET envelope = ?1 WHERE position = 3",
+            [&full],
+        )
+        .unwrap();
+    let mut d = w.dev("d");
+    let mut ed = Engine::open(&d.dir, w.space(), &keys_d).unwrap();
+    w.exchange(&mut ed);
+    assert_eq!(ed.status(), Status::Ok);
+    assert!(d.pull_or_reset(&ed));
+    assert_eq!(local_stubs(&ed), [4]);
+}
+
+/// A grant of a new device by `e` on its verified head, with a key set of
+/// `epochs` that seals random keys: the check reads only the epochs.
+fn grant_with_epochs(e: &Engine, epochs: &[u64]) -> snailfish_protocol::envelope::Envelope {
+    use snailfish_protocol::records::{Author, Device, KeySet, Keys};
+    let k = new_device_keys().unwrap();
+    let sign = snailfish_protocol::sig::SecretKey::from_seed(&k.sign_seed).public();
+    let seal = Box::new(keys::seal_public(&k.seal_seed));
+    let id = keys::device_id(&sign, &seal);
+    let all = vec![[7; 32]; epochs.len()];
+    let set = KeySet {
+        to: Author::Device(id),
+        epochs: epochs.to_vec(),
+        sealed: keys::seal_key_set(&seal[..], &e.log_id, &id, epochs, &all).unwrap(),
+    };
+    let device = Device {
+        id,
+        keys: Keys { sign, seal },
+        name: "D".into(),
+        level: MAX_LEVEL,
+    };
+    let t = "snailfish.grant.v1";
+    let payload = snailfish_protocol::write::grant(
+        &e.log_id,
+        &Author::Device(e.device_id),
+        &e.base().unwrap(),
+        &device,
+        &set,
+    );
+    let sig = e.sign.sign_record(t, &payload);
+    let json = snailfish_protocol::envelope::write_json(t, &payload, &sig, "d_");
+    snailfish_protocol::envelope::Envelope::parse(json.as_bytes()).unwrap()
+}
+
+/// [CMP-20] PROTOCOL.md 14.5, the engine check of a fetched grant: A removes
+/// B (epoch 2), edits in epoch 2 and rotates to epoch 3 with a recovery key
+/// replacement. No snapshot covers the change, so a grant needs epoch 2.
+/// Without this, a relay could serve a grant that leaves a new device
+/// without the key of a change that it must apply.
+#[test]
+fn fetched_grant_must_hold_each_needed_epoch() {
+    use snailfish_protocol::space::{Mode, Verdict, check_append};
+    let (mut w, mut a, b) = World::new();
+    let mut ea = w.engine(&a);
+    let eb = w.engine(&b);
+    w.exchange(&mut ea);
+    ea.remove_devices(&[eb.device_id()]).unwrap();
+    w.exchange(&mut ea);
+    a.edit(&ea, b"in epoch 2");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    let new = Engine::new_recovery_key().unwrap();
+    ea.replace_recovery_key(&w.recovery_key.clone(), &new)
+        .unwrap();
+    w.exchange(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.current_epoch().unwrap(), 3);
+    let tx = Transaction::new_unchecked(&ea.db, TransactionBehavior::Deferred).unwrap();
+    let view = state::DbSpace::new(&tx, ea.log_id).unwrap();
+    for (epochs, ok) in [(&[1, 3][..], false), (&[1, 2, 3][..], true)] {
+        let v = check_append(&view, &grant_with_epochs(&ea, epochs), Mode::Verify);
+        assert_eq!(matches!(v, Verdict::Store(_)), ok, "{epochs:?}: {v:?}");
+    }
+    assert!(view.error.borrow().is_none());
 }
 
 /// One exchange with no limit on the number of requests, for the SLO case.

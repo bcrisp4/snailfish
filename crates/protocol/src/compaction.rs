@@ -36,14 +36,10 @@ pub enum Kind {
         /// Its author.
         author: Hash32,
     },
-    /// A stub of a change ([CMP-1]). A change stub is covered, so its epoch
-    /// is not needed.
-    ChangeStub,
-    /// A stub of a snapshot. It holds no state position, so it is never
-    /// usable (14.1).
-    SnapshotStub,
-    /// Each other record. A removal changes the active devices, which the
-    /// caller passes with the entry.
+    /// Each other record, and a stub ([CMP-1]). A stub holds no epoch and
+    /// no state position, so it never moves the usable snapshot (14.1). A
+    /// removal changes the active devices, which the caller passes with the
+    /// entry.
     Other,
 }
 
@@ -133,18 +129,6 @@ pub fn kind(record: &Record) -> Kind {
     }
 }
 
-/// The [`Kind`] of a stub of `payload_type`.
-#[must_use]
-pub fn stub_kind(payload_type: &str) -> Kind {
-    if payload_type == "snailfish.change.v1" {
-        Kind::ChangeStub
-    } else if payload_type == "snailfish.snapshot.v1" {
-        Kind::SnapshotStub
-    } else {
-        Kind::Other
-    }
-}
-
 /// An SQL condition on a `payload_type` column: the rows that [`replay`]
 /// takes, the security, snapshot and accept records. It is a list, so the
 /// index on the payload type of a store serves it.
@@ -160,8 +144,8 @@ pub fn replay_sql() -> String {
 }
 
 /// The compaction state of a log from its records that are not changes, in
-/// position order: `(position, payload type, envelope JSON)`, with an empty
-/// envelope for a stub. Changes do not move the usable snapshot, so the
+/// position order: `(position, envelope JSON)`, with an empty envelope for
+/// a stub. Changes do not move the usable snapshot, so the
 /// caller leaves them out. Returns the state and the first position of each
 /// epoch, `(epoch, position)`, from which the caller fills
 /// [`Compaction::last_change`].
@@ -170,14 +154,14 @@ pub fn replay_sql() -> String {
 ///
 /// The parse error of a stored record.
 pub fn replay<'a>(
-    rows: impl IntoIterator<Item = (u64, &'a str, &'a str)>,
+    rows: impl IntoIterator<Item = (u64, &'a str)>,
 ) -> Result<(Compaction, Vec<(u64, u64)>), String> {
     let mut state = crate::space::State::default();
     let mut cmp = Compaction::default();
     let mut starts = vec![(1, 1)];
-    for (position, ptype, env) in rows {
+    for (position, env) in rows {
         let kind = if env.is_empty() {
-            stub_kind(ptype)
+            Kind::Other
         } else {
             let e = crate::envelope::Envelope::parse(env.as_bytes()).map_err(|e| e.to_string())?;
             let record = crate::records::parse_payload(&e.payload_type, &e.payload)
@@ -231,7 +215,7 @@ impl Compaction {
                     s.accepters.insert(author);
                 }
             }
-            Kind::ChangeStub | Kind::SnapshotStub | Kind::Other => {}
+            Kind::Other => {}
         }
         // 14.1 rule 3 at this position: each snapshot with an accept from
         // every device that is active here is accepted.
@@ -250,8 +234,8 @@ impl Compaction {
     }
 
     /// True if the usable snapshot covers the record at `position` of kind
-    /// `kind` (14.2). A stub is covered. A security record or an accept
-    /// record never is ([CMP-20]).
+    /// `kind` (14.2). A security record or an accept record never is
+    /// ([CMP-20]).
     #[must_use]
     pub fn covers(&self, position: u64, kind: &Kind) -> bool {
         let u = self.usable.unwrap_or(0);
@@ -259,7 +243,6 @@ impl Compaction {
         match kind {
             Kind::Change { .. } => covers_change(position, f),
             Kind::Snapshot { state, .. } => covers_snapshot(position, *state, u, f),
-            Kind::ChangeStub | Kind::SnapshotStub => true,
             Kind::Accept { .. } | Kind::Other => false,
         }
     }
