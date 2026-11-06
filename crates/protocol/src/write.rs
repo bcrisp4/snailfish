@@ -271,6 +271,18 @@ pub fn checkpoint(log: &[u8; 16], author: &Hash32, at: &Position) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A `snailfish.delete.v1` statement (`PROTOCOL.md` 6.3 and 10.12, [LOG-13]).
+#[must_use]
+pub fn delete(log: &[u8; 16], author: &Author, head: &Position, expires: u64) -> Vec<u8> {
+    format!(
+        r#"{{"log":"{}","author":"{}","head":{},"expires":{expires}}}"#,
+        encode_id("l_", log),
+        author_text(author),
+        position(head)
+    )
+    .into_bytes()
+}
+
 /// A `snailfish.confirm.v1` statement (`PROTOCOL.md` 6.3 and 11.2, [ENR-7]).
 #[must_use]
 pub fn confirm(
@@ -358,6 +370,26 @@ mod tests {
             prop_assert_eq!(
                 parse_statement("snailfish.checkpoint.v1", &p).unwrap(),
                 Statement::Checkpoint { log, author, at }
+            );
+        }
+
+        /// [LOG-13]: a written deletion parses back to the same fields, for a
+        /// device author and a recovery author.
+        #[test]
+        fn delete_round_trip(
+            log in any::<[u8; 16]>(),
+            id in any::<[u8; 32]>(),
+            recovery: bool,
+            pos in 0u64..(1 << 53),
+            digest in any::<[u8; 32]>(),
+            expires in 0u64..(1 << 53),
+        ) {
+            let author = if recovery { Author::Recovery(id) } else { Author::Device(id) };
+            let head = Position { position: pos, digest };
+            let p = delete(&log, &author, &head, expires);
+            prop_assert_eq!(
+                parse_statement("snailfish.delete.v1", &p).unwrap(),
+                Statement::Delete { log, author, head, expires }
             );
         }
 

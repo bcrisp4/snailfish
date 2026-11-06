@@ -1,0 +1,68 @@
+# Checks for the forkrepair model. specs/tools/verify.py reads this file.
+
+model = "model.qnt"
+module = "forkrepair"
+tests = "test.qnt"
+test_module = "forkrepairTest"
+test_modules = ["forkrepairTestSnap"]
+
+invariants = ["noLostChange", "noDoubleApply", "noResurrect"]
+
+witness_configs = ["honest", "snapshots"]
+witness_steps = 40
+
+fast_config = "honest"
+
+[deep]
+config = "tiny"
+invariants = ["noLostChange", "noDoubleApply", "noResurrect"]
+max_steps = 8
+
+[defaults]
+MAX_IDS = "5"
+SNAPSHOTS = "false"
+BUG = '"none"'
+
+# ---------------------------------------------------------------- configs
+
+# A fork, the repair procedure, crashes between the steps. No snapshots.
+[configs.honest]
+
+# Devices can write snapshots and replace their changes with stubs.
+[configs.snapshots]
+SNAPSHOTS = "true"
+MAX_IDS = "6"
+
+[configs.tiny]
+MAX_IDS = "3"
+
+# ---------------------------------------------------------------- known limits
+
+[[limits]]
+config = "snapshots"
+invariant = "noLostChange"
+why = "CMP-21: an own change that a snapshot on the losing branch covers is a stub in the old state file, so FRK-7 cannot send it again."
+
+# ---------------------------------------------------------------- mutants
+
+[mutants.skipOld]
+base = "honest"
+caught_by = "noLostChange"
+
+[mutants.freshIds]
+base = "honest"
+caught_by = "noDoubleApply"
+
+[mutants.noReset]
+base = "honest"
+caught_by = "noDoubleApply"
+
+[mutants.uploadAfterDelete]
+base = "honest"
+caught_by = "noResurrect"
+
+[[exhaustive]]
+config = "tiny"
+invariants = ["noLostChange", "noDoubleApply", "noResurrect"]
+mutants = ["skipOld", "freshIds", "noReset", "uploadAfterDelete"]
+why = "Three devices, at most three change and snapshot IDs, one fork, no snapshots."

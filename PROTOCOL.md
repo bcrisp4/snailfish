@@ -201,7 +201,7 @@ These statements use the same envelope and signature input. They have no `base` 
 | Payload type | Author | Fields |
 | --- | --- | --- |
 | `snailfish.checkpoint.v1` | device ID | `log`, `author`, `position` (integer from 1), `digest` (32-byte binary) |
-| `snailfish.delete.v1` | device ID or recovery ID | `log`, `author`, `head` (position), `expires` (integer, Unix time in seconds) ([LOG-13]) |
+| `snailfish.delete.v1` | device ID or recovery ID | `log`, `author`, `head` (position), `expires` (integer, Unix time in seconds) ([LOG-13], 10.12) |
 | `snailfish.confirm.v1` | the device in `device` | `session` (session ID text), `trusted` (device ID text), `device` (device), `trusted_nonce` (32-byte binary), `new_nonce` (32-byte binary) |
 
 - A checkpoint states the log digest at `position`. The trusted device signs it during enrollment ([ENR-8], section 11).
@@ -402,7 +402,7 @@ seal_seed = HKDF-Expand(prk, "snailfish.recovery.seal.v1", 32)
 
 ## 10. HTTP API
 
-This section gives the sync and setup surface routes of M7. Later milestones add routes under the same prefix ([VER-12]). Section 12 gives the user surface. Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
+This section gives the sync and setup surface routes of M9. Later milestones add routes under the same prefix ([VER-12]). Section 12 gives the user surface. Bodies are UTF-8 JSON with `content-type: application/json`. Binary fields are standard base64 with padding.
 
 - The relay refuses a request body, or an object inside it, with a field that this section does not name (`bad_request`). The relay is upgraded before the engines ([VER-11]), so a newer engine never meets an older relay. The envelopes inside a body follow the looser rule of section 4.
 - The engine ignores unknown fields in a response body ([VER-13]).
@@ -425,6 +425,10 @@ This section gives the sync and setup surface routes of M7. Later milestones add
 | `POST` | `/v1/t/{tenant}/s/{log}/repair` | Yes, by a device that is active in the log or in the request entries | Start a repair session with the first chunk (10.9) |
 | `POST` | `/v1/t/{tenant}/s/{log}/repair/chunk` | Yes, by the device of the session | Add a chunk to the repair session (10.9) |
 | `POST` | `/v1/t/{tenant}/s/{log}/repair/finish` | Yes, by the device of the session | Move the staged entries into the log (10.9) |
+| `POST` | `/v1/t/{tenant}/s/{log}/delete` | Yes, by an active device, or by the current recovery ID with a setup token | Delete the space (10.12) |
+| `POST` | `/v1/t/{tenant}/s/{log}/import` | Yes, by the device of the setup token in the body | Start an import session with the first chunk (10.13) |
+| `POST` | `/v1/t/{tenant}/s/{log}/import/chunk` | Yes, by the device of the session | Add a chunk to the import session (10.13) |
+| `POST` | `/v1/t/{tenant}/s/{log}/import/finish` | Yes, by the device of the session if it is active at the tip, or by the current recovery ID at the tip | Make the space from the staged entries (10.13) |
 | `POST` | `/v1/t/{tenant}/s/{log}/enroll` | Yes, by an active device | Open an enrollment session (10.10) |
 | `GET` | `/v1/t/{tenant}/s/{log}/enroll/{session}` | Yes, by the device that opened the session | Read the session (10.10) |
 | `POST` | `/v1/t/{tenant}/s/{log}/enroll/{session}` | Yes, by the device that opened the session | Write a message of the trusted device (10.10) |
@@ -435,7 +439,7 @@ This section gives the sync and setup surface routes of M7. Later milestones add
 - `{log}` is the log ID text (section 2.2).
 - `{session}` is the session ID text (section 2.2).
 - The relay finds the tenant only through the handle, and the space only through the space index of the tenant file ([STO-3]).
-- Space creation needs a device signature and a setup token ([USR-6]).
+- Space creation and import need a device signature and a setup token ([USR-6]). A deletion by the recovery key needs a setup token ([LOG-13]).
 - The relay limits the request rate for each IP address on `GET /v1/e/{session}`, `POST /v1/e/{session}` and `POST /v1/setup/token` (12.6).
 
 ### 10.2 Active devices
@@ -479,6 +483,7 @@ Each error response has an HTTP status and this body:
 | `unknown_device` | 403 | `keyid` names no active device of the space | `paused: relay unavailable`. On a fetch, if the verified log holds the grant of the device, the engine starts a repair first ([LOG-12], 10.9). |
 | `unknown_tenant` | 404 | No tenant has the handle | `paused: relay unavailable` |
 | `unknown_space` | 404 | The tenant has no space with the log ID | `paused: relay unavailable` |
+| `deleted` | 410 | The tenant has no space with the log ID and holds a deletion marker for it ([LOG-13]). The relay returns it in place of `unknown_space`, and for a `PUT` of the log ID. | `stopped: deleted`. The engine sends no request for the space until the app opens it again. |
 | `not_found` | 404 | No route has the path | `paused: relay unavailable` |
 | `space_exists` | 409 | `PUT` with another genesis record for an existing log ID | `stopped: fork` |
 | `unknown_session` | 404 | The relay holds no session with the ID that has not expired, or the session belongs to another device or space (10.10) | Enrollment: a new device that shows the session writes `new.hello` again until its own 10 minutes end. Each other device fails the enrollment. |
@@ -486,6 +491,8 @@ Each error response has an HTTP status and this body:
 | `bad_step` | 409 | An enrollment message that is not the next message of the session (10.10) | The enrollment fails |
 | `session_closed` | 409 | An enrollment message after the session ended (10.10) | The enrollment fails |
 | `repair_busy` | 409 | Another device holds a repair session of the space that has not expired (10.9) | `paused: relay unavailable` |
+| `bad_head` | 409 | The `head` of a deletion statement is not an entry of the relay log (10.12) | The engine fetches and signs the deletion again |
+| `bad_import` | 409 | An import request that does not continue its session (10.13) | The import fails. The app starts it again. |
 | `bad_repair` | 409 | The repair request does not continue the session: see 10.9 | `paused: relay unavailable`. The engine starts a new session at the next sync. For a repair from the position before the own grant ([LOG-12]), this code and `unknown_device`: `paused: repair needs another device`. |
 | `invalid_record` | 422 | The genesis record of a `PUT` breaks 10.5, or a repair entry fails the chain check of 10.9 | `stopped: fork` |
 | `uncovered_stub` | 422 | A repair entry is a stub that no usable snapshot of the staged range covers ([LOG-11]) | `stopped: fork` |
@@ -493,8 +500,9 @@ Each error response has an HTTP status and this body:
 | `rate_limited` | 429 | The IP address sent too many requests to a limited route (12.6) | `paused: relay unavailable`. A new device in enrollment waits and sends again. |
 | `wrong_authority` | 421 | `snailfish-authority` differs from the relay configuration (8.6 step 1) | `paused: relay authority` |
 | `internal` | 500 | A relay failure | `paused: relay unavailable` |
-| `backup_running` | 503 | `PUT` while `snailfish-relay backup` runs ([STO-8]) | `paused: relay unavailable` |
-| `space_limit` | 507 | `PUT` of a new space when the tenant holds the most spaces that its configuration allows ([QTA-5]) | `stopped: setup failed`. The app tells the user to ask the relay operator. |
+| `backup_running` | 503 | `PUT`, a deletion or an import request while `snailfish-relay backup` runs ([STO-8]) | `paused: relay unavailable` |
+| `space_limit` | 507 | `PUT` or import of a new space when the tenant holds the most spaces that its configuration allows ([QTA-5]) | `stopped: setup failed`. The app tells the user to ask the relay operator. |
+| `quota` | 507 | An import whose records do not fit the space quota and the reserves (10.13) | The import fails. The app tells the user to ask the relay operator. |
 
 A response that is not JSON, or JSON without a string `error`, is a fault outside the relay, for example a proxy page. The engine reports `paused: relay unavailable`.
 
@@ -523,7 +531,7 @@ Request body: `{"genesis":<envelope>,"setup":"st_..."}`. `setup` is the setup to
 The relay runs 8.6 steps 1 to 4, then parses the body. It checks the genesis record: the envelope (section 4), the payload (section 6), the signature by the recovery key of the record, and `log` equal to `{log}`. The request signer must be the device of the record (8.6 steps 7 to 9). Then:
 
 1. If the space exists with the same genesis record hash, return `200`. This is an exact retry, and the relay does not check the setup token.
-2. If the space exists with another genesis record, return `space_exists`.
+2. If the space exists with another genesis record, return `space_exists`. If the tenant file holds a deletion marker for `{log}`, return `deleted` ([LOG-13]).
 3. If the relay holds no setup token with the value of `setup`, or the token expired (relay time at or after its expiry), if the device ID of the token differs from the request `keyid`, or if the tenant of the token is not the tenant of `{tenant}`, return `bad_setup` ([USR-6]).
 4. If the tenant holds the most spaces that its configuration allows, return `space_limit` ([QTA-5]).
 5. If `snailfish-relay backup` runs, return `backup_running`.
@@ -806,6 +814,89 @@ The response is `200` with `{}`.
 - The relay stores the last report of each device in the tenant file, with the relay time of the report. A new report replaces the old one.
 - The relay also takes reports during a restore hold.
 
+### 10.12 `POST /v1/t/{tenant}/s/{log}/delete`
+
+A trusted device or the recovery key deletes the space on the relay ([LOG-13]). The deletion removes the relay copy only. Devices keep their logs, and an import (10.13) makes the space again.
+
+Request body from a device: `{"statement":<envelope>}`. From the recovery key: `{"statement":<envelope>,"setup":"st_..."}`, with the setup token of 12.3. `statement` is a `snailfish.delete.v1` statement (6.3).
+
+The relay checks a deletion in this order:
+
+1. 8.6 steps 1 to 4.
+2. If the body breaks this section, return `bad_request`. A body from a device ID `keyid` with `setup`, or from a recovery ID `keyid` without `setup`, breaks this section.
+3. 8.6 steps 5 to 9. Step 7 accepts the current recovery ID.
+4. If `statement` breaks section 4 or 6, if it is not a `snailfish.delete.v1` statement, if its `log` differs from `{log}`, if its `author` differs from `keyid`, or if its signature does not verify with the signing key of `author`, return `invalid_record`.
+5. For a recovery ID: if the relay holds no setup token with the value of `setup`, if the token expired, or if the tenant of the token is not the tenant of `{tenant}`, return `bad_setup`. The token can name any device of the tenant, because the recovery key signs the request.
+6. If `head.position` is after the relay head, or the log digest at `head.position` differs from `head.digest`, return `bad_head`. Position 0 with `digest(0)` is an entry of each log.
+7. If `expires` is at or before the relay time, or more than 600 seconds after it, return `expired`.
+8. If `snailfish-relay backup` runs, return `backup_running`.
+9. In one transaction in the tenant file, write the deletion marker of `{log}`, and delete its row in the space index, its restore hold, its hold reports and its device status rows. Then delete the space file and its WAL files ([STO-5]).
+
+The response is `200` with `{"deleted":true}`.
+
+- After the deletion, each route of the log ID returns `deleted` (10.3), and a `PUT` of the log ID returns `deleted` (10.5). An import of the log ID removes the marker.
+- The engine signs `head` with its verified head. After a fork, the verified head of a device can be outside the relay log. The device then signs the last position that it shares with the relay, the relay operator deletes the space with `snailfish-relay space delete`, or the user moves to another relay (DESIGN.md "Fork repair").
+- `expires` limits the time in which a copy of the statement can delete the space. The request nonce stops an exact replay.
+
+### 10.13 Import session
+
+A device or the recovery key imports an export file (section 15) into a space that the relay does not hold, on the same relay after a deletion or on another relay ([FRK-5]). The device uploads the entries in position order from position 1, in chunks, as in a repair session (10.9). The relay writes them into a temporary space file, and makes the space only at the finish ([STO-6]).
+
+Start: `POST /v1/t/{tenant}/s/{log}/import`
+
+```json
+{"setup":"st_...","device":{"sign":"<base64>","seal":"<base64>"},"entries":[{"position":1,"envelope":{...}},{"position":2,"envelope":{...}}]}
+```
+
+Chunk: `POST /v1/t/{tenant}/s/{log}/import/chunk`
+
+```json
+{"session":"00112233445566778899aabbccddeeff","entries":[{"position":3,"stub":{...}}]}
+```
+
+Finish: `POST /v1/t/{tenant}/s/{log}/import/finish`
+
+```json
+{"session":"00112233445566778899aabbccddeeff","tip":{"position":3,"digest":"<base64>"}}
+```
+
+| Route | Result | Body |
+| --- | --- | --- |
+| Start | 201 | `{"session":"<32 hex digits>","next":3}` |
+| Chunk | 200 | `{"next":4}` |
+| Finish | 201 | `{"head":{"position":3,"digest":"<base64>"}}` |
+
+- `entries` holds 1 to `max_append_envelopes` entries in the form of 10.9. The body size rule of 10.9 applies.
+- `session` is 16 random bytes from the relay. `next` is the position after the last staged entry. A session expires 86,400 seconds after its start or its last chunk.
+- A tenant has at most one import session for each log ID. A start replaces an older session of the same log ID, and deletes its temporary file.
+- `device` is the keys object (6.1) of the device that signs the start and each chunk. Its device ID must be the device of the setup token. The relay verifies these requests with its `sign` key, because the staged entries can grant the device only at a later position.
+
+The relay checks a start request in this order:
+
+1. 8.6 steps 1 to 4.
+2. If the body breaks this section, return `bad_request`.
+3. If the device ID of `device` differs from `keyid`, return `bad_request`. If the relay holds no setup token with the value of `setup`, if the token expired, if the device ID of the token differs from `keyid`, or if the tenant of the token is not the tenant of `{tenant}`, return `bad_setup`.
+4. 8.6 steps 5, 8 and 9, with the `sign` key of `device`.
+5. If the tenant holds a space with the log ID, return `space_exists`. If the tenant holds the most spaces that its configuration allows, return `space_limit`. If `snailfish-relay backup` runs, return `backup_running`.
+6. Run the chain check from position 0 with `digest(0)` of `{log}` and an empty space state. Position 1 must hold a genesis record that passes the checks of 10.5, with `log` equal to `{log}`. Each later entry passes the repair chain check of 10.9 start step 3 against the entries before it. A security record also passes 10.6 step 14 against the entries before it, and a change, a snapshot or an accept record passes 10.6 step 16 with the quota of the tenant. 10.6 step 15 does not apply, because the records were stored before. If an entry fails, return `invalid_record`, `uncovered_stub`, `bad_import` for a wrong position, or `quota` for steps 14 and 16.
+7. Create the temporary space file and the session, and stage the entries.
+
+A chunk request uses the same order without steps 3 and 5. In step 4, the relay uses the device and the `sign` key of the named session. Before step 6: if the session is unknown or expired, or the request signer is not the device of the session, return `bad_import`. The first entry must have the position `next`, and the chain continues the staged entries.
+
+A finish request runs 8.6 steps 1 to 4, returns `bad_request` for a body that breaks this section, and then:
+
+1. If the session is unknown or expired, return `bad_import`.
+2. 8.6 steps 5, 8 and 9. The signer is the device of the session if it is active at the tip of the staged entries, or the current recovery ID at that tip. Each other `keyid` gets `unknown_device`.
+3. If `tip` differs from the last staged entry (position or digest), return `bad_import`.
+4. If a staged stub fails the stub check of 14.3 against the staged entries, return `uncovered_stub`.
+5. If the tenant holds a space with the log ID, return `space_exists`. If the tenant holds the most spaces that its configuration allows, return `space_limit`. If `snailfish-relay backup` runs, return `backup_running`.
+6. In one transaction in the tenant file, add the space index row with the app ID of the genesis record, remove the deletion marker of the log ID, and delete the session. Then rename the temporary file to its space file name ([STO-6]). The space is not on restore hold.
+
+- A request that fails a check changes no stored state, except the nonce of 8.6 step 9.
+- An import ends no repair session and no enrollment session, because the relay holds no space with the log ID during the import.
+- The relay does not replace covered records with stubs at the finish. A covered record of the file stays in full until the next append or repair.
+- After the finish, the source device syncs as before. Each other device of a fork repair enrolls again ([FRK-6]). For a move to another relay, each other device signs in on the new relay and syncs with its own state file, because its verified log is the same.
+
 ## 11. Enrollment
 
 This section gives the transcript of DESIGN.md "Enrollment" ([ENR-1] to [ENR-9]). `specs/enrollment/` checks it in a symbolic model.
@@ -967,6 +1058,7 @@ The relay configuration sets the origin of the user page, for example `https://s
 | `GET` | `/u/signin`, `/u/invite` | No | Pages |
 | `GET` | `/u/authorize` | Optional | Without a session, the sign-in page. With a session, the request and the "Allow" form with the anti-CSRF token (12.2). |
 | `GET` | `/u/app.js` | No | The script of the WebAuthn calls |
+| `GET` | `/u/export?log=<log ID>` | Yes | The export file of a space of the tenant (section 15), as `application/x-ndjson` with `content-disposition: attachment` |
 | `POST` | `/u/signin/start`, `/u/signin/finish` | No | Passkey sign-in. The start body is `{"name":"<user name>"}`. |
 | `POST` | `/u/invite/start`, `/u/invite/finish` | No | Passkey registration with an invite token |
 | `POST` | `/u/passkeys/start`, `/u/passkeys/finish` | Yes | Register one more passkey |
@@ -1012,6 +1104,7 @@ Write rules ([USR-7]):
 | `bad_passkey` | 403 | The WebAuthn response does not verify, or the ceremony is unknown or expired |
 | `bad_webhook` | 400 | The webhook URL breaks 12.5 |
 | `not_empty` | 409 | A tenant delete while the tenant has a space |
+| `not_found` | 404 | An export of a log ID that the tenant does not hold |
 
 ### 12.5 Webhooks
 
@@ -1151,3 +1244,34 @@ The snapshot reserve is 2 x (`max_snapshot_bytes` + 65,536) bytes. A snapshot or
 - `usable_snapshot` decrypts the usable snapshot. `genesis_base` is position 0 with `digest(0)`. `is_covered(change_id)` is true if the verified log holds the change ID, in full or as a stub, at or before the frontier ([CMP-14]).
 - `changes_after(applied)` raises `ResetRequired` if the applied position is before the frontier ([CMP-16], [DLV-12]).
 - After `changes_after` with an applied position at or after the frontier, if the verified log holds an own accept record that counts for the usable snapshot, the engine replaces its covered records with stubs ([CMP-13]).
+
+## 15. Export file
+
+An export file holds a space log as envelopes and stubs (DESIGN.md "Data retention", [FRK-3]). It holds no key and no plaintext, so a user can store it anywhere. An engine writes it from its verified log, and the user page writes it from the relay log. The import session of 10.13 reads it.
+
+The file is UTF-8 text in JSON Lines form. Each line is one JSON object and ends with LF. The file has no empty line.
+
+Line 1 is the header:
+
+```json
+{"type":"snailfish.export.v1","log":"l_...","app":"com.example.tasks","head":{"position":3,"digest":"<base64>"}}
+```
+
+Each later line is one entry in the form of a fetch entry (10.7), in position order from position 1 to `head.position`, with no gap:
+
+```json
+{"position":1,"envelope":{"payloadType":"snailfish.genesis.v1","payload":"...","signatures":[{"keyid":"...","sig":"..."}]}}
+{"position":2,"stub":{"type":"snailfish.change.v1","change_id":"c_...","hash":"<base64>"}}
+```
+
+A reader refuses the file if:
+
+- the header breaks the strict rules of section 3, has a field that this section does not name, or `type` is not `snailfish.export.v1`,
+- an entry line breaks the form of a fetch entry, or its position is not the next position,
+- position 1 does not hold a genesis record with the `log` and `app` of the header,
+- the log digest after the last entry differs from `head.digest`, or the last position differs from `head.position`,
+- the file has a line after the last entry, or the last line has no LF.
+
+- A reader that checks the digests also checks each envelope as in section 4 and the stub form of 10.7. The relay runs the full chain check at the import (10.13). An engine checks the file before it uploads it, so a damaged file fails before the upload starts.
+- The writer sends each envelope as the log holds it. The record hash does not depend on the layout ([WIR-3]).
+

@@ -89,6 +89,11 @@ enum Command {
         /// The log ID text.
         log: String,
     },
+    /// Manage spaces.
+    Space {
+        #[command(subcommand)]
+        action: SpaceAction,
+    },
     /// End the restore hold of a space.
     ReleaseHold {
         /// The user name.
@@ -153,6 +158,18 @@ impl ServeArgs {
 }
 
 #[derive(Subcommand)]
+enum SpaceAction {
+    /// Delete a space of a user and keep its deletion marker. Devices keep
+    /// their logs, and an import makes the space again.
+    Delete {
+        /// The user name.
+        user: String,
+        /// The log ID text.
+        log: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum UserAction {
     /// Create a user and its tenant, and print a one-time invite link.
     Add {
@@ -165,6 +182,23 @@ enum UserAction {
         /// The user name.
         name: String,
     },
+}
+
+/// `snailfish-relay space`: the operator commands of one space. They need
+/// no authority.
+fn space_command(cfg: Config, action: SpaceAction) -> ExitCode {
+    match action {
+        SpaceAction::Delete { user, log } => {
+            match Relay::open(cfg).and_then(|r| r.operator_delete(&user, &log)) {
+                Ok(true) => {
+                    println!("deleted: {log}");
+                    ExitCode::SUCCESS
+                }
+                Ok(false) => fail(&format!("{user} holds no space {log}")),
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+    }
 }
 
 fn fail(msg: &str) -> ExitCode {
@@ -218,6 +252,7 @@ async fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Command::Space { action } => space_command(config("unused.invalid"), action),
         Command::Health { .. } => ExitCode::SUCCESS,
         Command::Backup { dir } => match ops::backup(&data, &dir) {
             Ok(s) => {

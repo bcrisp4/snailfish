@@ -22,7 +22,7 @@ pub enum Kind {
 }
 
 /// The schema version of every file kind.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The schema of `directory.db`.
 const DIRECTORY_DDL: &str = "CREATE TABLE IF NOT EXISTS users (
@@ -84,6 +84,10 @@ const TENANT_DDL: &str = "CREATE TABLE IF NOT EXISTS tenant (
                  CREATE INDEX IF NOT EXISTS nonces_expires ON nonces (expires);
                  CREATE TABLE IF NOT EXISTS deletion_markers (
                     log_id TEXT PRIMARY KEY
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS imports (
+                    log_id TEXT PRIMARY KEY, session BLOB NOT NULL, device_id BLOB NOT NULL,
+                    sign_key BLOB NOT NULL, file_name TEXT NOT NULL, last INTEGER NOT NULL
                  ) WITHOUT ROWID;
                  CREATE TABLE IF NOT EXISTS holds (
                     log_id TEXT PRIMARY KEY,

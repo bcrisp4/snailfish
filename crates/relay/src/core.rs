@@ -31,6 +31,7 @@ use crate::store::{self, Kind, StoreError};
 
 pub mod compact;
 mod enroll;
+mod lifecycle;
 mod setup;
 pub mod user;
 
@@ -365,10 +366,26 @@ impl Relay {
         std::fs::create_dir_all(cfg.data_dir.join("tenants")).map_err(StoreError::Io)?;
         store::open(&cfg.data_dir.join("directory.db"), Kind::Directory, true)?;
         let auth = user::Auth::open(&cfg)?;
-        Ok(Self {
+        let relay = Self {
             cfg: Arc::new(cfg),
             auth: Arc::new(auth),
-        })
+        };
+        relay.sweep()?;
+        Ok(relay)
+    }
+
+    /// The startup work of [STO-5] and [STO-6] in each tenant directory.
+    fn sweep(&self) -> Result<(), StoreError> {
+        let d = self.directory()?;
+        let mut st = d.prepare("SELECT tenant_id FROM tenants")?;
+        let ids: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for id in ids {
+            let t = self.tenant_by_id(id)?;
+            if t.db().exists() {
+                lifecycle::sweep_tenant(&t)?;
+            }
+        }
+        Ok(())
     }
 
     /// The configuration.
@@ -511,6 +528,16 @@ impl Relay {
             }
             ("POST", ["", "v1", "t", t, "s", l, "repair", "finish"]) => {
                 self.repair(req, now, t, l, RepairRoute::Finish)
+            }
+            ("POST", ["", "v1", "t", t, "s", l, "delete"]) => self.delete_space(req, now, t, l),
+            ("POST", ["", "v1", "t", t, "s", l, "import"]) => {
+                self.import(req, now, t, l, RepairRoute::Start)
+            }
+            ("POST", ["", "v1", "t", t, "s", l, "import", "chunk"]) => {
+                self.import(req, now, t, l, RepairRoute::Chunk)
+            }
+            ("POST", ["", "v1", "t", t, "s", l, "import", "finish"]) => {
+                self.import(req, now, t, l, RepairRoute::Finish)
             }
             ("POST", ["", "v1", "t", t, "s", l, "enroll"]) => self.enroll_open(req, now, t, l),
             ("GET", ["", "v1", "t", t, "s", l, "enroll", e]) => {
@@ -719,6 +746,10 @@ impl Relay {
                 "the space exists with another genesis record",
             ));
         }
+        // 10.5 step 2 ([LOG-13]): no device makes a deleted space again.
+        if lifecycle::has_marker(&tx, log)? {
+            return Err(api(410, "deleted", "the space is deleted"));
+        }
         // 10.5 steps 3 and 4 ([USR-6], [QTA-5]).
         self.check_setup(&tenant, &body.setup, &v.keyid, now)?;
         let spaces: i64 = tx.query_row(
@@ -858,13 +889,8 @@ impl Relay {
             )
         })?;
         let tc = store::open(&tenant.db(), Kind::Tenant, false)?;
-        let path = Self::space_file(&tenant, &tc, log)?.ok_or_else(|| {
-            api(
-                404,
-                "unknown_space",
-                "the tenant has no space with this log ID",
-            )
-        })?;
+        let path = Self::space_file(&tenant, &tc, log)?
+            .ok_or_else(|| lifecycle::missing_space(&tc, log))?;
         let hold = hold_since(&tc, log)?.is_some();
         let space_bytes = user::limits(&tc, &self.cfg.quotas)?.space_bytes;
         let blocked = match signer {
@@ -937,6 +963,7 @@ impl Relay {
             quota,
             snapshot_limit,
             reserve: self.cfg.security_reserve,
+            daily: true,
         };
         // The stored records go to the tables after the checks, so the
         // checks read the log as it was before the request, and the overlay
@@ -1231,6 +1258,9 @@ struct Budget {
     quota: u64,
     snapshot_limit: u64,
     reserve: u64,
+    /// Step 15 applies: false for an import, whose records were stored
+    /// before (10.13 start step 6).
+    daily: bool,
 }
 
 impl Budget {
@@ -1243,7 +1273,7 @@ impl Budget {
             return Some("reserve");
         }
         // Step 15 ([STO-15], T10): the daily limit of the request keyid.
-        if security && self.today >= SECURITY_PER_DAY {
+        if security && self.daily && self.today >= SECURITY_PER_DAY {
             return Some("security_limit");
         }
         // Step 16 ([QTA-1], [QTA-3], [CMP-18]): changes, snapshots and accept

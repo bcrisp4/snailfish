@@ -244,7 +244,7 @@ Each space has one log. The log holds every signed record of the space: security
 - If the relay log ends before a position that a device verified, the device repairs the log in a repair session. It uploads its copies of the lost records and stubs in position order, in chunks under the request size limit. The finish request names the verified tip of the device. [LOG-10]
 - A space has at most one repair session at a time. The relay keeps the chunks in a staging table in the space file, outside the space quota, and checks the chain of each chunk. At the finish, it moves the staged entries into the log in one transaction, if they end at the named tip and the usable snapshot of the staged range covers every staged stub. A session expires after 24 hours without a chunk, and the device can start it again. [LOG-11]
 - A repair request needs the signature of a device that is active in the log or in the staged entries. A device whose grant is only in the lost range can therefore repair the log. That device cannot fetch, so it does not know the relay head. It starts the repair at the position before its own grant. If the relay head is another position, the engine reports `paused: repair needs another device`, and a device that is active in the relay log must repair it. [LOG-12]
-- A trusted device or the recovery key must sign a space deletion: a `snailfish.delete.v1` statement with the log ID, the log head and an expiry time. A browser session alone cannot delete a space. The setup surface accepts a deletion that the recovery key signs with a setup token and no device signature. When the relay deletes a space, it keeps a deletion marker for the log ID. A device that sees the marker stops with `stopped: deleted` and does not upload the log again. An import of the log through the setup surface removes the marker. [LOG-13]
+- A trusted device or the recovery key must sign a space deletion: a `snailfish.delete.v1` statement with the log ID, the log head and an expiry time. A browser session alone cannot delete a space. The setup surface accepts a deletion that the recovery key signs with a setup token and no device signature. When the relay deletes a space, it keeps a deletion marker for the log ID, and it refuses a new space with that log ID. A device that sees the marker stops with `stopped: deleted` and does not upload the log again. An import of the log through the setup surface removes the marker. [LOG-13]
 - `snailfish-relay restore` puts each restored space on hold. During the hold, the relay accepts fetches, status reports, repair sessions and security records, and refuses changes, snapshots and accept records. A removal therefore works during a hold. A device reports its verified tip in each status report. A device with a new engine state file also reports that fact, until a fetch reaches the relay head with no hold. A fetch during the hold does not end the report, and the relay keeps the mark until the hold ends. [LOG-14]
 - The hold ends only when the user releases it on the user page, or the relay operator releases it with `snailfish-relay release-hold`. The relay cannot end the hold by itself, because a restored backup cannot list the devices that joined after the backup. The user page shows each device that reported since the restore, with its verified tip, and each repair session. It marks a device with a new engine state file as "not repaired" and warns before a release, because the app database of that device can hold changes that only the lost engine state file and the old relay held. The relay sends a user webhook message when a space goes on hold. A release before every device reports can cause a fork. [LOG-15]
 
@@ -344,9 +344,9 @@ A fork means that the relay showed two devices two different logs. The repair is
 2. The user selects one device as the source. [FRK-2]
 3. The source device exports its space log. [FRK-3]
 4. The user deletes the space on the relay, or moves to a relay that they trust. [FRK-4]
-5. The source device imports the log through the setup surface. The import removes the deletion marker of the log ID. [FRK-5]
+5. The source device imports the log through the setup surface, in chunks, into a temporary space file. The import removes the deletion marker of the log ID. The import can also go to a new relay. [FRK-5]
 6. Each other device enrolls again from the source device, with a new engine state file. [FRK-6]
-7. The engine compares the old state file with the new log. It gives the app each own change that the new log does not hold and that the old engine still holds in full, with its `change_id`. [FRK-7]
+7. The engine compares the old state file with the new log. It gives the app each own change that the new log does not hold and that the old engine still holds in full, with its `change_id`. The app keeps the old state file until its outbox holds each of these changes, because a crash before that point loses them. A second comparison gives the same changes. [FRK-7]
 8. The app writes an outbox row for each of these changes, and then handles `ResetRequired`. The delivery rules send each change with its old `change_id`, so no device applies it twice. [FRK-8]
 
 The merge contract makes the result independent of the order in which the changes arrive.
@@ -456,7 +456,7 @@ Rules:
 - A space file name is 128 random bits in base32. The tenant file maps each log ID to its file name, app ID, status, quota and restore hold. The relay never builds a path from a log ID, an app ID or any other value from a caller. [STO-3]
 - The tenant file keeps a deletion marker for each deleted log ID after the space file is gone. [STO-4]
 - A space deletion first writes the deletion marker in the tenant file, and then deletes the space file. At startup, the relay deletes each space file that has a deletion marker. [STO-5]
-- An import writes the space file under a temporary name, removes the deletion marker, and then renames the file. At startup, the relay deletes each temporary file. [STO-6]
+- An import writes the space file under a temporary name. Then one tenant file transaction adds the space index row, removes the deletion marker and deletes the import session, and then the relay renames the file. At startup, the relay deletes each temporary file of an import session, and renames the temporary file of an index row whose space file is missing. [STO-6]
 - Each space file holds its own log ID and app ID. `snailfish-relay restore` rebuilds the space index from the space files, because a backup does not copy the files at one instant. A deletion marker in the restored tenant file wins over a restored space file with the same log ID. [STO-7]
 - `snailfish-relay backup` copies the space files, then each tenant file, then `directory.db`. The relay refuses space creation, import and deletion while a backup runs. [STO-8]
 - The `secrets` directory is outside `data` and has mode 0700. `snailfish-relay backup` does not copy it. After a restore on a new host, the relay makes a new session key, and each user signs in again in the browser. Devices are not affected. [STO-9]
@@ -650,7 +650,7 @@ These numbers justify one small process and embedded SQLite files, with no queue
 
 ## Monitoring and alerting
 
-The relay cannot see content, so every signal is aggregate or per device. The relay serves metrics on a separate listen address, and it does not expose them on the public port.
+The relay cannot see content, so every signal is aggregate or per device. The relay serves metrics in the Prometheus text format on a separate listen address (`--metrics-listen`), and it does not expose them on the public port. `ops/prometheus` holds the rules file, and `ops/proxy` holds the sample proxy configurations.
 
 Relay operator signals:
 
@@ -674,7 +674,7 @@ Client-detected failures:
 
 13. Only devices can detect rollback, forks, gaps and bad signatures, because only devices verify the log. The sync engine reports these failures to the host app in the sync status (see Sync status). The app shows them to the user. The relay never receives a report with content.
 
-Metrics hold no tenant, device or app identifiers. The exceptions are the user's own view and the per-tenant storage figure for the relay operator.
+Metrics hold no tenant, device or app identifiers. The exceptions are the user's own view and the per-tenant storage figure for the relay operator, which carries the user name of `snailfish-relay user add`, not the tenant handle. The stub figures are a sum and a maximum over all spaces.
 
 ## Security
 

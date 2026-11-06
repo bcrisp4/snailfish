@@ -19,17 +19,18 @@ func main() {
 	out := flag.String("out", "", "write vector files to this directory")
 	outHTTP := flag.String("out-http", "", "write only http.json to this directory, using the sealed values of protocol.json there")
 	outEnroll := flag.String("out-enroll", "", "write only enroll.json to this directory")
+	outExport := flag.String("out-export", "", "write only export.json to this directory, from protocol.json there")
 	check := flag.String("check", "", "check vector files in this directory")
 	openRust := flag.String("open-rust", "", "open key sets that Rust sealed (JSON file)")
 	flag.Parse()
 	n := 0
-	for _, v := range []string{*out, *outHTTP, *outEnroll, *check, *openRust} {
+	for _, v := range []string{*out, *outHTTP, *outEnroll, *outExport, *check, *openRust} {
 		if v != "" {
 			n++
 		}
 	}
 	if n != 1 {
-		fmt.Fprintln(os.Stderr, "give exactly one of -out, -out-http, -out-enroll, -check, -open-rust")
+		fmt.Fprintln(os.Stderr, "give exactly one of -out, -out-http, -out-enroll, -out-export, -check, -open-rust")
 		os.Exit(2)
 	}
 	var err error
@@ -40,6 +41,8 @@ func main() {
 		err = runOutHTTP(*outHTTP)
 	case *outEnroll != "":
 		err = runOutEnroll(*outEnroll)
+	case *outExport != "":
+		err = runOutExport(*outExport)
 	case *check != "":
 		err = runCheck(*check)
 	default:
@@ -102,7 +105,11 @@ func runOut(dir string) error {
 	if err != nil {
 		return err
 	}
-	for name, v := range map[string]any{"protocol.json": p, "strict-json.json": st, "recovery-key.json": rk, "http.json": h, "enroll.json": en} {
+	ex, err := buildExport(p)
+	if err != nil {
+		return err
+	}
+	for name, v := range map[string]any{"protocol.json": p, "strict-json.json": st, "recovery-key.json": rk, "http.json": h, "enroll.json": en, "export.json": ex} {
 		b, err := marshal(v)
 		if err != nil {
 			return err
@@ -157,6 +164,28 @@ func runOutEnroll(dir string) error {
 		return err
 	}
 	path := filepath.Join(dir, "enroll.json")
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s (%d bytes)\n", path, len(b))
+	return nil
+}
+
+// runOutExport writes export.json only, from the committed protocol.json.
+func runOutExport(dir string) error {
+	var p protocolJ
+	if err := load(filepath.Join(dir, "protocol.json"), &p); err != nil {
+		return err
+	}
+	ex, err := buildExport(&p)
+	if err != nil {
+		return err
+	}
+	b, err := marshal(ex)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "export.json")
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		return err
 	}
@@ -268,6 +297,10 @@ func runCheck(dir string) error {
 	if err := load(filepath.Join(dir, "enroll.json"), &ef); err != nil {
 		return err
 	}
+	var xf exportJ
+	if err := load(filepath.Join(dir, "export.json"), &xf); err != nil {
+		return err
+	}
 	w, err := newWorld()
 	if err != nil {
 		return err
@@ -312,6 +345,9 @@ func runCheck(dir string) error {
 	if err := checkEnrollOracle(&ef, w); err != nil {
 		return fmt.Errorf("enroll.json: %w", err)
 	}
+	if err := checkExport(&p, &xf); err != nil {
+		return err
+	}
 	if err := checkEnvelopes(&p); err != nil {
 		return err
 	}
@@ -321,9 +357,9 @@ func runCheck(dir string) error {
 	if err := checkRecovery(&rk); err != nil {
 		return err
 	}
-	fmt.Printf("OK: %d entries, %d statements, %d key sets opened, %d ciphertexts, %d envelopes, %d strict cases, %d+%d recovery texts, http: %d signed, %d invalid, %d append, %d append_hold, %d fetch, %d status, %d repair, %d enroll; enroll: %d codes, %d+%d typed, %d+%d payloads, %d transcripts, %d confirmations\n",
+	fmt.Printf("OK: %d entries, %d statements, %d key sets opened, %d ciphertexts, %d envelopes, %d strict cases, %d+%d recovery texts, http: %d signed, %d invalid, %d append, %d append_hold, %d fetch, %d status, %d repair, %d enroll; enroll: %d codes, %d+%d typed, %d+%d payloads, %d transcripts, %d confirmations; export: %d cases\n",
 		len(p.Log.Entries), len(p.Statements), len(p.KeySets), len(p.Ciphertexts), len(p.Envelopes), len(st.Cases), len(rk.Valid), len(rk.Invalid), len(hf.Signed), len(hf.Invalid), len(hf.Append), len(hf.AppendHold), len(hf.Fetch), len(hf.Status), len(hf.Repair), len(hf.Enroll),
-		len(ef.Codes), len(ef.Typed.Valid), len(ef.Typed.Invalid), len(ef.Payloads.Valid), len(ef.Payloads.Invalid), len(ef.Transcripts), len(ef.Confirmations))
+		len(ef.Codes), len(ef.Typed.Valid), len(ef.Typed.Invalid), len(ef.Payloads.Valid), len(ef.Payloads.Invalid), len(ef.Transcripts), len(ef.Confirmations), len(xf.Cases))
 	return nil
 }
 
