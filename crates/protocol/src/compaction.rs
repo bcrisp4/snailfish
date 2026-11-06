@@ -90,9 +90,7 @@ pub fn covers_change(position: u64, frontier: u64) -> bool {
 /// ([CMP-11], finding C1).
 #[must_use]
 pub fn covers_snapshot(position: u64, state: u64, usable: u64, frontier: u64) -> bool {
-    usable > 0
-        && position != usable
-        && (state < frontier || (state == frontier && position < usable))
+    (state, position) < (frontier, usable)
 }
 
 /// The stub check of 14.3 ([CMP-15]). `usable` is 0 if the log has no usable
@@ -100,7 +98,7 @@ pub fn covers_snapshot(position: u64, state: u64, usable: u64, frontier: u64) ->
 #[must_use]
 pub fn stub_valid(change: bool, position: u64, usable: u64, frontier: u64) -> bool {
     if change {
-        usable > 0 && covers_change(position, frontier)
+        covers_change(position, frontier)
     } else {
         usable > 0 && position != usable
     }
@@ -526,6 +524,34 @@ mod tests {
         }
     }
 
+    /// [CMP-8] [CMP-10]: the order of `better`, also for equal values.
+    #[test]
+    fn better_orders_state_then_position() {
+        assert!(better((2, 4), None));
+        assert!(better((3, 1), Some((2, 9))));
+        assert!(better((2, 5), Some((2, 4))));
+        assert!(!better((2, 4), Some((2, 4))));
+        assert!(!better((2, 3), Some((2, 4))));
+        assert!(!better((1, 9), Some((2, 4))));
+    }
+
+    /// [CMP-11] and finding C1: the usable snapshot at 7 with frontier 2
+    /// covers a lower state position, and the same state position only at
+    /// a lower log position.
+    #[test]
+    fn coverage_of_changes_and_snapshots() {
+        assert!(!covers_change(0, 0));
+        assert!(!covers_change(1, 0));
+        assert!(covers_change(2, 2));
+        assert!(!covers_change(3, 2));
+        assert!(covers_snapshot(9, 1, 7, 2));
+        assert!(covers_snapshot(4, 2, 7, 2));
+        assert!(!covers_snapshot(7, 2, 7, 2));
+        assert!(!covers_snapshot(9, 2, 7, 2));
+        assert!(!covers_snapshot(9, 3, 7, 2));
+        assert!(!covers_snapshot(4, 1, 0, 0));
+    }
+
     #[test]
     fn epochs_rule() {
         let need: BTreeSet<u64> = [1, 2].into();
@@ -560,10 +586,12 @@ mod proofs {
         let u: u64 = kani::any();
         let f: u64 = kani::any();
         let state: u64 = kani::any();
-        if u > 0 {
-            assert!(stub_valid(true, p, u, f) == covers_change(p, f));
-        }
-        assert!(!covers_snapshot(u, state, u, f));
+        // A log has a frontier only with a usable snapshot, and the usable
+        // snapshot has the frontier as its state position.
+        kani::assume(u > 0 || f == 0);
+        kani::assume(p != u || state == f);
+        assert!(stub_valid(true, p, u, f) == covers_change(p, f));
+        assert!(!covers_snapshot(u, f, u, f));
         assert!(!stub_valid(false, u, u, f));
         if covers_snapshot(p, state, u, f) {
             assert!(stub_valid(false, p, u, f));

@@ -103,8 +103,8 @@ fn local_stubs(e: &Engine) -> Vec<u64> {
         .collect()
 }
 
-/// The stub positions of the relay log, read from its space file.
-fn relay_stubs(w: &World) -> Vec<u64> {
+/// The space file of the relay.
+fn relay_space_file(w: &World) -> std::path::PathBuf {
     let tenants = w.relay_data().join("tenants");
     let t = std::fs::read_dir(tenants)
         .unwrap()
@@ -112,12 +112,28 @@ fn relay_stubs(w: &World) -> Vec<u64> {
         .unwrap()
         .unwrap()
         .path();
-    let f = std::fs::read_dir(t.join("spaces"))
+    std::fs::read_dir(t.join("spaces"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|x| x == "db"))
+        .unwrap()
+}
+
+/// A relay fault: the relay drops the envelope at `position`, so it serves
+/// a stub there.
+fn blank_relay_entry(w: &World, position: i64) {
+    Connection::open(relay_space_file(w))
+        .unwrap()
+        .execute(
+            "UPDATE entries SET envelope = '' WHERE position = ?1",
+            [position],
+        )
         .unwrap();
-    let c = Connection::open(f).unwrap();
+}
+
+/// The stub positions of the relay log, read from its space file.
+fn relay_stubs(w: &World) -> Vec<u64> {
+    let c = Connection::open(relay_space_file(w)).unwrap();
     let mut st = c
         .prepare("SELECT position FROM entries WHERE envelope = '' ORDER BY position")
         .unwrap();
@@ -130,12 +146,18 @@ fn relay_stubs(w: &World) -> Vec<u64> {
 /// A and B, with two changes of A that both apply, then a snapshot of A
 /// that both accept. Returns the devices with their engines.
 fn compacted() -> (World, Dev, Engine, Dev, Engine) {
+    compacted_with(&[b"a1", b"a2"])
+}
+
+/// `compacted` with the change bytes `edits`.
+fn compacted_with(edits: &[&[u8]]) -> (World, Dev, Engine, Dev, Engine) {
     let (mut w, mut a, mut b) = World::new();
     let mut ea = w.engine(&a);
     let mut eb = w.engine(&b);
     w.exchange(&mut ea);
-    a.edit(&ea, b"a1");
-    a.edit(&ea, b"a2");
+    for e in edits {
+        a.edit(&ea, e);
+    }
     a.enqueue(&mut ea);
     w.exchange(&mut ea);
     a.pull(&ea).unwrap();
@@ -398,7 +420,7 @@ fn grant_after_compaction_seals_only_the_needed_epochs() {
     Dev::check_snapshots(&mut ea);
     w.exchange(&mut ea);
     assert!(ea.usable_snapshot().unwrap().is_some());
-    queue_grant(&ea, "D");
+    let keys_d = queue_grant(&ea, "D");
     w.exchange(&mut ea);
     assert_eq!(ea.status(), Status::Ok);
     let head = ea.verified_head().unwrap().position;
@@ -409,6 +431,11 @@ fn grant_after_compaction_seals_only_the_needed_epochs() {
         panic!("the head is the grant")
     };
     assert_eq!(keys[0].epochs, [1, 3]);
+    // D checks its own grant against the compaction state of its verified
+    // log, so the key set without epoch 2 passes there too.
+    let mut ed = Engine::open(&w.root.join("d"), w.space(), &keys_d).unwrap();
+    w.exchange(&mut ed);
+    assert_eq!(ed.status(), Status::Ok);
 }
 
 /// `specs/compaction/test.qnt::repairStubsTest` ([LOG-11], [CMP-17]): the
@@ -427,6 +454,25 @@ fn repair_uploads_stubs() {
     assert_eq!(relay_stubs(&w), [3, 4]);
 }
 
+/// [CMP-17] [STO-13]: B still holds the changes at 3 and 4 in full when
+/// the relay goes back to position 2. B repairs the log with them, the
+/// relay makes stubs of them again and rebuilds its file, so the file
+/// keeps no free page.
+#[test]
+fn repair_with_full_records_makes_stubs_and_reclaims_space() {
+    let (mut w, _a, _ea, _b, mut eb) = compacted_with(&[&vec![1; 40_000], &vec![2; 40_000]]);
+    assert_eq!(local_stubs(&eb), Vec::<u64>::new());
+    w.cut_relay(2);
+    w.exchange(&mut eb);
+    assert_eq!(eb.status(), Status::Ok);
+    assert_eq!(relay_stubs(&w), [3, 4]);
+    let free: i64 = Connection::open(relay_space_file(&w))
+        .unwrap()
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(free, 0);
+}
+
 /// [CMP-15]: a relay that sends a stub that no usable snapshot covers stops
 /// the engine with `missing records`, also at a later sync.
 #[test]
@@ -440,22 +486,7 @@ fn uncovered_stub_stops_the_engine() {
     w.exchange(&mut ea);
     // The relay drops the envelope of the change at 3 with no snapshot. The
     // change at 4 stays in full.
-    let tenants = w.relay_data().join("tenants");
-    let t = std::fs::read_dir(tenants)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let f = std::fs::read_dir(t.join("spaces"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| p.extension().is_some_and(|x| x == "db"))
-        .unwrap();
-    Connection::open(f)
-        .unwrap()
-        .execute("UPDATE entries SET envelope = '' WHERE position = 3", [])
-        .unwrap();
+    blank_relay_entry(&w, 3);
     let tmp = tempfile::tempdir().unwrap();
     let mut eb2 = Engine::open(tmp.path(), w.space(), &w.keys[1]).unwrap();
     w.exchange(&mut eb2);
@@ -470,6 +501,252 @@ fn uncovered_stub_stops_the_engine() {
     };
     w.exchange(&mut eb2);
     assert_eq!(eb2.status(), Status::MissingRecords);
+}
+
+/// [CMP-15]: a change stub after the frontier fails the stub check, also
+/// when a usable snapshot exists. The relay drops the envelope of the change
+/// at 8, after the frontier 4. A new engine stops with `missing records`.
+#[test]
+fn change_stub_after_the_frontier_stops_the_engine() {
+    let (mut w, mut a, mut ea, _b, _eb) = compacted();
+    a.edit(&ea, b"a3");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    blank_relay_entry(&w, 8);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut eb2 = Engine::open(tmp.path(), w.space(), &w.keys[1]).unwrap();
+    w.exchange(&mut eb2);
+    assert_eq!(eb2.status(), Status::MissingRecords);
+}
+
+/// [CMP-14]: `is_covered` is true for a change at or before the frontier,
+/// and false for a change after it or a change that the log does not hold.
+#[test]
+fn is_covered_holds_up_to_the_frontier() {
+    let (mut w, mut a, mut ea, _b, _eb) = compacted();
+    let at3: Vec<u8> = ea
+        .db
+        .query_row("SELECT change_id FROM log WHERE position = 3", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let late = a.edit(&ea, b"a3");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    assert!(ea.is_covered(&at3).unwrap());
+    assert!(!ea.is_covered(&late).unwrap());
+    assert!(!ea.is_covered(&ea.new_change_id().unwrap()).unwrap());
+}
+
+/// PROTOCOL.md 14.7 [CMP-9]: a rotation with no removal does not make a
+/// snapshot due. 1 MiB of change envelopes does, with 20 changes only. A
+/// change in the engine outbox makes it false until the push.
+#[test]
+fn snapshot_due_follows_the_size_and_the_outbox() {
+    let (mut w, mut a, _b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let new = Engine::new_recovery_key().unwrap();
+    ea.replace_recovery_key(&w.recovery_key.clone(), &new)
+        .unwrap();
+    w.exchange(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.current_epoch().unwrap(), 2);
+    assert!(!ea.snapshot_due().unwrap(), "a rotation removes no device");
+    for i in 0..20u8 {
+        a.edit(&ea, &vec![i; 40_000]);
+    }
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.outbox_len().unwrap(), 0);
+    assert!(ea.snapshot_due().unwrap());
+    a.edit(&ea, b"small");
+    a.enqueue(&mut ea);
+    assert!(!ea.snapshot_due().unwrap(), "the outbox holds a change");
+    w.exchange(&mut ea);
+    assert!(ea.snapshot_due().unwrap());
+}
+
+/// Replace the relay limits that the engine read from `GET /v1/info`.
+fn set_limits(e: &Engine, snapshot: u64, request: u64) {
+    let limits = snailfish_protocol::wire::Limits {
+        max_snapshot_bytes: snapshot,
+        max_request_bytes: request,
+        ..Default::default()
+    };
+    e.db.execute(
+        "UPDATE relay_info SET body = ?1 WHERE id = 1",
+        [snailfish_protocol::wire::info_body(&[1], &limits, 0)],
+    )
+    .unwrap();
+}
+
+/// [CMP-3] PROTOCOL.md 14.7, decision D12: the applied position must be an
+/// entry of the verified log after position 0. The payload limit and the
+/// limit of the append body that holds the snapshot alone are inclusive.
+#[test]
+fn write_snapshot_checks_the_applied_entry_and_the_limits() {
+    let (mut w, mut a, _b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    for bad in [
+        ea.genesis_base(),
+        Applied {
+            position: a.applied.position,
+            digest: [9; 32],
+        },
+    ] {
+        assert!(matches!(
+            ea.write_snapshot(&bad, b"s"),
+            Err(EngineError::Invalid(_))
+        ));
+    }
+    let state = [1; 100];
+    assert!(ea.write_snapshot(&a.applied, &state).unwrap());
+    let (_, env) = crate::compact::pending_records(&ea.db).unwrap().remove(0);
+    let payload = snailfish_protocol::envelope::Envelope::parse(env.as_bytes())
+        .unwrap()
+        .payload
+        .len() as u64;
+    let body = (payload * 4).div_ceil(3) + 1024;
+    let big = 1 << 30;
+    for (snapshot, request, ok) in [
+        (payload, big, true),
+        (payload - 1, big, false),
+        (big, body, true),
+        (big, body - 1, false),
+    ] {
+        set_limits(&ea, snapshot, request);
+        assert_eq!(
+            ea.write_snapshot(&a.applied, &state).unwrap(),
+            ok,
+            "{snapshot} {request}"
+        );
+    }
+}
+
+/// [CMP-5] PROTOCOL.md 14.7: the app checks each snapshot once. A rejected
+/// snapshot before the frontier and the accepted usable snapshot are not
+/// for the app. A snapshot at the frontier state position that the app
+/// applied past is. S1 (state 3) is rejected by B, S2 (state 4) is
+/// accepted, and B writes S3 at state 4. A new engine of B, whose app
+/// imports S2 and pulls one more change, gets S3 alone.
+#[test]
+fn unchecked_snapshots_lists_only_what_the_app_must_check() {
+    let (mut w, mut a, mut b) = World::new();
+    let mut ea = w.engine(&a);
+    let mut eb = w.engine(&b);
+    w.exchange(&mut ea);
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    a.write_snapshot(&mut ea);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    b.pull(&eb).unwrap();
+    assert_eq!(Dev::check_snapshots(&mut ea), 1);
+    let s1 = eb.unchecked_snapshots().unwrap();
+    assert_eq!(s1.len(), 1);
+    eb.accept_snapshot(s1[0].position, false).unwrap();
+    a.edit(&ea, b"a2");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    a.write_snapshot(&mut ea);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    b.pull(&eb).unwrap();
+    assert_eq!(Dev::check_snapshots(&mut ea), 1);
+    assert_eq!(Dev::check_snapshots(&mut eb), 1);
+    w.exchange(&mut ea);
+    w.exchange(&mut eb);
+    w.exchange(&mut ea);
+    let s2 = ea.usable_snapshot().unwrap().unwrap();
+    assert_eq!(s2.state_position, b.applied.position);
+    b.pull(&eb).unwrap();
+    b.write_snapshot(&mut eb);
+    w.exchange(&mut eb);
+    a.edit(&ea, b"a3");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut eb2 = Engine::open(tmp.path(), w.space(), &w.keys[1]).unwrap();
+    w.exchange(&mut eb2);
+    let mut fresh = w.dev("b2");
+    assert!(fresh.pull_or_reset(&eb2));
+    assert!(fresh.applied.position > s2.state_position);
+    let got = eb2.unchecked_snapshots().unwrap();
+    assert_eq!(got.len(), 1);
+    assert_ne!(got[0].position, s1[0].position);
+    assert_ne!(got[0].position, s2.position);
+    assert_eq!(got[0].state_position, s2.state_position);
+    eb2.accept_snapshot(got[0].position, true).unwrap();
+    assert_eq!(eb2.unchecked_snapshots().unwrap(), vec![]);
+}
+
+/// PROTOCOL.md 14.7: the answer to a queued snapshot. `on_hold` and `quota`
+/// keep it with their status. Another refusal drops it and sets
+/// `degraded`.
+#[test]
+fn refused_snapshot_is_kept_or_dropped_by_its_code() {
+    // on_hold: the relay restores a backup from before the change at 3.
+    let (mut w, mut a, _b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    let backup = w.backup("b1");
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    w.restore(&backup);
+    a.write_snapshot(&mut ea);
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::RestoreHold);
+    assert_eq!(crate::compact::pending_records(&ea.db).unwrap().len(), 1);
+
+    // quota: the usage is above the quota and the snapshot reserve.
+    let (mut w, mut a, _b) = World::new();
+    let mut cfg = relay_config(&w.root);
+    cfg.limits.max_snapshot_bytes = 4096;
+    w.relay = Relay::open(cfg).unwrap();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    for i in 0..3u8 {
+        a.edit(&ea, &vec![i; 40_000]);
+    }
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    w.relay.set_quotas("sam", None, Some(0)).unwrap();
+    assert!(ea.write_snapshot(&a.applied, b"small").unwrap());
+    w.exchange(&mut ea);
+    assert_eq!(ea.status(), Status::Quota);
+    assert_eq!(crate::compact::pending_records(&ea.db).unwrap().len(), 1);
+
+    // too_large: the relay limit goes down after the engine read it.
+    let (mut w, mut a, _b) = World::new();
+    let mut ea = w.engine(&a);
+    w.exchange(&mut ea);
+    a.edit(&ea, b"a1");
+    a.enqueue(&mut ea);
+    w.exchange(&mut ea);
+    a.pull(&ea).unwrap();
+    assert!(ea.write_snapshot(&a.applied, &[1; 5000]).unwrap());
+    let mut cfg = relay_config(&w.root);
+    cfg.limits.max_snapshot_bytes = 4096;
+    w.relay = Relay::open(cfg).unwrap();
+    w.exchange(&mut ea);
+    assert!(
+        matches!(ea.status(), Status::Degraded { ref cause } if cause == "refused: too_large"),
+        "{:?}",
+        ea.status()
+    );
+    assert_eq!(crate::compact::pending_records(&ea.db).unwrap(), vec![]);
 }
 
 /// One exchange with no limit on the number of requests, for the SLO case.

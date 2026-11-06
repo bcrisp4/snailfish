@@ -596,3 +596,53 @@ fn overlay_reads_the_recovery_key_of_the_log() {
         Verdict::Store(_)
     ));
 }
+
+/// [CMP-5] PROTOCOL.md 14.4: an accept names the snapshot by position and
+/// record hash, and its applied position is an entry at or before its base.
+/// The Go log has the snapshot of B at 4. An accept by A with base 4 and
+/// applied position 4 is stored. A wrong snapshot hash and an applied
+/// position after the base are refused. Without this, a relay would count an
+/// accept of another snapshot, or of state that the device never applied.
+#[test]
+fn accept_names_the_snapshot_and_an_applied_entry_up_to_its_base() {
+    use snailfish_protocol::records::Position;
+    use snailfish_protocol::write;
+    let v = vectors();
+    let mut s = setup(&v);
+    let (a, ka) = device(&v, "A");
+    let (b, _) = device(&v, "B");
+    let snap = stored(check_append(&s, &env(&v, 4), relay(b)));
+    s.apply(&snap);
+    let base = Position {
+        position: 4,
+        digest: snap.digest,
+    };
+    let accept = |hash: &[u8; 32], applied: &Position| {
+        let ty = "snailfish.accept.v1";
+        let payload = write::accept(&s.log_id, &a, &base, 4, hash, applied);
+        Envelope {
+            payload_type: ty.to_owned(),
+            sig: ka.sign_record(ty, &payload),
+            payload,
+        }
+    };
+    stored(check_append(
+        &s,
+        &accept(&snap.record_hash, &base),
+        relay(a),
+    ));
+    let mut wrong = snap.record_hash;
+    wrong[0] ^= 1;
+    match check_append(&s, &accept(&wrong, &base), relay(a)) {
+        Verdict::Refused(Refusal::InvalidRecord(why)) => assert!(why.contains("no snapshot")),
+        other => panic!("expected invalid_record, got {other:?}"),
+    }
+    let after = Position {
+        position: 5,
+        digest: snap.digest,
+    };
+    match check_append(&s, &accept(&snap.record_hash, &after), relay(a)) {
+        Verdict::Refused(Refusal::InvalidRecord(why)) => assert!(why.contains("applied position")),
+        other => panic!("expected invalid_record, got {other:?}"),
+    }
+}

@@ -202,8 +202,9 @@ func httpTenant() string { return "t_" + hx(testSeed("tenant", "handle")[:16]) }
 // http entry 1 is genesis (protocol entry 1), 3 is the grant to B (protocol
 // entry 2), 100 is a grant to C (protocol entry 8), 101 is an epoch 2 record
 // with key sets to A, B and R1 (protocol entry 9).
-// The M7 cases (entries from 200) take a stored sealed value of the same
-// length: protocol entry 8 for one epoch, entry 11 for two. Their HPKE info
+// The M7 and compaction cases (entries from 200) take a stored sealed value
+// of the same length: protocol entry 8 for one epoch, entry 11 for two, and
+// entry 11 with 32 zero bytes after it for three. Their HPKE info
 // differs, so these key sets do not open. The relay never opens a key set,
 // and protocol.json checks the key sets that a device opens.
 func httpSealer(p *protocolJ) sealer {
@@ -219,6 +220,9 @@ func httpSealer(p *protocolJ) sealer {
 				return storedSealed(p, 8, 0)
 			case 64:
 				return storedSealed(p, 11, 0)
+			case 96:
+				s, err := storedSealed(p, 11, 0)
+				return append(s, make([]byte, 32)...), err
 			}
 		}
 		return nil, fmt.Errorf("no stored key set for http entry %d", entry)

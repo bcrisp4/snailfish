@@ -968,6 +968,23 @@ mod tests {
         assert_eq!(classify("snailfish.change"), TypeClass::UpdateRequired);
         assert_eq!(classify(""), TypeClass::UpdateRequired);
     }
+
+    #[test]
+    fn security_types_are_the_record_types_outside_the_content_families() {
+        // [VER-5]: a stored security record that the list misses would leave
+        // the space state replay of a store without it.
+        for t in RECORD_TYPES {
+            let content = ["snailfish.change", "snailfish.snapshot", "snailfish.accept"]
+                .iter()
+                .any(|f| is_family(t, f));
+            assert_eq!(SECURITY_TYPES.contains(&t), !content, "{t}");
+        }
+        assert_eq!(
+            security_sql(),
+            "payload_type IN ('snailfish.genesis.v1', 'snailfish.grant.v1', 'snailfish.epoch.v1', \
+             'snailfish.recovery.v1', 'snailfish.device.v1', 'snailfish.level.v1')"
+        );
+    }
 }
 
 /// Kani proofs. Run with `cargo kani -p snailfish-protocol`.
@@ -986,23 +1003,6 @@ mod proofs {
     /// change and an unknown security record could be skipped ([VER-4]).
     #[kani::proof]
     #[kani::unwind(8)]
-    fn security_types_are_the_record_types_outside_the_content_families() {
-        // [VER-5]: a stored security record that the list misses would leave
-        // the space state replay of a store without it.
-        for t in RECORD_TYPES {
-            let content = ["snailfish.change", "snailfish.snapshot", "snailfish.accept"]
-                .iter()
-                .any(|f| is_family(t, f));
-            assert_eq!(SECURITY_TYPES.contains(&t), !content, "{t}");
-        }
-        assert_eq!(
-            security_sql(),
-            "payload_type IN ('snailfish.genesis.v1', 'snailfish.grant.v1', 'snailfish.epoch.v1', \
-             'snailfish.recovery.v1', 'snailfish.device.v1', 'snailfish.level.v1')"
-        );
-    }
-
-    #[test]
     fn is_family_needs_a_dot_after_the_family() {
         let bytes: [u8; 4] = kani::any();
         let len: usize = kani::any_where(|&n| n <= 4);

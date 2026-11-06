@@ -447,7 +447,7 @@ impl Engine {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(f > 0 && p.map(to_u64).transpose()?.is_some_and(|p| p <= f))
+        Ok(p.map(to_u64).transpose()?.is_some_and(|p| p <= f))
     }
 }
 
@@ -497,7 +497,7 @@ pub(crate) fn before_changes(e: &Engine, applied: u64) -> Result<bool, EngineErr
     // with no new frontier scans nothing.
     let stubbed: i64 =
         e.db.query_row("SELECT stubbed FROM meta", [], |r| r.get(0))?;
-    if f > 0 && own_accept && to_u64(stubbed)? < f {
+    if own_accept && to_u64(stubbed)? < f {
         let tx = Transaction::new_unchecked(&e.db, TransactionBehavior::Immediate)?;
         stub_covered(&tx, &c)?;
         tx.execute("UPDATE meta SET stubbed = ?1", [to_i64(f)?])?;

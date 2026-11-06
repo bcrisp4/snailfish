@@ -183,6 +183,10 @@ func buildCompaction(h *httpJ, b *logBuilder, w *world, base *space, envs []stri
 		cases = append(cases, cmpCaseJ{Name: name, Quota: quota, Steps: steps})
 	}
 	state := `{"tasks":[{"id":1,"title":"Buy milk","done":true}]}`
+	// The case grant-needs-uncovered-epoch needs a key for epoch 3, as the
+	// M7 epoch skip case does. protocol.json has keys for epochs 1 and 2 only.
+	w.appKeys[3] = testSeed("log", "app-key-3")
+	defer delete(w.appKeys, 3)
 
 	// [CMP-5] [CMP-6] [CMP-12] [CMP-19] specs/compaction/test.qnt::compactTest:
 	// after both accepts the relay makes stubs of the changes at 2 and 4. The
@@ -301,6 +305,51 @@ func buildCompaction(h *httpJ, b *logBuilder, w *world, base *space, envs []stri
 			{Kind: "finish", Signer: A.name, Body: finish(7)},
 		}
 		add("repair-stubs", 0, cb, steps...)
+	}
+	// [CMP-15] [LOG-11]: a usable snapshot covers the changes up to its state
+	// position only. After a restore to position 1, a repair with a stub of
+	// the change at 8, after the frontier 4, is `uncovered_stub`.
+	{
+		cb := newCB(0)
+		s0 := cb.appendStep(A, cb.snapshot(A, 4, 4, 1, state))
+		s1 := cb.appendStep(A, cb.accept(A, 5, 5, cb.rh(5), 4))
+		s2 := cb.appendStep(B, cb.accept(B, 6, 5, cb.rh(5), 4))
+		s3 := cb.appendStep(A, change(A, 34, cb.base(7), 1, w.logIDText, `{"op":"add","task":13}`))
+		full := cb.sp
+		ent := func(p int) string {
+			if full.cmp[p-1].stub {
+				return fmt.Sprintf(`{"position":%d,"stub":%s}`, p, full.stubJSON(p))
+			}
+			return fmt.Sprintf(`{"position":%d,"envelope":%s}`, p, cb.envAt(p))
+		}
+		stub := func(p int) string { return fmt.Sprintf(`{"position":%d,"stub":%s}`, p, full.stubJSON(p)) }
+		steps := []cmpStepJ{s0, s1, s2, s3,
+			{Kind: "cut", N: 1},
+			{Kind: "start", Signer: A.name, Body: `{"base":` + posRaw(1, full.digestAt(1)) + `,"entries":[` + strings.Join([]string{ent(2), ent(3), ent(4)}, ",") + `]}`},
+			{Kind: "chunk", Signer: A.name, Body: `{"session":"{{session}}","entries":[` + strings.Join([]string{ent(5), ent(6), ent(7)}, ",") + `]}`},
+			{Kind: "chunk", Signer: A.name, Body: `{"session":"{{session}}","entries":[` + stub(8) + `]}`},
+			{Kind: "finish", Signer: A.name, Body: `{"session":"{{session}}","tip":` + posRaw(8, full.digestAt(8)) + `}`},
+		}
+		add("uncovered-change-stub", 0, cb, steps...)
+	}
+	// [CMP-20] PROTOCOL.md 14.5: a change after the frontier keeps its epoch
+	// needed. After compaction, A removes B (epoch 2), adds a change in epoch
+	// 2 and rotates to epoch 3. A grant to C without epoch 2 is refused, and
+	// a grant with epochs 1, 2 and 3 is stored.
+	{
+		cb := newCB(0)
+		s1 := cb.appendStep(A, cb.snapshot(A, 4, 4, 1, state))
+		s2 := cb.appendStep(A, cb.accept(A, 5, 5, cb.rh(5), 4))
+		s3 := cb.appendStep(B, cb.accept(B, 6, 5, cb.rh(5), 4))
+		ep2, _ := cb.m.epoch(A, cb.base(7), 2, []*party{B}, []*party{A}, w.R1)
+		s4 := cb.appendStep(A, ep2)
+		s5 := cb.appendStep(A, change(A, 35, cb.base(8), 2, w.logIDText, `{"op":"add","task":14}`))
+		ep3, _ := cb.m.epoch(A, cb.base(9), 3, nil, []*party{A}, w.R1)
+		s6 := cb.appendStep(A, ep3)
+		s7 := cb.appendStep(A,
+			cb.m.grant(A, C, 1, cb.base(10), []int{1, 3}),
+			cb.m.grant(A, C, 1, cb.base(10), []int{1, 2, 3}))
+		add("grant-needs-uncovered-epoch", 0, cb, s1, s2, s3, s4, s5, s6, s7)
 	}
 	if err := errors.Join(errs...); err != nil {
 		return err

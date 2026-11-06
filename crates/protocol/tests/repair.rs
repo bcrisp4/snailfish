@@ -213,3 +213,38 @@ fn overlay_reads_the_log_state_until_an_added_record_changes_it() {
     assert_eq!(over.last_security(), 2, "a change is not a security record");
     assert_eq!(over.head(), 3);
 }
+
+/// PROTOCOL.md 10.7 [CMP-1]: a snapshot stub has no change ID, and a change
+/// stub has one. A stub of the other form is `invalid_record`, not
+/// `uncovered_stub`. Without this, a relay would store a stub that names no
+/// change, or tell the device that a well-formed repair is uncovered.
+#[test]
+fn stub_form_depends_on_its_type() {
+    let v = vectors();
+    let s = genesis_only(&v);
+    let e2 = env(&v, 2);
+    let stub = |t: &str, cid: Option<&str>| Stub {
+        payload_type: t.into(),
+        change_id: cid.map(Into::into),
+        hash: [7; 32],
+    };
+    let snap = stub("snailfish.snapshot.v1", None);
+    let ok = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub(&snap)]);
+    assert_eq!(ok.failure, None);
+    assert!(matches!(ok.accepted[1], Staged::Stub(_)));
+    let cid = v["log"]["entries"][2]["change_id"].as_str().unwrap();
+    for bad in [
+        stub("snailfish.change.v1", None),
+        stub("snailfish.snapshot.v1", Some(cid)),
+    ] {
+        let got = check_chain(&s, &[2, 3], &[Item::Envelope(&e2), Item::Stub(&bad)]);
+        assert!(
+            matches!(
+                got.failure,
+                Some((1, ChainError::Invalid(Refusal::InvalidRecord(_))))
+            ),
+            "{bad:?}: {:?}",
+            got.failure
+        );
+    }
+}

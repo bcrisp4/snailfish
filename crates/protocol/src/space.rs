@@ -793,20 +793,6 @@ impl MemorySpace {
         self.compaction
             .apply(a.position, compaction::kind(&a.record), &active);
     }
-
-    /// Apply a stub at the next position ([CMP-1]).
-    pub fn apply_stub(&mut self, s: &StubEntry) {
-        self.digests.push(s.digest);
-        if let Some(cid) = s.change_id {
-            self.changes.insert(cid, (s.position, s.record_hash));
-        }
-        if s.payload_type == "snailfish.snapshot.v1" {
-            self.snapshots.insert(s.position, s.record_hash);
-        }
-        let active = self.state.devices.keys().copied().collect();
-        self.compaction
-            .apply(s.position, compaction::stub_kind(&s.payload_type), &active);
-    }
 }
 
 /// A stub at a position, with its log digest (`PROTOCOL.md` 10.7, [CMP-1]).
