@@ -184,3 +184,18 @@ def test_enrollment_vectors() -> None:
         else:
             with pytest.raises(sf.SnailfishError.Invalid):
                 sf.enroll_check_confirm(*args)
+
+
+def test_export_files() -> None:
+    """PROTOCOL.md section 15: each export case of the Go generator gets its
+    verdict through the binding. A form fault never reaches the chain check."""
+    cases = load("export.json")["cases"]
+    assert len(cases) >= 15
+    for c in cases:
+        file = c["file"].encode()
+        if c["valid_form"] and c["valid_log"]:
+            assert sf.check_export(file) >= 1, c["name"]
+            continue
+        want = "'log:" if c["valid_form"] else "'form:"
+        with pytest.raises(sf.SnailfishError.Invalid, match=want):
+            sf.check_export(file)

@@ -297,14 +297,16 @@ module forkrepair {
   }
 
   // [FRK-7] The engine gives the app each own change that the new log does
-  // not hold and that the old state file holds in full. [FRK-8] The app
+  // not hold and that the old verified log holds in full. It reads no old
+  // outbox: the app outbox row of each change stays until the change comes
+  // back from changes_after ([DLV-11]), so the app outbox holds it. [FRK-8] The app
   // writes an outbox row for each one with its old change ID and calls
   // enqueue_many. The app keys its outbox rows by change ID, so a second
   // run after a crash adds nothing.
   action recover(d: Dev): bool = {
     val x = dev(d)
     val own = x.old.indices().filter(i => x.old[i].author == d and not(x.old[i].snap) and not(x.old[i].stub))
-      .map(i => x.old[i].cid).union(x.oldOutbox)
+      .map(i => x.old[i].cid)
     val found = if (BUG == "skipOld") Set() else own.filter(c => not(holdsCid(x.log, c)))
     val stubbed = x.old.indices().exists(i => x.old[i].author == d and x.old[i].stub and not(holdsCid(x.log, x.old[i].cid)))
     all {

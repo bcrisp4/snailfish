@@ -281,3 +281,40 @@ def test_code_mismatch_appends_no_grant(relay: Relay, tmp_path: Path) -> None:
     assert n.joined() is None
     exchange(relay, a)
     assert a.verified_head().position == 1
+
+
+def run_import(relay: Relay, imp: sf.Import) -> None:
+    """Run an import session (PROTOCOL.md 10.13) until it ends."""
+    while (req := imp.next_request()) is not None:
+        imp.handle_response(*relay.send(req.method, req.url, req.headers, req.body))
+
+
+def test_delete_export_and_import_cross_the_binding(
+    relay: Relay, tmp_path: Path
+) -> None:
+    """[LOG-13] [FRK-5]: a deletion gives `stopped: deleted`, an import of the
+    verified log makes the space again, and a second import gives the relay
+    code `space_exists` as a `Refused` error. The export file passes the
+    reader of section 15. A fork repair needs these calls."""
+    ka = sf.new_device_keys()
+    setup = sf.create_space(APP, sf.NewDevice(keys=ka, name="A"))
+    ka.app_key = setup.app_key
+    space, token = relay.first_device(ka, setup.log_id)
+    sa = MemStore()
+    sf.install_setup(str(tmp_path / "a"), space, ka, setup.envelopes, token, sa)
+    a = sf.Engine.open(str(tmp_path / "a"), space, sa)
+    exchange(relay, a)
+    assert sf.check_export(a.export_log()) == a.verified_head().position
+    req = a.delete_request()
+    a.handle_delete_response(*relay.send(req.method, req.url, req.headers, req.body))
+    assert a.status() == sf.Status.DELETED()
+    exchange(relay, a)
+    assert a.status() == sf.Status.DELETED()
+    imp = a.import_space(space, relay.setup_token(ka).token)
+    run_import(relay, imp)
+    assert imp.finished()
+    exchange(relay, a)
+    assert a.status() == sf.Status.OK()
+    again = a.import_space(space, relay.setup_token(ka).token)
+    with pytest.raises(sf.SnailfishError.Refused, match="space_exists"):
+        run_import(relay, again)
