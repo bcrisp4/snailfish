@@ -1000,7 +1000,7 @@ impl Relay {
         }
         let head = read_head(&tx)?;
         tx.commit()?;
-        if stubs > 0 {
+        if stubs != 0 {
             compact::reclaim(&sc);
         }
         Ok((200, wire::append_response(&results, &head)))
@@ -1203,7 +1203,7 @@ impl Relay {
             }
         };
         tx.commit()?;
-        if stubs > 0 {
+        if stubs != 0 {
             compact::reclaim(&sc);
         }
         Ok(out)

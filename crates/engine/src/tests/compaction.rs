@@ -454,23 +454,29 @@ fn repair_uploads_stubs() {
     assert_eq!(relay_stubs(&w), [3, 4]);
 }
 
-/// [CMP-17] [STO-13]: B still holds the changes at 3 and 4 in full when
-/// the relay goes back to position 2. B repairs the log with them, the
-/// relay makes stubs of them again and rebuilds its file, so the file
-/// keeps no free page.
+/// [CMP-12] [CMP-17] [STO-13]: the relay rebuilds its file after each
+/// compaction, so the file keeps no free page. The append of the last
+/// accept makes stubs of the changes at 3 and 4. B still holds them in full
+/// when the relay goes back to position 2, and its repair makes the stubs
+/// again.
 #[test]
 fn repair_with_full_records_makes_stubs_and_reclaims_space() {
     let (mut w, _a, _ea, _b, mut eb) = compacted_with(&[&vec![1; 40_000], &vec![2; 40_000]]);
+    assert_eq!(relay_free_pages(&w), 0, "the append of the last accept");
     assert_eq!(local_stubs(&eb), Vec::<u64>::new());
     w.cut_relay(2);
     w.exchange(&mut eb);
     assert_eq!(eb.status(), Status::Ok);
     assert_eq!(relay_stubs(&w), [3, 4]);
-    let free: i64 = Connection::open(relay_space_file(&w))
+    assert_eq!(relay_free_pages(&w), 0, "the repair finish");
+}
+
+/// The free pages of the relay space file.
+fn relay_free_pages(w: &World) -> i64 {
+    Connection::open(relay_space_file(w))
         .unwrap()
         .query_row("PRAGMA freelist_count", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(free, 0);
+        .unwrap()
 }
 
 /// [CMP-15]: a relay that sends a stub that no usable snapshot covers stops
