@@ -139,4 +139,38 @@ fn user_add_prints_the_invite_link() {
         link.starts_with("https://relay.test/u/invite#it_"),
         "{link}"
     );
+    // `user list` needs no authority and prints the user with its tenant
+    // ID, the label of the storage metric.
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .arg("--data")
+            .arg(dir.path().join("data"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&["user", "list"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list = String::from_utf8(out.stdout).unwrap();
+    let (name, id) = list.trim().split_once(' ').unwrap();
+    assert_eq!(name, "sam");
+    assert!(dir.path().join("data/tenants").join(id).is_dir(), "{list}");
+    // `space delete` of a log ID that the user does not hold fails with a
+    // message, so the operator sees that nothing was deleted.
+    let out = run(&[
+        "space",
+        "delete",
+        "sam",
+        "l_00112233445566778899aabbccddeeff",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("sam holds no space l_00112233445566778899aabbccddeeff"),
+        "{err}"
+    );
 }

@@ -87,6 +87,19 @@ fn fork_repair_restores_the_own_changes_of_each_device() {
     assert_eq!(ea.status(), Status::Deleted);
     let token = w.sign_in(&w.keys[0]).token;
     let mut imp = ea.import_space(w.space(), &token).unwrap();
+    // A refused import never reports the space as made, and the Debug
+    // output names the step, not the setup token.
+    assert!(!imp.finished());
+    let dbg = format!("{imp:?}");
+    assert!(dbg.contains("Import") && dbg.contains("step"), "{dbg}");
+    assert!(!dbg.contains(&token), "{dbg}");
+    // The target must name this log and this app.
+    let mut other_app = w.space();
+    other_app.app_id = "com.example.other".into();
+    assert!(matches!(
+        ea.import_space(other_app, &token),
+        Err(EngineError::Invalid(_))
+    ));
     run_import(&w, &mut imp).unwrap();
     assert!(imp.finished());
     w.exchange(&mut ea);
@@ -313,4 +326,77 @@ fn old_keys_open_only_the_old_state_file() {
     ));
     assert!(!empty.join(crate::STATE_FILE).exists());
     drop(a);
+}
+
+/// FRK-7: before the checkpoint check of its first exchange, an enrolled
+/// engine refuses the comparison, also when the app gave it the app key.
+#[test]
+fn comparison_waits_for_the_first_exchange() {
+    let (w, a, b) = World::new();
+    let ea = w.engine(&a);
+    let eb = w.engine(&b);
+    assert!(eb.app_key().is_some(), "World::new gives B the app key");
+    assert!(matches!(eb.fork_changes(&ea), Err(EngineError::Invalid(_))));
+}
+
+/// 10.13 with the size rule of 10.9: each chunk body of an import fits
+/// `max_request_bytes` and `max_append_envelopes`, and each chunk but the
+/// last is full: the next entry does not fit. Without the exact overhead,
+/// a start body passes the limit (`too_large`), or an import sends more
+/// requests than it needs.
+#[test]
+fn import_chunks_are_full_and_fit_the_limits() {
+    use snailfish_protocol::wire::{self, Limits, OutEntry, Stub};
+    let token = [7u8; 32];
+    let keys = new_device_keys().unwrap();
+    let device = snailfish_protocol::records::Keys {
+        sign: snailfish_protocol::sig::SecretKey::from_seed(&keys.sign_seed).public(),
+        seal: Box::new(snailfish_protocol::keys::seal_public(&keys.seal_seed)),
+    };
+    let entries: Vec<(u64, OutEntry)> = (1..=40u64)
+        .map(|p| {
+            let cid = format!("c_{}", format!("{p:02x}").repeat(16));
+            (
+                p,
+                OutEntry::Stub(Stub {
+                    payload_type: "snailfish.change.v1".into(),
+                    change_id: Some(cid),
+                    hash: [1; 32],
+                }),
+            )
+        })
+        .collect();
+    let start = wire::import_start_body(&token, &device, &[]).unwrap().len();
+    let chunk = wire::repair_chunk_body(&[0; 16], &[]).unwrap().len();
+    for (max, n_max) in [(start + 600, 100usize), (start + 3000, 7), (8192, 100)] {
+        let limits = Limits {
+            max_request_bytes: max as u64,
+            max_append_envelopes: n_max as u64,
+            ..Limits::default()
+        };
+        let got = crate::lifecycle::chunks(&entries, &limits, start, chunk).unwrap();
+        let flat: Vec<u64> = got.iter().flatten().map(|(p, _)| *p).collect();
+        assert_eq!(flat, (1..=40).collect::<Vec<_>>());
+        let body = |i: usize, c: &[(u64, OutEntry)]| {
+            if i == 0 {
+                wire::import_start_body(&token, &device, c).unwrap().len()
+            } else {
+                wire::repair_chunk_body(&[0; 16], c).unwrap().len()
+            }
+        };
+        let chunks: Vec<_> = got.iter().collect();
+        for (i, c) in chunks.iter().enumerate() {
+            assert_ne!(c.len(), 0);
+            assert!(c.len() <= n_max);
+            assert!(body(i, c) <= max, "chunk {i} of {max}: {}", body(i, c));
+            if let Some(next) = chunks.get(i + 1) {
+                let mut more = (*c).clone();
+                more.push(next[0].clone());
+                assert!(
+                    body(i, &more) > max || c.len() == n_max,
+                    "chunk {i} of {max} is not full"
+                );
+            }
+        }
+    }
 }

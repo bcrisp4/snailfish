@@ -258,12 +258,46 @@ mod tests {
             }
         }
 
+        /// Section 15: `well_formed` holds exactly when `split_lines` gives
+        /// lines.
+        #[test]
+        fn well_formed_matches_split_lines(bytes in proptest::collection::vec(prop_oneof![Just(b'\n'), Just(b'a')], 0..12)) {
+            prop_assert_eq!(well_formed(&bytes), split_lines(&bytes).is_some());
+        }
+
         /// Section 15: a header line parses back to the same header.
         #[test]
         fn header_round_trip(log in any::<[u8; 16]>(), app in "[a-z]{1,8}\\.[a-z]{1,8}", pos in 1u64..(1 << 53), digest in any::<[u8; 32]>()) {
             let h = Header { log_id: log, app, head: Head { position: pos, digest } };
             prop_assert_eq!(parse_header(header_line(&h).as_bytes()).unwrap(), h);
         }
+    }
+
+    #[test]
+    fn well_formed_edges() {
+        assert!(well_formed(b"a\n"));
+        assert!(!well_formed(b"a"));
+        assert!(!well_formed(b""));
+        assert!(!well_formed(b"\n"));
+        assert!(!well_formed(b"a\n\nb\n"));
+    }
+
+    #[test]
+    fn check_errors_name_the_position() {
+        assert_eq!(
+            CheckError::Digest.to_string(),
+            "the last digest differs from head.digest"
+        );
+        assert!(
+            CheckError::Genesis("x".into())
+                .to_string()
+                .starts_with("position 1: x")
+        );
+        assert!(
+            CheckError::Chain(3, ChainError::Position)
+                .to_string()
+                .starts_with("position 3: ")
+        );
     }
 
     #[test]

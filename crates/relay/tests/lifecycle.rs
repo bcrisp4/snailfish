@@ -114,6 +114,7 @@ fn deletion_removes_the_space_and_blocks_its_log_id() {
     let r = delete(&fx, "A", &stmt, None);
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert!(!file.exists());
+    assert_eq!(r.body, br#"{"deleted":true}"#);
     let r = fx.fetch(fx.tenant(), 0, 10);
     assert_eq!((r.status, error_code(&r).as_str()), (410, "deleted"));
     let r = fx.put_genesis(fx.tenant());
@@ -531,8 +532,8 @@ fn operator_deletes_a_space() {
 }
 
 /// 10.12 step 1 and 10.13 start step 1: 8.6 steps 1 to 4 run first, so a
-/// body that differs from its `content-digest` gets `bad_digest` before
-/// any other check.
+/// body that differs from its `content-digest` and breaks JSON gets
+/// `bad_digest` before the body check.
 #[test]
 fn deletion_and_import_check_the_digest_first() {
     let fx = Fx::new();
@@ -540,7 +541,9 @@ fn deletion_and_import_check_the_digest_first() {
     let stmt = statement(&fx, "A", relay_head(&fx), now(&fx) + 60);
     let path = format!("{}/delete", fx.space_path(fx.tenant(), fx.log()));
     let mut req = fx.signed("POST", &path, "", &wire::delete_body(&stmt, None), "A");
-    req.body.push(b' ');
+    // A body that breaks JSON too: the digest check runs first (step 1),
+    // so the answer is `bad_digest`, not `bad_request`.
+    req.body.push(b'x');
     let r = fx.relay.handle(&req);
     assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_digest"));
     let other = Fx::new();
@@ -548,7 +551,9 @@ fn deletion_and_import_check_the_digest_first() {
     let token = other.setup_token("sam", "A");
     let body = wire::import_start_body(&token, &keys_of("A"), &entries[..1]).unwrap();
     let mut req = other.signed("POST", &import_path(&other, ""), "", &body, "A");
-    req.body.push(b' ');
+    // A body that breaks JSON too: the digest check runs first (step 1),
+    // so the answer is `bad_digest`, not `bad_request`.
+    req.body.push(b'x');
     let r = other.relay.handle(&req);
     assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_digest"));
     // 10.13 start step 6: position 1 must be a genesis envelope, not a stub.

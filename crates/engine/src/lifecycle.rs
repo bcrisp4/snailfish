@@ -10,7 +10,7 @@ use snailfish_protocol::encoding::{Hash32, decode_id, encode_id};
 use snailfish_protocol::envelope::{self, Envelope};
 use snailfish_protocol::export::{self, Header as ExportHeader};
 use snailfish_protocol::keys;
-use snailfish_protocol::records::{Author, Body, Keys, parse_payload};
+use snailfish_protocol::records::{Author, Keys, parse_payload};
 use snailfish_protocol::request::{self, Params, Target};
 use snailfish_protocol::setup;
 use snailfish_protocol::sig::SecretKey;
@@ -246,9 +246,8 @@ impl Engine {
                 .map_err(|e| EngineError::Storage(format!("stored record: {e}")))?;
             let rec = parse_payload(&env.payload_type, &env.payload)
                 .map_err(|e| EngineError::Storage(format!("stored record: {e}")))?;
-            if rec.author != Author::Device(old.device_id)
-                || !matches!(rec.body, Body::Change { .. })
-            {
+            // The query reads change records only.
+            if rec.author != Author::Device(old.device_id) {
                 continue;
             }
             // [DLV-13]: a change that does not decrypt has no bytes to send.
@@ -342,9 +341,10 @@ pub struct Import {
     chunks: VecDeque<Vec<(u64, OutEntry)>>,
     session: Option<[u8; 16]>,
     step: Step,
+    // The relay made the space: the finish answered with the tip.
+    made: bool,
     sent: bool,
     offset: i64,
-    clock: fn() -> u64,
 }
 
 impl std::fmt::Debug for Import {
@@ -356,13 +356,16 @@ impl std::fmt::Debug for Import {
     }
 }
 
-/// Split `entries` into chunks whose body fits `max_request_bytes` and
-/// `max_append_envelopes` (10.13 with the size rule of 10.9). An entry that
-/// does not fit alone goes alone: the relay allows 1,024 bytes more.
-fn chunks(
+/// Split `entries` into chunks for one start and its chunks (10.13). Each
+/// body fits `max_request_bytes` and `max_append_envelopes`: the start
+/// body of the first chunk has `start` bytes with no entry, and each later
+/// chunk body `chunk` bytes. An entry that does not fit alone goes alone:
+/// the relay allows 1,024 bytes more (10.9).
+pub(crate) fn chunks(
     entries: &[(u64, OutEntry)],
     limits: &Limits,
-    first_extra: usize,
+    start: usize,
+    chunk: usize,
 ) -> Result<VecDeque<Vec<(u64, OutEntry)>>, EngineError> {
     let max = usize::try_from(limits.max_request_bytes).unwrap_or(usize::MAX);
     let n_max = usize::try_from(limits.max_append_envelopes)
@@ -370,18 +373,16 @@ fn chunks(
         .max(1);
     let mut out = VecDeque::new();
     let mut cur: Vec<(u64, OutEntry)> = Vec::new();
-    // The wrapper of a chunk body: session, brackets and the setup and
-    // device fields of the start.
-    let wrapper = 96usize;
-    let mut size = wrapper.saturating_add(first_extra);
+    let mut size = start;
     for (p, e) in entries {
+        // The entry and the comma before it.
         let len = wire::entry_json(*p, e)
             .map_err(|e| EngineError::Storage(e.0))?
             .len()
             .saturating_add(1);
         if !cur.is_empty() && (size.saturating_add(len) > max || cur.len() >= n_max) {
             out.push_back(std::mem::take(&mut cur));
-            size = wrapper;
+            size = chunk;
         }
         size = size.saturating_add(len);
         cur.push((*p, e.clone()));
@@ -419,29 +420,21 @@ impl Import {
             chunks: VecDeque::new(),
             session: None,
             step: Step::Info,
+            made: false,
             sent: false,
             offset: 0,
-            clock: crate::system_time,
         })
     }
 
-    /// Set the device clock, for tests.
-    pub fn set_clock(&mut self, clock: fn() -> u64) {
-        self.clock = clock;
-    }
-
     fn now(&self) -> u64 {
-        let t = (self.clock)();
+        let t = crate::system_time();
         t.checked_add_signed(self.offset).unwrap_or(t)
     }
 
     /// True after the relay made the space.
     #[must_use]
     pub fn finished(&self) -> bool {
-        self.step == Step::Done
-            && self.session.is_none()
-            && self.chunks.is_empty()
-            && self.entries.is_empty()
+        self.made
     }
 
     fn path(&self, tail: &str) -> String {
@@ -557,7 +550,7 @@ impl Import {
             return Err(EngineError::UnexpectedResponse);
         }
         if let Some(t) = time_of(headers) {
-            let local = (self.clock)();
+            let local = crate::system_time();
             self.offset =
                 i64::try_from(i128::from(t).saturating_sub(i128::from(local))).unwrap_or(0);
         }
@@ -571,8 +564,18 @@ impl Import {
         match self.step {
             Step::Info => {
                 let info = wire::parse_info(body).map_err(|_| bad("info"))?;
-                let extra = 128usize.saturating_add(self.device.seal.len().saturating_mul(4) / 3);
-                self.chunks = chunks(&std::mem::take(&mut self.entries), &info.limits, extra)?;
+                let start = wire::import_start_body(&self.setup, &self.device, &[])
+                    .map_err(|e| EngineError::Storage(e.0))?
+                    .len();
+                let chunk = wire::repair_chunk_body(&[0; 16], &[])
+                    .map_err(|e| EngineError::Storage(e.0))?
+                    .len();
+                self.chunks = chunks(
+                    &std::mem::take(&mut self.entries),
+                    &info.limits,
+                    start,
+                    chunk,
+                )?;
                 self.step = Step::Start;
             }
             Step::Start | Step::Chunk => {
@@ -608,6 +611,7 @@ impl Import {
                 }
                 self.session = None;
                 self.step = Step::Done;
+                self.made = true;
             }
             Step::Done => return Err(EngineError::UnexpectedResponse),
         }
