@@ -54,9 +54,13 @@ why = "CMP-21: an own change that a snapshot on the losing branch covers is a st
 base = "honest"
 caught_by = "noLostChange"
 
+# A sampled run of 5,000 traces can miss two recoveries of one device
+# before its push (CI seed 0xccb5d2a2d5d4a670), so a named scenario catches
+# it. TLC checks it on every state of tiny.
 [mutants.freshIds]
 base = "honest"
-caught_by = "noDoubleApply"
+caught_by = "tests"
+test = "recoverTwiceTest"
 
 [mutants.noReset]
 base = "honest"

@@ -1,6 +1,12 @@
 module forkrepairTest {
   import forkrepair(DEVS = Set(1, 2, 3), MAX_IDS = 6, SNAPSHOTS = false, BUG = "none").* from "./model"
 
+  // Push the one change of the engine outbox of d, whatever its change ID.
+  action pushOutbox(d: Dev): bool = {
+    nondet c = dev(d).outbox.oneOf()
+    all { dev(d).outbox.size() == 1, push(d, c) }
+  }
+
   // The relay forks after change 1. Device 2 writes change 2 on branch 1 and
   // its app applies it back, so its app outbox row is gone. Device 1 writes
   // change 3 on branch 0. The relay then shows device 2 branch 0.
@@ -23,9 +29,9 @@ module forkrepairTest {
       .expect(wDeletedSeen and dev(3).stop == Deleted)
       .then(importLog)
       .then(reenroll(2)).then(recover(2))
-      .expect(wRecovered and dev(2).appOutbox == Set(2) and noLostChange)
+      .expect(wRecovered and contentsOf(dev(2).appOutbox) == Set(2) and noLostChange)
       .then(dropOld(2))
-      .then(push(2, 2)).then(fetch(2)).then(reset(2))
+      .then(pushOutbox(2)).then(fetch(2)).then(reset(2))
       .then(pull(2)).then(pull(2)).then(pull(2))
       .then(fetch(1)).then(pull(1)).then(pull(1)).then(pull(1))
       .then(fetch(3)).then(pull(3)).then(pull(3)).then(pull(3))
@@ -37,8 +43,10 @@ module forkrepairTest {
   // the old ones.
   run recoverTwiceTest =
     forked.then(exportLog(1)).then(delete).then(importLog)
-      .then(reenroll(2)).then(recover(2)).then(recover(2)).then(dropOld(2))
-      .then(push(2, 2)).then(fetch(2)).then(reset(2))
+      .then(reenroll(2)).then(recover(2)).then(recover(2))
+      .expect(dev(2).appOutbox == Set(2) and dev(2).outbox == Set(2))
+      .then(dropOld(2))
+      .then(pushOutbox(2)).then(fetch(2)).then(reset(2))
       .then(pull(2)).then(pull(2)).then(pull(2))
       .expect(noDoubleApply and dev(2).appState == Set(1, 2, 3) and s.relay[0].length() == 3)
 
@@ -46,7 +54,7 @@ module forkrepairTest {
   run resetNeededTest =
     forked.then(exportLog(1)).then(delete).then(importLog)
       .then(reenroll(2)).then(recover(2)).then(dropOld(2))
-      .then(push(2, 2)).then(fetch(2))
+      .then(pushOutbox(2)).then(fetch(2))
       .expect(not(isPrefix(dev(2).appliedLog, cids(dev(2).log))))
       .then(reset(2)).then(pull(2)).then(pull(2)).then(pull(2))
       .expect(noDoubleApply)
