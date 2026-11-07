@@ -44,7 +44,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
   "ring",
   "tls12",
 ] }
-webauthn-rs = "0.5"
+webauthn-rs = "0.6"
 webpki-roots = "1"
 
 [dev-dependencies]

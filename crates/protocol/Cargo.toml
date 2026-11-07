@@ -14,7 +14,7 @@ chacha20poly1305 = "0.11"
 ed25519-dalek = "3"
 getrandom = "0.4"
 hkdf = "0.13"
-hpke = { version = "0.14", default-features = false, features = [
+hpke = { version = "0.15", default-features = false, features = [
   "alloc",
   "mlkem",
   "chacha",
@@ -35,7 +35,7 @@ test-vectors = []
 # The integration tests in tests/ need the test-vectors API.
 snailfish-protocol = { path = ".", features = ["test-vectors"] }
 hex = "0.4"
-hpke = { version = "0.14", default-features = false, features = [
+hpke = { version = "0.15", default-features = false, features = [
   "alloc",
   "mlkem",
   "chacha",
