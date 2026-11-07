@@ -508,6 +508,10 @@ impl Relay {
                 content_type: "text/javascript; charset=utf-8",
                 headers: vec![("cache-control".into(), "no-store".into())],
             }),
+            ("GET", "/u/export") => {
+                let s = session.ok_or_else(|| api(401, "signed_out", "sign in first"))?;
+                self.export_route(&s, &req.query)
+            }
             ("GET", "/u/authorize") => {
                 let a = setup::parse_authorize_query(&req.query)
                     .map_err(|e| api(400, "bad_request", e.0))?;
@@ -996,6 +1000,33 @@ impl Relay {
         r
     }
 
+    /// `GET /u/export?log=<log ID>` (12.4): the export file of a space of
+    /// the tenant (section 15, Data retention).
+    fn export_route(&self, session: &Session, query: &str) -> ApiResult<Reply> {
+        let log = query
+            .strip_prefix("log=")
+            .filter(|l| decode_id::<16>(l, "l_").is_ok())
+            .ok_or_else(|| api(400, "bad_request", "the query must be log=<log ID>"))?;
+        let dir = self.directory()?;
+        let user = user_row(&dir, &session.user_id)?
+            .ok_or_else(|| api(401, "signed_out", "sign in first"))?;
+        let tenant = self.tenant_by_id(user.tenant_id)?;
+        let body = Self::export_file(&tenant, log)?
+            .ok_or_else(|| api(404, "not_found", "the tenant has no space with this log ID"))?;
+        Ok(Reply {
+            status: 200,
+            body,
+            content_type: "application/x-ndjson",
+            headers: vec![
+                ("cache-control".into(), "no-store".into()),
+                (
+                    "content-disposition".into(),
+                    format!("attachment; filename=\"{log}.snailfish-export\""),
+                ),
+            ],
+        })
+    }
+
     fn home(&self, session: &Session, now: u64) -> ApiResult<Reply> {
         let dir = self.directory()?;
         let user = user_row(&dir, &session.user_id)?
@@ -1222,7 +1253,7 @@ impl Form<'_> {
 
 fn spaces_html(spaces: &[SpaceRow], quota: &Quotas, hidden: &str) -> String {
     let mut html = String::from(
-        "<section><h2>Spaces</h2><table><tr><th>App</th><th>Log</th><th>Usage</th><th>Restore hold</th></tr>",
+        "<section><h2>Spaces</h2><table><tr><th>App</th><th>Log</th><th>Usage</th><th>Restore hold</th><th>Export</th></tr>",
     );
     for sp in spaces {
         let pct = percent(sp.used, quota.space_bytes);
@@ -1240,11 +1271,13 @@ fn spaces_html(spaces: &[SpaceRow], quota: &Quotas, hidden: &str) -> String {
         };
         let _ = write!(
             html,
-            "<tr><td>{}</td><td><code>{}</code></td><td{warn}>{} of {} bytes ({pct}%)</td><td>{hold}</td></tr>",
+            "<tr><td>{}</td><td><code>{}</code></td><td{warn}>{} of {} bytes ({pct}%)</td><td>{hold}</td>\
+             <td><a href=\"/u/export?log={l}\" download>Export file</a></td></tr>",
             esc(&sp.app),
             esc(&sp.log),
             sp.used,
-            quota.space_bytes
+            quota.space_bytes,
+            l = esc(&sp.log)
         );
     }
     let _ = write!(

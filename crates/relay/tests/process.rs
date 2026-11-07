@@ -40,6 +40,7 @@ fn health(url: &str) -> bool {
 fn serve_answers_health_and_the_health_command_reports_failure() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
+    let mport = free_port();
     let url = format!("http://127.0.0.1:{port}/v1/health");
     assert!(!health(&url), "nothing listens yet");
     let mut server = Server(
@@ -47,6 +48,7 @@ fn serve_answers_health_and_the_health_command_reports_failure() {
             .args(["serve", "--data"])
             .arg(dir.path())
             .args(["--listen", &format!("127.0.0.1:{port}")])
+            .args(["--metrics-listen", &format!("127.0.0.1:{mport}")])
             .args(["--authority", "relay.test"])
             .stderr(Stdio::piped())
             .spawn()
@@ -70,6 +72,12 @@ fn serve_answers_health_and_the_health_command_reports_failure() {
     );
     // A 404 is not a healthy answer.
     assert!(!health(&format!("http://127.0.0.1:{port}/v1/nothing")));
+    // DESIGN.md "Monitoring and alerting": the metrics are on their own
+    // listener only. Without this, a proxy in front of the public port
+    // would publish them.
+    assert!(health(&format!("http://127.0.0.1:{mport}/metrics")));
+    assert!(!health(&format!("http://127.0.0.1:{port}/metrics")));
+    assert!(!health(&format!("http://127.0.0.1:{mport}/v1/health")));
     assert!(!health("https://127.0.0.1/v1/health"));
 }
 
@@ -130,5 +138,39 @@ fn user_add_prints_the_invite_link() {
     assert!(
         link.starts_with("https://relay.test/u/invite#it_"),
         "{link}"
+    );
+    // `user list` needs no authority and prints the user with its tenant
+    // ID, the label of the storage metric.
+    let run = |args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .arg("--data")
+            .arg(dir.path().join("data"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&["user", "list"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list = String::from_utf8(out.stdout).unwrap();
+    let (name, id) = list.trim().split_once(' ').unwrap();
+    assert_eq!(name, "sam");
+    assert!(dir.path().join("data/tenants").join(id).is_dir(), "{list}");
+    // `space delete` of a log ID that the user does not hold fails with a
+    // message, so the operator sees that nothing was deleted.
+    let out = run(&[
+        "space",
+        "delete",
+        "sam",
+        "l_00112233445566778899aabbccddeeff",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("sam holds no space l_00112233445566778899aabbccddeeff"),
+        "{err}"
     );
 }

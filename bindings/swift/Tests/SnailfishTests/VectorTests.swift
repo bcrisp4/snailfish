@@ -170,6 +170,29 @@ final class VectorTests: XCTestCase {
         }
     }
 
+    /// PROTOCOL.md section 15: each export case of the Go generator gets its
+    /// verdict through the binding. A form fault never reaches the chain check.
+    func testExportFiles() throws {
+        let cases = try list(dict(loadVector("export.json"))["cases"])
+        XCTAssertGreaterThanOrEqual(cases.count, 15)
+        for c in cases {
+            let name = try str(c["name"])
+            let file = Data(try str(c["file"]).utf8)
+            let form = try XCTUnwrap(c["valid_form"] as? Bool)
+            let log = try XCTUnwrap(c["valid_log"] as? Bool)
+            if form && log {
+                XCTAssertGreaterThanOrEqual(try checkExport(file: file), 1, name)
+                continue
+            }
+            XCTAssertThrowsError(try checkExport(file: file), name) { error in
+                guard case let SnailfishError.Invalid(message) = error else {
+                    return XCTFail("\(name): \(error)")
+                }
+                XCTAssertTrue(message.hasPrefix(form ? "log:" : "form:"), "\(name): \(message)")
+            }
+        }
+    }
+
     func testRecoveryKeys() throws {
         let v = try dict(loadVector("recovery-key.json"))
         for c in try list(v["valid"]) {

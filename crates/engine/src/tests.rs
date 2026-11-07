@@ -4308,3 +4308,4 @@ fn rotation_signs_after_a_new_device_joins() {
 }
 
 mod compaction;
+mod forkrepair;

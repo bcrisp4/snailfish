@@ -302,6 +302,20 @@ pub fn check_statement(payload_type: &str, payload: &[u8]) -> Result<(), CodecEr
         .map_err(err)
 }
 
+/// The verdict of an export file (`PROTOCOL.md` section 15): its form,
+/// then the chain check of 10.13 with its last digest. Returns the head
+/// position.
+///
+/// # Errors
+///
+/// The first failure. A message that starts with `form:` is a form fault.
+pub fn check_export(file: &[u8]) -> Result<u64, CodecError> {
+    let f = snailfish_protocol::export::parse(file)
+        .map_err(|e| CodecError(format!("form: {}", e.0)))?;
+    snailfish_protocol::export::check_log(&f).map_err(|e| CodecError(format!("log: {e}")))?;
+    Ok(f.header.head.position)
+}
+
 /// The key commitment of the app key of one epoch.
 ///
 /// # Errors

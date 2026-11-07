@@ -127,7 +127,15 @@ pub(super) fn compact(tx: &Connection) -> Result<u64, StoreError> {
 /// a failure here loses nothing.
 pub(super) fn reclaim(c: &Connection) {
     let _ = c.execute_batch("VACUUM");
-    let _ = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    // [STO-2]: a reader can block the checkpoint. The next compaction tries
+    // again, and the metrics count the delay.
+    if c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .is_ok_and(|busy| busy != 0)
+    {
+        crate::metrics::CHECKPOINT_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The stub of a stored row with an empty envelope.
@@ -159,8 +167,12 @@ pub(super) fn stub_of(
 ///
 /// A storage failure or a malformed stub row.
 pub fn stub_usage(c: &Connection) -> Result<(u64, u64), StoreError> {
-    let mut st =
-        c.prepare("SELECT payload_type, change_id, record_hash FROM entries WHERE envelope = ''")?;
+    // `octet_length` reads the stored length and not the envelope, so the
+    // scan skips the overflow pages of each full envelope. The metrics
+    // page runs this for each space at each scrape.
+    let mut st = c.prepare(
+        "SELECT payload_type, change_id, record_hash FROM entries WHERE octet_length(envelope) = 0",
+    )?;
     let mut q = st.query([])?;
     let (mut n, mut bytes) = (0u64, 0u64);
     while let Some(r) = q.next()? {
@@ -170,4 +182,45 @@ pub fn stub_usage(c: &Connection) -> Result<(u64, u64), StoreError> {
         }
     }
     Ok((n, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{self, Kind};
+    use std::sync::atomic::Ordering;
+
+    /// [STO-2]: a reader that blocks the checkpoint after a compaction
+    /// counts in `snailfish_wal_checkpoint_busy_total`. Without this, the
+    /// operator cannot see that deleted records stay in the WAL file.
+    #[test]
+    fn blocked_checkpoint_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let w = store::open(&path, Kind::Space, true).unwrap();
+        w.execute("UPDATE usage SET bytes = 1 WHERE id = 1", [])
+            .unwrap();
+        let r = store::open(&path, Kind::Space, false).unwrap();
+        r.execute_batch("BEGIN").unwrap();
+        let _: i64 = r
+            .query_row("SELECT bytes FROM usage", [], |x| x.get(0))
+            .unwrap();
+        w.execute("UPDATE usage SET bytes = 2 WHERE id = 1", [])
+            .unwrap();
+        let before = crate::metrics::CHECKPOINT_BUSY.load(Ordering::SeqCst);
+        // The VACUUM of reclaim fails at once on the reader, not after the
+        // 5 s busy timeout of the relay.
+        w.busy_timeout(std::time::Duration::from_millis(1)).unwrap();
+        reclaim(&w);
+        assert_eq!(
+            crate::metrics::CHECKPOINT_BUSY.load(Ordering::SeqCst),
+            before + 1
+        );
+        r.execute_batch("COMMIT").unwrap();
+        reclaim(&w);
+        assert_eq!(
+            crate::metrics::CHECKPOINT_BUSY.load(Ordering::SeqCst),
+            before + 1
+        );
+    }
 }

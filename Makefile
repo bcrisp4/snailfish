@@ -58,12 +58,12 @@ endif
         app-project test-app test-app-signed app-ios-device \
         check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
-        rust-nightly-check rust-nightly-components mutants-ramdisk mutants-tmpdir verify-crypto
+        rust-nightly-check rust-nightly-components mutants-ramdisk mutants-tmpdir verify-crypto test-rules
 
 ## The gate for each commit: Rust lint and tests, the shared vectors in Go and
-## Python, runner tests, then the fast Quint tier. `make test-swift` needs Xcode,
-## so it runs on macOS only.
-check: rust vectors-check test-python test-demo verify-tools verify-workflows verify-fast
+## Python, runner tests, the Prometheus rules, then the fast Quint tier.
+## `make test-swift` needs Xcode, so it runs on macOS only.
+check: rust vectors-check test-python test-demo verify-tools verify-workflows test-rules verify-fast
 
 ## ---------------------------------------------------------------- Quint
 
@@ -90,6 +90,11 @@ verify-tools:
 ## Check workflow syntax, expressions, and action inputs before a merge.
 verify-workflows:
 	mise exec -- actionlint
+
+## Check the syntax of the Prometheus alert rules, then run their unit tests.
+test-rules:
+	mise exec -- promtool check rules ops/prometheus/snailfish.rules.yml
+	cd ops/prometheus && mise exec -- promtool test rules snailfish.rules.test.yml
 
 ## Fail if a DESIGN.md rule changed and no model file in specs/ changed since BASE.
 ## It also fails if BASE is not a valid git commit. Default BASE is main.

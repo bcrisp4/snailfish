@@ -1,6 +1,6 @@
 # Snailfish
 
-Snailfish is a self-hosted sync system for local-first apps. It keeps one person's devices in sync, and the server cannot read the data. The project is at milestone M1: `PROTOCOL.md`, the shared test vectors, the protocol crate, a skeleton sync engine, and the Python and Swift bindings.
+Snailfish is a self-hosted sync system for local-first apps. It keeps one person's devices in sync, and the server cannot read the data. The relay, the sync engine, the Python and Swift bindings and a sample SwiftUI app are complete up to milestone M9. The project has no public release yet.
 
 ## Problem
 
@@ -19,6 +19,10 @@ Snailfish live deeper than any other fish on record, more than 8,000 m down in o
 ## Status
 
 See [DESIGN.md](DESIGN.md) for the design and [PROTOCOL.md](PROTOCOL.md) for the exact bytes.
+
+## Run a relay
+
+Follow [docs/self-host.md](docs/self-host.md). It sets up the relay and a Caddy proxy with Docker Compose.
 
 ## Develop
 

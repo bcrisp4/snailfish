@@ -1097,3 +1097,156 @@ fn removal_and_recovery_cross_the_binding() {
         "paused: blocked"
     );
 }
+
+/// Run an import session through the binding object.
+fn run_import(
+    relay: &snailfish_relay::core::Relay,
+    imp: &snailfish::Import,
+) -> Result<(), snailfish::SnailfishError> {
+    while let Some(req) = imp.next_request()? {
+        let (st, h, b) = send(relay, req);
+        imp.handle_response(st, &h, &b)?;
+    }
+    Ok(())
+}
+
+/// `PROTOCOL.md` section 15: each export case of the Go generator gets its
+/// verdict and head position through the binding, and a form fault never
+/// reaches the chain check. A marshalling fault in `check_export` fails here.
+#[test]
+fn export_vectors_through_the_binding() {
+    let v = load("export.json");
+    for c in v["cases"].as_array().unwrap() {
+        let name = s(&c["name"]);
+        let file = s(&c["file"]).as_bytes();
+        let got = snailfish::check_export(file);
+        match (
+            c["valid_form"].as_bool().unwrap(),
+            c["valid_log"].as_bool().unwrap(),
+        ) {
+            (true, true) => assert_eq!(got.unwrap(), 5, "{name}"),
+            (form, _) => match got {
+                Err(snailfish::SnailfishError::Invalid { message }) => {
+                    let want = if form { "log:" } else { "form:" };
+                    assert!(message.starts_with(want), "{name}: {message}");
+                }
+                other => panic!("{name}: {other:?}"),
+            },
+        }
+    }
+}
+
+/// [LOG-13] [FRK-3] [FRK-5] [FRK-6] [FRK-7] through the binding objects
+/// (`specs/forkrepair/test.qnt::repairTest`): the export file, the old key
+/// item and the old state file, the comparison with its change ID and
+/// bytes, the deletion and its status, the import session and its refusal
+/// code. A marshalling fault or a wrapper that drops a result fails here.
+#[test]
+fn deletion_import_and_fork_comparison_cross_the_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = snailfish_relay::core::Relay::open(snailfish_relay::core::Config::new(
+        dir.path().join("relay"),
+        "sync.example.net",
+    ))
+    .unwrap();
+    let tenant = relay.add_user("sam").unwrap();
+    let mut ka = snailfish::new_device_keys().unwrap();
+    let setup = snailfish::create_space(
+        "com.example.tasks",
+        &snailfish::NewDevice {
+            keys: ka.clone(),
+            name: "A".into(),
+        },
+    )
+    .unwrap();
+    ka.app_key.clone_from(&setup.app_key);
+    let sp = space(&setup.log_id, &tenant);
+    let pa = dir.path().join("a");
+    let pa = pa.to_str().unwrap();
+    let sa = MemStore::shared();
+    snailfish::install_setup(
+        pa,
+        sp.clone(),
+        &ka,
+        &setup.envelopes,
+        &sign_in(&relay, &ka),
+        sa.clone(),
+    )
+    .unwrap();
+    let a = std::sync::Arc::new(snailfish::Engine::open(pa, sp.clone(), sa.clone()).unwrap());
+    exchange(&relay, &a);
+    // B joins and syncs before A writes X, so the verified log of B lacks X.
+    let kb = snailfish::new_device_keys().unwrap();
+    let tb = snailfish::TrustedEnrollment::new(a.clone(), None, None).unwrap();
+    let (st, h, b) = send(&relay, tb.next_request().unwrap().unwrap());
+    tb.handle_response(st, &h, &b).unwrap();
+    let nb =
+        snailfish::NewEnrollment::new("https://sync.example.net", &kb, "B", tb.payload().unwrap())
+            .unwrap();
+    drive(&relay, &tb, &nb, (true, true));
+    let pb = dir.path().join("b");
+    let pb = pb.to_str().unwrap();
+    let sb = MemStore::shared();
+    snailfish::install_enrollment(
+        pb,
+        sp.clone(),
+        &kb,
+        &nb.joined().unwrap().unwrap(),
+        sb.clone(),
+    )
+    .unwrap();
+    let eb = std::sync::Arc::new(snailfish::Engine::open(pb, sp.clone(), sb).unwrap());
+    exchange(&relay, &eb);
+    let x = a.new_change_id().unwrap();
+    a.enqueue_many(&[snailfish::OutboxRow {
+        change_id: x.clone(),
+        change_bytes: b"X".to_vec(),
+    }])
+    .unwrap();
+    exchange(&relay, &a);
+    // FRK-7: X is an own change of A that the log of B does not hold.
+    assert_eq!(
+        eb.fork_changes(&a).unwrap(),
+        vec![snailfish::OutboxRow {
+            change_id: x,
+            change_bytes: b"X".to_vec()
+        }]
+    );
+    // FRK-3: the export file ends at the verified head of A.
+    let file = a.export_log().unwrap();
+    assert_eq!(
+        snailfish::check_export(&file).unwrap(),
+        a.verified_head().unwrap().position
+    );
+    // LOG-13: the deletion, then `stopped: deleted`.
+    let (st, h, b) = send(&relay, a.delete_request().unwrap());
+    a.handle_delete_response(st, &h, &b).unwrap();
+    assert_eq!(a.status().unwrap(), snailfish::Status::Deleted);
+    let (st, h, b) = send(&relay, eb.delete_request().unwrap());
+    assert_eq!(st, 410);
+    let (st2, h2, b2) = (st, h, b);
+    assert!(matches!(eb.handle_delete_response(st2, &h2, &b2), Ok(())));
+    // FRK-5: the import session ends with the space made.
+    let imp = a.import_space(sp.clone(), &sign_in(&relay, &ka)).unwrap();
+    assert!(!imp.finished().unwrap());
+    run_import(&relay, &imp).unwrap();
+    assert!(imp.finished().unwrap());
+    exchange(&relay, &a);
+    assert_eq!(a.status().unwrap(), snailfish::Status::Ok);
+    let again = a.import_space(sp.clone(), &sign_in(&relay, &ka)).unwrap();
+    match run_import(&relay, &again) {
+        Err(snailfish::SnailfishError::Refused { code }) => assert_eq!(code, "space_exists"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        snailfish::import_file(b"not a file", sp.clone(), &ka, &sign_in(&relay, &ka), None),
+        Err(snailfish::SnailfishError::Invalid { .. })
+    ));
+    // FRK-6: the old key item survives a new item, and opens the old state.
+    let device = a.device_id().unwrap();
+    snailfish::keep_old_keys(sa.clone(), &setup.log_id).unwrap();
+    drop((a, tb, nb));
+    snailfish::KeyStore::store(sa.as_ref(), setup.log_id.clone(), vec![9; 96]).unwrap();
+    let old = snailfish::Engine::open_old(pa, sp, sa).unwrap();
+    assert_eq!(old.device_id().unwrap(), device);
+}

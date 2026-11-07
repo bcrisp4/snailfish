@@ -7,9 +7,11 @@
 //! gives the exact bytes.
 
 pub mod compaction;
+pub mod delete;
 pub mod encoding;
 pub mod enroll;
 pub mod envelope;
+pub mod export;
 pub mod hash;
 pub mod keys;
 pub mod mailbox;

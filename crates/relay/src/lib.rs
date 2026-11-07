@@ -7,10 +7,12 @@
 //! [`core`] holds all SQLite and protocol logic and needs no async runtime.
 //! [`http`] is the thin HTTP edge. Each handler calls the core once, inside
 //! `spawn_blocking`. [`ops`] holds the operator commands: backup, restore
-//! and the restore hold. [`webhook`] sends the user webhooks.
+//! and the restore hold. [`webhook`] sends the user webhooks. [`metrics`]
+//! holds the operator metrics.
 
 pub mod core;
 pub mod http;
+pub mod metrics;
 pub mod ops;
 pub mod store;
 pub mod webhook;

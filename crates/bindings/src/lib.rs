@@ -42,6 +42,12 @@ pub enum SnailfishError {
         /// The cause.
         message: String,
     },
+    /// The relay refused a deletion or an import request, with its error
+    /// code (`PROTOCOL.md` 10.12 and 10.13).
+    Refused {
+        /// The error code.
+        code: String,
+    },
 }
 
 impl std::fmt::Display for SnailfishError {
@@ -52,6 +58,7 @@ impl std::fmt::Display for SnailfishError {
             }
             Self::Locked => f.write_str("another engine uses this data directory"),
             Self::ResetRequired => f.write_str("reset required"),
+            Self::Refused { code } => write!(f, "the relay refused the request: {code}"),
         }
     }
 }
@@ -71,6 +78,7 @@ impl From<snailfish_engine::EngineError> for SnailfishError {
             snailfish_engine::EngineError::ResetRequired => Self::ResetRequired,
             snailfish_engine::EngineError::Invalid(message) => Self::Invalid { message },
             snailfish_engine::EngineError::KeyStore(message) => Self::KeyStore { message },
+            snailfish_engine::EngineError::Refused { code } => Self::Refused { code },
             other => Self::Engine {
                 message: other.to_string(),
             },
@@ -200,6 +208,7 @@ pub enum Status {
     Blocked,
     Removed,
     MissingRecords,
+    Deleted,
 }
 
 /// The status text of DESIGN.md "Sync status", without its cause.
@@ -794,6 +803,18 @@ pub fn check_statement(payload_type: &str, payload: &[u8]) -> Result<()> {
     Ok(codec::check_statement(payload_type, payload)?)
 }
 
+/// The verdict of an export file (`PROTOCOL.md` section 15). Returns the
+/// head position.
+///
+/// # Errors
+///
+/// [`SnailfishError::Invalid`]: a message that starts with `form:` is a
+/// form fault, `log:` a chain fault.
+#[uniffi::export]
+pub fn check_export(file: &[u8]) -> Result<u64> {
+    Ok(codec::check_export(file)?)
+}
+
 /// The key commitment of the app key of one epoch.
 ///
 /// # Errors
@@ -1334,6 +1355,101 @@ impl Engine {
             .recovery_key_needed()?)
     }
 
+    /// Open the old state file of a fork repair with the keys that
+    /// [`keep_old_keys`] kept ([FRK-7]). The engine writes nothing to the
+    /// key store.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::KeyStore`] or [`SnailfishError::Engine`].
+    #[uniffi::constructor]
+    pub fn open_old(
+        data_dir: &str,
+        space: SpaceRef,
+        key_store: std::sync::Arc<dyn KeyStore>,
+    ) -> Result<Self> {
+        let inner = snailfish_engine::keystore::open_old(
+            &PathBuf::from(data_dir),
+            space,
+            &HostKeyStore(key_store),
+        )?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// The export file of the verified log (`PROTOCOL.md` section 15).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn export_log(&self) -> Result<Vec<u8>> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.export_log()?)
+    }
+
+    /// The deletion request of the space on the verified head (10.12).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn delete_request(&self) -> Result<Request> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .delete_request()?)
+    }
+
+    /// Read the answer to the deletion request.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Refused`] with the relay error code.
+    pub fn handle_delete_response(
+        &self,
+        status: u16,
+        headers: &[Header],
+        body: &[u8],
+    ) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .handle_delete_response(status, headers, body)?)
+    }
+
+    /// An import of the verified log into a space on `target` (10.13).
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
+    pub fn import_space(
+        &self,
+        target: SpaceRef,
+        setup_token: &str,
+    ) -> Result<std::sync::Arc<Import>> {
+        let i = self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .import_space(target, setup_token)?;
+        Ok(std::sync::Arc::new(Import {
+            inner: Mutex::new(i),
+        }))
+    }
+
+    /// FRK-7: the own changes of the old engine that the verified log of
+    /// this engine does not hold, with their change IDs.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Invalid`] or [`SnailfishError::Engine`].
+    pub fn fork_changes(&self, old: &Engine) -> Result<Vec<OutboxRow>> {
+        let me = self.inner.lock().map_err(|_| poisoned())?;
+        let old = old.inner.lock().map_err(|_| poisoned())?;
+        Ok(me.fork_changes(&old)?)
+    }
+
     /// Start one exchange with the relay.
     ///
     /// # Errors
@@ -1375,6 +1491,85 @@ impl Sync {
         let mut engine = self.engine.inner.lock().map_err(|_| poisoned())?;
         let mut sync = self.inner.lock().map_err(|_| poisoned())?;
         Ok(sync.handle_response(&mut engine, status, headers, body)?)
+    }
+}
+
+/// FRK-6: copy the key item of `log_id` to its old item before the device
+/// enrolls again.
+///
+/// # Errors
+///
+/// [`SnailfishError::KeyStore`].
+#[uniffi::export]
+pub fn keep_old_keys(key_store: std::sync::Arc<dyn KeyStore>, log_id: &str) -> Result<()> {
+    Ok(snailfish_engine::keystore::keep_old_keys(
+        &HostKeyStore(key_store),
+        log_id,
+    )?)
+}
+
+/// An import of an export file by a device with no state for the space
+/// (DESIGN.md "Data retention"). With `recovery_key`, the recovery key
+/// signs the finish.
+///
+/// # Errors
+///
+/// [`SnailfishError::Invalid`] for a file that fails its checks.
+#[uniffi::export]
+pub fn import_file(
+    file: &[u8],
+    space: SpaceRef,
+    keys: &DeviceKeys,
+    setup_token: &str,
+    recovery_key: Option<String>,
+) -> Result<std::sync::Arc<Import>> {
+    let keys = keys.to_engine()?;
+    let i = match recovery_key {
+        Some(k) => snailfish_engine::import_file(file, space, &keys, setup_token, Some(&k)),
+        None => snailfish_engine::import_file(file, space, &keys, setup_token, None),
+    }?;
+    Ok(std::sync::Arc::new(Import {
+        inner: Mutex::new(i),
+    }))
+}
+
+/// One import session (`PROTOCOL.md` 10.13).
+#[derive(uniffi::Object)]
+pub struct Import {
+    inner: Mutex<snailfish_engine::Import>,
+}
+
+#[uniffi::export]
+impl Import {
+    /// The next request, or `None` at the end.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn next_request(&self) -> Result<Option<Request>> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.next_request()?)
+    }
+
+    /// Read the response to the last request.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Refused`] with the relay error code.
+    pub fn handle_response(&self, status: u16, headers: &[Header], body: &[u8]) -> Result<()> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| poisoned())?
+            .handle_response(status, headers, body)?)
+    }
+
+    /// True after the relay made the space.
+    ///
+    /// # Errors
+    ///
+    /// [`SnailfishError::Engine`].
+    pub fn finished(&self) -> Result<bool> {
+        Ok(self.inner.lock().map_err(|_| poisoned())?.finished())
     }
 }
 

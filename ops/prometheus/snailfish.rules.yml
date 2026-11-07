@@ -1,0 +1,106 @@
+# Alert rules for a Snailfish relay (DESIGN.md "Monitoring and alerting",
+# signals 1 and 5). Alertmanager routes the alerts.
+#
+# Prometheus scrapes the relay metrics listener (--metrics-listen). Do not
+# expose that listener on the public address.
+#
+# SnailfishDown needs a blackbox exporter job with the name "snailfish-health".
+# The job probes the health route of the public URL every 5 minutes:
+#
+#   - job_name: snailfish-health
+#     scrape_interval: 5m
+#     metrics_path: /probe
+#     params: { module: [http_2xx] }
+#     static_configs: [{ targets: ["https://sync.example.net/v1/health"] }]
+#     relabel_configs:
+#       - { source_labels: [__address__], target_label: __param_target }
+#       - { target_label: __address__, replacement: "127.0.0.1:9115" }
+#
+# The metric alerts need a scrape job with the name "snailfish" for the
+# metrics listener.
+#
+# Run `make test-rules` after a change to this file.
+groups:
+  - name: snailfish
+    rules:
+      - alert: SnailfishDown
+        # The 15 minute window holds the last 3 probes at a 5 minute interval.
+        # The count condition stops an alert before 3 probes exist.
+        expr: |
+          sum_over_time(probe_success{job="snailfish-health"}[15m]) == 0
+          and count_over_time(probe_success{job="snailfish-health"}[15m]) >= 3
+        labels:
+          severity: critical
+        annotations:
+          summary: The relay health route failed 3 probes in a row.
+          description: The blackbox probe of {{ $labels.instance }} failed for 15 minutes. Devices cannot sync. Read the relay process status and its logs.
+
+      - alert: SnailfishMetricsDown
+        # Each other metric alert needs the scrape. A failed scrape has no
+        # series, so those alerts cannot fire.
+        expr: up{job="snailfish"} == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: Prometheus cannot scrape the relay metrics.
+          description: For 15 minutes, the scrape of {{ $labels.instance }} failed. The other relay metric alerts cannot fire. Read the relay logs and the --metrics-listen address.
+
+      - alert: SnailfishHigh5xxRate
+        expr: |
+          sum by (instance) (rate(snailfish_requests_total{class="5xx"}[5m]))
+            / sum by (instance) (rate(snailfish_requests_total[5m])) > 0.05
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: More than 5% of relay requests get a 5xx response.
+          description: For 15 minutes, {{ $value | humanizePercentage }} of the requests to {{ $labels.instance }} got a 5xx response. Read the relay logs for the error classes.
+
+      - alert: SnailfishSpaceAboveQuota
+        expr: max without (ratio) (snailfish_spaces_above_quota{ratio="0.95"}) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: A space uses more than 95% of its quota.
+          description: "{{ $value }} spaces on {{ $labels.instance }} use more than 95% of their quota. At the quota, the relay refuses appends. Find the tenant in snailfish_tenant_stored_bytes and its user with `snailfish-relay user list`. Raise the quota with `snailfish-relay quota <user>`, or ask the user to delete data."
+
+      - alert: SnailfishSpaceAboveReserve
+        expr: max without (ratio) (snailfish_spaces_above_reserve{ratio="0.5"}) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: A space uses more than 50% of its security record reserve.
+          description: "{{ $value }} spaces on {{ $labels.instance }} use more than 50% of their security record reserve. When the reserve is full, the relay refuses security records, for example a device removal."
+
+      - alert: SnailfishSpaceManyStubs
+        expr: snailfish_space_stubs_max > 1000000
+        labels:
+          severity: warning
+        annotations:
+          summary: A space holds more than 1 million stubs.
+          description: The largest space on {{ $labels.instance }} holds {{ $value | humanize }} stubs. Stubs make fetches and compaction slower. Ask the user to compact the space.
+
+      - alert: SnailfishDiskFull
+        expr: snailfish_data_free_bytes / snailfish_data_size_bytes < 0.10
+        labels:
+          severity: critical
+        annotations:
+          summary: The relay data disk has less than 10% free space.
+          description: The data disk of {{ $labels.instance }} has {{ $value | humanizePercentage }} free space. SQLite fails writes on a full disk. Add disk space or remove old backups.
+
+      - alert: SnailfishStorageError
+        expr: increase(snailfish_storage_errors_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: The relay storage layer reported an error.
+          description: The relay on {{ $labels.instance }} counted {{ $value | humanize }} storage errors in 15 minutes. Read the relay logs for the error class and the disk health.
+
+      - alert: SnailfishMigrationFailed
+        expr: increase(snailfish_migration_failures_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: A relay schema migration failed.
+          description: The relay on {{ $labels.instance }} counted {{ $value | humanize }} failed schema migrations in 15 minutes. The affected space stays unavailable. Read the relay logs and restore from a backup if necessary.

@@ -1,0 +1,77 @@
+# Checks for the forkrepair model. specs/tools/verify.py reads this file.
+
+model = "model.qnt"
+module = "forkrepair"
+tests = "test.qnt"
+test_module = "forkrepairTest"
+test_modules = ["forkrepairTestSnap"]
+
+invariants = ["noLostChange", "noDoubleApply", "noResurrect"]
+
+witness_configs = ["honest", "snapshots"]
+witness_steps = 40
+
+fast_config = "honest"
+
+[deep]
+config = "tiny"
+# Apalache at 6 steps takes about 2 minutes on an M5 Max. 8 steps ran for
+# more than 10 minutes, and 8 steps with three devices for more than 34.
+# TLC below checks every reachable state of tiny at any depth.
+invariants = ["noLostChange", "noDoubleApply", "noResurrect"]
+max_steps = 6
+
+[defaults]
+DEVS = "Set(1, 2, 3)"
+MAX_IDS = "5"
+SNAPSHOTS = "false"
+BUG = '"none"'
+
+# ---------------------------------------------------------------- configs
+
+# A fork, the repair procedure, crashes between the steps. No snapshots.
+[configs.honest]
+
+# Devices can write snapshots and replace their changes with stubs.
+[configs.snapshots]
+SNAPSHOTS = "true"
+MAX_IDS = "6"
+
+[configs.tiny]
+DEVS = "Set(1, 2)"
+MAX_IDS = "3"
+
+# ---------------------------------------------------------------- known limits
+
+[[limits]]
+config = "snapshots"
+invariant = "noLostChange"
+why = "CMP-21: an own change that a snapshot on the losing branch covers is a stub in the old state file, so FRK-7 cannot send it again."
+
+# ---------------------------------------------------------------- mutants
+
+[mutants.skipOld]
+base = "honest"
+caught_by = "noLostChange"
+
+# A sampled run of 5,000 traces can miss two recoveries of one device
+# before its push (CI seed 0xccb5d2a2d5d4a670), so a named scenario catches
+# it. TLC checks it on every state of tiny.
+[mutants.freshIds]
+base = "honest"
+caught_by = "tests"
+test = "recoverTwiceTest"
+
+[mutants.noReset]
+base = "honest"
+caught_by = "noDoubleApply"
+
+[mutants.uploadAfterDelete]
+base = "honest"
+caught_by = "noResurrect"
+
+[[exhaustive]]
+config = "tiny"
+invariants = ["noLostChange", "noDoubleApply", "noResurrect"]
+mutants = ["skipOld", "freshIds", "noReset", "uploadAfterDelete"]
+why = "Two devices, at most three change IDs, one fork, no snapshots."

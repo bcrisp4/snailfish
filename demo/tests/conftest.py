@@ -34,7 +34,9 @@ def free_port() -> int:
 class Relay:
     """A relay process and its data directory."""
 
-    def __init__(self, data: Path, authority: str | None = None) -> None:
+    def __init__(
+        self, data: Path, authority: str | None = None, serve_args: list[str] | None = None
+    ) -> None:
         """Create one user and start the relay on a free port.
 
         `authority` is the authority that request signatures cover. A test
@@ -50,7 +52,7 @@ class Relay:
         self.authority = authority or f"localhost:{self.port}"
         self.url = f"http://{self.authority}"
         self.proc: subprocess.Popen[bytes] | None = None
-        self.serve_args: list[str] = []
+        self.serve_args: list[str] = serve_args or []
         self.start()
         self.browser = self.add_user("sam")
 

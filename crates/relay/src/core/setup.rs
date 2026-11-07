@@ -176,6 +176,36 @@ impl Relay {
         Ok(())
     }
 
+    /// 10.12 step 5: the setup token exists, has not expired and belongs to
+    /// the user of the tenant. It can name any device, because the recovery
+    /// key signs the request.
+    pub(super) fn check_setup_any_device(
+        &self,
+        tenant: &Tenant,
+        token: &[u8; 32],
+        now: u64,
+    ) -> ApiResult<()> {
+        let d = self.directory()?;
+        let row: Option<(i64, String)> = d
+            .query_row(
+                "SELECT s.expires, u.tenant_id FROM setup_tokens s
+                 JOIN users u ON u.user_id = s.user_id WHERE s.token_hash = ?1",
+                params![setup::token_hash(token).as_slice()],
+                |q| Ok((q.get(0)?, q.get(1)?)),
+            )
+            .optional()?;
+        let Some((expires, tenant_id)) = row else {
+            return Err(bad_setup("the relay holds no such setup token"));
+        };
+        if now >= from_i64(expires)? {
+            return Err(bad_setup("the setup token expired"));
+        }
+        if tenant_id != tenant.id {
+            return Err(bad_setup("the setup token belongs to another tenant"));
+        }
+        Ok(())
+    }
+
     /// `POST /v1/t/{tenant}/s/{log}/device-status` (10.11).
     pub(super) fn device_status(
         &self,

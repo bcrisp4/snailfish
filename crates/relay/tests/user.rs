@@ -1456,3 +1456,31 @@ fn page_marks_the_device_that_blocks_compaction() {
         )
     );
 }
+
+/// DESIGN.md "Data retention", PROTOCOL.md 12.4 and section 15: the user
+/// page serves the export file of a space of the tenant, as an attachment,
+/// and the file passes the section 15 reader. A log ID of no space of the
+/// tenant gets `not_found`, and a request with no session `signed_out`.
+#[test]
+fn user_page_exports_the_relay_log() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let (mut b, _) = signed_in(&fx);
+    assert!(b.home().contains(&format!("/u/export?log={}", fx.log())));
+    let r = b.send("GET", "/u/export", &format!("log={}", fx.log()), b"", &[]);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.content_type, "application/x-ndjson");
+    assert!(
+        r.header("content-disposition")
+            .unwrap()
+            .starts_with("attachment;")
+    );
+    let f = snailfish_protocol::export::parse(&r.body).unwrap();
+    snailfish_protocol::export::check_log(&f).unwrap();
+    assert_eq!(f.header.head, fx.head(fx.tenant()));
+    let other = format!("l_{}", "00".repeat(16));
+    let r = b.send("GET", "/u/export", &format!("log={other}"), b"", &[]);
+    assert_eq!((r.status, error_code(&r).as_str()), (404, "not_found"));
+    let r = Browser::new(&fx).send("GET", "/u/export", &format!("log={}", fx.log()), b"", &[]);
+    assert_eq!((r.status, error_code(&r).as_str()), (401, "signed_out"));
+}

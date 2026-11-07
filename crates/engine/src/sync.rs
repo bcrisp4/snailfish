@@ -528,6 +528,8 @@ impl Sync {
             Some("blocked") => Status::Blocked,
             // T8: an epoch record removed this device.
             Some("removed") => Status::Removed,
+            // [LOG-13]: the relay deleted the space. Nothing goes up again.
+            Some("deleted") => Status::Deleted,
             Some("expired") if !self.retried => {
                 // The offset is now fresh from this answer. Send once more.
                 self.retried = true;

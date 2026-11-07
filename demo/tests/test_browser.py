@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+import snailfish as sf
 from conftest import Relay, sync_ok
 from playwright.sync_api import Error, Page, sync_playwright
 
@@ -199,4 +200,17 @@ def test_user_page_works_in_chrome(relay: Relay, chrome: Chrome, tmp_path: Path)
     assert resp.value.status == 303
     page.wait_for_load_state("load")
     assert "Open security actions" not in page.content()
+
+    # DESIGN.md "Data retention", PROTOCOL.md 12.4 and section 15: the
+    # export link of a space downloads the relay copy of its log. The file
+    # passes the section 15 reader and ends at the head of the device.
+    with page.expect_download() as dl:
+        page.click("text=Export file")
+    saved = tmp_path / "export.ndjson"
+    dl.value.save_as(saved)
+    dev = app.Device(a)
+    try:
+        assert sf.check_export(saved.read_bytes()) == dev.engine.verified_head().position
+    finally:
+        dev.close()
     assert chrome.errors == [], chrome.errors
