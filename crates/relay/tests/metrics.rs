@@ -121,3 +121,26 @@ fn error_responses_count_by_code() {
         ) >= 1
     );
 }
+
+/// An import finish adds the index row before its rename, and a deletion
+/// removes the row before the file. A scrape in either window finds an
+/// index row with no file. It skips that space and keeps the page, so the
+/// alerts on the other series stay live.
+#[test]
+fn scrape_skips_a_space_file_that_is_not_there() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let file = fx.space_file(fx.tenant());
+    std::fs::remove_file(&file).unwrap();
+    for s in ["-wal", "-shm"] {
+        let mut p = file.clone().into_os_string();
+        p.push(s);
+        let _ = std::fs::remove_file(p);
+    }
+    let text = fx.relay.metrics_text().unwrap();
+    assert!(text.contains("# TYPE snailfish_requests_total counter\n"));
+    // A file that is there and does not open is a storage fault: the scrape
+    // fails, and SnailfishMetricsDown reports it.
+    std::fs::write(&file, b"not a database").unwrap();
+    assert!(fx.relay.metrics_text().is_err());
+}

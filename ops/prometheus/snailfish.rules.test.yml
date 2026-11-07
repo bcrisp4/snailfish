@@ -171,6 +171,27 @@ tests:
               summary: The relay storage layer reported an error.
               description: "The relay on relay:9464 counted 1 storage errors in 15 minutes. Read the relay logs for the error class and the disk health."
 
+  # SnailfishMetricsDown: 15 minutes of failed scrapes fire. 14 do not.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="snailfish", instance="relay:9464"}'
+        values: "1x5 0x20"
+    alert_rule_test:
+      # The first failed scrape is at 6m.
+      - eval_time: 20m
+        alertname: SnailfishMetricsDown
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: SnailfishMetricsDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: snailfish
+              instance: relay:9464
+            exp_annotations:
+              summary: Prometheus cannot scrape the relay metrics.
+              description: For 15 minutes, the scrape of relay:9464 failed. The other relay metric alerts cannot fire. Read the relay logs and the --metrics-listen address.
+
   # SnailfishMigrationFailed: one failure fires. A flat counter does not.
   - interval: 1m
     input_series:

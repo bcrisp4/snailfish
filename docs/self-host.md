@@ -84,7 +84,7 @@ At a full quota, the relay refuses new changes and serves the stored changes. Th
 
 The relay serves metrics in the Prometheus text format on `127.0.0.1:9464` of the host, at `/metrics`. Caddy does not forward this port.
 
-1. Add a scrape job to Prometheus for `127.0.0.1:9464`.
+1. Add a scrape job to Prometheus for `127.0.0.1:9464`, with the job name `snailfish`.
 2. Add `ops/prometheus/snailfish.rules.yml` to the `rule_files` of Prometheus.
 3. Add a blackbox exporter probe of `https://<your domain>/v1/health` every 5 minutes, with the job name `snailfish-health`.
 4. Route the alerts with Alertmanager.
@@ -94,6 +94,7 @@ The rules alert on these conditions:
 | Alert | Condition |
 | --- | --- |
 | `SnailfishDown` | 3 failed health probes in a row |
+| `SnailfishMetricsDown` | The metrics scrape fails for 15 minutes |
 | `SnailfishHigh5xxRate` | More than 5% of responses are 5xx for 15 minutes |
 | `SnailfishSpaceAboveQuota` | A space uses more than 95% of its quota |
 | `SnailfishSpaceAboveReserve` | A space uses more than 50% of its security record reserve |

@@ -167,8 +167,12 @@ pub(super) fn stub_of(
 ///
 /// A storage failure or a malformed stub row.
 pub fn stub_usage(c: &Connection) -> Result<(u64, u64), StoreError> {
-    let mut st =
-        c.prepare("SELECT payload_type, change_id, record_hash FROM entries WHERE envelope = ''")?;
+    // `octet_length` reads the stored length and not the envelope, so the
+    // scan skips the overflow pages of each full envelope. The metrics
+    // page runs this for each space at each scrape.
+    let mut st = c.prepare(
+        "SELECT payload_type, change_id, record_hash FROM entries WHERE octet_length(envelope) = 0",
+    )?;
     let mut q = st.query([])?;
     let (mut n, mut bytes) = (0u64, 0u64);
     while let Some(r) = q.next()? {

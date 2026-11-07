@@ -16,6 +16,9 @@
 #       - { source_labels: [__address__], target_label: __param_target }
 #       - { target_label: __address__, replacement: "127.0.0.1:9115" }
 #
+# The metric alerts need a scrape job with the name "snailfish" for the
+# metrics listener.
+#
 # Run `make test-rules` after a change to this file.
 groups:
   - name: snailfish
@@ -31,6 +34,17 @@ groups:
         annotations:
           summary: The relay health route failed 3 probes in a row.
           description: The blackbox probe of {{ $labels.instance }} failed for 15 minutes. Devices cannot sync. Read the relay process status and its logs.
+
+      - alert: SnailfishMetricsDown
+        # Each other metric alert needs the scrape. A failed scrape has no
+        # series, so those alerts cannot fire.
+        expr: up{job="snailfish"} == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: Prometheus cannot scrape the relay metrics.
+          description: For 15 minutes, the scrape of {{ $labels.instance }} failed. The other relay metric alerts cannot fire. Read the relay logs and the --metrics-listen address.
 
       - alert: SnailfishHigh5xxRate
         expr: |

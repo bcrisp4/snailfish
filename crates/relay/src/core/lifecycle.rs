@@ -332,7 +332,14 @@ impl Relay {
     /// space, and no backup. Returns the backup lock.
     fn import_room(&self, tenant: &Tenant, log: &str) -> ApiResult<std::fs::File> {
         let tc = store::open(&tenant.db(), Kind::Tenant, false)?;
-        if Self::space_file(tenant, &tc, log)?.is_some() {
+        self.room(tenant, &tc, log)?;
+        self.backup_shared()
+    }
+
+    /// No space with the log ID and room for one more space, read through
+    /// `tc`.
+    fn room(&self, tenant: &Tenant, tc: &Connection, log: &str) -> ApiResult<()> {
+        if Self::space_file(tenant, tc, log)?.is_some() {
             return Err(api(
                 409,
                 "space_exists",
@@ -344,14 +351,14 @@ impl Relay {
             [],
             |r| r.get(0),
         )?;
-        if from_i64(spaces)? >= user::limits(&tc, &self.cfg.quotas)?.max_spaces {
+        if from_i64(spaces)? >= user::limits(tc, &self.cfg.quotas)?.max_spaces {
             return Err(api(
                 507,
                 "space_limit",
                 "the tenant holds the most spaces that its configuration allows",
             ));
         }
-        self.backup_shared()
+        Ok(())
     }
 
     fn import_start(
@@ -616,7 +623,7 @@ impl Relay {
             ));
         }
         // Step 5.
-        let _backup = self.import_room(tenant, log)?;
+        let _backup = self.backup_shared()?;
         let app: String =
             tx.query_row("SELECT app_id FROM space WHERE id = 1", [], |r| r.get(0))?;
         move_staged(&tx, &x.session, tip.position, now)?;
@@ -625,10 +632,15 @@ impl Relay {
         // WAL and a closed connection.
         c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         drop(c);
-        // Step 6: the index row, the marker and the session in one tenant
-        // transaction, then the rename ([STO-6]).
+        // Step 6: the room check, the index row, the marker and the session
+        // in one tenant transaction, then the rename ([STO-6]). The check
+        // and the index row share the write lock, so a concurrent `PUT` or
+        // finish cannot pass the check between them ([QTA-5]). A refused
+        // finish keeps the session: the moved file has an empty staging
+        // table, so a later finish moves nothing and succeeds.
         let mut tc = store::open(&tenant.db(), Kind::Tenant, false)?;
         let ttx = tc.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.room(tenant, &ttx, log)?;
         ttx.execute(
             "INSERT INTO spaces (log_id, file_name, app_id, status) VALUES (?1, ?2, ?3, 'active')",
             params![log, x.file_name, app],
@@ -750,6 +762,16 @@ fn finish_rename(tenant: &Tenant, name: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The log ID of the space file at `p`, or `None` if the file has no
+/// readable space row.
+fn file_log(p: &Path) -> Option<String> {
+    let c = store::open(p, Kind::Space, false).ok()?;
+    let log_id: Vec<u8> = c
+        .query_row("SELECT log_id FROM space WHERE id = 1", [], |r| r.get(0))
+        .ok()?;
+    Some(encode_id("l_", &<[u8; 16]>::try_from(log_id).ok()?))
+}
+
 /// The startup work of one tenant directory ([STO-5], [STO-6]): delete the
 /// files of each import session, finish the rename of an imported space
 /// whose index row exists, and delete each space file that is not in the
@@ -800,16 +822,11 @@ pub(super) fn sweep_tenant(tenant: &Tenant) -> Result<(), StoreError> {
             && safe_name(stem, 26)
             && !indexed.contains(stem)
         {
-            let c = store::open(&p, Kind::Space, false)?;
-            let log_id: Vec<u8> =
-                c.query_row("SELECT log_id FROM space WHERE id = 1", [], |r| r.get(0))?;
-            drop(c);
-            let log = encode_id(
-                "l_",
-                &<[u8; 16]>::try_from(log_id)
-                    .map_err(|_| StoreError::Corrupt("a malformed log ID"))?,
-            );
-            if has_marker(&tc, &log)? {
+            // A file with no readable log ID stays: a `PUT` that stopped
+            // before its space row leaves one. It must not stop the start.
+            if let Some(log) = file_log(&p)
+                && has_marker(&tc, &log)?
+            {
                 remove_db_files(&p);
             }
         }

@@ -70,11 +70,15 @@ impl Relay {
                 .query_map(params![], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
             for f in files.iter().filter(|f| safe_name(f, 26)) {
-                let c = store::open(
-                    &t.dir.join("spaces").join(format!("{f}.db")),
-                    Kind::Space,
-                    false,
-                )?;
+                let path = t.dir.join("spaces").join(format!("{f}.db"));
+                // An import finish adds the index row before its rename, and
+                // a deletion removes the row before the file. A file that is
+                // not there skips one space and does not fail the page.
+                let c = match store::open(&path, Kind::Space, false) {
+                    Ok(c) => c,
+                    Err(_) if !path.exists() => continue,
+                    Err(e) => return Err(e),
+                };
                 let used =
                     from_i64(
                         c.query_row("SELECT bytes FROM usage WHERE id = 1", [], |r| r.get(0))?,

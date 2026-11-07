@@ -79,6 +79,23 @@ fn import(
     chunk: usize,
     tip: Head,
 ) -> snailfish_relay::core::Response {
+    let session = stage_import(fx, signer, entries, chunk);
+    finish_import(fx, signer, session, tip)
+}
+
+fn finish_import(
+    fx: &Fx,
+    signer: &str,
+    session: [u8; 16],
+    tip: Head,
+) -> snailfish_relay::core::Response {
+    let body = wire::repair_finish_body(&RepairFinish { session, tip });
+    fx.relay
+        .handle(&fx.signed("POST", &import_path(fx, "/finish"), "", &body, signer))
+}
+
+/// The start and the chunks of an import. Returns the session.
+fn stage_import(fx: &Fx, signer: &str, entries: &[(u64, OutEntry)], chunk: usize) -> [u8; 16] {
     let token = fx.setup_token("sam", signer);
     let mut parts = entries.chunks(chunk);
     let first = parts.next().unwrap();
@@ -97,9 +114,7 @@ fn import(
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         next = wire::parse_repair_next(&r.body).unwrap();
     }
-    let body = wire::repair_finish_body(&RepairFinish { session, tip });
-    fx.relay
-        .handle(&fx.signed("POST", &import_path(fx, "/finish"), "", &body, signer))
+    session
 }
 
 /// [LOG-13] [FRK-4] [STO-5]: a device deletes the space. The file is gone,
@@ -514,8 +529,16 @@ fn restart_deletes_a_marked_space_file() {
     assert_eq!(r.status, 200);
     // The file is back, as after a crash between the commit and the unlink.
     std::fs::rename(&keep, &file).unwrap();
+    // Unindexed files with no space row, as a `PUT` that stopped before its
+    // space row leaves them: an empty file and a file that is not SQLite.
+    let spaces = file.parent().unwrap();
+    let empty = spaces.join("aaaaaaaaaaaaaaaaaaaaaaaaaa.db");
+    let junk = spaces.join("bbbbbbbbbbbbbbbbbbbbbbbbbb.db");
+    std::fs::write(&empty, b"").unwrap();
+    std::fs::write(&junk, b"not a database").unwrap();
     fx.restart(common::limits_of(&fx.h));
     assert!(!file.exists());
+    assert!(empty.exists() && junk.exists());
 }
 
 /// DESIGN.md "User roles": the relay operator deletes a space with a
@@ -630,4 +653,25 @@ fn restart_deletes_a_stray_import_file() {
     fx.restart(common::limits_of(&fx.h));
     assert!(!stray.exists());
     assert!(!spaces.join("abcdefghijklmnopqrstuvwxyz.db").exists());
+}
+
+/// 10.13 finish steps 5 and 6 ([QTA-5], [STO-6]): the finish checks the
+/// space in its tenant transaction, so a space that a `PUT` made during
+/// the import refuses it with `space_exists`, not `internal`. The session
+/// stays, and after the space goes the same finish makes the imported log.
+#[test]
+fn finish_refused_by_a_new_space_finishes_later() {
+    let src = Fx::new();
+    src.setup_space(src.tenant());
+    let (entries, head) = log_entries(&src);
+    let fx = Fx::new();
+    let session = stage_import(&fx, "B", &entries, 1);
+    assert_eq!(fx.put_genesis(fx.tenant()).status, 201);
+    let finish = || finish_import(&fx, "B", session, head);
+    let r = finish();
+    assert_eq!((r.status, error_code(&r).as_str()), (409, "space_exists"));
+    assert!(fx.relay.operator_delete("sam", fx.log()).unwrap());
+    let r = finish();
+    assert_eq!(r.status, 201, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(log_entries(&fx), (entries, head));
 }
