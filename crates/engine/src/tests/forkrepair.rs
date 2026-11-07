@@ -267,6 +267,20 @@ fn import_refusals_reach_the_app() {
             code: "space_exists".into()
         })
     );
+    // A file of this log for another app, and a good file for another log.
+    let good = ea.export_log().unwrap();
+    let mut other_app = w.space();
+    other_app.app_id = "com.example.other".into();
+    assert!(matches!(
+        crate::lifecycle::import_file(&good, other_app, &new_device_keys().unwrap(), &token, None),
+        Err(EngineError::Invalid(_))
+    ));
+    let mut other_log = w.space();
+    other_log.log_id = format!("l_{}", "00".repeat(16));
+    assert!(matches!(
+        crate::lifecycle::import_file(&good, other_log, &new_device_keys().unwrap(), &token, None),
+        Err(EngineError::Invalid(_))
+    ));
     let mut file = ea.export_log().unwrap();
     let n = file.len();
     file.truncate(n - 1);

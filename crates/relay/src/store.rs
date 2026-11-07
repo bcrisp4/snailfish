@@ -332,3 +332,48 @@ pub fn open(path: &Path, kind: Kind, create: bool) -> Result<Connection, StoreEr
     }
     Ok(conn)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Signal 4: a migration of a file with an older schema that fails
+    /// counts in `snailfish_migration_failures_total`, and the file stays
+    /// closed. Without this, the alert on failed migrations never fires.
+    #[test]
+    fn failed_migration_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("space.db");
+        {
+            // Schema version 1 with an `entries` table that lacks the
+            // `envelope` column, so the usage query of the DDL fails.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE entries (position INTEGER PRIMARY KEY, payload_type TEXT);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let before = crate::metrics::MIGRATION_FAILURES.load(Ordering::SeqCst);
+        assert!(open(&path, Kind::Space, false).is_err());
+        assert_eq!(
+            crate::metrics::MIGRATION_FAILURES.load(Ordering::SeqCst),
+            before + 1
+        );
+        // A new file that fails its first schema is not a migration.
+        let fresh = dir.path().join("fresh.db");
+        {
+            let c = Connection::open(&fresh).unwrap();
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE entries (position INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        }
+        assert!(open(&fresh, Kind::Space, true).is_err());
+        assert_eq!(
+            crate::metrics::MIGRATION_FAILURES.load(Ordering::SeqCst),
+            before + 1
+        );
+    }
+}

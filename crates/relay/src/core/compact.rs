@@ -179,3 +179,44 @@ pub fn stub_usage(c: &Connection) -> Result<(u64, u64), StoreError> {
     }
     Ok((n, bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{self, Kind};
+    use std::sync::atomic::Ordering;
+
+    /// [STO-2]: a reader that blocks the checkpoint after a compaction
+    /// counts in `snailfish_wal_checkpoint_busy_total`. Without this, the
+    /// operator cannot see that deleted records stay in the WAL file.
+    #[test]
+    fn blocked_checkpoint_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let w = store::open(&path, Kind::Space, true).unwrap();
+        w.execute("UPDATE usage SET bytes = 1 WHERE id = 1", [])
+            .unwrap();
+        let r = store::open(&path, Kind::Space, false).unwrap();
+        r.execute_batch("BEGIN").unwrap();
+        let _: i64 = r
+            .query_row("SELECT bytes FROM usage", [], |x| x.get(0))
+            .unwrap();
+        w.execute("UPDATE usage SET bytes = 2 WHERE id = 1", [])
+            .unwrap();
+        let before = crate::metrics::CHECKPOINT_BUSY.load(Ordering::SeqCst);
+        // The VACUUM of reclaim fails at once on the reader, not after the
+        // 5 s busy timeout of the relay.
+        w.busy_timeout(std::time::Duration::from_millis(1)).unwrap();
+        reclaim(&w);
+        assert_eq!(
+            crate::metrics::CHECKPOINT_BUSY.load(Ordering::SeqCst),
+            before + 1
+        );
+        r.execute_batch("COMMIT").unwrap();
+        reclaim(&w);
+        assert_eq!(
+            crate::metrics::CHECKPOINT_BUSY.load(Ordering::SeqCst),
+            before + 1
+        );
+    }
+}

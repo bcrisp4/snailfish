@@ -529,3 +529,100 @@ fn operator_deletes_a_space() {
     assert_eq!(error_code(&r), "deleted");
     assert!(fx.relay.operator_delete("nobody", fx.log()).is_err());
 }
+
+/// 10.12 step 1 and 10.13 start step 1: 8.6 steps 1 to 4 run first, so a
+/// body that differs from its `content-digest` gets `bad_digest` before
+/// any other check.
+#[test]
+fn deletion_and_import_check_the_digest_first() {
+    let fx = Fx::new();
+    fx.setup_space(fx.tenant());
+    let stmt = statement(&fx, "A", relay_head(&fx), now(&fx) + 60);
+    let path = format!("{}/delete", fx.space_path(fx.tenant(), fx.log()));
+    let mut req = fx.signed("POST", &path, "", &wire::delete_body(&stmt, None), "A");
+    req.body.push(b' ');
+    let r = fx.relay.handle(&req);
+    assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_digest"));
+    let other = Fx::new();
+    let (entries, _) = log_entries(&fx);
+    let token = other.setup_token("sam", "A");
+    let body = wire::import_start_body(&token, &keys_of("A"), &entries[..1]).unwrap();
+    let mut req = other.signed("POST", &import_path(&other, ""), "", &body, "A");
+    req.body.push(b' ');
+    let r = other.relay.handle(&req);
+    assert_eq!((r.status, error_code(&r).as_str()), (400, "bad_digest"));
+    // 10.13 start step 6: position 1 must be a genesis envelope, not a stub.
+    let stub = OutEntry::Stub(snailfish_protocol::wire::Stub {
+        payload_type: "snailfish.snapshot.v1".into(),
+        change_id: None,
+        hash: [1; 32],
+    });
+    let body = wire::import_start_body(&token, &keys_of("A"), &[(1, stub)]).unwrap();
+    let r = other
+        .relay
+        .handle(&other.signed("POST", &import_path(&other, ""), "", &body, "A"));
+    assert_eq!((r.status, error_code(&r).as_str()), (422, "invalid_record"));
+}
+
+/// 10.13: a chunk names its live session. Another session ID, an expired
+/// session (86,400 s after the last chunk) and a blocked device are each
+/// refused, and a chunk one second before the expiry passes.
+#[test]
+fn import_chunk_needs_its_live_session_and_an_unblocked_device() {
+    let fx = Fx::new();
+    let src = Fx::new();
+    src.setup_space(src.tenant());
+    let (entries, _) = log_entries(&src);
+    let token = fx.setup_token("sam", "A");
+    let body = wire::import_start_body(&token, &keys_of("A"), &entries[..1]).unwrap();
+    let r = fx
+        .relay
+        .handle(&fx.signed("POST", &import_path(&fx, ""), "", &body, "A"));
+    assert_eq!(r.status, 201);
+    let (session, _) = wire::parse_repair_started(&r.body).unwrap();
+    let chunk = |fx: &Fx, s: &[u8; 16], i: usize| {
+        let body = wire::repair_chunk_body(s, &entries[i..=i]).unwrap();
+        fx.relay
+            .handle(&fx.signed("POST", &import_path(fx, "/chunk"), "", &body, "A"))
+    };
+    let mut wrong = session;
+    wrong[0] ^= 1;
+    let r = chunk(&fx, &wrong, 1);
+    assert_eq!((r.status, error_code(&r).as_str()), (409, "bad_import"));
+    let start = now(&fx);
+    fx.now
+        .store(start + 86_399, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(chunk(&fx, &session, 1).status, 200);
+    fx.now
+        .store(start + 86_399 + 86_400, std::sync::atomic::Ordering::SeqCst);
+    let r = chunk(&fx, &session, 2);
+    assert_eq!((r.status, error_code(&r).as_str()), (409, "bad_import"));
+    // A blocked device cannot add a chunk ([STO-12]).
+    fx.now.store(start, std::sync::atomic::Ordering::SeqCst);
+    let body = wire::import_start_body(&token, &keys_of("A"), &entries[..1]).unwrap();
+    let r = fx
+        .relay
+        .handle(&fx.signed("POST", &import_path(&fx, ""), "", &body, "A"));
+    let (session, _) = wire::parse_repair_started(&r.body).unwrap();
+    let c = rusqlite::Connection::open(fx.tenant_db(fx.tenant())).unwrap();
+    c.execute(
+        "INSERT INTO blocks (kind, id) VALUES ('device', ?1)",
+        [fx.key("A").2],
+    )
+    .unwrap();
+    let r = chunk(&fx, &session, 1);
+    assert_eq!((r.status, error_code(&r).as_str()), (403, "blocked"));
+}
+
+/// [STO-6]: at startup a temporary import file that no session names and
+/// no index row names goes, and it never becomes a space file.
+#[test]
+fn restart_deletes_a_stray_import_file() {
+    let mut fx = Fx::new();
+    let spaces = fx.tenant_db(fx.tenant()).parent().unwrap().join("spaces");
+    let stray = spaces.join("abcdefghijklmnopqrstuvwxyz.import");
+    std::fs::write(&stray, b"x").unwrap();
+    fx.restart(common::limits_of(&fx.h));
+    assert!(!stray.exists());
+    assert!(!spaces.join("abcdefghijklmnopqrstuvwxyz.db").exists());
+}
