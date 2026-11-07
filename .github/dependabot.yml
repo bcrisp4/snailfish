@@ -1,0 +1,59 @@
+# Version updates. Security updates are on in the repository settings and
+# ignore the cooldown.
+#
+# Each ecosystem waits 7 days after a release before it proposes it. This
+# gives time to detect and yank a compromised release. One grouped pull
+# request for each ecosystem keeps the CI cost to one run each week.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: uv
+    directories: [/bindings/python, /demo]
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      uv:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /tools/vectorgen
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      gomod:
+        patterns: ["*"]
+
+  # The base images of the Dockerfile, pinned by digest.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker:
+        patterns: ["*"]
+
+  # The workflows pin each action by commit SHA.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]

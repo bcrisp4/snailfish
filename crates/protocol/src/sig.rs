@@ -90,7 +90,9 @@ impl PublicKey {
     }
 }
 
-/// An Ed25519 signing key.
+/// An Ed25519 signing key. A clone is a second copy of the secret, for
+/// an exchange that outlives its engine, for example an import.
+#[derive(Clone)]
 pub struct SecretKey(SigningKey);
 
 impl SecretKey {

@@ -1,0 +1,130 @@
+# Build, test and publish the `snailfish` Python wheels (DESIGN.md "Code layout").
+# Unverified: this workflow has not run on GitHub yet.
+#
+# A tag py-v<version> starts it. The version must match
+# bindings/python/pyproject.toml. Each wheel holds the UniFFI module and the
+# native library, so a user needs no Rust toolchain. PyPI trusted publishing
+# uploads the wheels after a reviewer approves the `pypi` environment.
+#
+# The jobs use no Rust cache: a tag run cannot read the cache of another tag.
+name: release-python
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  push:
+    tags: ["py-v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-15
+            manylinux: "off"
+          # manylinux 2_28 (glibc 2.28): the build runs in the PyPA container.
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            manylinux: "2_28"
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            manylinux: "2_28"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag matches the package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("bindings/python/pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$TAG" != "py-v$version" ]; then
+            echo "FAIL: tag $TAG, pyproject.toml version $version"; exit 1
+          fi
+      # The Linux build runs in a container. Pass the pinned toolchain of
+      # rust-toolchain.toml to the container explicitly.
+      - id: toolchain
+        run: echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          rust-toolchain: ${{ steps.toolchain.outputs.channel }}
+          maturin-version: v1.15.0
+          working-directory: bindings/python
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-${{ matrix.name }}
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+
+  test:
+    # Install each wheel in a clean venv on its own platform. The shared
+    # vectors find a marshalling fault in the packaged module.
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-15
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          # The uv version of mise.toml.
+          version: "0.10.0"
+      - name: Install the wheel in a clean venv
+        run: |
+          uv venv --python 3.13 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" dist/*.whl pytest==9.1.1
+      # Run outside the checkout, so Python cannot import a local snailfish.
+      - name: Import the package
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -I -c 'import snailfish; assert len(snailfish.new_device_keys().sign_seed) == 32'
+      # pythonpath=tests replaces the build/ path of pyproject.toml, so the
+      # test imports the installed wheel.
+      - name: The shared vectors through the wheel
+        working-directory: bindings/python
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -m pytest -p no:cacheprovider -o pythonpath=tests tests/test_vectors.py
+
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    # The environment needs a reviewer. Its name must match the trusted
+    # publisher on PyPI.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/snailfish
+    permissions:
+      # Trusted publishing exchanges the OIDC token for a short-lived PyPI token.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

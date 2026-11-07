@@ -8,7 +8,7 @@
 # Run: docker run -e SNAILFISH_AUTHORITY=sync.example.net -v data:/data -v secrets:/secrets -p 8080:8080 IMAGE
 # The secrets volume holds session.key. Backups do not copy it ([STO-9]).
 
-FROM rust:1.99.1-alpine3.22 AS build
+FROM rust:1.99.1-alpine3.22@sha256:9a744dc47d1ac2a7d17fc3cedfc8b4928b1696dfcba3274ab25bfb40988a9ff0 AS build
 # The vendored OpenSSL build needs a C compiler, perl and make.
 RUN apk add --no-cache musl-dev perl make linux-headers
 WORKDIR /src
@@ -20,7 +20,7 @@ RUN cargo build --locked --release -p snailfish-relay \
  && ! readelf -l /snailfish-relay | grep -q INTERP \
  && mkdir -p /data /secrets && chmod 0700 /secrets
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=build /snailfish-relay /usr/local/bin/snailfish-relay
 COPY --from=build --chown=nonroot:nonroot /data /data
 COPY --from=build --chown=nonroot:nonroot /secrets /secrets

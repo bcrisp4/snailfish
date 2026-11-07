@@ -75,9 +75,13 @@ func invite(engine: Engine, scanned: String?, transport: Transport, ui: Enrollme
 /// checks the log up to the checkpoint before it uploads anything. It
 /// follows `join` in demo/src/snailfish_demo/app.py.
 ///
+/// With `rejoin`, the device enrolls again after a fork ([FRK-6]):
+/// `SyncDevice.prepareRejoin` came first, and the app keeps its database.
+///
 /// - Returns: An empty string on success, or the cause of the failure.
 func join(
-    device: SyncDevice, relayURL: String, name: String, scanned: String?, transport: Transport, ui: EnrollmentUI
+    device: SyncDevice, relayURL: String, name: String, scanned: String?, transport: Transport, ui: EnrollmentUI,
+    rejoin: Bool = false
 ) async throws -> String {
     let keys = try newDeviceKeys()
     let n = try NewEnrollment(relayUrl: relayURL, keys: keys, name: name, scanned: scanned)
@@ -102,6 +106,10 @@ func join(
         return c.isEmpty ? "the enrollment ended with no result" : c
     }
     let space = SpaceRef(relayUrl: try n.relayUrl(), tenant: joined.tenant, logId: joined.logId, appId: appID)
-    try await device.finishJoin(space: space, keys: keys, joined: joined)
+    if rejoin {
+        try await device.finishRejoin(space: space, keys: keys, joined: joined)
+    } else {
+        try await device.finishJoin(space: space, keys: keys, joined: joined)
+    }
     return ""
 }

@@ -51,7 +51,7 @@ struct ContentView: View {
             .sheet(item: $sheet, onDismiss: sheetClosed) { which in
                 switch which {
                 case .settings: SyncSettings(model: model, web: web) { afterSettings = $0 }
-                case .flow: FlowSheet(model: model)
+                case .flow: FlowSheet(model: model, web: web)
                 }
             }
             .onChange(of: model.step) { _, step in
@@ -137,12 +137,19 @@ struct StatusBar: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        HStack {
-            Circle().fill(color).frame(width: 8, height: 8)
-            Text("Sync: \(model.status)")
-                .font(.footnote)
-                .accessibilityIdentifier("sync-status")
-            Spacer()
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Circle().fill(color).frame(width: 8, height: 8)
+                Text("Sync: \(model.status)")
+                    .font(.footnote)
+                    .accessibilityIdentifier("sync-status")
+                Spacer()
+            }
+            if let next = model.nextStep {
+                Text(next)
+                    .font(.footnote)
+                    .accessibilityIdentifier("sync-next-step")
+            }
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
@@ -184,7 +191,25 @@ struct SyncSettings: View {
                         .accessibilityIdentifier("relay-url")
                     Text("Sync: \(model.status)")
                 }
-                if !model.syncOn {
+                if model.rejoinWaits || model.status.hasPrefix("stopped: fork") {
+                    // [FRK-6]: the source shows a code in "Add a device".
+                    Section {
+                        Button("Join again: scan the code of the source") {
+                            then { model.joinAgain(scan: true) }
+                        }
+                        .accessibilityIdentifier("rejoin-scan")
+                        Button("Join again: show a code for the source") {
+                            then { model.joinAgain(scan: false) }
+                        }
+                        .accessibilityIdentifier("rejoin-show")
+                    } header: {
+                        Text("Fork")
+                    } footer: {
+                        Text("Join again after the source imported its copy. The own changes of this device go to "
+                            + "the space again.")
+                    }
+                }
+                if !model.syncOn, !model.rejoinWaits {
                     Section("First device") {
                         Button("Turn on sync") {
                             let w = web.web
@@ -215,7 +240,7 @@ struct SyncSettings: View {
                         .disabled(recoveryKey.isEmpty)
                         .accessibilityIdentifier("recover")
                     }
-                } else {
+                } else if model.syncOn {
                     Section("Add a device") {
                         Button("Show a code for the new device") {
                             then { model.addDevice(scan: false) }
@@ -245,6 +270,17 @@ struct SyncSettings: View {
                             then { model.showRemoval() }
                         }
                         .accessibilityIdentifier("remove-devices")
+                    }
+                    Section {
+                        Button("Delete and import this device's copy", role: .destructive) {
+                            then { model.confirmDeleteAndImport() }
+                        }
+                        .accessibilityIdentifier("delete-import")
+                    } header: {
+                        Text("Fork repair")
+                    } footer: {
+                        Text("Use this on one device, the source, after a fork. Then join again from it on each "
+                            + "other device.")
                     }
                     Section("Recovery key") {
                         Button("Replace the recovery key") {
@@ -294,6 +330,7 @@ struct SyncSettings: View {
 /// The steps of an enrollment or a setup.
 struct FlowSheet: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var web: WebSignInBox
     @State private var typedKey = ""
 
     var body: some View {
@@ -317,16 +354,16 @@ struct FlowSheet: View {
                     .textSelection(.enabled)
                     .accessibilityIdentifier("enroll-payload")
                 ProgressView("Waiting for the other device")
-            case .scanning(let trusted):
+            case .scanning(let trusted, let rejoin):
                 Text("Scan the code on your other device").font(.headline)
                 #if DEBUG
                     if UITestSeam.current != nil {
-                        PayloadEntry { model.scanned($0, trusted: trusted) }
+                        PayloadEntry { model.scanned($0, trusted: trusted, rejoin: rejoin) }
                     } else {
-                        ScanView { model.scanned($0, trusted: trusted) }
+                        ScanView { model.scanned($0, trusted: trusted, rejoin: rejoin) }
                     }
                 #else
-                    ScanView { model.scanned($0, trusted: trusted) }
+                    ScanView { model.scanned($0, trusted: trusted, rejoin: rejoin) }
                 #endif
             case .comparing(let code):
                 Text("Does the other device show this code?").font(.headline)
@@ -352,6 +389,15 @@ struct FlowSheet: View {
                 RemovalView(devices: devices) { model.remove(ids: $0) }
             case .newRecoveryKey(let key):
                 ReplaceKeyView(key: key) { model.replaceRecoveryKey(current: $0, new: key) }
+            case .confirmDelete:
+                Text("Delete the space on the relay?").font(.headline)
+                Text("Each device keeps its data. This device then imports its copy, and each other device "
+                    + "joins again from this device.")
+                Button("Delete and import", role: .destructive) {
+                    let w = web.web
+                    model.deleteAndImport { try await w.redirect(for: $0) }
+                }
+                .accessibilityIdentifier("delete-import-confirm")
             }
             // The recovery key of a new space must reach the paper (S1). A
             // replacement changes nothing until the user replaces the key.

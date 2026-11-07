@@ -25,6 +25,7 @@ pub const MAX_CONCURRENT: usize = 64;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn respond(r: Response) -> HttpResponse {
+    crate::metrics::record_status(r.status);
     let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut out = HttpResponse::new(Body::from(r.body));
     *out.status_mut() = status;
@@ -245,6 +246,36 @@ pub fn router(relay: Relay) -> Router {
         .layer(middleware::from_fn(move |req, next| {
             time_limit(limit.clone(), req, next)
         }))
+}
+
+/// The router of the metrics listener (`--metrics-listen`): `GET /metrics`
+/// in the Prometheus text format, and 404 for each other request. It is a
+/// separate listener, so the public port never serves the metrics
+/// (DESIGN.md "Monitoring and alerting").
+pub fn metrics_router(relay: Relay) -> Router {
+    Router::new().fallback(move |req: HttpRequest<Body>| metrics(relay.clone(), req))
+}
+
+async fn metrics(relay: Relay, req: HttpRequest<Body>) -> HttpResponse {
+    let text = |status: StatusCode, body: String| {
+        let mut out = HttpResponse::new(Body::from(body));
+        *out.status_mut() = status;
+        out.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        );
+        out
+    };
+    if req.method() != axum::http::Method::GET || req.uri().path() != "/metrics" {
+        return text(StatusCode::NOT_FOUND, "not found\n".into());
+    }
+    match tokio::task::spawn_blocking(move || relay.metrics_text()).await {
+        Ok(Ok(body)) => text(StatusCode::OK, body),
+        _ => text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the metrics failed\n".into(),
+        ),
+    }
 }
 
 #[cfg(test)]

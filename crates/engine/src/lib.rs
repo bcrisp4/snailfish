@@ -13,6 +13,7 @@ pub mod codec;
 mod compact;
 pub mod enroll;
 pub mod keystore;
+pub mod lifecycle;
 mod removal;
 pub mod setup;
 pub mod signin;
@@ -29,6 +30,7 @@ use snailfish_protocol::keys;
 use snailfish_protocol::records::Position;
 use snailfish_protocol::sig::SecretKey;
 
+pub use lifecycle::{Import, import_file};
 pub use removal::ActiveDevice;
 pub use sync::Sync;
 
@@ -44,7 +46,7 @@ pub const MAX_ENQUEUE: usize = 500;
 /// The most changes of one `changes_after` batch.
 pub const MAX_BATCH: usize = 500;
 
-const STATE_FILE: &str = "engine.sqlite3";
+pub(crate) const STATE_FILE: &str = "engine.sqlite3";
 const LOCK_FILE: &str = "engine.lock";
 
 /// An engine failure. The message holds no secret and no app data.
@@ -73,6 +75,12 @@ pub enum EngineError {
     /// The host key store failed or holds no keys for the space. The engine
     /// does not continue without the key store (C62).
     KeyStore(String),
+    /// The relay refused a deletion or an import request (`PROTOCOL.md`
+    /// 10.12 and 10.13), with its error code.
+    Refused {
+        /// The error code of 10.3, or `http <status>` without one.
+        code: String,
+    },
 }
 
 impl std::fmt::Display for EngineError {
@@ -91,6 +99,7 @@ impl std::fmt::Display for EngineError {
                 f.write_str("reset required: the applied position is not on the verified log")
             }
             Self::KeyStore(e) => write!(f, "key store: {e}"),
+            Self::Refused { code } => write!(f, "the relay refused the request: {code}"),
         }
     }
 }
@@ -162,6 +171,10 @@ pub enum Status {
     /// `stopped: missing records`: the verified log holds a stub that no
     /// usable snapshot covers ([CMP-15]).
     MissingRecords,
+    /// `stopped: deleted`: the relay holds the deletion marker of the log
+    /// ([LOG-13]). The engine sends nothing for the space until the app
+    /// opens it again, for example after an import ([FRK-5]).
+    Deleted,
     /// `stopped: setup failed`: the relay refused to create the space
     /// (`bad_setup` or `space_limit`, `PROTOCOL.md` 10.5). The app signs in
     /// again and gives the engine a new setup token.
@@ -191,6 +204,7 @@ impl Status {
             Self::Blocked => "paused: blocked",
             Self::Removed => "stopped: removed",
             Self::MissingRecords => "stopped: missing records",
+            Self::Deleted => "stopped: deleted",
         }
     }
 }

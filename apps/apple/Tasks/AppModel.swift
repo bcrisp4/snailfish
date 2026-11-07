@@ -10,8 +10,9 @@ final class AppModel: ObservableObject {
         case none
         /// This device shows the session: the QR payload and the typed code.
         case showing(payload: String, code: String)
-        /// This device scans the QR code of the other device.
-        case scanning(trusted: Bool)
+        /// This device scans the QR code of the other device. With `rejoin`,
+        /// this device enrolls again after a fork ([FRK-6]).
+        case scanning(trusted: Bool, rejoin: Bool = false)
         /// Both devices show the 6-digit code ([ENR-7]).
         case comparing(code: String)
         case confirmAgain
@@ -23,6 +24,9 @@ final class AppModel: ObservableObject {
         /// A replacement recovery key, shown once, then typed back, then the
         /// current key (T9, PROTOCOL.md 13.3).
         case newRecoveryKey(String)
+        /// The user confirms the deletion of the space on the relay before
+        /// this device imports its copy ([FRK-4], [FRK-5]).
+        case confirmDelete
         case working(String)
     }
 
@@ -31,6 +35,8 @@ final class AppModel: ObservableObject {
     @Published var syncOn = false
     /// A full recovery did not grant this device before the app stopped.
     @Published var recoveryWaits = false
+    /// An enrollment again after a fork did not finish ([FRK-6]).
+    @Published var rejoinWaits = false
     @Published var step: Step = .none
     @Published var message: String?
     @Published var relayURL: String {
@@ -103,6 +109,7 @@ final class AppModel: ObservableObject {
             tasks = try await device.tasks()
             syncOn = await device.syncOn
             recoveryWaits = try await device.recoveryWaits()
+            rejoinWaits = await device.rejoinWaits
             status = try await device.statusText()
             if let syncError { status += " (last sync: \(syncError))" }
         } catch {
@@ -350,8 +357,8 @@ final class AppModel: ObservableObject {
         startJoin(scanned: nil)
     }
 
-    func scanned(_ text: String, trusted: Bool) {
-        if trusted { startInvite(scanned: text) } else { startJoin(scanned: text) }
+    func scanned(_ text: String, trusted: Bool, rejoin: Bool = false) {
+        if trusted { startInvite(scanned: text) } else { startJoin(scanned: text, rejoin: rejoin) }
     }
 
     private func startInvite(scanned: String?) {
@@ -364,14 +371,109 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startJoin(scanned: String?) {
+    private func startJoin(scanned: String?, rejoin: Bool = false) {
         let relay = relayURL
-        run("join") { [self] in
+        run(rejoin ? "join again" : "join") { [self] in
+            if rejoin { try await device.prepareRejoin() }
             step = .working("Waiting for the other device")
+            // The source lists the old and the new device of this device,
+            // and the user removes the old one there.
+            let name = rejoin ? deviceName() + " again" : deviceName()
             let cause = try await join(
-                device: device, relayURL: relay, name: deviceName(), scanned: scanned, transport: transport, ui: self)
+                device: device, relayURL: relay, name: name, scanned: scanned, transport: transport, ui: self,
+                rejoin: rejoin)
+            guard cause.isEmpty else {
+                step = .none
+                message = "The enrollment failed: \(cause)"
+                return
+            }
+            guard rejoin else {
+                step = .none
+                message = "This device joined."
+                return
+            }
+            try await sendOwnChangesAgain()
+        }
+    }
+
+    // MARK: Fork repair (DESIGN.md "Fork repair", PROTOCOL.md 10.12, 10.13)
+
+    /// The next step for the user at `stopped: fork` or `stopped: deleted`
+    /// ([FRK-1], [LOG-13]).
+    var nextStep: String? {
+        if rejoinWaits || status.hasPrefix("stopped: fork") {
+            return "The relay showed your devices different copies of the data. Pick one device as the source, "
+                + "and on it select \"Delete and import this device's copy\". Then join again from the source "
+                + "on each other device."
+        }
+        if status.hasPrefix("stopped: deleted") {
+            return "The space is deleted on the relay. Sync continues after a device imports its copy. "
+                + "To import the copy of this device, select \"Delete and import this device's copy\"."
+        }
+        return nil
+    }
+
+    /// Ask the user to confirm the deletion of the space on the relay.
+    func confirmDeleteAndImport() {
+        step = .confirmDelete
+    }
+
+    /// [FRK-4], [FRK-5]: delete the space on the relay, sign in, and import
+    /// the verified log of this device. After a deletion that stopped before
+    /// the import, only the import runs.
+    func deleteAndImport(browser: @escaping (URL) async throws -> URL) {
+        run("delete and import") { [self] in
+            guard let relay = await device.space?.relayUrl else { throw SetupError.syncOff }
+            let deleted = try await device.statusText().hasPrefix("stopped: deleted")
+            if !deleted {
+                step = .working("Deleting the space on the relay")
+                let st: Status
+                do {
+                    st = try await device.deleteSpace(transport)
+                } catch SnailfishError.Refused(let code) where code == "bad_head" {
+                    // PROTOCOL.md 10.12: after a fork, the head of this
+                    // device can be outside the relay log.
+                    throw SetupError.message(
+                        "the relay log does not hold the last record of this device. Pick another device as "
+                            + "the source, or ask the relay operator to delete the space")
+                }
+                guard st == .deleted else {
+                    throw SetupError.message("the relay did not delete the space: \(try await device.statusText())")
+                }
+            }
+            step = .working("Importing the copy of this device")
+            try await importSpace(device: device, relayURL: relay, transport: transport, browser: browser)
+            _ = try await device.sync(transport, background: false)
             step = .none
-            message = cause.isEmpty ? "This device joined." : "The enrollment failed: \(cause)"
+            message = "The relay holds the copy of this device again. On each other device, join again from this device."
+        }
+    }
+
+    /// Enroll this device again from the source after a fork ([FRK-6]).
+    /// With `scan`, this device scans the QR code of the source.
+    func joinAgain(scan: Bool) {
+        if scan {
+            step = .scanning(trusted: false, rejoin: true)
+            return
+        }
+        startJoin(scanned: nil, rejoin: true)
+    }
+
+    /// [FRK-7], [FRK-8]: the first sync recovers the own changes of the old
+    /// engine state into the outbox, then the pull resets the app data and
+    /// applies the outbox again. The second sync sends these changes.
+    private func sendOwnChangesAgain() async throws {
+        step = .working("Sending the changes of this device again")
+        _ = try await device.sync(transport, background: false)
+        _ = try await device.sync(transport, background: false)
+        step = .none
+        if await device.forkRecoveryWaits {
+            let st = try await device.statusText()
+            message = "This device joined again. Its own changes wait for the next sync: \(st)."
+        } else {
+            let n = await device.recovered ?? 0
+            message = "This device joined again and sent \(n) of its own changes again. "
+                + "On the source device, remove the old entry of this device."
         }
     }
 

@@ -89,6 +89,11 @@ enum Command {
         /// The log ID text.
         log: String,
     },
+    /// Manage spaces.
+    Space {
+        #[command(subcommand)]
+        action: SpaceAction,
+    },
     /// End the restore hold of a space.
     ReleaseHold {
         /// The user name.
@@ -136,6 +141,11 @@ struct ServeArgs {
         default_value = ""
     )]
     trusted_proxy: Vec<String>,
+    /// The address of the metrics listener, for example `127.0.0.1:9464`.
+    /// Empty turns the metrics off. Do not expose it through the proxy
+    /// (DESIGN.md "Monitoring and alerting").
+    #[arg(long, env = "SNAILFISH_METRICS_LISTEN", default_value = "")]
+    metrics_listen: String,
 }
 
 impl ServeArgs {
@@ -153,6 +163,18 @@ impl ServeArgs {
 }
 
 #[derive(Subcommand)]
+enum SpaceAction {
+    /// Delete a space of a user and keep its deletion marker. Devices keep
+    /// their logs, and an import makes the space again.
+    Delete {
+        /// The user name.
+        user: String,
+        /// The log ID text.
+        log: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum UserAction {
     /// Create a user and its tenant, and print a one-time invite link.
     Add {
@@ -165,6 +187,26 @@ enum UserAction {
         /// The user name.
         name: String,
     },
+    /// Print each user with its internal tenant ID, the label of the
+    /// per-tenant storage metric.
+    List,
+}
+
+/// `snailfish-relay space`: the operator commands of one space. They need
+/// no authority.
+fn space_command(cfg: Config, action: SpaceAction) -> ExitCode {
+    match action {
+        SpaceAction::Delete { user, log } => {
+            match Relay::open(cfg).and_then(|r| r.operator_delete(&user, &log)) {
+                Ok(true) => {
+                    println!("deleted: {log}");
+                    ExitCode::SUCCESS
+                }
+                Ok(false) => fail(&format!("{user} holds no space {log}")),
+                Err(e) => fail(&e.to_string()),
+            }
+        }
+    }
 }
 
 fn fail(msg: &str) -> ExitCode {
@@ -198,13 +240,7 @@ async fn main() -> ExitCode {
     let need_authority =
         || fail("set --authority or SNAILFISH_AUTHORITY: the relay does not start without it");
     match cli.command {
-        Command::User { action } => {
-            // The invite link names the origin of the user page.
-            let Some(a) = authority else {
-                return need_authority();
-            };
-            user_command(config(&a), action)
-        }
+        Command::User { action } => user_command(authority.as_deref(), &config, action),
         Command::Quota {
             user,
             spaces,
@@ -218,6 +254,7 @@ async fn main() -> ExitCode {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        Command::Space { action } => space_command(config("unused.invalid"), action),
         Command::Health { .. } => ExitCode::SUCCESS,
         Command::Backup { dir } => match ops::backup(&data, &dir) {
             Ok(s) => {
@@ -268,10 +305,11 @@ async fn main() -> ExitCode {
             };
             let mut c = config(&a);
             let listen = args.listen.clone();
+            let metrics = args.metrics_listen.clone();
             if let Err(e) = args.apply(&mut c) {
                 return fail(&e);
             }
-            serve(c, &listen).await
+            serve(c, &listen, &metrics).await
         }
     }
 }
@@ -289,10 +327,31 @@ fn parse_proxies(list: &[String]) -> Result<Vec<std::net::IpAddr>, String> {
 }
 
 /// `user add` and `user invite`: print the invite link.
-fn user_command(config: Config, action: UserAction) -> ExitCode {
-    let made = Relay::open(config).and_then(|r| match action {
+fn user_command(
+    authority: Option<&str>,
+    config: &dyn Fn(&str) -> Config,
+    action: UserAction,
+) -> ExitCode {
+    // An invite link names the origin of the user page. `list` needs no
+    // authority.
+    let a = match (authority, &action) {
+        (Some(a), _) => a,
+        (None, UserAction::List) => "unused.invalid",
+        (None, _) => {
+            return fail(
+                "set --authority or SNAILFISH_AUTHORITY: the relay does not start without it",
+            );
+        }
+    };
+    let made = Relay::open(config(a)).and_then(|r| match action {
         UserAction::Add { name } => r.add_user(&name).and_then(|_| r.invite(&name)),
         UserAction::Invite { name } => r.invite(&name),
+        UserAction::List => r.users().map(|u| {
+            u.iter()
+                .map(|(name, id)| format!("{name} {id}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
     });
     match made {
         Ok(link) => {
@@ -304,7 +363,7 @@ fn user_command(config: Config, action: UserAction) -> ExitCode {
     }
 }
 
-async fn serve(config: Config, listen: &str) -> ExitCode {
+async fn serve(config: Config, listen: &str, metrics: &str) -> ExitCode {
     // Held until the process ends, so `restore` cannot run beside it.
     let _lock = match ops::serve_lock(&config.data_dir) {
         Ok(l) => l,
@@ -314,6 +373,9 @@ async fn serve(config: Config, listen: &str) -> ExitCode {
         Ok(r) => r,
         Err(e) => return fail(&e.to_string()),
     };
+    if let Err(e) = relay.sweep() {
+        return fail(&e.to_string());
+    }
     let listener = match tokio::net::TcpListener::bind(listen).await {
         Ok(l) => l,
         Err(e) => return fail(&format!("cannot listen: {e}")),
@@ -333,6 +395,18 @@ async fn serve(config: Config, listen: &str) -> ExitCode {
             () = term => {}
         }
     };
+    if !metrics.is_empty() {
+        let ml = match tokio::net::TcpListener::bind(metrics).await {
+            Ok(l) => l,
+            Err(e) => return fail(&format!("cannot listen for metrics: {e}")),
+        };
+        let app = snailfish_relay::http::metrics_router(relay.clone());
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(ml, app).await {
+                eprintln!("snailfish-relay: metrics listener: {e}");
+            }
+        });
+    }
     tokio::spawn(snailfish_relay::webhook::run(relay.clone()));
     let app = router(relay).into_make_service_with_connect_info::<std::net::SocketAddr>();
     match axum::serve(listener, app)

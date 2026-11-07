@@ -159,6 +159,58 @@ pub fn install_enrollment(
     put(store, &account, keys)
 }
 
+/// The suffix of the key item that keeps the keys of an old state file
+/// during a fork repair ([FRK-6], [FRK-7]).
+pub const OLD_SUFFIX: &str = ".old";
+
+/// FRK-6: copy the key item of `log_id` to `<log_id>.old` before the device
+/// enrolls again, because the enrollment replaces the item. The old state
+/// file needs these keys for [`Engine::fork_changes`], and the app keeps
+/// both until its outbox holds each change of the comparison.
+///
+/// # Errors
+///
+/// [`EngineError::KeyStore`] if the store fails or holds no item.
+pub fn keep_old_keys(store: &dyn KeyStore, log_id: &str) -> Result<(), EngineError> {
+    let b = store
+        .load(log_id)
+        .map_err(EngineError::KeyStore)?
+        .ok_or_else(|| {
+            EngineError::KeyStore(format!("the key store holds no keys for {log_id}"))
+        })?;
+    let keys = decode(&b)?;
+    put(store, &format!("{log_id}{OLD_SUFFIX}"), &keys)
+}
+
+/// Open the old state file of a fork repair with the keys that
+/// [`keep_old_keys`] kept. The engine writes nothing to the store.
+///
+/// # Errors
+///
+/// [`EngineError::KeyStore`] if the store holds no old item, and the
+/// errors of [`Engine::open`].
+pub fn open_old(
+    data_dir: &Path,
+    space: SpaceRef,
+    store: &dyn KeyStore,
+) -> Result<Engine, EngineError> {
+    // An empty directory would get a new state file with these keys and
+    // an empty log, and the comparison would then find no change.
+    if !data_dir.join(crate::STATE_FILE).exists() {
+        return Err(EngineError::Invalid(
+            "the old directory holds no engine state file".into(),
+        ));
+    }
+    let account = format!("{}{OLD_SUFFIX}", space.log_id);
+    let b = store
+        .load(&account)
+        .map_err(EngineError::KeyStore)?
+        .ok_or_else(|| {
+            EngineError::KeyStore(format!("the key store holds no keys for {account}"))
+        })?;
+    Engine::open(data_dir, space, &decode(&b)?)
+}
+
 impl Engine {
     /// Write the app key to the key store once the engine has it. An engine
     /// that [`open`] did not open has no store, and this does nothing.

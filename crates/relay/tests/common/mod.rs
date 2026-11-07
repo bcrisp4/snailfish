@@ -134,6 +134,8 @@ impl Fx {
     /// The same data directory with a new relay value, as after a restart.
     pub fn restart(&mut self, limits: Limits) {
         self.relay = Self::open(&self.dir, &self.authority, limits, &self.now).unwrap();
+        // `serve` runs the startup sweep of [STO-5] and [STO-6].
+        self.relay.sweep().unwrap();
     }
 
     pub fn tenant(&self) -> &str {

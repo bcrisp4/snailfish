@@ -265,7 +265,8 @@ fn backup_and_restore_hold_each_space() {
     let res = ops::restore(fx.dir.path(), &dst, true, 2).unwrap();
     assert_eq!(res.held, [] as [std::string::String; 0]);
     fx.restart(common::limits_of(&fx.h));
-    assert_eq!(error_code(&fx.fetch(fx.tenant(), 0, 10)), "unknown_space");
+    // [LOG-13]: the marker gives `deleted`, so no device uploads the log again.
+    assert_eq!(error_code(&fx.fetch(fx.tenant(), 0, 10)), "deleted");
 }
 
 /// [QTA-1], [LOG-10]: a repair after a restore moves the lost change back,

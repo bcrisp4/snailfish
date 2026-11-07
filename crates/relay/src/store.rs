@@ -22,7 +22,7 @@ pub enum Kind {
 }
 
 /// The schema version of every file kind.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The schema of `directory.db`.
 const DIRECTORY_DDL: &str = "CREATE TABLE IF NOT EXISTS users (
@@ -84,6 +84,10 @@ const TENANT_DDL: &str = "CREATE TABLE IF NOT EXISTS tenant (
                  CREATE INDEX IF NOT EXISTS nonces_expires ON nonces (expires);
                  CREATE TABLE IF NOT EXISTS deletion_markers (
                     log_id TEXT PRIMARY KEY
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS imports (
+                    log_id TEXT PRIMARY KEY, session BLOB NOT NULL, device_id BLOB NOT NULL,
+                    sign_key BLOB NOT NULL, file_name TEXT NOT NULL, last INTEGER NOT NULL
                  ) WITHOUT ROWID;
                  CREATE TABLE IF NOT EXISTS holds (
                     log_id TEXT PRIMARY KEY,
@@ -310,12 +314,66 @@ pub fn open(path: &Path, kind: Kind, create: bool) -> Result<Connection, StoreEr
         }
         // An older schema migrates forward: every statement of the DDL is
         // `IF NOT EXISTS`, and each version only adds tables ([VER-14]).
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Every statement of the DDL is `IF NOT EXISTS`, so a second creator
-        // that waited for the lock repeats it without harm.
-        tx.execute_batch(kind.ddl())?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        tx.commit()?;
+        let migrated = (|| -> Result<(), rusqlite::Error> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Every statement of the DDL is `IF NOT EXISTS`, so a second
+            // creator that waited for the lock repeats it without harm.
+            tx.execute_batch(kind.ddl())?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()
+        })();
+        if let Err(e) = migrated {
+            if version != 0 {
+                crate::metrics::MIGRATION_FAILURES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Err(e.into());
+        }
     }
     Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Signal 4: a migration of a file with an older schema that fails
+    /// counts in `snailfish_migration_failures_total`, and the file stays
+    /// closed. Without this, the alert on failed migrations never fires.
+    #[test]
+    fn failed_migration_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("space.db");
+        {
+            // Schema version 1 with an `entries` table that lacks the
+            // `envelope` column, so the usage query of the DDL fails.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE entries (position INTEGER PRIMARY KEY, payload_type TEXT);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let before = crate::metrics::MIGRATION_FAILURES.load(Ordering::SeqCst);
+        assert!(open(&path, Kind::Space, false).is_err());
+        assert_eq!(
+            crate::metrics::MIGRATION_FAILURES.load(Ordering::SeqCst),
+            before + 1
+        );
+        // A new file that fails its first schema is not a migration.
+        let fresh = dir.path().join("fresh.db");
+        {
+            let c = Connection::open(&fresh).unwrap();
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE entries (position INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        }
+        assert!(open(&fresh, Kind::Space, true).is_err());
+        assert_eq!(
+            crate::metrics::MIGRATION_FAILURES.load(Ordering::SeqCst),
+            before + 1
+        );
+    }
 }

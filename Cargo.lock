@@ -1920,6 +1920,7 @@ dependencies = [
  "hyper-util",
  "openssl",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_cbor_2",
  "serde_json",

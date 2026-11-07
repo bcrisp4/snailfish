@@ -92,3 +92,17 @@ path = "fuzz_targets/setup.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "export"
+path = "fuzz_targets/export.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import"
+path = "fuzz_targets/import.rs"
+test = false
+doc = false
+bench = false

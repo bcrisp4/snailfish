@@ -13,6 +13,13 @@ Usage:
     snailfish-demo --dir DIR replace-recovery-key [--current KEY] [--new KEY]
     snailfish-demo recover --relay URL --recovery-key KEY
         [--browser STATE --user NAME] [--name NAME] DIR
+    snailfish-demo --dir DIR delete
+    snailfish-demo --dir DIR export FILE
+    snailfish-demo --dir DIR import [--relay URL] [--browser STATE --user NAME]
+    snailfish-demo --dir DIR switch-relay --relay URL [--browser STATE --user NAME]
+    snailfish-demo rejoin [--scan TEXT] [--name NAME] [--confirm ask|yes|no] DIR
+    snailfish-demo restore --relay URL --file FILE --recovery-key KEY
+        [--browser STATE --user NAME] [--name NAME] DIR
 
 `invite` runs on a device of the space and `join` on the new device. The
 device that shows the session prints its QR payload as a text line and
@@ -32,6 +39,16 @@ prints a new recovery key, asks the user to type it back, and asks for the
 current key (`--current` and `--new` answer with no input, for tests).
 `recover` signs in on a new device, finds the space of the app and recovers
 it with the paper recovery key (S5).
+
+Fork repair (DESIGN.md "Fork repair"): on the source device, `delete`
+deletes the space on the relay and `import` uploads its log again, or to
+another relay with `--relay`. Each other device runs `rejoin`: it keeps
+its old state file, enrolls again from the source (with `invite` there),
+and sends each own change that only the old file holds. For a move to
+another relay, the source runs `import --relay URL` and each other device
+runs `switch-relay --relay URL`. `export` writes the export file of the
+log, and `restore` makes the space again from it with the recovery key
+after the loss of every device.
 
 `SNAILFISH_DEMO_CRASH_AT=N` makes the process exit at the Nth crash point
 of the run, with no cleanup, as a kill does. The crash points are before
@@ -240,7 +257,33 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--user")
     v.add_argument("--name", default="new device")
     v.add_argument("dir_new", type=Path)
+    sub.add_parser("delete")
+    x = sub.add_parser("export")
+    x.add_argument("file", type=Path)
+    im = sub.add_parser("import")
+    im.add_argument("--relay")
+    im.add_argument("--browser", type=Path)
+    im.add_argument("--user")
+    sw = sub.add_parser("switch-relay")
+    sw.add_argument("--relay", required=True)
+    sw.add_argument("--browser", type=Path)
+    sw.add_argument("--user")
+    rj = sub.add_parser("rejoin")
+    rj.add_argument("--scan")
+    rj.add_argument("--name", default="new device")
+    rj.add_argument("--confirm", choices=("ask", "yes", "no"), default="ask")
+    rj.add_argument("dir_old", type=Path)
+    rs = sub.add_parser("restore")
+    rs.add_argument("--relay", required=True)
+    rs.add_argument("--file", type=Path, required=True)
+    rs.add_argument("--recovery-key", required=True)
+    rs.add_argument("--browser", type=Path)
+    rs.add_argument("--user")
+    rs.add_argument("--name", default="new device")
+    rs.add_argument("dir_new", type=Path)
     args = p.parse_args(argv)
+    if args.cmd in ("rejoin", "restore"):
+        return lifecycle_command(args)
 
     if args.cmd == "setup":
         with httpx.Client(timeout=30) as client:
@@ -390,6 +433,33 @@ def main(argv: list[str] | None = None) -> int:
                 status = dev.sync(send)
             print(f"status: {status}")
             return 0 if status.is_ok() else 1
+        elif args.cmd == "delete":
+            with httpx.Client(timeout=30) as client:
+                try:
+                    status = app.delete_space(dev, http_transport(client, crasher))
+                except sf.SnailfishError.Refused as e:
+                    # bad_head: the verified head of this device is not in the
+                    # relay log, for example after a fork (PROTOCOL.md 10.12).
+                    return finish(
+                        f"the relay refused the deletion ({e}): delete it from a device "
+                        "that did not stop, or ask the relay operator to run "
+                        "`snailfish-relay space delete`"
+                    )
+            print(f"status: {status}")
+            return 0 if status.is_deleted() else 1
+        elif args.cmd == "export":
+            head = app.export_log(dev, args.file)
+            print(f"exported: {head} entries to {args.file}")
+        elif args.cmd in ("import", "switch-relay"):
+            url = args.relay or dev.space.relay_url
+            with httpx.Client(timeout=30) as client, BrowserFor(args, url) as (redirect, browse):
+                send = http_transport(client, crasher)
+                fn = app.import_space if args.cmd == "import" else app.switch_relay
+                try:
+                    space = fn(dev, url, redirect, browse, send)
+                except app.ImportError_ as e:
+                    return finish(str(e))
+            print(f"space {space.log_id} on {space.relay_url}, tenant {space.tenant}")
         elif args.cmd == "dump":
             print(
                 json.dumps(
@@ -412,6 +482,83 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         dev.close()
     return 0
+
+
+class BrowserFor:
+    """The browser of a sign-in: the software browser with `--browser`, or
+    the system browser with a loopback redirect."""
+
+    def __init__(self, args: argparse.Namespace, relay_url: str) -> None:
+        """Keep the arguments."""
+        self.args = args
+        self.url = relay_url
+        self.lb: Loopback | None = None
+
+    def __enter__(self) -> tuple[str, app.Browser]:
+        """Return the redirect URI and the browser."""
+        if self.args.browser is not None:
+            soft = softbrowser.SoftBrowser(self.args.browser, self.url)
+            user = self.args.user or ""
+            return SOFT_REDIRECT, lambda authorize_url: soft.approve(authorize_url, user)
+        self.lb = Loopback()
+        lb = self.lb.__enter__()
+        return lb.uri, lb.wait
+
+    def __exit__(self, *exc: object) -> None:
+        """Stop the loopback server."""
+        if self.lb is not None:
+            self.lb.__exit__(*exc)
+
+
+def lifecycle_command(args: argparse.Namespace) -> int:
+    """`rejoin` and `restore`: they open the engine themselves."""
+    with httpx.Client(timeout=30) as client:
+        send = http_transport(client, Crasher())
+        if args.cmd == "restore":
+            with BrowserFor(args, args.relay) as (redirect, browse):
+                try:
+                    dev = app.restore_from_file(
+                        args.relay,
+                        args.dir_new,
+                        args.name,
+                        args.file,
+                        args.recovery_key,
+                        redirect,
+                        browse,
+                        send,
+                    )
+                except (app.ImportError_, app.RecoveryError) as e:
+                    return finish(str(e))
+            dev.close()
+            print("restored: remove the lost devices with `remove`")
+            return 0
+        space = json.loads((args.dir_old / "space.json").read_text())
+        app.prepare_rejoin(args.dir_old, space["log_id"])
+        if not (args.dir_old / "engine").exists():
+            cause = app.join(
+                args.dir_old,
+                space["relay_url"],
+                args.name,
+                send,
+                answer_for(args.confirm),
+                say,
+                args.scan,
+            )
+            if cause:
+                return finish(cause)
+        ref = sf.SpaceRef(**json.loads((args.dir_old / "space.json").read_text()))
+        engine = sf.Engine.open(str(args.dir_old / "engine"), ref, app.key_store(args.dir_old))
+        app.first_exchange(engine, send)
+        n = app.recover_fork(args.dir_old, ref, engine)
+        dev = app.Device(args.dir_old, engine=engine)
+        try:
+            status = dev.sync(send)
+        finally:
+            dev.close()
+    print(f"recovered: {n} own changes")
+    print("remove the old device ID of this device on the source with `remove`")
+    print(f"status: {status}")
+    return 0 if status.is_ok() else 1
 
 
 if __name__ == "__main__":

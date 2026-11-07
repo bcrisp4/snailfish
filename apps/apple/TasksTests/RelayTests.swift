@@ -460,6 +460,104 @@ final class RelayTests: XCTestCase {
         XCTAssertEqual(got["p1"]?["title"] as? String, "before the fire")
     }
 
+    /// `specs/forkrepair/test.qnt::repairTest` ([FRK-1] to [FRK-8]) with
+    /// two app devices, so each side of the repair runs in the app code: A
+    /// writes "only on A" and applies it back, and the relay loses it with
+    /// no hold. B writes "on B" at the same position, and A stops with
+    /// `fork`. B is the source: it deletes the space and imports its log. A
+    /// joins again from B, and its first sync puts its own change back in
+    /// the outbox before the pull resets the app data.
+    func testForkRepairWithTwoAppDevices() async throws {
+        let relay = try env("SNAILFISH_RELAY_URL")
+        let approver = try env("SNAILFISH_APPROVER")
+        let transport = transport
+        let (a, b, own) = try await forkedAppDevices(relay: relay, approver: approver)
+
+        // [FRK-4], [FRK-5] on the source.
+        let v4 = try await b.deleteSpace(transport)
+        XCTAssertEqual(v4, .deleted)
+        try await importSpace(device: b, relayURL: relay, transport: transport, browser: browser(approver))
+        let v5 = try await b.sync(transport)
+        XCTAssertEqual(v5, .ok)
+
+        // [FRK-6] to [FRK-8] on A.
+        try await a.prepareRejoin()
+        let m2 = CodeMatch()
+        let engineBOpt = await b.engine
+        let engineB = try XCTUnwrap(engineBOpt)
+        let shownB = Task { try await invite(engine: engineB, scanned: nil, transport: transport, ui: SideUI("b", m2)) }
+        let payloadB = try await m2.waitForPayload()
+        let rejoined = try await join(
+            device: a, relayURL: relay, name: "A again", scanned: payloadB, transport: transport,
+            ui: SideUI("a", m2), rejoin: true)
+        let invitedB = try await shownB.value
+        XCTAssertEqual([invitedB, rejoined], ["", ""])
+        let v6 = try await a.sync(transport)
+        XCTAssertEqual(v6, .ok)
+        let recovered = await a.recovered
+        XCTAssertEqual(recovered, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: a.oldEngineDir.path))
+        _ = try await a.sync(transport)
+        _ = try await b.sync(transport)
+        let want = [
+            TaskItem(id: "a1", title: "only on A", done: false),
+            TaskItem(id: "b1", title: "on B", done: false),
+        ]
+        let gotA = try await a.tasks()
+        let gotB = try await b.tasks()
+        XCTAssertEqual(gotA, want)
+        XCTAssertEqual(gotB, want)
+        // [FRK-8]: A sent its change again with its old change ID.
+        let ids = try engineB.changesAfter(applied: try engineB.genesisBase(), maxChanges: 100).map(\.changeId)
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertTrue(ids.contains(own))
+    }
+
+    /// The fork of `testForkRepairWithTwoAppDevices`. Returns the devices
+    /// and the change ID of the change that only A holds. The engine
+    /// objects of the test go at the return, because an engine holds the
+    /// lock of its directory until it closes.
+    private func forkedAppDevices(relay: String, approver: String) async throws -> (SyncDevice, SyncDevice, Data) {
+        let transport = transport
+        try await PythonDevice(base: approver).call("POST", "user")
+        let a = try device("a")
+        _ = try await createSpace(device: a, relayURL: relay, name: "A", transport: transport, browser: browser(approver))
+        _ = try await a.sync(transport)
+        let b = try device("b")
+        let m1 = CodeMatch()
+        let engineAOpt = await a.engine
+        let engineA = try XCTUnwrap(engineAOpt)
+        let shown = Task { try await invite(engine: engineA, scanned: nil, transport: transport, ui: SideUI("a", m1)) }
+        let payload = try await m1.waitForPayload()
+        let joined = try await join(
+            device: b, relayURL: relay, name: "B", scanned: payload, transport: transport, ui: SideUI("b", m1))
+        let invited = try await shown.value
+        XCTAssertEqual([invited, joined], ["", ""])
+        let v1 = try await b.sync(transport)
+        XCTAssertEqual(v1, .ok)
+        _ = try await a.sync(transport)
+        let keep = try engineA.verifiedHead().position
+
+        try await a.edit(task: "a1", field: "title", value: .string("only on A"))
+        let v2 = try await a.sync(transport)
+        XCTAssertEqual(v2, .ok)
+        let own = try engineA.changesAfter(applied: try engineA.genesisBase(), maxChanges: 100)
+            .filter { try TaskChange.decode($0.changeBytes).task == "a1" }.map(\.changeId)
+        XCTAssertEqual(own.count, 1)
+        let logOpt = await a.space?.logId
+        let log = try XCTUnwrap(logOpt)
+        try await PythonDevice(base: approver).call("POST", "cut", ["keep": String(keep), "log": log])
+        try await b.edit(task: "b1", field: "title", value: .string("on B"))
+        let v3 = try await b.sync(transport)
+        XCTAssertEqual(v3, .ok)
+        let forked = try await a.sync(transport)
+        guard case .fork = forked else {
+            XCTFail("A did not stop with fork: \(forked)")
+            throw SetupError.message("no fork")
+        }
+        return (a, b, own[0])
+    }
+
     /// M6 open item, PROTOCOL.md 10.5: the relay refuses to create the space
     /// with a setup token of another device (`stopped: setup failed`). The
     /// app signs in again with the keys of the engine, and the next sync

@@ -763,6 +763,148 @@ pub fn parse_repair_finished(body: &[u8]) -> Result<Head, WireError> {
     read_head(object(body)?.get("head"))
 }
 
+/// A deletion request body (`PROTOCOL.md` 10.12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteBody {
+    /// The `snailfish.delete.v1` statement. `Err` holds the reason if it
+    /// breaks section 4: the relay answers `invalid_record` (10.12 step 4).
+    pub statement: AppendItem,
+    /// The setup token of a deletion by the recovery key.
+    pub setup: Option<[u8; 32]>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteJson<'a> {
+    #[serde(borrow)]
+    statement: &'a RawValue,
+    #[serde(default)]
+    setup: Option<String>,
+}
+
+fn setup_token(text: &str) -> Result<[u8; 32], WireError> {
+    crate::setup::parse_token(crate::setup::TokenKind::Setup, text)
+        .map_err(|e| bad(format!("setup: {e}")))
+}
+
+/// Parse a deletion request body (`PROTOCOL.md` 10.12).
+///
+/// # Errors
+///
+/// Refuses a body that is not an object with `statement` and an optional
+/// valid `setup`, and a body with a duplicate or unknown field.
+pub fn parse_delete(body: &[u8]) -> Result<DeleteBody, WireError> {
+    let parsed: DeleteJson<'_> =
+        serde_json::from_slice(body).map_err(|e| bad(format!("delete body: {e}")))?;
+    Ok(DeleteBody {
+        statement: raw_envelope(parsed.statement),
+        setup: parsed.setup.as_deref().map(setup_token).transpose()?,
+    })
+}
+
+/// The body of a deletion request.
+#[must_use]
+pub fn delete_body(statement: &str, setup: Option<&[u8; 32]>) -> Vec<u8> {
+    match setup {
+        None => format!("{{\"statement\":{statement}}}"),
+        Some(t) => format!(
+            "{{\"statement\":{statement},\"setup\":\"{}\"}}",
+            crate::setup::token_text(crate::setup::TokenKind::Setup, t)
+        ),
+    }
+    .into_bytes()
+}
+
+/// The response body of a deletion.
+#[must_use]
+pub fn deleted_body() -> Vec<u8> {
+    b"{\"deleted\":true}".to_vec()
+}
+
+/// An import start body (`PROTOCOL.md` 10.13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportStart {
+    /// The setup token.
+    pub setup: [u8; 32],
+    /// The `sign` and `seal` keys of the signing device (`PROTOCOL.md` 6.1).
+    pub device: crate::records::Keys,
+    /// The first chunk, from position 1.
+    pub entries: Vec<(u64, RepairItem)>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportStartJson<'a> {
+    setup: String,
+    device: Value,
+    #[serde(borrow)]
+    entries: Vec<RequestItem<'a>>,
+}
+
+/// Parse an import start body. A chunk and a finish body have the form of
+/// a repair chunk and a repair finish ([`parse_repair_chunk`],
+/// [`parse_repair_finish`]).
+///
+/// # Errors
+///
+/// Refuses a body without a valid `setup` and 1 to `max` entries in the
+/// form of 10.9, and a body with an unknown field.
+pub fn parse_import_start(body: &[u8], max: u64) -> Result<ImportStart, WireError> {
+    let parsed: ImportStartJson<'_> =
+        serde_json::from_slice(body).map_err(|e| bad(format!("import body: {e}")))?;
+    let keys = serde_json::to_vec(&parsed.device).map_err(|e| bad(e.to_string()))?;
+    let device = crate::records::parse_keys_json(&keys).map_err(|e| bad(format!("device: {e}")))?;
+    Ok(ImportStart {
+        setup: setup_token(&parsed.setup)?,
+        device,
+        entries: repair_entries(parsed.entries, max)?,
+    })
+}
+
+/// The body of an import start.
+///
+/// # Errors
+///
+/// Refuses an envelope text that is not JSON.
+pub fn import_start_body(
+    setup: &[u8; 32],
+    device: &crate::records::Keys,
+    entries: &[(u64, OutEntry)],
+) -> Result<Vec<u8>, WireError> {
+    Ok(format!(
+        "{{\"setup\":\"{}\",\"device\":{{\"sign\":\"{}\",\"seal\":\"{}\"}},\"entries\":[{}]}}",
+        crate::setup::token_text(crate::setup::TokenKind::Setup, setup),
+        encode_b64(&device.sign),
+        encode_b64(device.seal.as_slice()),
+        entry_list(entries)?
+    )
+    .into_bytes())
+}
+
+/// The JSON text of one entry (`PROTOCOL.md` 10.7): an export file line
+/// without its LF (section 15).
+///
+/// # Errors
+///
+/// Refuses an envelope text that is not JSON.
+pub fn entry_json(position: u64, entry: &OutEntry) -> Result<String, WireError> {
+    entry_list(&[(position, entry.clone())])
+}
+
+/// Parse one entry object in the strict form of a repair entry
+/// (`PROTOCOL.md` 10.9): an export file line (section 15).
+///
+/// # Errors
+///
+/// Refuses text that is not one entry object with `position` and one of
+/// `envelope` and `stub`, or that has an unknown field.
+pub fn parse_entry(text: &[u8]) -> Result<(u64, RepairItem), WireError> {
+    let item: RequestItem<'_> =
+        serde_json::from_slice(text).map_err(|e| bad(format!("entry: {e}")))?;
+    let mut v = repair_entries(vec![item], 1)?;
+    v.pop().ok_or_else(|| bad("entry: empty"))
+}
+
 /// The body of `GET /v1/info` (`PROTOCOL.md` 10.4).
 #[must_use]
 pub fn info_body(levels: &[u64], limits: &Limits, time: u64) -> Vec<u8> {

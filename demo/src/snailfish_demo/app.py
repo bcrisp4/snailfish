@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import sqlite3
 import time
 from typing import TYPE_CHECKING, Any, Protocol
@@ -164,6 +165,12 @@ class FileKeyStore(sf.KeyStore):
         items = self._items()
         items[account] = secret.hex()
         write_private(self.path, json.dumps(items))
+
+    def delete(self, account: str) -> None:
+        """Remove the item of `account`, durably, if it exists."""
+        items = self._items()
+        if items.pop(account, None) is not None:
+            write_private(self.path, json.dumps(items))
 
 
 def key_store(data_dir: Path) -> FileKeyStore:
@@ -859,3 +866,194 @@ def iter_tasks(state: dict[str, dict[str, Any]]) -> Iterator[str]:
     for task, f in sorted(state.items()):
         mark = "x" if f.get("done") else " "
         yield f"[{mark}] {task}: {f.get('title', '')}"
+
+
+# ---------------------------------------------------------------- M9
+# Deletion, export, import, a move to another relay and fork repair
+# (PROTOCOL.md 10.12, 10.13 and section 15, DESIGN.md "Fork repair").
+
+OLD_ENGINE = "engine-old"
+
+
+class ImportError_(Exception):
+    """The relay refused an import, or the space is not in the account."""
+
+
+def run_import(imp: sf.Import, send: Transport) -> None:
+    """Run an import session (PROTOCOL.md 10.13) until it ends.
+
+    Raises:
+        ImportError_: The relay refused a request, with its error code.
+    """
+    try:
+        while (req := imp.next_request()) is not None:
+            imp.handle_response(*send(req))
+    except sf.SnailfishError.Refused as e:
+        raise ImportError_(str(e)) from e
+
+
+def delete_space(dev: Device, send: Transport) -> sf.Status:
+    """Delete the space on the relay ([LOG-13], [FRK-4]). The device syncs
+    first, because the statement names the verified head. Each device keeps
+    its data. Returns `stopped: deleted` on success."""
+    dev.sync(send)
+    req = dev.engine.delete_request()
+    dev.engine.handle_delete_response(*send(req))
+    return dev.engine.status()
+
+
+def export_log(dev: Device, path: Path) -> int:
+    """Write the export file of the verified log ([FRK-3], section 15).
+    Returns the head position."""
+    data = dev.engine.export_log()
+    write_private(path, data.decode())
+    return dev.engine.verified_head().position
+
+
+def _engine_token(
+    engine: sf.Engine, relay_url: str, redirect_uri: str, browser: Browser, send: Transport
+) -> sf.SetupToken:
+    """A setup token for the device keys of `engine` on `relay_url`."""
+    si = sf.SignIn(relay_url, redirect_uri)
+    redirect = browser(si.authorize_url())
+    for _ in range(2):
+        status, headers, body = send(
+            si.token_request_for_engine(redirect, engine, int(time.time()))
+        )
+        try:
+            return si.read_token(status, headers, body)
+        except sf.SnailfishError.Invalid as e:
+            # PROTOCOL.md 8.5: after `expired`, send once more with the relay time.
+            if "expired" not in str(e):
+                raise
+    raise ImportError_("the sign-in failed twice with expired")
+
+
+def _save_space(data_dir: Path, space: sf.SpaceRef) -> None:
+    write_private(
+        data_dir / "space.json",
+        json.dumps(
+            {
+                "relay_url": space.relay_url,
+                "tenant": space.tenant,
+                "log_id": space.log_id,
+                "app_id": space.app_id,
+            }
+        ),
+    )
+
+
+def import_space(
+    dev: Device, relay_url: str, redirect_uri: str, browser: Browser, send: Transport
+) -> sf.SpaceRef:
+    """Import the verified log into the relay at `relay_url` ([FRK-5]): the
+    same relay after a deletion, or a new relay. The user signs in there.
+    The device then uses that relay. Returns the new space reference."""
+    token = _engine_token(dev.engine, relay_url, redirect_uri, browser, send)
+    target = sf.SpaceRef(
+        relay_url=relay_url, tenant=token.tenant, log_id=dev.space.log_id, app_id=APP_ID
+    )
+    run_import(dev.engine.import_space(target, token.token), send)
+    _save_space(dev.dir, target)
+    return target
+
+
+def switch_relay(
+    dev: Device, relay_url: str, redirect_uri: str, browser: Browser, send: Transport
+) -> sf.SpaceRef:
+    """Use the space on another relay after a move ([FRK-5]). The device
+    keeps its state file: its verified log is the imported log.
+
+    Raises:
+        ImportError_: The account on that relay holds no space of this log.
+    """
+    token = _engine_token(dev.engine, relay_url, redirect_uri, browser, send)
+    if not any(s.log_id == dev.space.log_id for s in token.spaces):
+        raise ImportError_("the account on that relay holds no space of this log")
+    target = sf.SpaceRef(
+        relay_url=relay_url, tenant=token.tenant, log_id=dev.space.log_id, app_id=APP_ID
+    )
+    _save_space(dev.dir, target)
+    return target
+
+
+def prepare_rejoin(data_dir: Path, log_id: str) -> None:
+    """FRK-6: keep the key item and the state file of the old engine before
+    the device enrolls again. The enrollment writes new keys and a new state
+    file. The app database stays."""
+    old = data_dir / OLD_ENGINE
+    if old.exists():
+        # An earlier rejoin stopped before its recovery. The old key item
+        # and state file are in place. A new copy would hold the new keys.
+        return
+    sf.keep_old_keys(key_store(data_dir), log_id)
+    (data_dir / "engine").rename(old)
+
+
+def first_exchange(engine: sf.Engine, send: Transport) -> sf.Status:
+    """One exchange with no pull. A new state file checks its enrollment
+    checkpoint and opens the app key in it ([ENR-9])."""
+    exchange = engine.start_sync()
+    while (req := exchange.next_request()) is not None:
+        exchange.handle_response(*send(req))
+    return engine.status()
+
+
+def recover_fork(data_dir: Path, space: sf.SpaceRef, engine: sf.Engine) -> int:
+    """FRK-7 and FRK-8: write an outbox row for each own change that only the
+    old state file holds, with its old change ID. The app writes the rows
+    before its next pull, because that pull raises ResetRequired and the
+    reset applies each outbox row again. The old state file goes only after
+    the commit, so a crash before that point runs the comparison again with
+    the same result.
+
+    Returns:
+        The number of recovered changes.
+    """
+    old_dir = data_dir / OLD_ENGINE
+    if not old_dir.exists():
+        return 0
+    old = sf.Engine.open_old(str(old_dir), space, key_store(data_dir))
+    rows = engine.fork_changes(old)
+    db = sqlite3.connect(data_dir / "app.sqlite3", isolation_level=None)
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA fullfsync=ON")
+        db.execute("BEGIN IMMEDIATE")
+        seq = db.execute("SELECT coalesce(max(seq), 0) FROM outbox").fetchone()[0]
+        for r in rows:
+            seq += 1
+            db.execute(
+                "INSERT OR IGNORE INTO outbox (change_id, change_bytes, seq) VALUES (?, ?, ?)",
+                (bytes(r.change_id), bytes(r.change_bytes), seq),
+            )
+        db.execute("COMMIT")
+    finally:
+        db.close()
+    del old
+    shutil.rmtree(old_dir)
+    key_store(data_dir).delete(f"{space.log_id}.old")
+    return len(rows)
+
+
+def restore_from_file(
+    relay_url: str,
+    data_dir: Path,
+    name: str,
+    file: Path,
+    recovery_key: str,
+    redirect_uri: str,
+    browser: Browser,
+    send: Transport,
+) -> Device:
+    """DESIGN.md "Data retention": after the loss of every device and of the
+    relay copy, import the export file and recover the space with the paper
+    recovery key on a new device."""
+    data = file.read_bytes()
+    log_id = json.loads(data.split(b"\n", 1)[0])["log"]
+    keys = sf.new_device_keys()
+    token = sign_in(relay_url, keys, redirect_uri, browser, send)
+    space = sf.SpaceRef(relay_url=relay_url, tenant=token.tenant, log_id=log_id, app_id=APP_ID)
+    run_import(sf.import_file(data, space, keys, token.token, recovery_key), send)
+    return recover(relay_url, data_dir, name, recovery_key, redirect_uri, browser, send)

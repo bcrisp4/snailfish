@@ -9,10 +9,10 @@ Tasks is the SwiftUI version of the demo task app (DESIGN.md M6). It runs on iOS
 | `Tasks/KeychainKeyStore.swift` | The `key_store` of the app: the data protection keychain, fail-closed (C62). |
 | `Tasks/SignInFlow.swift` | The native sign-in with `ASWebAuthenticationSession` and the first-device setup (S1). |
 | `Tasks/EnrollmentFlow.swift`, `Tasks/QRCode.swift` | QR enrollment in both directions (S2). |
-| `Tasks/AppModel.swift`, `Tasks/ContentView.swift` | Removal of a lost device (S4), recovery key replacement (T9) and full recovery with the paper recovery key (S5), `PROTOCOL.md` section 13. |
+| `Tasks/AppModel.swift`, `Tasks/ContentView.swift` | Removal of a lost device (S4), recovery key replacement (T9) and full recovery with the paper recovery key (S5), `PROTOCOL.md` section 13. Fork repair (DESIGN.md "Fork repair"): the source deletes the space and imports its copy, and each other device joins again. |
 | `Tasks/Measurements.swift` | The sync delay log and the durable commit benchmark. |
 | `Tasks/UITestSeam.swift` | The test seam of the UI tests, in Debug builds only. The sign-in goes to `tools/approver.py`, and the scan screen takes the QR payload as text. |
-| `TasksUITests/AppFlowTests.swift` | The UI tests: S4, S5 and the recovery key replacement through the screens. |
+| `TasksUITests/AppFlowTests.swift` | The UI tests: S4, S5, the recovery key replacement and the fork repair through the screens. |
 | `tools/approver.py` | The passkey step of the sign-in for the tests, because the simulator cannot make a passkey. It also drives a Python demo device and the user page, so a test can share a space with the demo and block a device. |
 
 ## Build and test

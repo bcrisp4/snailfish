@@ -31,7 +31,9 @@ use crate::store::{self, Kind, StoreError};
 
 pub mod compact;
 mod enroll;
+mod lifecycle;
 mod setup;
+mod stats;
 pub mod user;
 
 pub use user::Quotas;
@@ -201,6 +203,7 @@ impl Response {
     /// A JSON error response for the edge (`PROTOCOL.md` 10.3).
     #[must_use]
     pub fn error(status: u16, code: &str, message: &str, time: u64) -> Self {
+        crate::metrics::record_error(code);
         Self {
             status,
             body: wire::error_body(code, message),
@@ -263,12 +266,14 @@ fn internal() -> ApiError {
 
 impl From<StoreError> for ApiError {
     fn from(_: StoreError) -> Self {
+        crate::metrics::STORAGE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         internal()
     }
 }
 
 impl From<rusqlite::Error> for ApiError {
     fn from(_: rusqlite::Error) -> Self {
+        crate::metrics::STORAGE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         internal()
     }
 }
@@ -369,6 +374,28 @@ impl Relay {
             cfg: Arc::new(cfg),
             auth: Arc::new(auth),
         })
+    }
+
+    /// The startup work of [STO-5] and [STO-6] in each tenant directory:
+    /// delete the files of each import session, finish the rename of an
+    /// imported space, and delete each marked space file. Only `serve` runs
+    /// it, after it holds the serve lock: an operator command opens the
+    /// relay while `serve` runs, and must not end a live import session.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    pub fn sweep(&self) -> Result<(), StoreError> {
+        let d = self.directory()?;
+        let mut st = d.prepare("SELECT tenant_id FROM tenants")?;
+        let ids: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for id in ids {
+            let t = self.tenant_by_id(id)?;
+            if t.db().exists() {
+                lifecycle::sweep_tenant(&t)?;
+            }
+        }
+        Ok(())
     }
 
     /// The configuration.
@@ -511,6 +538,16 @@ impl Relay {
             }
             ("POST", ["", "v1", "t", t, "s", l, "repair", "finish"]) => {
                 self.repair(req, now, t, l, RepairRoute::Finish)
+            }
+            ("POST", ["", "v1", "t", t, "s", l, "delete"]) => self.delete_space(req, now, t, l),
+            ("POST", ["", "v1", "t", t, "s", l, "import"]) => {
+                self.import(req, now, t, l, RepairRoute::Start)
+            }
+            ("POST", ["", "v1", "t", t, "s", l, "import", "chunk"]) => {
+                self.import(req, now, t, l, RepairRoute::Chunk)
+            }
+            ("POST", ["", "v1", "t", t, "s", l, "import", "finish"]) => {
+                self.import(req, now, t, l, RepairRoute::Finish)
             }
             ("POST", ["", "v1", "t", t, "s", l, "enroll"]) => self.enroll_open(req, now, t, l),
             ("GET", ["", "v1", "t", t, "s", l, "enroll", e]) => {
@@ -719,6 +756,10 @@ impl Relay {
                 "the space exists with another genesis record",
             ));
         }
+        // 10.5 step 2 ([LOG-13]): no device makes a deleted space again.
+        if lifecycle::has_marker(&tx, log)? {
+            return Err(api(410, "deleted", "the space is deleted"));
+        }
         // 10.5 steps 3 and 4 ([USR-6], [QTA-5]).
         self.check_setup(&tenant, &body.setup, &v.keyid, now)?;
         let spaces: i64 = tx.query_row(
@@ -858,13 +899,8 @@ impl Relay {
             )
         })?;
         let tc = store::open(&tenant.db(), Kind::Tenant, false)?;
-        let path = Self::space_file(&tenant, &tc, log)?.ok_or_else(|| {
-            api(
-                404,
-                "unknown_space",
-                "the tenant has no space with this log ID",
-            )
-        })?;
+        let path = Self::space_file(&tenant, &tc, log)?
+            .ok_or_else(|| lifecycle::missing_space(&tc, log))?;
         let hold = hold_since(&tc, log)?.is_some();
         let space_bytes = user::limits(&tc, &self.cfg.quotas)?.space_bytes;
         let blocked = match signer {
@@ -937,6 +973,7 @@ impl Relay {
             quota,
             snapshot_limit,
             reserve: self.cfg.security_reserve,
+            daily: true,
         };
         // The stored records go to the tables after the checks, so the
         // checks read the log as it was before the request, and the overlay
@@ -947,7 +984,7 @@ impl Relay {
             let mut view = snailfish_protocol::space::Overlay::new(&base);
             for item in items {
                 let Ok(raw) = item else {
-                    results.push(AppendResult::Refused("invalid_record".into()));
+                    results.push(with_metrics(AppendResult::Refused("invalid_record".into())));
                     continue;
                 };
                 let mode = Mode::Relay {
@@ -959,7 +996,7 @@ impl Relay {
                 let verdict = check_append_at(&view, &raw.envelope, mode, &self.cfg.levels);
                 base.take_error()?;
                 let len = raw.json.len() as u64;
-                results.push(match verdict {
+                results.push(with_metrics(match verdict {
                     Verdict::Store(acc) if let Some(code) = budget.refusal(&acc.record, len) => {
                         AppendResult::Refused(code.into())
                     }
@@ -973,7 +1010,7 @@ impl Relay {
                     Verdict::Known(p) => AppendResult::Known(p),
                     Verdict::Conflict(p) => AppendResult::Conflict(p),
                     Verdict::Refused(r) => AppendResult::Refused(r.code().to_owned()),
-                });
+                }));
             }
             view.into_added()
         };
@@ -1210,6 +1247,14 @@ impl Relay {
     }
 }
 
+/// Count a refused envelope in the metrics (signal 2).
+fn with_metrics(r: AppendResult) -> AppendResult {
+    if let AppendResult::Refused(code) = &r {
+        crate::metrics::record_refusal(code);
+    }
+    r
+}
+
 /// Store the security record count of `signer` in the relay day `day`
 /// ([STO-15]) and drop the counts of earlier days.
 fn save_today(tx: &Connection, signer: &str, day: i64, today: u64) -> Result<(), StoreError> {
@@ -1231,6 +1276,9 @@ struct Budget {
     quota: u64,
     snapshot_limit: u64,
     reserve: u64,
+    /// Step 15 applies: false for an import, whose records were stored
+    /// before (10.13 start step 6).
+    daily: bool,
 }
 
 impl Budget {
@@ -1243,7 +1291,7 @@ impl Budget {
             return Some("reserve");
         }
         // Step 15 ([STO-15], T10): the daily limit of the request keyid.
-        if security && self.today >= SECURITY_PER_DAY {
+        if security && self.daily && self.today >= SECURITY_PER_DAY {
             return Some("security_limit");
         }
         // Step 16 ([QTA-1], [QTA-3], [CMP-18]): changes, snapshots and accept

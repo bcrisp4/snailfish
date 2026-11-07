@@ -47,6 +47,17 @@ async fn health_and_info_are_unsigned_and_carry_the_time() {
     assert_eq!(info.limits, common::limits_of(&fx.h));
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["time"], now);
+    // Signal 2: the HTTP edge counts each response by its class. nextest
+    // runs each test in its own process, so the count starts at 0.
+    let page = fx.relay.metrics_text().unwrap();
+    assert!(
+        page.contains("snailfish_requests_total{class=\"2xx\"} 2\n"),
+        "{page}"
+    );
+    assert!(
+        page.contains("snailfish_requests_total{class=\"5xx\"} 0\n"),
+        "{page}"
+    );
 }
 
 #[tokio::test]

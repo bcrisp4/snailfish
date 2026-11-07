@@ -162,6 +162,60 @@ final class AppFlowTests: XCTestCase {
         waitForMessage(again, "The devices are removed, and the key is new.")
     }
 
+    // MARK: Fork repair
+
+    /// `specs/forkrepair/test.qnt::repairTest` ([FRK-1] to [FRK-8]): the app
+    /// writes "only on the app", applies it back, and the relay loses it
+    /// with no hold. The Python device writes "on python" at the same
+    /// position, and the app shows `stopped: fork` with the next step. The
+    /// Python device is the source: it deletes the space and imports its
+    /// log. The app joins again from it through the screens, gets its own
+    /// change back from the old engine state, and sends it again with its
+    /// old change ID. Both devices end with both tasks.
+    func testForkRepairJoinsAgainFromTheSource() async throws {
+        try await pythonSpace()
+        let app = launch()
+        try await joinPythonSpace(app)
+        let synced = try await py.call("POST", "sync")
+        XCTAssertEqual(synced, "ok")
+        let head = try await py.call("GET", "head")
+
+        // The edit starts a sync. The cut waits until the app reports that
+        // it applied the change back, so its app outbox row is gone.
+        type(app, "new-task", "only on the app")
+        tap(app, "add-task")
+        XCTAssertTrue(texts(app)["only on the app"].waitForExistence(timeout: timeout))
+        try await py.call("POST", "cut", ["keep": head, "wait": "1"])
+        try await py.call("POST", "edit", ["task": "p1", "field": "title", "value": #""on python""#])
+        let wrote = try await py.call("POST", "sync")
+        XCTAssertEqual(wrote, "ok")
+
+        // [FRK-1]: the sync loop finds the fork.
+        waitForStatus(app, "stopped: fork")
+        XCTAssertTrue(texts(app)["sync-next-step"].exists)
+
+        // [FRK-4], [FRK-5] on the source.
+        let deleted = try await py.call("POST", "delete")
+        XCTAssertTrue(deleted.contains("DELETED"), deleted)
+        try await py.call("POST", "import")
+        let imported = try await py.call("POST", "sync")
+        XCTAssertEqual(imported, "ok")
+
+        // [FRK-6] to [FRK-8] on the app.
+        try await enrollFromPython(app, button: "rejoin-scan")
+        waitForMessage(app, "This device joined again and sent 1 of its own changes again.")
+        waitForStatus(app, "ok")
+        XCTAssertFalse(texts(app)["sync-next-step"].exists)
+        XCTAssertTrue(texts(app)["on python"].waitForExistence(timeout: timeout))
+        XCTAssertTrue(texts(app)["only on the app"].exists)
+
+        let after = try await py.call("POST", "sync")
+        XCTAssertEqual(after, "ok")
+        let data = Data(try await py.call("GET", "tasks").utf8)
+        let got = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: [String: Any]])
+        XCTAssertEqual(Set(got.values.compactMap { $0["title"] as? String }), ["on python", "only on the app"])
+    }
+
     // MARK: Steps
 
     private func launch(data: String = UUID().uuidString, fault: String? = nil) -> XCUIApplication {
@@ -196,9 +250,17 @@ final class AppFlowTests: XCTestCase {
     /// S2: the Python device shows the session, and the app scans its
     /// payload. Each side confirms only if the codes match ([ENR-7]).
     private func joinPythonSpace(_ app: XCUIApplication) async throws {
+        try await enrollFromPython(app, button: "join-scan")
+        waitForMessage(app, "This device joined.")
+        waitForStatus(app, "ok")
+    }
+
+    /// The enrollment of S2 with the Python device as the trusted device.
+    /// `button` starts the scan in the sync settings of the app.
+    private func enrollFromPython(_ app: XCUIApplication, button: String) async throws {
         let payload = try await py.call("POST", "invite")
         openSettings(app)
-        tap(app, "join-scan")
+        tap(app, button)
         type(app, "scan-payload", payload)
         tap(app, "scan-use")
         let code = texts(app)["compare-code"]
@@ -208,8 +270,6 @@ final class AppFlowTests: XCTestCase {
         tap(app, "compare-yes")
         let result = try await py.call("GET", "invite/result")
         XCTAssertEqual(result, "")
-        waitForMessage(app, "This device joined.")
-        waitForStatus(app, "ok")
     }
 
     /// S1: sign in, make the space, and type the recovery key back.
