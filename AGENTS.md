@@ -21,6 +21,8 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | An app screen or flow in `apps/apple/Tasks` | `apps/apple/README.md`, `apps/apple/TasksUITests/AppFlowTests.swift` | Extend the UI test for each new screen flow. Keep `Tasks/UITestSeam.swift` behind `#if DEBUG`, because it replaces the passkey and the camera. |
 | A metric, an alert rule, the proxy samples or the compose file (`ops/`) | `ops/prometheus/snailfish.rules.yml`, `docs/self-host.md` | Keep the metric names of `crates/relay/src/metrics.rs`, the rules and the guide equal. A renamed metric silences its alert. |
 | The binding API (`crates/bindings`) | `crates/engine/src/codec.rs`, `bindings/python/tests`, `bindings/swift/Tests` | Put logic in `snailfish-engine`, not in the binding. Run the shared vectors in each binding, because a marshalling fault passes the Rust tests. |
+| The Python package, `release-python.yml` or a release | `docs/release.md` | The PyPI trusted publisher names the workflow file and the `pypi` environment. A rename of either stops each upload. |
+| A workflow action or a Dockerfile base image | `.github/dependabot.yml` | Pin each action by commit SHA with its version as a comment, and each image by digest. A tag can move to other code. Dependabot updates the pins. |
 | Verification tools or CI | `specs/README.md`, the runner tests, and `.github/workflows/verify.yml` | Reject tool errors and incomplete runs. An expected counterexample must identify the intended property. |
 
 ### After a change

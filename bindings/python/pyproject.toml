@@ -1,9 +1,22 @@
 [project]
 name = "snailfish"
-version = "0.0.0"
+version = "0.1.0"
 description = "Python binding for the Snailfish sync engine."
+readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Ben Crisp" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Repository = "https://github.com/bcrisp4/snailfish"
+Issues = "https://github.com/bcrisp4/snailfish/issues"
 
 # The wheel holds the UniFFI module and the native library of
 # crates/bindings. maturin runs the uniffi-bindgen binary of the workspace, so
