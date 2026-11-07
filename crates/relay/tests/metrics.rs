@@ -17,8 +17,8 @@ fn value(text: &str, series: &str) -> u64 {
 }
 
 /// Signals 3 and 5: a space at its quota shows in the 80% and 95% gauges,
-/// and a quota refusal counts. The page names the user, not the tenant
-/// handle or the log ID. Without this, the quota alert of the rules file
+/// and a quota refusal counts. The page names the internal tenant ID, not
+/// the user name, the tenant handle or the log ID. Without this, the quota alert of the rules file
 /// could never fire.
 #[test]
 fn full_space_shows_in_the_quota_gauges_without_identifiers() {
@@ -69,7 +69,38 @@ fn full_space_shows_in_the_quota_gauges_without_identifiers() {
         0
     );
     assert!(value(&text, "snailfish_append_refusals_total{reason=\"quota\"}") >= 1);
-    assert!(value(&text, "snailfish_tenant_stored_bytes{user=\"sam\"}") > 0);
+    let tenant_id = fx
+        .tenant_db(fx.tenant())
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        value(
+            &text,
+            &format!("snailfish_tenant_stored_bytes{{tenant=\"{tenant_id}\"}}")
+        ) > 0
+    );
+    assert!(!text.contains("sam"), "a user name leaks");
+    // The value is the bytes on disk of the tenant directory, with the
+    // space file in its `spaces` subdirectory.
+    let tdir = fx.tenant_db(fx.tenant()).parent().unwrap().to_owned();
+    let floor = std::fs::metadata(fx.tenant_db(fx.tenant())).unwrap().len()
+        + std::fs::metadata(fx.space_file(fx.tenant())).unwrap().len();
+    let got = value(
+        &text,
+        &format!("snailfish_tenant_stored_bytes{{tenant=\"{tenant_id}\"}}"),
+    );
+    assert!(got >= floor, "{got} < {floor} in {}", tdir.display());
+    assert!(text.contains("# TYPE snailfish_space_stubs_max gauge\n"));
+    assert!(text.contains("# TYPE snailfish_requests_total counter\n"));
+    assert_eq!(
+        fx.relay.users().unwrap(),
+        vec![("sam".to_owned(), tenant_id)]
+    );
     assert!(value(&text, "snailfish_data_size_bytes") > 0);
     assert!(!text.contains(fx.tenant()), "the tenant handle leaks");
     assert!(!text.contains(fx.log()), "the log ID leaks");

@@ -34,18 +34,35 @@ impl Relay {
         Ok(crate::metrics::render(&self.gauges()?))
     }
 
+    /// Each user name with its internal tenant ID, in name order: the map
+    /// of the label of `snailfish_tenant_stored_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    pub fn users(&self) -> Result<Vec<(String, String)>, super::OpenError> {
+        let d = self.directory()?;
+        let mut st = d
+            .prepare("SELECT name, tenant_id FROM users ORDER BY name")
+            .map_err(StoreError::from)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(StoreError::from)?
+            .collect::<Result<_, _>>()
+            .map_err(StoreError::from)?;
+        Ok(rows)
+    }
+
     fn gauges(&self) -> Result<Gauges, StoreError> {
         let mut g = Gauges::default();
         let d = self.directory()?;
-        let mut st = d.prepare("SELECT name, tenant_id FROM users ORDER BY name")?;
-        let users: Vec<(String, String)> = st
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?;
+        let mut st = d.prepare("SELECT tenant_id FROM users ORDER BY tenant_id")?;
+        let ids: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
         drop(st);
         drop(d);
-        for (name, id) in users {
+        for id in ids {
             let t = self.tenant_by_id(id)?;
-            g.tenant_bytes.insert(name, dir_bytes(&t.dir));
+            g.tenant_bytes.insert(t.id.clone(), dir_bytes(&t.dir));
             let tc = store::open(&t.db(), Kind::Tenant, false)?;
             let quota = user::limits(&tc, &self.cfg.quotas)?.space_bytes;
             let mut st = tc.prepare("SELECT file_name FROM spaces WHERE status = 'active'")?;

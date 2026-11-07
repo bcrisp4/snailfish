@@ -4,8 +4,11 @@
 //! Counters are process-wide, because one relay process serves one data
 //! directory. Gauges come from the data directory at each scrape. No label
 //! holds a tenant handle, a log ID, a device ID or an app ID. The one
-//! exception is the per-tenant storage figure, which carries the user name
-//! of `snailfish-relay user add` (DESIGN.md "Monitoring and alerting").
+//! exception is the per-tenant storage figure, which carries the internal
+//! tenant ID: the name of `data/tenants/<id>`. It is not a user name and not
+//! the tenant handle, which is a routing credential ([STO-10]).
+//! `snailfish-relay user list` maps it to the user (DESIGN.md "Monitoring
+//! and alerting").
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -113,7 +116,7 @@ pub fn record_refusal(reason: &str) {
 /// The gauges of one scrape, from the data directory.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Gauges {
-    /// Bytes on disk of each tenant, by user name.
+    /// Bytes on disk of each tenant, by internal tenant ID.
     pub tenant_bytes: BTreeMap<String, u64>,
     /// Spaces at or above 80% and 95% of their quota.
     pub above_80: u64,
@@ -227,13 +230,13 @@ fn gauges(out: &mut String, g: &Gauges) {
         out,
         "snailfish_tenant_stored_bytes",
         "gauge",
-        "Bytes on disk of each tenant, by user name.",
+        "Bytes on disk of each tenant, by internal tenant ID.",
     );
-    for (user, n) in &g.tenant_bytes {
+    for (tenant, n) in &g.tenant_bytes {
         let _ = writeln!(
             out,
-            "snailfish_tenant_stored_bytes{{user=\"{}\"}} {n}",
-            escape(user)
+            "snailfish_tenant_stored_bytes{{tenant=\"{}\"}} {n}",
+            escape(tenant)
         );
     }
     metric(
@@ -311,11 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn user_label_is_escaped() {
+    fn tenant_label_is_escaped() {
         let g = Gauges {
             tenant_bytes: BTreeMap::from([("a\"b\\c\nd".to_owned(), 1)]),
             ..Gauges::default()
         };
-        assert!(render(&g).contains("user=\"a\\\"b\\\\c\\nd\"} 1"));
+        assert!(render(&g).contains("tenant=\"a\\\"b\\\\c\\nd\"} 1"));
     }
 }

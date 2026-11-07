@@ -101,7 +101,11 @@ The rules alert on these conditions:
 | `SnailfishDiskFull` | Less than 10% of the data file system is free |
 | `SnailfishStorageError`, `SnailfishMigrationFailed` | A storage error or a failed schema migration |
 
-The metrics hold no tenant handle, log ID or device ID. The storage figure of each tenant carries the user name.
+The metrics hold no user name, tenant handle, log ID or device ID. The storage figure of each tenant carries the internal tenant ID. Find its user with this command.
+
+```bash
+docker compose exec relay snailfish-relay user list
+```
 
 ## Back up and restore
 

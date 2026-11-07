@@ -32,7 +32,8 @@ ALERTS = (
 QUOTA_SUMMARY = "A space uses more than 95% of its quota."
 QUOTA_DESCRIPTION = (
     "1 spaces on relay use more than 95% of their quota. At the quota, the relay refuses "
-    "appends. Find the user in snailfish_tenant_stored_bytes. Raise the quota with "
+    "appends. Find the tenant in snailfish_tenant_stored_bytes and its user with "
+    "`snailfish-relay user list`. Raise the quota with "
     "`snailfish-relay quota <user>`, or ask the user to delete data."
 )
 

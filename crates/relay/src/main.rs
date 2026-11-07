@@ -187,6 +187,9 @@ enum UserAction {
         /// The user name.
         name: String,
     },
+    /// Print each user with its internal tenant ID, the label of the
+    /// per-tenant storage metric.
+    List,
 }
 
 /// `snailfish-relay space`: the operator commands of one space. They need
@@ -237,13 +240,7 @@ async fn main() -> ExitCode {
     let need_authority =
         || fail("set --authority or SNAILFISH_AUTHORITY: the relay does not start without it");
     match cli.command {
-        Command::User { action } => {
-            // The invite link names the origin of the user page.
-            let Some(a) = authority else {
-                return need_authority();
-            };
-            user_command(config(&a), action)
-        }
+        Command::User { action } => user_command(authority.as_deref(), &config, action),
         Command::Quota {
             user,
             spaces,
@@ -330,10 +327,31 @@ fn parse_proxies(list: &[String]) -> Result<Vec<std::net::IpAddr>, String> {
 }
 
 /// `user add` and `user invite`: print the invite link.
-fn user_command(config: Config, action: UserAction) -> ExitCode {
-    let made = Relay::open(config).and_then(|r| match action {
+fn user_command(
+    authority: Option<&str>,
+    config: &dyn Fn(&str) -> Config,
+    action: UserAction,
+) -> ExitCode {
+    // An invite link names the origin of the user page. `list` needs no
+    // authority.
+    let a = match (authority, &action) {
+        (Some(a), _) => a,
+        (None, UserAction::List) => "unused.invalid",
+        (None, _) => {
+            return fail(
+                "set --authority or SNAILFISH_AUTHORITY: the relay does not start without it",
+            );
+        }
+    };
+    let made = Relay::open(config(a)).and_then(|r| match action {
         UserAction::Add { name } => r.add_user(&name).and_then(|_| r.invite(&name)),
         UserAction::Invite { name } => r.invite(&name),
+        UserAction::List => r.users().map(|u| {
+            u.iter()
+                .map(|(name, id)| format!("{name} {id}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
     });
     match made {
         Ok(link) => {

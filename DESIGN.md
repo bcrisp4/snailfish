@@ -674,7 +674,7 @@ Client-detected failures:
 
 13. Only devices can detect rollback, forks, gaps and bad signatures, because only devices verify the log. The sync engine reports these failures to the host app in the sync status (see Sync status). The app shows them to the user. The relay never receives a report with content.
 
-Metrics hold no tenant, device or app identifiers. The exceptions are the user's own view and the per-tenant storage figure for the relay operator, which carries the user name of `snailfish-relay user add`, not the tenant handle. The stub figures are a sum and a maximum over all spaces.
+Metrics hold no tenant, device or app identifiers. The exceptions are the user's own view and the per-tenant storage figure for the relay operator, which carries the internal tenant ID. It is not PII and not the tenant handle, which is the routing credential of the tenant (see "Relay storage"). `snailfish-relay user list` maps it to the user. The stub figures are a sum and a maximum over all spaces.
 
 ## Security
 

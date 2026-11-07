@@ -49,7 +49,7 @@ groups:
           severity: warning
         annotations:
           summary: A space uses more than 95% of its quota.
-          description: "{{ $value }} spaces on {{ $labels.instance }} use more than 95% of their quota. At the quota, the relay refuses appends. Find the user in snailfish_tenant_stored_bytes. Raise the quota with `snailfish-relay quota <user>`, or ask the user to delete data."
+          description: "{{ $value }} spaces on {{ $labels.instance }} use more than 95% of their quota. At the quota, the relay refuses appends. Find the tenant in snailfish_tenant_stored_bytes and its user with `snailfish-relay user list`. Raise the quota with `snailfish-relay quota <user>`, or ask the user to delete data."
 
       - alert: SnailfishSpaceAboveReserve
         expr: max without (ratio) (snailfish_spaces_above_reserve{ratio="0.5"}) > 0
