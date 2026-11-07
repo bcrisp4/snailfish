@@ -368,6 +368,20 @@ fn import_chunks_are_full_and_fit_the_limits() {
         .collect();
     let start = wire::import_start_body(&token, &device, &[]).unwrap().len();
     let chunk = wire::repair_chunk_body(&[0; 16], &[]).unwrap().len();
+    // A limit that 5 entries fill exactly: the fifth entry still fits, and
+    // the sixth goes to the next chunk.
+    let exact: usize = start
+        + entries[..5]
+            .iter()
+            .map(|(p, e)| wire::entry_json(*p, e).unwrap().len() + 1)
+            .sum::<usize>();
+    let at_limit = Limits {
+        max_request_bytes: exact as u64,
+        max_append_envelopes: 100,
+        ..Limits::default()
+    };
+    let got = crate::lifecycle::chunks(&entries, &at_limit, start, chunk).unwrap();
+    assert_eq!(got[0].len(), 5);
     for (max, n_max) in [(start + 600, 100usize), (start + 3000, 7), (8192, 100)] {
         let limits = Limits {
             max_request_bytes: max as u64,
