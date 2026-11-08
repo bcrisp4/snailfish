@@ -111,8 +111,10 @@ verify-tools:
 	uv run --with pytest pytest -q specs/tools/tests
 
 ## Check workflow syntax, expressions, and action inputs before a merge.
+## zizmor finds security faults, for example template injection.
 verify-workflows:
 	mise exec -- actionlint
+	mise exec -- zizmor --offline .github/workflows
 
 ## Check the syntax of the Prometheus alert rules, then run their unit tests.
 test-rules:

@@ -97,7 +97,9 @@ jobs:
         run: |
           id=$(bindings/scripts/ios-sim.sh)
           echo "id=$id" >> "$GITHUB_OUTPUT"
-      - run: make test-swift DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=${{ steps.sim.outputs.id }}"
+      - run: make test-swift DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=$SIM_ID"
+        env:
+          SIM_ID: ${{ steps.sim.outputs.id }}
 
   app:
     # DESIGN.md M6: the Swift sample app on an iOS simulator and on macOS,
@@ -123,7 +125,9 @@ jobs:
         run: |
           id=$(bindings/scripts/ios-sim.sh)
           echo "id=$id" >> "$GITHUB_OUTPUT"
-      - run: make test-app DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=${{ steps.sim.outputs.id }}"
+      - run: make test-app DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=$SIM_ID"
+        env:
+          SIM_ID: ${{ steps.sim.outputs.id }}
 
   image:
     # DESIGN.md "Relay deployment": the static musl image for each
@@ -226,7 +230,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
       - run: make verify-tools
-      - run: mise exec -- uv run --script specs/tools/verify.py full ${{ matrix.model }} --samples 5000
+      - run: mise exec -- uv run --script specs/tools/verify.py full "$MODEL" --samples 5000
+        env:
+          MODEL: ${{ matrix.model }}
 
   deep-quint:
     # Apalache and TLC, one job per model.
@@ -247,7 +253,9 @@ jobs:
       - run: make quint-evaluator
         env:
           GH_TOKEN: ${{ github.token }}
-      - run: make verify-deep MODEL=${{ matrix.model }}
+      - run: make verify-deep MODEL="$MODEL"
+        env:
+          MODEL: ${{ matrix.model }}
 
   kani:
     runs-on: ubuntu-24.04
