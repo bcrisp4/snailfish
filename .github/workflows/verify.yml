@@ -46,6 +46,10 @@ jobs:
       # rust-toolchain.toml pins the stable toolchain. Install it explicitly.
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+      # Quint downloads its evaluator with no token and can reach the API rate limit.
+      - run: make quint-evaluator
+        env:
+          GH_TOKEN: ${{ github.token }}
       # Cache the dependency builds. cargo-mutants copies the tree without
       # target/, so the mutants job gets no gain from this cache. The fuzz
       # crate builds with the Kani nightly, so its name is part of the key.
@@ -93,7 +97,9 @@ jobs:
         run: |
           id=$(bindings/scripts/ios-sim.sh)
           echo "id=$id" >> "$GITHUB_OUTPUT"
-      - run: make test-swift DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=${{ steps.sim.outputs.id }}"
+      - run: make test-swift DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=$SIM_ID"
+        env:
+          SIM_ID: ${{ steps.sim.outputs.id }}
 
   app:
     # DESIGN.md M6: the Swift sample app on an iOS simulator and on macOS,
@@ -119,7 +125,9 @@ jobs:
         run: |
           id=$(bindings/scripts/ios-sim.sh)
           echo "id=$id" >> "$GITHUB_OUTPUT"
-      - run: make test-app DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=${{ steps.sim.outputs.id }}"
+      - run: make test-app DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=$SIM_ID"
+        env:
+          SIM_ID: ${{ steps.sim.outputs.id }}
 
   image:
     # DESIGN.md "Relay deployment": the static musl image for each
@@ -217,8 +225,14 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+      # Quint downloads its evaluator with no token and can reach the API rate limit.
+      - run: make quint-evaluator
+        env:
+          GH_TOKEN: ${{ github.token }}
       - run: make verify-tools
-      - run: mise exec -- uv run --script specs/tools/verify.py full ${{ matrix.model }} --samples 5000
+      - run: mise exec -- uv run --script specs/tools/verify.py full "$MODEL" --samples 5000
+        env:
+          MODEL: ${{ matrix.model }}
 
   deep-quint:
     # Apalache and TLC, one job per model.
@@ -235,7 +249,13 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
       - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
-      - run: make verify-deep MODEL=${{ matrix.model }}
+      # Quint downloads its evaluator with no token and can reach the API rate limit.
+      - run: make quint-evaluator
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: make verify-deep MODEL="$MODEL"
+        env:
+          MODEL: ${{ matrix.model }}
 
   kani:
     runs-on: ubuntu-24.04
@@ -274,8 +294,10 @@ jobs:
     # suite, so one runner needs hours. A pull request and a push check the
     # mutants of the changed Rust code. The nightly run checks every mutant.
     # Sharding is by mutant index, so the shards cover each mutant once.
+    # The nightly run has about 480 mutants in each shard, and most shards
+    # take more than 2 hours.
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: ${{ github.event_name == 'schedule' && 300 || 120 }}
     strategy:
       fail-fast: false
       matrix:

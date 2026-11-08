@@ -21,6 +21,8 @@ taplo = "0.10.0"
 # The Xcode project of the Swift sample app (apps/apple/project.yml). macOS only.
 xcodegen = { version = "2.46.0", os = ["macos"] }
 actionlint = "1.7.12"
+# zizmor finds security faults in the GitHub workflows (make verify-workflows).
+"aqua:zizmorcore/zizmor" = "1.32.0"
 # promtool checks and tests ops/prometheus/snailfish.rules.yml (make test-rules).
 "aqua:prometheus/prometheus" = "3.15.1"
 

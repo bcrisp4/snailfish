@@ -56,7 +56,7 @@ endif
 
 .PHONY: vectors vectors-check bindings-python bindings-swift test-python test-swift test-demo test-browser test-powerloss \
         app-project test-app test-app-signed app-ios-device \
-        check verify-fast verify verify-deep verify-tools verify-workflows verify-drift \
+        check verify-fast verify verify-deep verify-tools verify-workflows verify-drift quint-evaluator \
         rust rust-lint rust-test rust-kani rust-fuzz rust-mutants rust-mutants-diff rust-deny \
         rust-nightly-check rust-nightly-components mutants-ramdisk mutants-tmpdir verify-crypto test-rules
 
@@ -83,13 +83,38 @@ verify: verify-tools $(if $(MODEL),,verify-crypto)
 verify-deep:
 	$(VERIFY) deep $(MODEL)
 
+## Install the Rust evaluator that Quint downloads on first use. Quint asks the
+## GitHub API with no token, and shared CI runners often reach the limit of 60
+## requests an hour. This target uses gh, so it uses GH_TOKEN. The version comes
+## from the installed Quint, so a Quint upgrade needs no change here.
+quint-evaluator:
+	@set -eu; \
+	src=$$(find "$$(mise where npm:@informalsystems/quint)" -path '*/quint/dist/src/rust/binaryManager.js' | head -n 1); \
+	ver=$$(sed -n "s/^exports.QUINT_EVALUATOR_VERSION = '\(.*\)';$$/\1/p" "$$src"); \
+	test -n "$$ver" || { echo "FAIL: no QUINT_EVALUATOR_VERSION in $$src"; exit 1; }; \
+	case "$$(uname -s)-$$(uname -m)" in \
+	  Linux-x86_64) asset=quint_evaluator-x86_64-unknown-linux-gnu.tar.gz ;; \
+	  Linux-aarch64) asset=quint_evaluator-aarch64-unknown-linux-gnu.tar.gz ;; \
+	  Darwin-arm64) asset=quint_evaluator-aarch64-apple-darwin.tar.gz ;; \
+	  Darwin-x86_64) asset=quint_evaluator-x86_64-apple-darwin.tar.gz ;; \
+	  *) echo "FAIL: no Quint evaluator for $$(uname -s) $$(uname -m)"; exit 1 ;; \
+	esac; \
+	dir="$${QUINT_HOME:-$$HOME/.quint}/rust-evaluator-$$ver"; \
+	if [ -x "$$dir/quint_evaluator" ]; then echo "Quint evaluator $$ver is installed"; exit 0; fi; \
+	mkdir -p "$$dir"; \
+	gh release download "evaluator/$$ver" -R quint-co/quint -p "$$asset" -O - | tar -xzf - -C "$$dir"; \
+	test -x "$$dir/quint_evaluator"; \
+	echo "Installed Quint evaluator $$ver in $$dir"
+
 ## Tests of the verification runner itself.
 verify-tools:
 	uv run --with pytest pytest -q specs/tools/tests
 
 ## Check workflow syntax, expressions, and action inputs before a merge.
+## zizmor finds security faults, for example template injection.
 verify-workflows:
 	mise exec -- actionlint
+	mise exec -- zizmor --offline .github/workflows
 
 ## Check the syntax of the Prometheus alert rules, then run their unit tests.
 test-rules:
