@@ -23,7 +23,7 @@ Issues = "https://github.com/bcrisp4/snailfish/issues"
 # the generated code matches the pinned UniFFI version. The release workflow
 # (.github/workflows/release-python.yml) builds one wheel for each platform.
 [build-system]
-requires = ["maturin==1.15.0"]
+requires = ["maturin==1.16.0"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -38,11 +38,11 @@ package = false
 [dependency-groups]
 # The tests sign in with the software browser of the demo (demo/src).
 dev = [
-  "pytest==9.1.1",
-  "ruff==0.17.2",
+  "pytest==9.2.0",
+  "ruff==0.17.3",
   "pyright==1.1.414",
-  "cbor2==5.7.1",
-  "cryptography==46.0.3",
+  "cbor2==6.1.5",
+  "cryptography==50.0.2",
 ]
 
 [tool.pytest.ini_options]
