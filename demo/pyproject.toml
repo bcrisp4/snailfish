@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "The Snailfish demo task app: a CLI on the Python binding."
 requires-python = ">=3.13"
 license = "MIT OR Apache-2.0"
-dependencies = ["httpx==0.28.1", "cbor2==6.1.5", "cryptography==50.0.2"]
+dependencies = ["httpx==0.28.1", "cbor2==6.2.0.post1", "cryptography==50.0.2"]
 
 [project.scripts]
 snailfish-demo = "snailfish_demo.cli:main"
