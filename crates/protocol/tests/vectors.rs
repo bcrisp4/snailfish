@@ -482,12 +482,13 @@ impl TryRng for Fixed {
 
 impl TryCryptoRng for Fixed {}
 
-fn hpke_case<K: hpke::Kem>(t: &Value) {
+/// `sk_bytes` maps the vector `skRm` to the bytes that hpke serializes.
+fn hpke_case<K: hpke::Kem>(t: &Value, sk_bytes: fn(Vec<u8>) -> Vec<u8>) {
     type A = hpke::aead::ChaCha20Poly1305;
     type F = hpke::kdf::HkdfSha256;
     let (sk, pk) = K::derive_keypair(&hex(&t["ikmR"]));
     assert_eq!(pk.to_bytes().to_vec(), hex(&t["pkRm"]));
-    assert_eq!(sk.to_bytes().to_vec(), hex(&t["skRm"]));
+    assert_eq!(sk.to_bytes().to_vec(), sk_bytes(hex(&t["skRm"])));
     let info = hex(&t["info"]);
     let (enc, mut sender) = hpke::setup_sender_with_rng::<A, F, K>(
         &hpke::OpModeS::Base,
@@ -521,7 +522,14 @@ fn hpke_rfc9180() {
     let v = load("third_party/hpke-rfc9180.json");
     let cases = v.as_array().unwrap();
     assert_eq!(cases.len(), 1);
-    hpke_case::<hpke::kem::X25519HkdfSha256>(&cases[0]);
+    // RFC 9180 gives the unclamped X25519 scalar. hpke 0.15 and later clamp
+    // it on serialization (RFC 7748 section 5). Both give the same key.
+    hpke_case::<hpke::kem::X25519HkdfSha256>(&cases[0], |mut sk| {
+        sk[0] &= 0xf8;
+        sk[31] &= 0x7f;
+        sk[31] |= 0x40;
+        sk
+    });
 }
 
 #[test]
@@ -530,5 +538,5 @@ fn hpke_pq_xwing() {
     let cases = v.as_array().unwrap();
     assert_eq!(cases.len(), 1);
     assert_eq!(cases[0]["kem_id"].as_u64(), Some(0x647a));
-    hpke_case::<hpke::kem::XWing>(&cases[0]);
+    hpke_case::<hpke::kem::XWing>(&cases[0], |sk| sk);
 }
