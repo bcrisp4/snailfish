@@ -32,3 +32,16 @@ A release is three binary wheels, one for each platform: macOS arm64, Linux x86_
 ## If a release is bad
 
 PyPI does not let you replace a file. Yank the version on pypi.org, so that a new install does not pick it. Then release the fix with the next version number.
+
+# Make a GitHub release
+
+The workflow `.github/workflows/release.yml` makes a GitHub release from a tag `v<version>`. The release notes come from the `## [<version>]` section of `CHANGELOG.md`. The tag ruleset "release tags" covers `refs/tags/v*`, so only an admin can create, move or delete the tag.
+
+## Steps
+
+1. In `CHANGELOG.md`, rename `## [Unreleased]` to `## [<version>] - <YYYY-MM-DD>`.
+2. Add an empty `## [Unreleased]` section above it.
+3. Merge the change to `main` through a pull request.
+4. Make the tag on the merge commit: `git tag -s v<version> <commit>`.
+5. Push the tag: `git push origin v<version>`.
+6. If the run fails with "has no section", add the section to `CHANGELOG.md`. Then make the tag again.
