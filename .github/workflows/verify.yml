@@ -108,7 +108,14 @@ jobs:
     # that a Release build has no UI test seam. The macOS keychain tests
     # check the fail-closed path, because an unsigned build has no keychain
     # entitlement.
-    runs-on: macos-15
+    #
+    # A booted iOS simulator keeps the 3-core runner at a load average of
+    # 500 to 700. On macos-15 the load stays high for the whole iOS test
+    # phase. A relay request of the approver then can take more than 10 s,
+    # and the test fails with "POST user: 502 TimeoutError". On macos-26
+    # the load falls in a few minutes, so the job boots the simulator
+    # before the build, and the tests start after the boot load.
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -125,6 +132,7 @@ jobs:
         run: |
           id=$(bindings/scripts/ios-sim.sh)
           echo "id=$id" >> "$GITHUB_OUTPUT"
+          xcrun simctl bootstatus "$id" -b
       - run: make test-app DEVELOPER_DIR="$(xcode-select -p)" IOS_SIM="platform=iOS Simulator,id=$SIM_ID"
         env:
           SIM_ID: ${{ steps.sim.outputs.id }}
