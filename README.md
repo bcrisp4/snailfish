@@ -9,7 +9,7 @@ Snailfish is a self-hosted sync system for local-first apps. It keeps the device
 
 ## Status
 
-Snailfish is pre-release. Milestones M1 to M9 of [DESIGN.md](DESIGN.md#milestones) are complete. The next step is the first public release.
+Version 0.1.0 is the first release. Milestones M1 to M9 of [DESIGN.md](DESIGN.md#milestones) are complete. See [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
 
 | Part | Path | State |
 | --- | --- | --- |
