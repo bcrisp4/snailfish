@@ -15,6 +15,12 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+    ignore:
+      # webauthn-rs 0.6 brings rsa 0.10.0-rc.19, which has RUSTSEC-2023-0071,
+      # so cargo deny fails. Remove this entry when webauthn-rs uses a stable
+      # rsa release with no open advisory.
+      - dependency-name: webauthn-rs
+        versions: [">= 0.6"]
 
   - package-ecosystem: uv
     directories: [/bindings/python, /demo]
