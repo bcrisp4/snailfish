@@ -41,7 +41,7 @@ dev = [
   "pytest==9.2.0",
   "ruff==0.17.3",
   "pyright==1.1.414",
-  "cbor2==6.1.5",
+  "cbor2==6.2.0.post1",
   "cryptography==50.0.2",
 ]
 
