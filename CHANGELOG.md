@@ -6,6 +6,10 @@ A tag `v<version>` makes a GitHub release with the notes of its section. The Pyt
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-08
+
+The first release. The protocol and the formats can change before 1.0.
+
 ### Added
 
 - The protocol in `PROTOCOL.md`, with shared test vectors for Rust, Go, Python and Swift.
