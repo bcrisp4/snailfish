@@ -45,7 +45,7 @@ jobs:
           fetch-depth: 0
       # rust-toolchain.toml pins the stable toolchain. Install it explicitly.
       - run: rustup toolchain install --profile minimal
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       # Quint downloads its evaluator with no token and can reach the API rate limit.
       - run: make quint-evaluator
         env:
@@ -86,7 +86,7 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
       - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       # One cache for the Apple jobs. The app job builds the Rust of this job
       # (the XCFramework) and the relay, so only the app job saves the cache.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -123,7 +123,7 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
       - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: apple
@@ -194,7 +194,7 @@ jobs:
           if [ -e /dev/kvm ] && [ ! -w /dev/kvm ]; then sudo chmod 0666 /dev/kvm; fi
           ls -l /dev/kvm || { echo "FAIL: this runner has no /dev/kvm"; exit 1; }
           test -w /dev/kvm
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/snailfish-qemu
@@ -232,7 +232,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       # Quint downloads its evaluator with no token and can reach the API rate limit.
       - run: make quint-evaluator
         env:
@@ -256,7 +256,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       # Quint downloads its evaluator with no token and can reach the API rate limit.
       - run: make quint-evaluator
         env:
@@ -273,7 +273,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       - run: mise exec -- cargo kani setup
       # A runner has 16 GB. decode_never_panics alone uses about 10.5 GB and
       # frame_layout about 9 GB, so two runs at once can stop the runner. One
@@ -294,7 +294,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes libgtk2.0-dev libexpat1-dev pkg-config
       - run: opam install proverif.2.05 --yes
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       - run: make verify-crypto
 
   mutants:
@@ -316,7 +316,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - run: rustup toolchain install --profile minimal
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       - if: github.event_name != 'schedule'
         run: make rust-mutants-diff BASE="$BASE" MUTANTS_JOBS=2 MUTANTS_SHARD=${{ matrix.shard }}/8
       - if: github.event_name == 'schedule'
@@ -333,7 +333,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       - id: nightly
         run: echo "name=$(sed -n 's/^NIGHTLY_NAME := //p' Makefile)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -353,7 +353,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install --profile minimal
-      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       - run: mise exec -- cargo kani setup
       - run: make rust-fuzz FUZZ_SECONDS=600
 
