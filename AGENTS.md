@@ -22,6 +22,7 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | A metric, an alert rule, the proxy samples or the compose file (`ops/`) | `ops/prometheus/snailfish.rules.yml`, `docs/self-host.md` | Keep the metric names of `crates/relay/src/metrics.rs`, the rules and the guide equal. A renamed metric silences its alert. |
 | The binding API (`crates/bindings`) | `crates/engine/src/codec.rs`, `bindings/python/tests`, `bindings/swift/Tests` | Put logic in `snailfish-engine`, not in the binding. Run the shared vectors in each binding, because a marshalling fault passes the Rust tests. |
 | The Python package, `release-python.yml` or a release | `docs/release.md` | The PyPI trusted publisher names the workflow file and the `pypi` environment. A rename of either stops each upload. |
+| The relay image: `Dockerfile`, `.dockerignore` or `publish-image.yml` | `docs/release.md` "Publish the relay image", the README "Container image" | The README verification commands name the workflow file and the image name. A rename makes each user verification fail. The power-loss build has its own ignore file, `tests/powerloss/Dockerfile.payload.dockerignore`. |
 | A workflow action or a Dockerfile base image | `.github/dependabot.yml` | Pin each action by commit SHA with its version as a comment, and each image by digest. A tag can move to other code. Dependabot updates the pins. |
 | Verification tools or CI | `specs/README.md`, the runner tests, and `.github/workflows/verify.yml` | Reject tool errors and incomplete runs. An expected counterexample must identify the intended property. |
 
@@ -44,7 +45,7 @@ Run `mise install` once. Use the pinned tools, not `cargo install`, `brew`, or `
 | After a change to `ops/prometheus` or a metric name | `make test-rules` | promtool loads the rules and fires each alert on test series. `make check` runs it. |
 | After a change to the user page or `APP_JS` | `make test-browser` | Chromium with a virtual WebAuthn authenticator runs the page script against a relay process. The first run downloads the Chromium build that `demo/uv.lock` pins, through Playwright. `make check` runs it too. |
 | Before a merge with engine, relay storage or demo changes | `make test-powerloss` | A SIGKILL of a VM finds a missing fsync that a process crash cannot find. `make check` runs only the process crash tests (`make test-demo`). |
-| Before a merge with `Dockerfile` or relay dependency changes | `docker build .` and the `image` CI job | The static musl and vendored OpenSSL build fails only in the container. |
+| Before a merge with `Dockerfile` or relay dependency changes | `docker build .`, then `tools/image-smoke-test.sh <image>`, and the `image` CI job | The static musl and vendored OpenSSL build fails only in the container. |
 | After a change to `PROTOCOL.md` bytes | `make vectors`, then `make vectors-check` | Go `crypto/hpke` takes no fixed ephemeral key, so a regeneration changes every `sealed` value. Regenerate only for a format change. |
 
 `BASE` is the target branch for a pull request, or the previous commit for a direct push. The default is `main`.

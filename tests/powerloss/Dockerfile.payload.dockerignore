@@ -1,0 +1,15 @@
+# The power-loss payload build (tests/powerloss/run.py) uses the repo root as
+# its context and reads demo/ and tests/powerloss/. BuildKit reads this file in place
+# of the root .dockerignore, which allows only the relay sources.
+target/
+.agents/
+**/.venv/
+**/__pycache__/
+bindings/python/build/
+bindings/swift/build/
+bindings/swift/.build/
+crates/*/fuzz/target/
+crates/*/fuzz/corpus/
+mutants.out*/
+specs/
+.scratch/

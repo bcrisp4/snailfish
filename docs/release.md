@@ -45,3 +45,39 @@ The workflow `.github/workflows/release.yml` makes a GitHub release from a tag `
 4. Make the tag on the merge commit: `git tag -s v<version> <commit>`.
 5. Push the tag: `git push origin v<version>`.
 6. If the run fails with "has no section", add the section to `CHANGELOG.md`. Then make the tag again.
+
+# Publish the relay image
+
+The workflow `.github/workflows/publish-image.yml` publishes the relay image to `ghcr.io/bcrisp4/snailfish-relay` for `linux/amd64` and `linux/arm64`. It runs for each push to `main` and each tag `v<version>` or `v<version>-rc.<n>`. A release tag also starts `release.yml` (see "Make a GitHub release"). The README lists the tags and the user verification commands.
+
+| Trigger | Image tags |
+| --- | --- |
+| Push to `main` | `main`, `sha-<commit>` |
+| Tag `v<version>-rc.<n>` | `<version>-rc.<n>`, `sha-<commit>` |
+| Tag `v<version>` | `<version>`, `<major>.<minor>`, `latest`, `sha-<commit>`. From 1.0 also `<major>`. |
+
+## Controls
+
+| Control | Where | Reason |
+| --- | --- | --- |
+| Tag check | The `meta` job | A tag that is not a semantic version, or a tag on a commit that is not on `main`, stops the run. |
+| Tag ruleset | GitHub ruleset "release tags" on `refs/tags/v*` | Only an admin can create, move or delete a release tag. |
+| No build cache | `no-cache: true` in the `build` job | A cache entry from an earlier run cannot change a published image. |
+| Pinned build inputs | The base images by digest, the actions by commit SHA, `cargo-auditable` by version, `--locked` | A moved tag or a new upstream release cannot change a build. Dependabot proposes updates after 7 days. |
+| Smoke test | `tools/image-smoke-test.sh` in the `build` job | Each architecture must start healthy, read-only and with no capabilities before it gets a tag. |
+| Vulnerability scan | Grype in the `build` job. The results go to code scanning. | A fixable High or Critical vulnerability stops the run. |
+| Signature and provenance | cosign and `actions/attest-build-provenance` in the `merge` job | A user can verify that this workflow built the image from this repository. The job verifies both before it moves a tag. |
+| Tag move after signing | The last step of the `merge` job | A moving tag never points to an index with no signature. |
+
+## First publish
+
+The first push makes a private package. Do these steps once:
+
+1. Open the `snailfish-relay` package settings on GitHub.
+2. Set the visibility to public.
+3. Under "Manage Actions access", check that the `snailfish` repository has the write role.
+
+## If an image is bad
+
+1. Fix the cause on `main` through a pull request.
+2. If the bad image is a release, make the next patch release. A release tag never moves.

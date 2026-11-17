@@ -1,0 +1,276 @@
+# Publish the relay container image to ghcr.io (DESIGN.md "Relay deployment").
+# Unverified: this workflow has not run on GitHub yet.
+#
+# A push to main and each release tag v<version> or v<version>-rc.<n> start
+# it. docs/release.md "Publish the relay image" lists the image tags and the
+# controls.
+#
+# 1. `meta` checks the release tag and computes the tags and labels.
+# 2. `build` builds each architecture natively with no cache and pushes it by
+#    digest, with no tag. It runs the smoke test and the vulnerability scan on
+#    the pushed image.
+# 3. `merge` joins the two images into one index. It signs the index with
+#    cosign, attests its build provenance, and verifies both. Only then does
+#    it move the tags to the index.
+#
+# The index holds the BuildKit SBOM and provenance of each architecture, so
+# the one signature also covers them.
+name: publish-image
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+# Runs for one ref do not overlap, so an older run cannot move a tag after a
+# newer run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/snailfish-relay
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      annotations: ${{ steps.meta.outputs.annotations }}
+      epoch: ${{ steps.epoch.outputs.epoch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # The tag ruleset (docs/release.md) limits who can push a tag. This step
+      # also stops a tag on a commit that did not pass review on main.
+      - name: A release tag is a semantic version on main
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$ ]]; then
+            echo "FAIL: tag $TAG is not v<major>.<minor>.<patch> or v<major>.<minor>.<patch>-rc.<n>"; exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "FAIL: tag $TAG is on a commit that is not on main"; exit 1
+          fi
+      # The commit time sets the layer timestamps and the created label, so a
+      # rebuild of one commit gives the same metadata.
+      - id: epoch
+        run: echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+      # A release candidate gets only its own tag. A release also gets
+      # <major>.<minor>, <major> (from 1.0) and latest.
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=main,enable={{is_default_branch}}
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=snailfish-relay
+            org.opencontainers.image.description=The Snailfish relay. It stores encrypted sync data and cannot read it.
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/docs/self-host.md
+            org.opencontainers.image.created={{commit_date 'YYYY-MM-DDTHH:mm:ss[Z]'}}
+          annotations: |
+            org.opencontainers.image.title=snailfish-relay
+            org.opencontainers.image.description=The Snailfish relay. It stores encrypted sync data and cannot read it.
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/docs/self-host.md
+            org.opencontainers.image.created={{commit_date 'YYYY-MM-DDTHH:mm:ss[Z]'}}
+
+  build:
+    needs: meta
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # Push the untagged image of one architecture.
+      packages: write
+      # The scan uploads its SARIF report to code scanning.
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # no-cache: a published image never reuses a layer from an earlier run,
+      # so a poisoned cache cannot reach it. The image has no tag until the
+      # merge job signs it.
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.meta.outputs.epoch }}
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ needs.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true
+          provenance: mode=max
+          sbom: true
+          no-cache: true
+          pull: true
+      - name: Pull the pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker pull "$IMAGE@$DIGEST"
+      - name: Smoke test
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: tools/image-smoke-test.sh "$IMAGE@$DIGEST"
+      # Grype reads the Rust crates from the cargo-auditable section of the
+      # binary and the Debian packages of the base image. A fixable High or
+      # Critical vulnerability stops the run before any tag moves.
+      - id: scan
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          severity-cutoff: high
+          only-fixed: true
+          output-format: sarif
+      - if: ${{ !cancelled() && steps.scan.outputs.sarif != '' }}
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: relay-image-${{ matrix.arch }}
+      - name: Write the digest
+        env:
+          ARCH: ${{ matrix.arch }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          echo "$DIGEST" > "$RUNNER_TEMP/digests/$ARCH"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      # Push the index, its signature and its attestation, and move the tags.
+      packages: write
+      # Keyless signing: Sigstore exchanges the OIDC token for a certificate.
+      id-token: write
+      # Store the build provenance attestation on GitHub.
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # The index gets only the immutable sha-<commit> tag here. The other
+      # tags move after the signature and the attestation exist.
+      - id: index
+        name: Create the multi-architecture index
+        env:
+          ANNOTATIONS: ${{ needs.meta.outputs.annotations }}
+        run: |
+          args=()
+          while IFS= read -r a; do
+            if [ -n "$a" ]; then args+=(--annotation "$a"); fi
+          done <<< "$ANNOTATIONS"
+          sources=()
+          for arch in amd64 arm64; do
+            sources+=("$IMAGE@$(cat "$RUNNER_TEMP/digests/$arch")")
+          done
+          docker buildx imagetools create "${args[@]}" --tag "$IMAGE:sha-$GITHUB_SHA" "${sources[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{json .Manifest}}' | jq -er .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Sign the index
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+      # GitHub stores the attestation and pushes it to ghcr.io next to the
+      # image. The storage record API is for organisations only.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      # The same commands as the README. A signature or an attestation that a
+      # user cannot verify stops the run before any tag moves.
+      - name: Verify the signature and the attestation
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cosign verify \
+            --certificate-identity "https://github.com/$REPO/.github/workflows/publish-image.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE@$DIGEST" > /dev/null
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo "$REPO" \
+            --signer-workflow "$REPO/.github/workflows/publish-image.yml" \
+            --source-ref "$GITHUB_REF"
+      - name: Move the tags to the index
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+          TAGS: ${{ needs.meta.outputs.tags }}
+        run: |
+          args=()
+          while IFS= read -r t; do
+            if [ -n "$t" ]; then args+=(--tag "$t"); fi
+          done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "$IMAGE@$DIGEST"
+          # A copy with a new digest would carry no signature.
+          for t in "${args[@]}"; do
+            if [ "$t" = --tag ]; then continue; fi
+            got=$(docker buildx imagetools inspect "$t" --format '{{json .Manifest}}' | jq -er .digest)
+            if [ "$got" != "$DIGEST" ]; then
+              echo "FAIL: $t is $got, not $DIGEST"; exit 1
+            fi
+          done
+          {
+            echo "Published \`$IMAGE@$DIGEST\`"
+            echo
+            echo "Tags:"
+            sed 's/^/- /' <<< "$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"
