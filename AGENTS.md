@@ -62,7 +62,7 @@ Each Rust test runs once for each mutant, and a branch can have 700 or more muta
 | Start a branch-wide mutants run only after the code stops changing. | A new push makes a running run out of date. |
 | A Rust test must not sleep, poll a wall clock or start a `cargo` build. If a test must, exclude it in the nextest `mutants` profile (`.config/nextest.toml`) and exclude the mutants that only it catches. | The mutants run repeats the cost for each mutant. |
 | A loop over independent items (fuzz targets, models, harnesses) runs the items in parallel, up to the core or memory limit. | A serial loop uses one core of many. |
-| A new CI job that builds Rust uses `Swatinem/rust-cache`. A new CI job must not take longer than the `mutants` job. | The slowest job sets the time to a result. |
+| A new CI job that builds Rust uses `Swatinem/rust-cache`, except a job that builds a published artefact. A new CI job must not take longer than the `mutants` job. | The slowest job sets the time to a result. A cache entry from an earlier run must not reach a published artefact, so `publish-image.yml` builds with no cache. |
 | Do not make a check faster by a reduction of its coverage (cases, bounds, configs or mutants) unless the user approves it. | A faster check that finds fewer faults is a weaker check. |
 
 ### Result requirements

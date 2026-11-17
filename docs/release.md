@@ -46,6 +46,8 @@ The workflow `.github/workflows/release.yml` makes a GitHub release from a tag `
 5. Push the tag: `git push origin v<version>`.
 6. If the run fails with "has no section", add the section to `CHANGELOG.md`. Then make the tag again.
 
+A release candidate uses the tag `v<version>-rc.<n>` on a commit on `main`. Its GitHub release is a prerelease with the notes of `## [Unreleased]`. Do steps 4 and 5 with that tag. Do not rename the section.
+
 # Publish the relay image
 
 The workflow `.github/workflows/publish-image.yml` publishes the relay image to `ghcr.io/bcrisp4/snailfish-relay` for `linux/amd64` and `linux/arm64`. It runs for each push to `main` and each tag `v<version>` or `v<version>-rc.<n>`. A release tag also starts `release.yml` (see "Make a GitHub release"). The README lists the tags and the user verification commands.
@@ -53,8 +55,10 @@ The workflow `.github/workflows/publish-image.yml` publishes the relay image to 
 | Trigger | Image tags |
 | --- | --- |
 | Push to `main` | `main`, `sha-<commit>` |
-| Tag `v<version>-rc.<n>` | `<version>-rc.<n>`, `sha-<commit>` |
-| Tag `v<version>` | `<version>`, `<major>.<minor>`, `latest`, `sha-<commit>`. From 1.0 also `<major>`. |
+| Tag `v<version>-rc.<n>` | `<version>-rc.<n>` |
+| Tag `v<version>` | `<version>`. Also `latest`, `<major>.<minor>` and (from 1.0) `<major>` if this release is the highest that the tag covers. |
+
+The release run does not write `sha-<commit>`, because the `main` build of the commit holds it. `tools/image-release-tags.sh` picks the moving tags from the release tags on GitHub just before the move. A patch release on an older line does not move `latest`.
 
 ## Controls
 
@@ -62,12 +66,12 @@ The workflow `.github/workflows/publish-image.yml` publishes the relay image to 
 | --- | --- | --- |
 | Tag check | The `meta` job | A tag that is not a semantic version, or a tag on a commit that is not on `main`, stops the run. |
 | Tag ruleset | GitHub ruleset "release tags" on `refs/tags/v*` | Only an admin can create, move or delete a release tag. |
-| No build cache | `no-cache: true` in the `build` job | A cache entry from an earlier run cannot change a published image. |
 | Pinned build inputs | The base images by digest, the actions by commit SHA, `cargo-auditable` by version, `--locked` | A moved tag or a new upstream release cannot change a build. Dependabot proposes updates after 7 days. |
 | Smoke test | `tools/image-smoke-test.sh` in the `build` job | Each architecture must start healthy, read-only and with no capabilities before it gets a tag. |
 | Vulnerability scan | Grype in the `build` job. The results go to code scanning. | A fixable High or Critical vulnerability stops the run. |
 | Signature and provenance | cosign and `actions/attest-build-provenance` in the `merge` job | A user can verify that this workflow built the image from this repository. The job verifies both before it moves a tag. |
 | Tag move after signing | The last step of the `merge` job | A moving tag never points to an index with no signature. |
+| No cache in the build | `no-cache: true`, an exception to the `rust-cache` rule of AGENTS.md | A cache entry from an earlier run cannot reach a published image. |
 
 ## First publish
 
@@ -76,6 +80,10 @@ The first push makes a private package. Do these steps once:
 1. Open the `snailfish-relay` package settings on GitHub.
 2. Set the visibility to public.
 3. Under "Manage Actions access", check that the `snailfish` repository has the write role.
+
+## Untagged versions
+
+Each run leaves untagged versions in the package: the image of each architecture, the attestation manifests and the signature. Do not delete untagged versions. A tagged index refers to them, so a deletion breaks the index or its signature. A run that fails the smoke test or the scan also leaves an untagged image. It has no signature, so `cosign verify` refuses it.
 
 ## If an image is bad
 

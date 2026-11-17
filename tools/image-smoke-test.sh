@@ -42,8 +42,14 @@ if [ "$code" != 0 ]; then
   echo "FAIL: exit code $code after SIGTERM"; exit 1
 fi
 
-# The relay does not start without an authority.
-if docker run --rm "$image" >/dev/null 2>&1; then
+# The relay does not start without an authority. A relay that starts serves
+# forever, so the wait has a time limit.
+docker rm "$name" >/dev/null
+docker run -d --name "$name" "$image" >/dev/null
+if ! code=$(timeout 30 docker wait "$name"); then
   echo "FAIL: the relay started without SNAILFISH_AUTHORITY"; exit 1
+fi
+if [ "$code" = 0 ]; then
+  echo "FAIL: the relay exited 0 without SNAILFISH_AUTHORITY"; exit 1
 fi
 echo "PASS: $image"

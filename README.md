@@ -58,9 +58,11 @@ The relay image is `ghcr.io/bcrisp4/snailfish-relay`, for `linux/amd64` and `lin
 | --- | --- | --- |
 | `<version>`, for example `0.2.0` | A release | No |
 | `<version>-rc.<n>` | A release candidate | No |
-| `<major>.<minor>`, `latest` | The newest release. `<major>` too from 1.0. | Yes |
+| `<major>.<minor>` | The highest release of that minor line | Yes |
+| `<major>`, from 1.0 | The highest release of that major line | Yes |
+| `latest` | The highest release | Yes |
 | `main` | The newest commit on `main`. Not for production. | Yes |
-| `sha-<commit>` | The build of one commit | No |
+| `sha-<commit>` | The `main` build of one commit | No |
 
 Deploy an image by its digest, not by a tag. Get the digest of a tag:
 

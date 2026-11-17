@@ -140,7 +140,10 @@ jobs:
   image:
     # DESIGN.md "Relay deployment": the static musl image for each
     # architecture, with vendored OpenSSL. Each runner builds its own
-    # architecture natively. CI does not push the image.
+    # architecture natively. CI does not push the image. A push to main
+    # skips this job: publish-image.yml builds the same commit and runs the
+    # same smoke test and scan before it publishes.
+    if: github.event_name != 'push'
     strategy:
       fail-fast: false
       matrix:

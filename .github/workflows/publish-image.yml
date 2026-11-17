@@ -5,13 +5,15 @@
 # it. docs/release.md "Publish the relay image" lists the image tags and the
 # controls.
 #
-# 1. `meta` checks the release tag and computes the tags and labels.
+# 1. `meta` checks the release tag and computes the pin tag and the labels.
+#    The pin tag never moves: sha-<commit> for main, <version> for a tag.
 # 2. `build` builds each architecture natively with no cache and pushes it by
 #    digest, with no tag. It runs the smoke test and the vulnerability scan on
 #    the pushed image.
 # 3. `merge` joins the two images into one index. It signs the index with
 #    cosign, attests its build provenance, and verifies both. Only then does
-#    it move the tags to the index.
+#    it move the tags to the index. tools/image-release-tags.sh picks the
+#    moving tags of a release from the release tags on GitHub at that time.
 #
 # The index holds the BuildKit SBOM and provenance of each architecture, so
 # the one signature also covers them.
@@ -44,6 +46,8 @@ jobs:
     permissions:
       contents: read
     outputs:
+      pin: ${{ steps.pin.outputs.pin }}
+      version: ${{ steps.pin.outputs.version }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
       annotations: ${{ steps.meta.outputs.annotations }}
@@ -70,8 +74,22 @@ jobs:
       # rebuild of one commit gives the same metadata.
       - id: epoch
         run: echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
-      # A release candidate gets only its own tag. A release also gets
-      # <major>.<minor>, <major> (from 1.0) and latest.
+      # A main build and a release build of one commit have different
+      # digests. Each gets its own pin tag, so neither overwrites the other.
+      - id: pin
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            echo "pin=${TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "pin=sha-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "version=main" >> "$GITHUB_OUTPUT"
+          fi
+      # The only tag here is `main`. The merge job adds the pin tag and the
+      # moving tags of a release.
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         env:
@@ -79,25 +97,21 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           flavor: latest=false
-          tags: |
-            type=raw,value=main,enable={{is_default_branch}}
-            type=sha,format=long
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
+          tags: type=raw,value=main,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=snailfish-relay
             org.opencontainers.image.description=The Snailfish relay. It stores encrypted sync data and cannot read it.
             org.opencontainers.image.licenses=MIT OR Apache-2.0
             org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/docs/self-host.md
             org.opencontainers.image.created={{commit_date 'YYYY-MM-DDTHH:mm:ss[Z]'}}
+            org.opencontainers.image.version=${{ steps.pin.outputs.version }}
           annotations: |
             org.opencontainers.image.title=snailfish-relay
             org.opencontainers.image.description=The Snailfish relay. It stores encrypted sync data and cannot read it.
             org.opencontainers.image.licenses=MIT OR Apache-2.0
             org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/docs/self-host.md
             org.opencontainers.image.created={{commit_date 'YYYY-MM-DDTHH:mm:ss[Z]'}}
+            org.opencontainers.image.version=${{ steps.pin.outputs.version }}
 
   build:
     needs: meta
@@ -203,12 +217,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # The index gets only the immutable sha-<commit> tag here. The other
-      # tags move after the signature and the attestation exist.
+      # The index gets only its pin tag here. The other tags move after the
+      # signature and the attestation exist.
       - id: index
         name: Create the multi-architecture index
         env:
           ANNOTATIONS: ${{ needs.meta.outputs.annotations }}
+          PIN: ${{ needs.meta.outputs.pin }}
         run: |
           args=()
           while IFS= read -r a; do
@@ -218,8 +233,8 @@ jobs:
           for arch in amd64 arm64; do
             sources+=("$IMAGE@$(cat "$RUNNER_TEMP/digests/$arch")")
           done
-          docker buildx imagetools create "${args[@]}" --tag "$IMAGE:sha-$GITHUB_SHA" "${sources[@]}"
-          digest=$(docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{json .Manifest}}' | jq -er .digest)
+          docker buildx imagetools create "${args[@]}" --tag "$IMAGE:$PIN" "${sources[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$PIN" --format '{{json .Manifest}}' | jq -er .digest)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: Sign the index
@@ -250,19 +265,35 @@ jobs:
             --repo "$REPO" \
             --signer-workflow "$REPO/.github/workflows/publish-image.yml" \
             --source-ref "$GITHUB_REF"
+      # The release tags come from GitHub just before the move, so a release
+      # tag pushed during this run still keeps `latest` from an older line.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: tools
       - name: Move the tags to the index
         env:
           DIGEST: ${{ steps.index.outputs.digest }}
-          TAGS: ${{ needs.meta.outputs.tags }}
+          MAIN_TAGS: ${{ needs.meta.outputs.tags }}
+          PIN: ${{ needs.meta.outputs.pin }}
+          REF_TYPE: ${{ github.ref_type }}
+          REPO: ${{ github.repository }}
         run: |
-          args=()
+          tags=("$IMAGE:$PIN")
           while IFS= read -r t; do
-            if [ -n "$t" ]; then args+=(--tag "$t"); fi
-          done <<< "$TAGS"
+            if [ -n "$t" ]; then tags+=("$t"); fi
+          done <<< "$MAIN_TAGS"
+          if [ "$REF_TYPE" = tag ]; then
+            moving=$(git ls-remote --tags --refs "https://github.com/$REPO.git" | tools/image-release-tags.sh "$PIN")
+            while IFS= read -r t; do
+              if [ -n "$t" ]; then tags+=("$IMAGE:$t"); fi
+            done <<< "$moving"
+          fi
+          args=()
+          for t in "${tags[@]}"; do args+=(--tag "$t"); done
           docker buildx imagetools create "${args[@]}" "$IMAGE@$DIGEST"
           # A copy with a new digest would carry no signature.
-          for t in "${args[@]}"; do
-            if [ "$t" = --tag ]; then continue; fi
+          for t in "${tags[@]}"; do
             got=$(docker buildx imagetools inspect "$t" --format '{{json .Manifest}}' | jq -er .digest)
             if [ "$got" != "$DIGEST" ]; then
               echo "FAIL: $t is $got, not $DIGEST"; exit 1
@@ -272,5 +303,5 @@ jobs:
             echo "Published \`$IMAGE@$DIGEST\`"
             echo
             echo "Tags:"
-            sed 's/^/- /' <<< "$TAGS"
+            printf -- '- %s\n' "${tags[@]}"
           } >> "$GITHUB_STEP_SUMMARY"
