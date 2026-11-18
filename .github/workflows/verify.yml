@@ -140,7 +140,10 @@ jobs:
   image:
     # DESIGN.md "Relay deployment": the static musl image for each
     # architecture, with vendored OpenSSL. Each runner builds its own
-    # architecture natively. CI does not push the image.
+    # architecture natively. CI does not push the image. A push to main
+    # skips this job: publish-image.yml builds the same commit and runs the
+    # same smoke test and scan before it publishes.
+    if: github.event_name != 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -156,22 +159,15 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build --platform linux/${{ matrix.arch }} -t snailfish-relay:ci .
-      - name: The container reports healthy and serves /v1/info
-        run: |
-          docker run -d --name relay -e SNAILFISH_AUTHORITY=localhost:8080 -p 8080:8080 snailfish-relay:ci
-          for _ in $(seq 60); do
-            s=$(docker inspect -f '{{.State.Health.Status}}' relay)
-            if [ "$s" = healthy ]; then break; fi
-            sleep 1
-          done
-          test "$s" = healthy
-          test "$(docker image inspect -f '{{.Config.User}}' snailfish-relay:ci)" = nonroot:nonroot
-          curl -fsS localhost:8080/v1/info | jq -e '.levels == [1]'
-          docker stop -t 10 relay
-          test "$(docker inspect -f '{{.State.ExitCode}}' relay)" = 0
-      - name: The relay does not start without an authority
-        run: |
-          if docker run --rm snailfish-relay:ci; then exit 1; fi
+      - run: tools/image-smoke-test.sh snailfish-relay:ci
+      # The publish-image workflow runs the same scan before it publishes. A
+      # pull request finds a vulnerable base image or crate before the merge.
+      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: snailfish-relay:ci
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
 
   powerloss:
     # DESIGN.md M2: SIGKILL a QEMU VM during push and pull. The disks use

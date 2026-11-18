@@ -6,6 +6,14 @@ A tag `v<version>` makes a GitHub release with the notes of its section. The Pyt
 
 ## [Unreleased]
 
+### Added
+
+- The relay image on `ghcr.io/bcrisp4/snailfish-relay` for each push to `main`, each release and each release candidate. Each image has a cosign signature, a build provenance attestation and an SBOM.
+
+### Changed
+
+- The relay image runs as the numeric user `65532:65532` on distroless Debian 13, with a smaller LTO build of the binary.
+
 ## [0.1.0] - 2026-11-08
 
 The first release. The protocol and the formats can change before 1.0.

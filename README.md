@@ -50,6 +50,58 @@ pip install snailfish
 
 The [demo](demo) app is a complete Python integration.
 
+## Container image
+
+The relay image is `ghcr.io/bcrisp4/snailfish-relay`, for `linux/amd64` and `linux/arm64`. It holds one static binary on [distroless/static](https://github.com/GoogleContainerTools/distroless), with no shell, and runs as UID 65532. Release 0.1.0 has no image. The first release image comes with the next release tag.
+
+| Tag | Content | Moves |
+| --- | --- | --- |
+| `<version>`, for example `0.2.0` | A release | No |
+| `<version>-rc.<n>` | A release candidate | No |
+| `<major>.<minor>` | The highest release of that minor line | Yes |
+| `<major>`, from 1.0 | The highest release of that major line | Yes |
+| `latest` | The highest release | Yes |
+| `main` | The newest commit on `main`. Not for production. | Yes |
+| `sha-<commit>` | The `main` build of one commit | No |
+
+Deploy an image by its digest, not by a tag. Get the digest of a tag:
+
+```bash
+docker buildx imagetools inspect ghcr.io/bcrisp4/snailfish-relay:<tag> --format '{{json .Manifest}}' | jq -r .digest
+```
+
+Each image has a cosign signature, a GitHub build provenance attestation (SLSA), and the BuildKit SBOM and provenance of each architecture. The signature covers the SBOM and the BuildKit provenance, because the signed index holds them.
+
+1. Verify the signature:
+
+   ```bash
+   cosign verify ghcr.io/bcrisp4/snailfish-relay@<digest> \
+     --certificate-identity-regexp '^https://github\.com/bcrisp4/snailfish/\.github/workflows/publish-image\.yml@refs/(heads/main|tags/v.+)$' \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+   ```
+
+2. Verify the build provenance:
+
+   ```bash
+   gh attestation verify oci://ghcr.io/bcrisp4/snailfish-relay@<digest> \
+     --repo bcrisp4/snailfish \
+     --signer-workflow bcrisp4/snailfish/.github/workflows/publish-image.yml
+   ```
+
+3. Read the SBOM of the Rust crates and the base image packages:
+
+   ```bash
+   docker buildx imagetools inspect ghcr.io/bcrisp4/snailfish-relay@<digest> --format '{{json .SBOM}}'
+   ```
+
+Run the image with a read-only root file system and no capabilities. The relay writes only to `/data` and `/secrets`.
+
+```bash
+docker run -d --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -e SNAILFISH_AUTHORITY=sync.example.net -v data:/data -v secrets:/secrets -p 8080:8080 \
+  ghcr.io/bcrisp4/snailfish-relay@<digest>
+```
+
 ## Verification
 
 Formal models in [specs](specs) define the protocol behaviour. The Rust implementation must agree with them.

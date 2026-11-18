@@ -1,7 +1,8 @@
 # Make a GitHub release from a tag v<version>. The release notes are the
 # "## [<version>]" section of CHANGELOG.md. A tag with no section stops the
-# run, so each release has notes. The Python package has its own workflow
-# (release-python.yml) and its own py-v<version> tags.
+# run, so each release has notes. A tag v<version>-rc.<n> makes a prerelease
+# with the notes of the "## [Unreleased]" section. The Python package has its
+# own workflow (release-python.yml) and its own py-v<version> tags.
 name: release
 
 permissions:
@@ -31,6 +32,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           version="${TAG#v}"
+          if [[ "$version" == *-rc.* ]]; then version=Unreleased; fi
           awk -v v="$version" '
             index($0, "## [" v "]") == 1 { found = 1; next }
             found && /^## \[/ { exit }
@@ -44,4 +46,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md
+        run: |
+          prerelease=()
+          if [[ "$TAG" == *-rc.* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file notes.md "${prerelease[@]}"

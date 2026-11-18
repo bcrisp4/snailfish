@@ -1,12 +1,10 @@
-target/
-.agents/
-**/.venv/
-**/__pycache__/
-bindings/python/build/
-bindings/swift/build/
-bindings/swift/.build/
+# An allowlist: the image build reads only these paths. A change to any other
+# file does not change the build context or invalidate a layer.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
 crates/*/fuzz/target/
 crates/*/fuzz/corpus/
-mutants.out*/
-specs/
-.scratch/
+**/.DS_Store
